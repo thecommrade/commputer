@@ -187,6 +187,16 @@ dependencies = [
 [[package]]
 name = "commputer-proofs"
 version = "0.1.0"
+dependencies = [
+ "blake3",
+ "borsh",
+ "commputer-core",
+ "rand",
+ "serde",
+ "sha2",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "commputer-storage"
