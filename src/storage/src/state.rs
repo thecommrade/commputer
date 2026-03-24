@@ -43,7 +43,11 @@ impl ChainState {
     }
 
     /// Whether emergency access mode is active (supply below 1M COMME).
+    /// Only triggers after emission has begun — not at genesis.
     pub fn is_emergency_access(&self) -> bool {
+        if self.total_emitted == 0 {
+            return false;
+        }
         let circulating_comme = self.circulating_supply() / commputer_core::token::UNITS_PER_COMME;
         circulating_comme < commputer_core::tier::HolderTier::EMERGENCY_SUPPLY_THRESHOLD
     }
