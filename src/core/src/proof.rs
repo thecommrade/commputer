@@ -1,0 +1,115 @@
+use serde::{Deserialize, Serialize};
+use borsh::{BorshDeserialize, BorshSerialize};
+use crate::identity::Address;
+
+/// The five resource channels in Commputer's multi-dimensional PoW.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash,
+         Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub enum ResourceChannel {
+    /// Proof of Processing — CPU compute verification.
+    Processing,
+    /// Proof of GPU — matrix operations / ML micro-benchmarks.
+    Gpu,
+    /// Proof of Storage — data retrievability challenges.
+    Storage,
+    /// Proof of RAM — memory-hard challenges.
+    Ram,
+    /// Proof of Bandwidth — timed data transfer.
+    Bandwidth,
+}
+
+impl ResourceChannel {
+    pub const ALL: [Self; 5] = [
+        Self::Processing,
+        Self::Gpu,
+        Self::Storage,
+        Self::Ram,
+        Self::Bandwidth,
+    ];
+
+    /// Minimum emission floor percentage (basis points, 10000 = 100%).
+    pub fn emission_floor_bps(&self) -> u32 {
+        match self {
+            Self::Processing => 1000, // 10%
+            Self::Gpu => 1000,        // 10%
+            Self::Storage => 1000,    // 10%
+            Self::Ram => 500,         // 5%
+            Self::Bandwidth => 500,   // 5%
+        }
+    }
+}
+
+/// A challenge issued by the network to a validator for a specific resource channel.
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct ProofChallenge {
+    /// Which resource this challenge targets.
+    pub channel: ResourceChannel,
+    /// Unique challenge identifier.
+    pub challenge_id: [u8; 32],
+    /// The epoch this challenge was issued in.
+    pub epoch: u64,
+    /// The validator being challenged.
+    pub target: Address,
+    /// Challenge-specific payload (varies by channel).
+    pub payload: Vec<u8>,
+    /// Deadline (block height) by which response must arrive.
+    pub deadline_block: u64,
+}
+
+/// A validator's response to a proof challenge.
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct ProofResponse {
+    /// The challenge being responded to.
+    pub challenge_id: [u8; 32],
+    /// The responding validator.
+    pub validator: Address,
+    /// Response payload (varies by channel).
+    pub result: Vec<u8>,
+    /// Time taken to compute response (self-reported, verified by timing).
+    pub compute_time_ms: u64,
+    /// Signature over (challenge_id || result).
+    pub signature: Vec<u8>,
+}
+
+/// Result of verifying a proof response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofVerdict {
+    /// Proof is valid — validator demonstrated the claimed resource.
+    Valid,
+    /// Proof is invalid — wrong answer, too slow, or signature mismatch.
+    Invalid,
+    /// Proof timed out — no response before deadline.
+    TimedOut,
+    /// Proof is suspicious — correct but timing suggests resource mismatch.
+    Suspicious,
+}
+
+/// Aggregated proof results for a validator across all channels in an epoch.
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct EpochProofSummary {
+    pub validator: Address,
+    pub epoch: u64,
+    pub processing_score: u32,
+    pub gpu_score: u32,
+    pub storage_score: u32,
+    pub ram_score: u32,
+    pub bandwidth_score: u32,
+    /// Diversity bonus (0-100). Higher if contributing across multiple channels.
+    pub diversity_bonus: u8,
+}
+
+impl EpochProofSummary {
+    /// Composite Resource Score with diversity weighting.
+    /// Used for emission allocation and Snowball anchor selection.
+    pub fn composite_score(&self) -> u64 {
+        let base = self.processing_score as u64
+            + self.gpu_score as u64
+            + self.storage_score as u64
+            + self.ram_score as u64
+            + self.bandwidth_score as u64;
+
+        // Diversity bonus: up to 50% boost for contributing across all channels.
+        let bonus = (base * self.diversity_bonus as u64) / 200;
+        base + bonus
+    }
+}

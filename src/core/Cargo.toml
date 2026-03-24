@@ -1,0 +1,18 @@
+[package]
+name = "commputer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core data types and primitives for the Commputer L1"
+
+[dependencies]
+serde = { workspace = true }
+borsh = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+hex = "0.4"

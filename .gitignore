@@ -1,0 +1,18 @@
+# Build artifacts
+src/target/
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+*.key
+*.pem
