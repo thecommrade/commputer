@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description.workspace = true
+description = "Snowstorm consensus engine: Avalanche-style sampling over multi-channel DAG"
 
 [dependencies]
+commputer-core = { workspace = true }
+serde = { workspace = true }
+borsh = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
