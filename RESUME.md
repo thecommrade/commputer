@@ -1,9 +1,9 @@
 # Commputer Development Resume Document
 
-**Last updated:** 2026-03-25 (evening session)
-**Last session test count:** 113 passing, 0 failing
-**Commits:** 33
-**Lines of Rust:** ~7,200
+**Last updated:** 2026-03-26 (overnight session)
+**Last session test count:** 125 passing, 0 failing
+**Commits:** 52
+**Lines of Rust:** ~8,600
 
 ## What This Is
 
@@ -67,57 +67,94 @@ All source code is in `src/` (Cargo workspace).
 6. **Transaction validation** → full ed25519 signature verification on receipt (mempool) AND in blocks (apply_block_validated). Transactions carry sender's public key.
 7. **Block validation** → parent hash check, merkle root verification (tx_root + proof_root), signature verification on all transactions
 8. **Anti-scale enforcement** → ComplianceChecker wired into live libp2p peer connections. IPs extracted from connection events, fed into checker. Same IP or /24 subnet triggers NerfedIncidental. Cleaned up on disconnect.
-9. **CLI** → wallet create/recover/show/export, chain status, send (offline-only — broadcast is next task)
+9. **CLI** → wallet create/recover/show/export, chain status, send (broadcasts via RPC), peers, balance, version
 10. **Persistence** → RocksDB, chain survives restarts
 11. **Two-node test** → integration test proves gossipsub block propagation works
+12. **RPC server** → axum on port 9944: submit tx, chain status, peers, balance, mempool, block explorer, health
+13. **Transaction fees** → minimum fee enforced, fees burned on block inclusion
+14. **Block validation** → size limits (500 tx / 1MB), timestamp checks, producer signature verification
+15. **Mempool protection** → nonce validation, double-spend prevention, size cap with fee-based eviction
+16. **Bad peer handling** → invalid block senders are banned and disconnected
+17. **Graceful shutdown** → SIGINT/SIGTERM flushes state to RocksDB
 
-## What Was JUST Completed (This Session — Mar 25 Evening)
+## What Was JUST Completed (This Session — Mar 25-26 Overnight)
 
-Three features landed in quick succession:
-1. **feat(core): add public key to transactions and verify signatures on receipt** (commit 077cf55)
-   - Transaction struct now has `public_key: Vec<u8>` field
-   - `Transaction::verify()` does full ed25519 verification (key length, address match, signature)
-   - `sign_transaction()` populates public_key automatically
-   - Event loop uses `tx.verify()` instead of length check
-2. **feat(core,storage): add merkle roots and full block validation** (commit 72c665d)
-   - `Block::compute_tx_root()` and `Block::compute_proof_root()` with real merkle tree
-   - Block production sets merkle roots before broadcasting
-   - `apply_block_validated` checks: height, parent hash, merkle roots, full signature verification
-3. **feat(node): wire compliance checker into live peer connections** (commit 27ca012)
-   - `peer_ips` and `peer_validators` maps on EventLoop
-   - ConnectionEstablished extracts IP from multiaddr, registers with ComplianceChecker
-   - ConnectionClosed cleans up tracking and deregisters from compliance
+Massive overnight session. 19 new commits, 12 new tests, ~1,400 new lines of Rust.
+
+### RPC Server & CLI (commits 33c9332..af71915)
+1. **RPC server for transaction broadcast** — axum HTTP server on port 9944. POST /tx submits signed transactions, GET /status returns chain info. CLI `send` command broadcasts via RPC.
+2. **RPC tests** — 4 unit tests: signed tx accepted, unsigned rejected, bad signature rejected, status endpoint works.
+3. **CLI peers command** — GET /peers shows connected peers, IPs, validator addresses, compliance status.
+4. **CLI balance command** — GET /balance/{address} shows balance, tier, nonce, validator status.
+5. **CLI version command** — prints protocol version, network, supply, consensus params.
+6. **Mempool RPC** — GET /mempool returns pending transactions.
+7. **Health endpoint** — GET /health returns node health status.
+8. **Block explorer RPC** — GET /block/{height} returns full block data for last 100 blocks.
+
+### Protocol Hardening (commits ef3efd8..3e22cbd)
+9. **Wire peer_validators map** — ValidatorRegister transactions now link sender Address to the PeerId, feeding into compliance checker.
+10. **Bad peer handling** — peers sending blocks with bad merkle roots or invalid tx signatures are banned and disconnected. Messages from banned peers are dropped.
+11. **Block producer signing** — producers sign block headers with ed25519 wallet key. BlockHeader gains producer_public_key field. verify_producer_signature() method.
+12. **Nonce validation & double-spend prevention** — mempool validates nonce matches expected next nonce (on-chain + pending). Tracks seen tx hashes to reject duplicates.
+13. **Transaction fees** — fee field on Transaction, MINIMUM_FEE = 0.0001 COMME. Fees are burned on block inclusion.
+14. **Block size limits** — MAX_TRANSACTIONS_PER_BLOCK = 500, MAX_BLOCK_SIZE_BYTES = 1MB. Block production caps txs; received blocks validated.
+15. **Timestamp validation** — reject blocks >30s in future or before parent timestamp.
+16. **Mempool size limit** — capped at 5000 txs, lowest-fee evicted when full.
+
+### Networking & Infrastructure (commits 05d0cef..c1c2341)
+17. **Protocol handshake** — identify protocol checks /commputer/ prefix, disconnects incompatible peers.
+18. **Connection timeout** — idle connections closed after 60 seconds.
+19. **Graceful shutdown** — SIGINT/SIGTERM handler flushes chain state to RocksDB before exit.
+
+### Storage (commit 931a336)
+20. **Block pruning** — blocks older than 1000 heights pruned from memory, remain in RocksDB.
+
+### Testing (commits 0d49dbd..93fa4b6)
+21. **Fork resolution tests** — unit tests for two ConsensusManagers converging, minority block losing. Integration test for competing block propagation via gossipsub.
 
 ## What's Next (IMMEDIATE — Pick Up Here)
 
-### 1. Transaction Broadcast from CLI (IN PROGRESS — was about to start)
-The `send` command in `src/node/src/main.rs` creates and signs a transaction but doesn't broadcast it to the network. Need to either:
-- Add an RPC endpoint (HTTP/JSON) to the running node that accepts transactions
-- Or have the CLI briefly connect to the P2P network just to submit the tx
-The RPC approach is cleaner — add a simple HTTP server (e.g., `axum` or `warp`) that listens alongside the P2P node.
+### 1. Genesis Configuration File (JSON)
+Define total supply, emission curve, channel floors, epoch duration, reference node specs in a JSON config file. Load on first boot instead of hardcoding.
 
-### 2. Multi-Machine Testing
-The founder has machines available. Test two nodes on different physical machines. This will surface real network issues (NAT, firewall, latency, state divergence).
+### 2. Chain Reorganization
+If a node receives a valid chain that's longer than its current chain, switch to it. Handle orphaned transactions.
 
-### 3. Fork Resolution Testing
-Test what happens when two validators produce competing blocks at the same height.
+### 3. Multi-Machine Integration Test
+Two data dirs, two ports, two wallets, connect, verify same chain state after 10 blocks.
 
-### 4. Error Recovery
-Crash recovery, garbage peer handling, network partition behavior.
+### 4. Sync Protocol
+When a node starts behind the network, sync missing blocks from peers before consensus.
 
-### 5. Longer Term
-- Block producer validation (verify the producer was actually the anchor)
-- Peer reputation / ban list for bad actors
-- State pruning and snapshot/restore
-- Wallet key import/export as files
+### 5. Block Request Protocol
+If a node is behind, request specific blocks by height from peers.
+
+### 6. Proof Channel Improvements
+- Cross-node proof verification
+- Proof difficulty scaling per epoch
+- Real bandwidth/storage challenges
+
+### 7. State & Storage
+- Account state merkle tree for state_root
+- State snapshots for fast bootstrap
+- Grace period tracking in live node
+
+### 8. Economic Refinement
+- Demand-weighted emission live calculation
+- Adaptive nerf percentage
+- Burst compute pricing
+- Milestone burn triggers
 
 ## Known Issues / Warnings
 
 - `candidates_at_height` in consensus_manager.rs has a dead_code warning (only used in tests)
-- The `send` CLI command creates transactions offline — needs network broadcast (NEXT TASK)
 - Proof scores are currently self-reported (node challenges itself) — needs cross-node validation
-- No peer banning for bad behavior yet
-- `peer_validators` map is declared but not yet populated from validator registration transactions — need to link incoming ValidatorRegister txs to the peer that sent them
+- No chain reorganization yet — longer-chain switching not implemented
+- No sync protocol — nodes that start behind can't catch up from peers
+- No block request protocol — can't ask peers for specific blocks
+- Genesis config is hardcoded — should be loaded from JSON file
+- `seen_tx_hashes` grows unbounded — needs periodic pruning
+- Block explorer RPC cache only holds last 100 blocks
 
 ## Completion Estimate
 
