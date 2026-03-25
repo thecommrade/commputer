@@ -129,8 +129,8 @@ async fn submit_tx(
             }),
         );
     }
-    if let Some(ref memo) = tx.memo {
-        if memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
+    if let Some(ref memo) = tx.memo
+        && memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(SubmitTxResponse {
@@ -140,7 +140,6 @@ async fn submit_tx(
                 }),
             );
         }
-    }
 
     // Basic validation before forwarding to event loop.
     if !tx.verify() {
@@ -705,14 +704,13 @@ async fn faucet(
 
     // Rate limit: 1 request per address per epoch.
     let mut claims = state.faucet_claims.lock().await;
-    if let Some(&last_epoch) = claims.get(&req.address) {
-        if last_epoch >= current_epoch {
+    if let Some(&last_epoch) = claims.get(&req.address)
+        && last_epoch >= current_epoch {
             return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
                 "error": "faucet already claimed this epoch",
                 "next_available_epoch": current_epoch + 1,
             })));
         }
-    }
 
     claims.insert(req.address.clone(), current_epoch);
 
@@ -757,6 +755,26 @@ async fn auth_middleware(
         }
     }
     next.run(req).await
+}
+
+/// Item 58: Security headers middleware.
+async fn security_headers(
+    req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    headers.insert("Cache-Control", "no-store".parse().unwrap());
+    headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
+    headers.insert(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'none'".parse().unwrap(),
+    );
+    // Item 57: CORS — localhost only (already bound to 127.0.0.1).
+    headers.insert("Access-Control-Allow-Origin", "http://localhost:*".parse().unwrap_or_else(|_| "http://localhost".parse().unwrap()));
+    response
 }
 
 // ── Feature 16: RPC per-IP rate limiting middleware ──
@@ -834,8 +852,11 @@ pub async fn start_rpc_server(
     rpc_port: u16,
     rpc_state: Arc<RpcState>,
 ) {
-    let app = build_router(rpc_state);
+    let app = build_router(rpc_state)
+        // Item 58: Security headers on all RPC responses.
+        .layer(axum::middleware::from_fn(security_headers));
 
+    // Item 57: Already bound to 127.0.0.1 (localhost only) for CORS safety.
     let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", rpc_port)).await {
         Ok(l) => l,
         Err(e) => {

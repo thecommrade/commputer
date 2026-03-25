@@ -141,11 +141,10 @@ impl ConsensusManager {
 
     /// Record a peer's response for a given height.
     pub fn record_response(&mut self, height: u64, preference: BlockHash) {
-        if let Some(state) = self.heights.get_mut(&height) {
-            if !state.voter.is_finalized() {
+        if let Some(state) = self.heights.get_mut(&height)
+            && !state.voter.is_finalized() {
                 *state.round_responses.entry(preference).or_insert(0) += 1;
             }
-        }
     }
 
     /// Feed accumulated responses into the voter and reset for the next round.
@@ -175,8 +174,8 @@ impl ConsensusManager {
             }
 
             // Feature 129: Consensus timeout — force finalization after 30s.
-            if let Some(start) = self.height_start_time.get(&height) {
-                if start.elapsed().as_secs() >= CONSENSUS_TIMEOUT_SECS {
+            if let Some(start) = self.height_start_time.get(&height)
+                && start.elapsed().as_secs() >= CONSENSUS_TIMEOUT_SECS {
                     // Force finalize on the current preference or first candidate.
                     let hash = match state.voter.preference()
                         .or_else(|| state.candidates.keys().next().copied()) {
@@ -191,7 +190,6 @@ impl ConsensusManager {
                     warn!("Consensus timeout at height {} — force-finalizing on {}", height, hash);
                     return true;
                 }
-            }
 
             if state.round_responses.is_empty() {
                 return false;

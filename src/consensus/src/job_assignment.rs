@@ -151,7 +151,7 @@ fn best_validator(
 /// Calculate flagship slot count from total.
 fn flagship_slots(total: usize, flagship_pct: u64) -> usize {
     // ceil(total * pct / 100)
-    ((total as u64 * flagship_pct + 99) / 100) as usize
+    (total as u64 * flagship_pct).div_ceil(100) as usize
 }
 
 /// Calculate other slot count from total.
@@ -238,7 +238,7 @@ impl CapacityTracker {
 
 /// Flagship slots: ceil(total * 51 / 100).
 pub fn capacity_flagship_slots(total: usize) -> usize {
-    ((total as u64 * 51 + 99) / 100) as usize
+    (total as u64 * 51).div_ceil(100) as usize
 }
 
 /// Other slots: total - flagship_slots.

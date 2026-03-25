@@ -52,7 +52,7 @@ pub fn address_to_qr_string(address: &str) -> String {
     let mut result = String::new();
 
     // Top border
-    result.push_str("\u{250c}");
+    result.push('\u{250c}');
     for _ in 0..width {
         result.push_str("\u{2500}\u{2500}");
     }
@@ -60,7 +60,7 @@ pub fn address_to_qr_string(address: &str) -> String {
 
     // Grid rows
     for row_start in (0..total).step_by(width) {
-        result.push_str("\u{2502}");
+        result.push('\u{2502}');
         for col in 0..width {
             let idx = row_start + col;
             if idx < total {
@@ -73,11 +73,11 @@ pub fn address_to_qr_string(address: &str) -> String {
     }
 
     // Bottom border
-    result.push_str("\u{2514}");
+    result.push('\u{2514}');
     for _ in 0..width {
         result.push_str("\u{2500}\u{2500}");
     }
-    result.push_str("\u{2518}");
+    result.push('\u{2518}');
 
     result
 }

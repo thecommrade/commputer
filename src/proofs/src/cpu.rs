@@ -44,7 +44,7 @@ impl CpuProver {
     pub fn iterative_hash(seed: &[u8], iterations: u32) -> [u8; 32] {
         let mut current = Sha256::digest(seed);
         for _ in 1..iterations {
-            current = Sha256::digest(&current);
+            current = Sha256::digest(current);
         }
         let mut result = [0u8; 32];
         result.copy_from_slice(&current);

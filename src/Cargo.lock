@@ -680,6 +680,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "commputer-desktop"
+version = "0.1.0"
+dependencies = [
+ "commputer-core",
+ "commputer-storage",
+ "dirs",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "commputer-network"
 version = "0.1.0"
 dependencies = [

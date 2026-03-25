@@ -45,9 +45,9 @@ pub async fn wait_for_confirmation(
 
         // Try to fetch the receipt
         let receipt_resp = client.get(&receipt_url).send().await;
-        if let Ok(resp) = receipt_resp {
-            if resp.status().is_success() {
-                if let Ok(receipt) = resp.json::<TxReceipt>().await {
+        if let Ok(resp) = receipt_resp
+            && resp.status().is_success()
+                && let Ok(receipt) = resp.json::<TxReceipt>().await {
                     // Fetch current chain height
                     let status_resp = client
                         .get(&status_url)
@@ -55,18 +55,15 @@ pub async fn wait_for_confirmation(
                         .await
                         .context("failed to fetch node status")?;
 
-                    if status_resp.status().is_success() {
-                        if let Ok(status) = status_resp.json::<NodeStatus>().await {
+                    if status_resp.status().is_success()
+                        && let Ok(status) = status_resp.json::<NodeStatus>().await {
                             let current_confirmations =
                                 status.height.saturating_sub(receipt.block_height);
                             if current_confirmations >= confirmations {
                                 return Ok(true);
                             }
                         }
-                    }
                 }
-            }
-        }
 
         // Sleep until next poll, but not past deadline
         let remaining = deadline.saturating_duration_since(Instant::now());

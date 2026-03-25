@@ -115,7 +115,7 @@ fn detect_gpu() -> (Option<String>, Option<u64>) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if line.contains("VGA") || line.contains("3D controller") {
-                    let model = line.split(':').last()
+                    let model = line.split(':').next_back()
                         .map(|s| s.trim().to_string());
                     return (model, None);
                 }

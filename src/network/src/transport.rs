@@ -1,5 +1,5 @@
 use libp2p::{
-    gossipsub, identify, kad, noise, tcp, yamux, quic,
+    gossipsub, identify, kad, noise, tcp, yamux,
     relay, dcutr, upnp,
     Multiaddr, PeerId as Libp2pPeerId, Swarm, SwarmBuilder,
 };
@@ -179,11 +179,10 @@ impl CommpNetwork {
     pub fn connect_to_seeds(&mut self) -> usize {
         let mut connected = 0;
         for addr_str in SEED_NODES {
-            if let Ok(addr) = addr_str.parse::<Multiaddr>() {
-                if self.dial(addr).is_ok() {
+            if let Ok(addr) = addr_str.parse::<Multiaddr>()
+                && self.dial(addr).is_ok() {
                     connected += 1;
                 }
-            }
         }
         connected
     }
@@ -250,19 +249,17 @@ impl CommpNetwork {
                             ),
                         };
                         // Try TCP
-                        if let Ok(multiaddr) = tcp_str.parse::<Multiaddr>() {
-                            if self.dial(multiaddr).is_ok() {
+                        if let Ok(multiaddr) = tcp_str.parse::<Multiaddr>()
+                            && self.dial(multiaddr).is_ok() {
                                 info!("Dialed DNS seed {} -> {} (TCP)", domain, tcp_str);
                                 connected += 1;
                             }
-                        }
                         // Also try QUIC
-                        if let Ok(multiaddr) = quic_str.parse::<Multiaddr>() {
-                            if self.dial(multiaddr).is_ok() {
+                        if let Ok(multiaddr) = quic_str.parse::<Multiaddr>()
+                            && self.dial(multiaddr).is_ok() {
                                 info!("Dialed DNS seed {} -> {} (QUIC)", domain, quic_str);
                                 connected += 1;
                             }
-                        }
                     }
                 }
                 Err(e) => {

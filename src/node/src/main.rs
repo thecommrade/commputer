@@ -1219,13 +1219,11 @@ fn address_book_path() -> PathBuf {
 
 fn load_address_book() -> std::collections::HashMap<String, String> {
     let path = address_book_path();
-    if path.exists() {
-        if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(book) = serde_json::from_str(&data) {
+    if path.exists()
+        && let Ok(data) = std::fs::read_to_string(&path)
+            && let Ok(book) = serde_json::from_str(&data) {
                 return book;
             }
-        }
-    }
     std::collections::HashMap::new()
 }
 

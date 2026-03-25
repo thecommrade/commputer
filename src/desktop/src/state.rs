@@ -39,13 +39,11 @@ impl AppConfig {
     /// Load config from the standard location (~/.commputer/desktop.json).
     pub fn load() -> Self {
         let path = config_path();
-        if path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(config) = serde_json::from_str(&data) {
+        if path.exists()
+            && let Ok(data) = std::fs::read_to_string(&path)
+                && let Ok(config) = serde_json::from_str(&data) {
                     return config;
                 }
-            }
-        }
         Self::default()
     }
 

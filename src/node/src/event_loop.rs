@@ -238,15 +238,13 @@ impl EventLoop {
             if let Ok(mut blk_guard) = rpc.blocks.try_lock() {
                 let height = self.state.blocks.height();
                 // Add any new blocks not yet tracked.
-                let start = if height > 100 { height - 100 } else { 0 };
+                let start = height.saturating_sub(100);
                 for h in start..=height {
-                    if !blk_guard.contains_key(&h) {
-                        if let Some(block) = self.state.blocks.get_by_height(h) {
-                            if let Ok(json) = serde_json::to_value(block) {
+                    if !blk_guard.contains_key(&h)
+                        && let Some(block) = self.state.blocks.get_by_height(h)
+                            && let Ok(json) = serde_json::to_value(block) {
                                 blk_guard.insert(h, json);
                             }
-                        }
-                    }
                 }
                 // Prune blocks older than 100 from the RPC cache.
                 if height > 100 {
@@ -533,8 +531,8 @@ impl EventLoop {
         info!("Orphan pool: {} parent hashes with pending blocks", self.orphan_pool.len());
 
         // Feature 8: Persist pending transactions to mempool.json.
-        if !self.pending_txs.is_empty() {
-            if let Some(ref dir) = self.data_dir {
+        if !self.pending_txs.is_empty()
+            && let Some(ref dir) = self.data_dir {
                 let mempool_path = dir.join("mempool.json");
                 match serde_json::to_string_pretty(&self.pending_txs) {
                     Ok(json) => {
@@ -547,7 +545,6 @@ impl EventLoop {
                     Err(e) => warn!("Failed to serialize mempool: {}", e),
                 }
             }
-        }
     }
 
     /// Feature 20: Maximum signature cache size.
@@ -580,8 +577,7 @@ impl EventLoop {
         // Find the peer with the lowest reputation score.
         if let Some((&worst_peer, &worst_score)) = self.peer_scores.iter()
             .min_by_key(|(_, score)| **score)
-        {
-            if worst_score < 50 {
+            && worst_score < 50 {
                 info!(
                     "Peer rotation: disconnecting {} (score {})",
                     worst_peer, worst_score
@@ -594,7 +590,6 @@ impl EventLoop {
                 self.peer_subnets.remove(&worst_peer);
                 self.peer_rtts.remove(&worst_peer);
             }
-        }
 
         // Try to discover a new peer from the Kademlia DHT.
         let random_key = libp2p::kad::RecordKey::new(&rand::random::<[u8; 32]>());
@@ -636,11 +631,10 @@ impl EventLoop {
                         // so we just log the intended change.
                     }
                     "contribution_percent" => {
-                        if let Ok(pct) = value.parse::<u8>() {
-                            if pct >= 1 && pct <= 100 {
+                        if let Ok(pct) = value.parse::<u8>()
+                            && (1..=100).contains(&pct) {
                                 info!("Config reload: contribution_percent = {}", pct);
                             }
-                        }
                     }
                     "max_peer_count" => {
                         if let Ok(_count) = value.parse::<usize>() {
@@ -702,7 +696,7 @@ impl EventLoop {
 
                 // Feature 177: Track messages received per peer.
                 self.peer_quality.entry(propagation_source)
-                    .or_insert_with(PeerQuality::default)
+                    .or_default()
                     .messages_received += 1;
 
                 // Item 18: Application-level duplicate message suppression.
@@ -751,8 +745,8 @@ impl EventLoop {
                     }
                 } else if topic == topics::TOPIC_PEER_ADDRS {
                     // Feature 6: Handle peer address gossip.
-                    if let Ok(msg) = serde_json::from_slice::<commputer_network::message::NetworkMessage>(&data) {
-                        if let commputer_network::message::MessageKind::PeerResponse(peers) = msg.kind {
+                    if let Ok(msg) = serde_json::from_slice::<commputer_network::message::NetworkMessage>(&data)
+                        && let commputer_network::message::MessageKind::PeerResponse(peers) = msg.kind {
                             for peer_info in peers {
                                 // Try to parse the address as a multiaddr and add to Kademlia.
                                 if let Ok(addr) = peer_info.address.parse::<libp2p::Multiaddr>() {
@@ -762,7 +756,6 @@ impl EventLoop {
                                 }
                             }
                         }
-                    }
                 }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -793,7 +786,7 @@ impl EventLoop {
                 }
 
                 // Feature 177: Initialize peer quality metrics.
-                self.peer_quality.entry(peer_id).or_insert_with(PeerQuality::default);
+                self.peer_quality.entry(peer_id).or_default();
 
                 // Enforce connection limit: max 50 peers.
                 // Feature 170: Geographic diversity — if new peer has unique /16,
@@ -867,8 +860,8 @@ impl EventLoop {
                         let observed_ip = extract_ip_from_multiaddr(&observed_str);
 
                         // Check if our observed IP differs from our listening addresses.
-                        if let Some(ref obs_ip) = observed_ip {
-                            if self.observed_external_addr.is_none() {
+                        if let Some(ref obs_ip) = observed_ip
+                            && self.observed_external_addr.is_none() {
                                 self.observed_external_addr = Some(obs_ip.clone());
                                 // Check if it looks like NAT (private vs public IP mismatch).
                                 let is_private = is_private_ip(obs_ip);
@@ -880,7 +873,6 @@ impl EventLoop {
                                     info!("External address observed: {}", obs_ip);
                                 }
                             }
-                        }
                     }
                 }
             }
@@ -960,13 +952,12 @@ impl EventLoop {
                 self.verified_peer_validators.remove(&peer_id);
                 self.peer_scores.remove(&peer_id);
                 // Drain grace period for disconnected validators.
-                if let Some(validator_addr) = self.peer_validators.get(&peer_id) {
-                    if let Some(account) = self.state.accounts.get_mut(validator_addr) {
+                if let Some(validator_addr) = self.peer_validators.get(&peer_id)
+                    && let Some(account) = self.state.accounts.get_mut(validator_addr) {
                         // Drain 1 epoch's worth of grace (3600s) on disconnect.
                         account.drain_grace(3600);
                         debug!("Drained grace for disconnected validator {}", validator_addr);
                     }
-                }
                 info!("Disconnected from peer: {}", peer_id);
             }
             _ => {}
@@ -1078,13 +1069,12 @@ impl EventLoop {
 
         // Timestamp must be >= parent block timestamp (no going backward).
         // Item 1: Don't ban for timestamp issues — could be clock skew or chain divergence.
-        if let Some(parent) = self.state.blocks.latest() {
-            if block.header.timestamp < parent.header.timestamp {
+        if let Some(parent) = self.state.blocks.latest()
+            && block.header.timestamp < parent.header.timestamp {
                 warn!("Rejected block from {}: timestamp before parent ({} < {})",
                     source, block.header.timestamp, parent.header.timestamp);
                 return false;
             }
-        }
 
         // === Stage 2: Merkle root verification ===
 
@@ -1132,14 +1122,14 @@ impl EventLoop {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if !self.block_seen_times.contains_key(&hash) {
-            self.block_seen_times.insert(hash, now_ts);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.block_seen_times.entry(hash) {
+            e.insert(now_ts);
             let propagation_delay_ms = now_ts.saturating_sub(block.header.timestamp) * 1000;
             if propagation_delay_ms > 0 {
                 self.propagation_delays.push(propagation_delay_ms);
                 debug!("Block {} propagation delay: {}ms", hash, propagation_delay_ms);
                 // Log percentiles every 100 blocks.
-                if self.propagation_delays.len() % 100 == 0 {
+                if self.propagation_delays.len().is_multiple_of(100) {
                     self.log_propagation_percentiles();
                 }
             }
@@ -1166,7 +1156,7 @@ impl EventLoop {
             debug!("Block {} at height {} is orphaned — parent {} not found", hash, height, block.header.parent_hash);
             self.orphan_pool
                 .entry(block.header.parent_hash)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(block);
             return;
         }
@@ -1264,17 +1254,15 @@ impl EventLoop {
             return Err("duplicate transaction");
         }
         // Feature 251: Validate memo length.
-        if let Some(ref memo) = tx.memo {
-            if memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
+        if let Some(ref memo) = tx.memo
+            && memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
                 return Err("memo exceeds max length");
             }
-        }
         // Feature 260: Validate timelock.
-        if let Some(timelock) = tx.timelock {
-            if self.state.blocks.height() < timelock {
+        if let Some(timelock) = tx.timelock
+            && self.state.blocks.height() < timelock {
                 return Err("transaction timelocked");
             }
-        }
         // Minimum fee check.
         if tx.fee < commputer_core::transaction::MINIMUM_FEE {
             return Err("fee below minimum");
@@ -1579,8 +1567,8 @@ impl EventLoop {
 
         // Feature 5: Validator cooldown — skip block production if within cooldown period.
         let our_addr = *self.wallet.address();
-        if let Some(acct) = self.state.accounts.get(&our_addr) {
-            if let Some(reg_height) = acct.validator_registered_height {
+        if let Some(acct) = self.state.accounts.get(&our_addr)
+            && let Some(reg_height) = acct.validator_registered_height {
                 let current_height = self.state.blocks.height();
                 if current_height < reg_height + commputer_core::transaction::VALIDATOR_COOLDOWN_BLOCKS {
                     debug!("Skipping block production — validator cooldown ({} blocks remaining)",
@@ -1588,7 +1576,6 @@ impl EventLoop {
                     return;
                 }
             }
-        }
 
         // Feature 172: Skip block production during network partition.
         if self.partition_detected {
@@ -1674,7 +1661,7 @@ impl EventLoop {
         block.header.state_root = self.state.compute_state_root();
 
         // Feature 248: Set checkpoint hash at checkpoint intervals.
-        if next_height % commputer_core::block::CHECKPOINT_HASH_INTERVAL == 0 && next_height > 0 {
+        if next_height.is_multiple_of(commputer_core::block::CHECKPOINT_HASH_INTERVAL) && next_height > 0 {
             block.header.checkpoint_hash = Some(self.state.compute_state_root());
             if let Some(ref hash) = block.header.checkpoint_hash {
                 info!("Checkpoint at height {}: state root = {}", next_height, hex::encode(hash));
@@ -1792,21 +1779,19 @@ impl EventLoop {
                     }));
 
                     // Push receipts to RPC state.
-                    if let Some(ref rpc) = self.rpc_state {
-                        if let Ok(mut rcpt_guard) = rpc.receipts.try_lock() {
+                    if let Some(ref rpc) = self.rpc_state
+                        && let Ok(mut rcpt_guard) = rpc.receipts.try_lock() {
                             for tx in &block.transactions {
                                 let tx_hash_hex = hex::encode(tx.hash().0);
-                                if let Some(receipt) = self.state.receipts.get(&tx.hash()) {
-                                    if let Ok(json) = serde_json::to_value(receipt) {
+                                if let Some(receipt) = self.state.receipts.get(&tx.hash())
+                                    && let Ok(json) = serde_json::to_value(receipt) {
                                         rcpt_guard.insert(tx_hash_hex, json);
                                     }
-                                }
                             }
                         }
-                    }
 
                     // Auto-snapshot every 100 blocks.
-                    if height % 100 == 0 && height > 0 {
+                    if height.is_multiple_of(100) && height > 0 {
                         let snap_path = std::path::PathBuf::from(
                             format!("snapshot-{}.json", height)
                         );
@@ -1954,8 +1939,7 @@ impl EventLoop {
         }
 
         // Build a list of known peers with their addresses.
-        let peer_infos: Vec<commputer_network::message::PeerInfo> = self.peer_ips.iter()
-            .map(|(_peer_id, ip)| {
+        let peer_infos: Vec<commputer_network::message::PeerInfo> = self.peer_ips.values().map(|ip| {
                 commputer_network::message::PeerInfo {
                     id: commputer_network::peer::PeerId([0u8; 32]), // Placeholder
                     address: ip.clone(),
@@ -2058,11 +2042,8 @@ impl EventLoop {
         for addr_str in &seeds {
             if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
                 // Only reconnect if we don't already have this peer.
-                match self.network.dial(addr) {
-                    Ok(()) => {
-                        reconnected += 1;
-                    }
-                    Err(_) => {}
+                if let Ok(()) = self.network.dial(addr) {
+                    reconnected += 1;
                 }
             }
         }
@@ -2084,13 +2065,11 @@ impl EventLoop {
     fn find_duplicate_subnet_peer(&self, exclude: &libp2p::PeerId) -> Option<libp2p::PeerId> {
         let counts = self.count_subnets();
         for (peer_id, subnet) in &self.peer_subnets {
-            if peer_id != exclude {
-                if let Some(&count) = counts.get(subnet) {
-                    if count > 1 {
+            if peer_id != exclude
+                && let Some(&count) = counts.get(subnet)
+                    && count > 1 {
                         return Some(*peer_id);
                     }
-                }
-            }
         }
         None
     }

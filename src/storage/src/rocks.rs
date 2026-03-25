@@ -54,7 +54,7 @@ impl RocksStore {
         // Feature 189: Ensure WAL is enabled (RocksDB default, but be explicit).
         opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::PointInTime);
 
-        let cf_names = vec![CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED];
+        let cf_names = [CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED];
         let cfs: Vec<ColumnFamilyDescriptor> = cf_names
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
@@ -216,11 +216,10 @@ impl RocksStore {
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         let mut accounts = Vec::new();
         for item in iter {
-            if let Ok((_key, value)) = item {
-                if let Ok(account) = borsh::from_slice::<Account>(&value) {
+            if let Ok((_key, value)) = item
+                && let Ok(account) = borsh::from_slice::<Account>(&value) {
                     accounts.push(account);
                 }
-            }
         }
         accounts
     }
@@ -232,13 +231,11 @@ impl RocksStore {
         let iter = self.db.iterator_cf(&cf_heights, rocksdb::IteratorMode::Start);
         let mut blocks = Vec::new();
         for item in iter {
-            if let Ok((_height_key, hash_bytes)) = item {
-                if let Ok(Some(data)) = self.db.get_cf(&cf_blocks, &*hash_bytes) {
-                    if let Ok(block) = borsh::from_slice::<Block>(&data) {
+            if let Ok((_height_key, hash_bytes)) = item
+                && let Ok(Some(data)) = self.db.get_cf(&cf_blocks, &*hash_bytes)
+                    && let Ok(block) = borsh::from_slice::<Block>(&data) {
                         blocks.push(block);
                     }
-                }
-            }
         }
         blocks
     }
@@ -350,13 +347,11 @@ impl RocksStore {
     pub fn estimate_db_size(&self) -> u64 {
         let mut total: u64 = 0;
         for cf_name in &[CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED] {
-            if let Some(cf) = self.db.cf_handle(cf_name) {
-                if let Ok(Some(size_str)) = self.db.property_value_cf(&cf, "rocksdb.estimate-live-data-size") {
-                    if let Ok(size) = size_str.parse::<u64>() {
+            if let Some(cf) = self.db.cf_handle(cf_name)
+                && let Ok(Some(size_str)) = self.db.property_value_cf(&cf, "rocksdb.estimate-live-data-size")
+                    && let Ok(size) = size_str.parse::<u64>() {
                         total += size;
                     }
-                }
-            }
         }
         total
     }

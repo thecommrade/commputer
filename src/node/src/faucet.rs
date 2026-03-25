@@ -57,14 +57,13 @@ pub fn handle_faucet_request(address: &str, state: &FaucetState) -> Result<Amoun
     let epoch = state.epoch();
     let mut claims = state.claims.lock().unwrap();
 
-    if let Some(&last_epoch) = claims.get(address) {
-        if last_epoch >= epoch {
+    if let Some(&last_epoch) = claims.get(address)
+        && last_epoch >= epoch {
             return Err(FaucetError::RateLimited {
                 address: address.to_string(),
                 epoch,
             });
         }
-    }
 
     claims.insert(address.to_string(), epoch);
     Ok(Amount::from_raw(FAUCET_AMOUNT))

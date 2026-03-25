@@ -73,6 +73,16 @@ commputer-proofs = { path = "proofs" }
 commputer-validator = { path = "validator" }
 commputer-storage = { path = "storage" }
 
+# Item 41: Clippy configuration — deny key lints in CI.
+[workspace.lints.clippy]
+# Critical safety lints
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+checked_conversions = "warn"
+# Style lints
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+
 [profile.release]
 lto = true
 codegen-units = 1
