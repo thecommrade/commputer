@@ -16,3 +16,4 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 hex = "0.4"
+libp2p = { workspace = true }

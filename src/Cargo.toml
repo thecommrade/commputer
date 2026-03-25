@@ -33,7 +33,7 @@ rand = "0.8"
 tokio = { version = "1", features = ["full"] }
 
 # Networking
-libp2p = { version = "0.54", features = ["tokio", "gossipsub", "kad", "noise", "tcp", "yamux", "identify"] }
+libp2p = { version = "0.54", features = ["tokio", "gossipsub", "kad", "noise", "tcp", "yamux", "identify", "macros"] }
 
 # Storage
 rocksdb = "0.22"
