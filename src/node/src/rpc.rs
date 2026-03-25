@@ -214,6 +214,21 @@ async fn get_metrics(
     Json(metrics)
 }
 
+/// GET /proofs/status — return proof status per channel.
+async fn get_proof_status(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let metrics = state.metrics.lock().await;
+    // Return what we know; the detailed proof data would need a dedicated field.
+    Json(serde_json::json!({
+        "epoch": metrics.epoch,
+        "height": metrics.height,
+        "channels": ["Processing", "Gpu", "Storage", "Ram", "Bandwidth"],
+        "challenge_interval_blocks": 300,
+        "note": "Detailed per-channel scores available via /balance/{address}"
+    }))
+}
+
 /// GET /health — basic health check.
 async fn get_health(
     State(state): State<Arc<RpcState>>,
@@ -238,6 +253,7 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/mempool", get(get_mempool))
         .route("/block/{height}", get(get_block_by_height))
         .route("/metrics", get(get_metrics))
+        .route("/proofs/status", get(get_proof_status))
         .route("/health", get(get_health))
         .with_state(rpc_state)
 }

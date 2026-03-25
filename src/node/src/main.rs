@@ -74,6 +74,14 @@ enum Commands {
         #[arg(long, default_value = "9944")]
         rpc_port: u16,
     },
+    /// Export chain state to a JSON file for debugging
+    ExportChain {
+        /// Output file path
+        #[arg(default_value = "chain-export.json")]
+        output: String,
+        #[arg(long, default_value = "true")]
+        testnet: bool,
+    },
     /// Send COMME to another address
     Send {
         /// Recipient address (hex)
@@ -704,6 +712,20 @@ async fn main() -> Result<()> {
         Commands::Status { testnet } => cmd_status(testnet)?,
         Commands::Peers { rpc_port } => cmd_peers(rpc_port).await?,
         Commands::Balance { address, rpc_port } => cmd_balance(&address, rpc_port).await?,
+        Commands::ExportChain { output, testnet } => {
+            let state = open_chain_state(testnet)?;
+            let export = serde_json::json!({
+                "height": state.blocks.height(),
+                "total_emitted": state.total_emitted,
+                "total_burned": state.total_burned,
+                "circulating_supply": state.circulating_supply(),
+                "remaining_supply": state.remaining_supply(),
+                "current_epoch": state.current_epoch,
+                "accounts": state.accounts.len(),
+            });
+            std::fs::write(&output, serde_json::to_string_pretty(&export)?)?;
+            println!("Chain state exported to {}", output);
+        }
         Commands::Send { to, amount, testnet, rpc_port } => {
             cmd_send(&to, amount, testnet, rpc_port).await?;
         }
