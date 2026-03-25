@@ -32,7 +32,7 @@ The result is a communal computer that belongs to its participants. Not a compan
 
 Three rules are enshrined in this whitepaper and will never change:
 
-1. **The flagship product always owns 51% of all network compute.** The communal product always has majority resources. Protocol-enforced.
+1. **51% of all network compute is reserved for building products that serve the users.** Shared storage, communication, AI, the Humanities Archive — whatever the network grows to support. This allocation also serves as an emergency safeguard: if the network suffers a sudden loss of resources, the 51% is deployed to protect user data — emails, photos, files — from being lost. Once capacity recovers, the 51% rebuilds to full and resumes creating. Protocol-enforced.
 
 2. **The remaining 49% is split equally among qualifying holders per tier.** Pure equal division. No whale advantages.
 
@@ -84,13 +84,9 @@ The L1 is the product. Everything else builds on top of it.
 
 Everything below is the direction. Not promises with dates. Not vaporware used to pump a token price. Real goals that the network works toward as it grows.
 
-### Analytics Platform (Founder's L2)
+### Founder's L2
 
-A world-class ML and analytics platform for cryptocurrency markets. Built by the founder. Powered by the 51% communal compute allocation. This is how the anonymous founder earns — not through a premine, not through a dev tax, but by building a product people use. The same opportunity available to anyone building on Commputer.
-
-**What exists today:** A production platform with 9 live data collectors, 60+ engineered features, multiple ML models with rigorous validation, live and paper trading infrastructure, and a real-time dashboard. This is the proof of concept — running, tested, and real.
-
-**Hold 1 $COMME and you have full access** when it launches on the network. Contribute a full desktop and you have full access without owning a single coin.
+The anonymous founder earns by building products on the network — not through a premine, not through a dev tax, but by creating something people use. The same opportunity is available to anyone who builds on Commputer. L2s and dApps built on the network have access to pooled compute through the job submission protocol, and the founder's L2 is no different from any other.
 
 ### Desktop App (Tauri GUI)
 
@@ -254,6 +250,7 @@ Floors are protocol-enforced. The remaining 60% floats to where demand is highes
 **What it may never fund:**
 - War, in any form, for any reason
 - Politics, parties, campaigns, or lobbying
+- Governments
 - Any venture that intends to make a profit, even if it claims to be doing good
 
 ---
@@ -297,6 +294,22 @@ The node software is written in Rust — the language the most battle-tested mod
 
 **Resource Orchestration:** Matches jobs to available resources. Respects the 51/49 split. Decomposes large tasks into desktop-sized pieces and reassembles results.
 
+### Compute Jobs
+
+The pooled resources are not theoretical. They are usable. Here is how:
+
+**Submitting a job:** A holder spends $COMME to submit a compute job — train a model, process a dataset, run inference, render video, anything that requires compute. The spent $COMME is permanently burned. The job specification describes resource requirements (CPU, GPU, RAM, storage, bandwidth), maximum duration, and the work to be done.
+
+**Routing:** The network matches the job to validators with the right resource profile. A GPU-intensive job routes to validators with GPUs. A storage-heavy job routes to validators with disk space. The protocol respects the 51/49 split: jobs tagged by the core development team for communal products (storage, communication, AI, the Humanities Archive) get priority access to 51% of capacity. All other jobs share the remaining 49%.
+
+**Execution:** Jobs run in sandboxed environments on the validator's machine. The validator cannot see the job contents. The job cannot access the validator's system. Resource limits are enforced by the protocol.
+
+**Verification:** When a job completes, random validators independently re-execute a portion of the work. If results don't match, the job is disputed. The majority result wins. Incorrect executors are penalized. Correct verifiers earn a share of the job's budget.
+
+**Pricing:** Dynamic, based on network load. When the network has surplus capacity, jobs are cheap. When capacity is scarce, prices rise steeply. Near full capacity, the price becomes prohibitive — the protocol's way of saying "the network needs more validators, not more jobs."
+
+**The 51% as safeguard:** In normal operation, the 51% allocation builds and powers communal products. In an emergency — sudden loss of validators, natural disaster, infrastructure failure — the 51% is redeployed to protect user data. Emails, photos, files, stored documents: the protocol prioritizes preservation over creation. Once the network recovers and capacity returns, the 51% rebuilds to full strength and resumes its role.
+
 ---
 
 ## 10. Transparency
@@ -323,7 +336,7 @@ The node software is written in Rust — the language the most battle-tested mod
 
 Anonymous. The L1 protocol has zero founder allocation. No premine. No dev tax. No hidden wallet. Every $COMME is earned through contribution.
 
-The founder earns by building on the network — the analytics platform is an L2 product on the roadmap, powered by the 51% communal compute allocation. It is the founder's contribution to the ecosystem and the source of the founder's livelihood. The same opportunity is available to anyone who builds on Commputer.
+The founder earns by building L2 products on the network. Not from the protocol. Not from a hidden allocation. By creating something people want to use, like anyone else who builds on Commputer.
 
 No VCs. No influencer deals. No paid listings. Word of mouth only. The product is the marketing.
 
@@ -335,7 +348,7 @@ This is not a meme coin. It is almost not even a cryptocurrency. It is a human p
 
 This is an act of peaceful revolution — not against any company or government, but against the idea that knowledge, compute, and AI should be owned by a few and rented to the many.
 
-Here is a working chain. Here is what it does differently: multi-dimensional Proof of Work, demand-weighted emission, anti-scale enforcement, a gold-standard hardware ceiling, grace periods for when life happens, and a will function for when it ends. Here is where we are going: an analytics platform, a desktop app, communication tools, personal infrastructure, and a permanent archive of human knowledge.
+Here is a working chain. Here is what it does differently: multi-dimensional Proof of Work, demand-weighted emission, anti-scale enforcement, a gold-standard hardware ceiling, grace periods for when life happens, and a will function for when it ends. Here is where we are going: a desktop app, communication tools, personal infrastructure, communal AI, and a permanent archive of human knowledge.
 
 Scale hurts. Honesty is the default. Life happens and the protocol accounts for it. The code is the contract. And the free path never closes.
 
