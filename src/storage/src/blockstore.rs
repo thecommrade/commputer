@@ -57,6 +57,30 @@ impl BlockStore {
     pub fn contains(&self, hash: &BlockHash) -> bool {
         self.blocks.contains_key(hash)
     }
+
+    /// Remove blocks from memory that are older than `keep_last` heights.
+    /// The latest `keep_last` blocks are retained. Returns the number of blocks pruned.
+    /// Note: pruned blocks should still be available in RocksDB.
+    pub fn prune(&mut self, keep_last: u64) -> usize {
+        if self.latest_height < keep_last || self.blocks.len() <= keep_last as usize {
+            return 0;
+        }
+
+        let cutoff = self.latest_height - keep_last;
+        let heights_to_remove: Vec<u64> = self.height_index.keys()
+            .filter(|&&h| h < cutoff)
+            .copied()
+            .collect();
+
+        let mut pruned = 0;
+        for h in heights_to_remove {
+            if let Some(hash) = self.height_index.remove(&h) {
+                self.blocks.remove(&hash);
+                pruned += 1;
+            }
+        }
+        pruned
+    }
 }
 
 #[cfg(test)]
@@ -94,6 +118,59 @@ mod tests {
         assert!(store.get(&genesis_hash).is_some());
         assert!(store.get_by_height(0).is_some());
         assert!(store.latest().is_some());
+    }
+
+    #[test]
+    fn prune_removes_old_blocks() {
+        let mut store = BlockStore::new();
+        let b0 = make_block(0, BlockHash::GENESIS);
+        let h0 = b0.hash();
+        store.put(b0);
+
+        let b1 = make_block(1, h0);
+        let h1 = b1.hash();
+        store.put(b1);
+
+        let b2 = make_block(2, h1);
+        let h2 = b2.hash();
+        store.put(b2);
+
+        let b3 = make_block(3, h2);
+        let h3 = b3.hash();
+        store.put(b3);
+
+        assert_eq!(store.len(), 4);
+
+        // Keep only last 2 blocks. cutoff = 3 - 2 = 1, remove heights < 1.
+        let pruned = store.prune(2);
+        assert_eq!(pruned, 1); // only block 0 removed
+        assert_eq!(store.len(), 3);
+
+        // Prune again — no change since blocks 1,2,3 are within window.
+        let pruned2 = store.prune(2);
+        assert_eq!(pruned2, 0);
+
+        // Keep only 1 block. cutoff = 3 - 1 = 2, remove heights < 2.
+        let pruned3 = store.prune(1);
+        assert_eq!(pruned3, 1); // only block 1 removed (block 0 already gone)
+        assert_eq!(store.len(), 2); // blocks 2 and 3 remain
+
+        // Blocks 2 and 3 remain; 0 and 1 are gone.
+        assert!(store.get_by_height(3).is_some());
+        assert!(store.get_by_height(2).is_some());
+        assert!(store.get_by_height(1).is_none());
+        assert!(store.get_by_height(0).is_none());
+        assert_eq!(store.height(), 3);
+    }
+
+    #[test]
+    fn prune_no_op_when_few_blocks() {
+        let mut store = BlockStore::new();
+        let b0 = make_block(0, BlockHash::GENESIS);
+        store.put(b0);
+        let pruned = store.prune(100);
+        assert_eq!(pruned, 0);
+        assert_eq!(store.len(), 1);
     }
 
     #[test]

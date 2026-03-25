@@ -41,6 +41,10 @@ impl std::fmt::Debug for ChainState {
 }
 
 impl ChainState {
+    /// Number of recent blocks to keep in memory when RocksDB is enabled.
+    /// Older blocks are pruned from the in-memory BlockStore but remain in RocksDB.
+    pub const MEMORY_BLOCK_RETENTION: u64 = 1000;
+
     /// Create a new in-memory-only ChainState. Existing behavior, tests unchanged.
     pub fn new() -> Self {
         Self {
@@ -166,6 +170,8 @@ impl ChainState {
             rocks.put_block(block)
                 .map_err(|e| StateError::StorageError(e.to_string()))?;
             self.flush_meta(rocks)?;
+            // Prune old blocks from memory (they remain in RocksDB).
+            self.blocks.prune(Self::MEMORY_BLOCK_RETENTION);
         }
 
         Ok(())
@@ -219,6 +225,8 @@ impl ChainState {
             rocks.put_block(block)
                 .map_err(|e| StateError::StorageError(e.to_string()))?;
             self.flush_meta(rocks)?;
+            // Prune old blocks from memory (they remain in RocksDB).
+            self.blocks.prune(Self::MEMORY_BLOCK_RETENTION);
         }
 
         Ok(())
