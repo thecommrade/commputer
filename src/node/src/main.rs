@@ -325,7 +325,10 @@ fn create_genesis_for_dir(data_dir: Option<&std::path::Path>) -> Block {
             tx_root: [0u8; 32],
             proof_root: [0u8; 32],
             state_root: [0u8; 32],
-            timestamp: 0, // Epoch zero.
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             producer: Address([0u8; 32]), // No producer for genesis.
             epoch: 0,
             producer_public_key: vec![],

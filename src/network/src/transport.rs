@@ -131,15 +131,20 @@ impl CommpNetwork {
 
         let local_peer_id = *swarm.local_peer_id();
 
-        // Listen on TCP (traditional)
-        let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?;
-        swarm.listen_on(tcp_addr)?;
+        // Item 7: If listen_port is 0, run in outbound-only mode (no listening).
+        if listen_port > 0 {
+            // Listen on TCP (traditional)
+            let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?;
+            swarm.listen_on(tcp_addr)?;
 
-        // Listen on QUIC (UDP — better NAT/VPN traversal)
-        let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1").parse()?;
-        swarm.listen_on(quic_addr)?;
+            // Listen on QUIC (UDP — better NAT/VPN traversal)
+            let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1").parse()?;
+            swarm.listen_on(quic_addr)?;
 
-        info!("P2P transport: TCP + QUIC (dual-stack)");
+            info!("P2P transport: TCP + QUIC (dual-stack)");
+        } else {
+            info!("P2P transport: outbound-only mode (no listening ports)");
+        }
         info!("P2P encryption: Noise (TCP) / TLS 1.3 (QUIC)");
         info!("P2P features: relay, hole-punching (DCUtR), UPnP");
         info!("P2P protocol: /commputer/0.1.0");

@@ -370,6 +370,9 @@ impl EventLoop {
             }
         }
 
+        // Item 6: Load config on startup to pick up seed nodes etc.
+        self.reload_config();
+
         let mut epoch_interval = time::interval(Duration::from_secs(3600));
         let mut block_interval = time::interval(Duration::from_secs(2));
         let mut consensus_interval = time::interval(Duration::from_millis(500));
@@ -593,9 +596,13 @@ impl EventLoop {
     }
 
     /// Feature 12: Config hot reload — re-read config.toml and update settings.
+    /// Item 6: Also reads seed nodes from config file.
     fn reload_config(&mut self) {
-        // Look for config.toml in the data directory.
-        let config_path = std::path::PathBuf::from("./commputer-testnet/config.toml");
+        // Look for commputer.toml in the data directory or current dir.
+        let config_path = self.data_dir
+            .as_ref()
+            .map(|d| d.join("commputer.toml"))
+            .unwrap_or_else(|| std::path::PathBuf::from("commputer.toml"));
 
         let contents = match std::fs::read_to_string(&config_path) {
             Ok(c) => c,
@@ -631,6 +638,17 @@ impl EventLoop {
                     "max_peer_count" => {
                         if let Ok(_count) = value.parse::<usize>() {
                             info!("Config reload: max_peer_count = {}", value);
+                        }
+                    }
+                    // Item 6: Read seed nodes from config file.
+                    "seeds" => {
+                        let seeds: Vec<String> = value.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !seeds.is_empty() {
+                            info!("Config reload: {} seed nodes from config", seeds.len());
+                            self.custom_seeds = seeds;
                         }
                     }
                     _ => {

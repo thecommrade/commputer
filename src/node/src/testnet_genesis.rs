@@ -42,6 +42,10 @@ pub fn generate_testnet_genesis(num_accounts: usize, output_path: &str) -> Resul
         emission_base_rate: 100 * UNITS_PER_COMME,
         emission_floor_rate: 10 * UNITS_PER_COMME,
         channel_floors,
+        proof_challenge_interval_secs: 60, // Fast proofs for testnet
+        block_time_secs: 2,
+        emission_decay_rate: 0.0001,
+        genesis_timestamp: 0,
     };
 
     let mut accounts = Vec::with_capacity(num_accounts);
