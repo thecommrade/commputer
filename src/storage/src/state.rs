@@ -305,4 +305,83 @@ mod tests {
         assert_eq!(state.total_burned, Amount::from_comme(5).raw());
         assert_eq!(state.circulating_supply(), Amount::from_comme(5).raw());
     }
+
+    #[test]
+    fn burst_compute_burns_and_deducts() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        // Fund sender
+        let sender = state.accounts.get_or_create(addr(1));
+        sender.balance = Amount::from_comme(10);
+        state.total_emitted = Amount::from_comme(10).raw();
+
+        // Burst compute: burn 3 COMME
+        let block = Block {
+            header: BlockHeader {
+                height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32],
+                proof_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 2000,
+                producer: addr(0),
+                epoch: 0,
+                signature: vec![],
+            },
+            transactions: vec![Transaction {
+                from: addr(1),
+                nonce: 0,
+                kind: TxKind::BurstCompute {
+                    channel: commputer_core::proof::ResourceChannel::Gpu,
+                    burn_amount: Amount::from_comme(3),
+                    job_hash: [0u8; 32],
+                },
+                signature: vec![],
+            }],
+            proof_summaries: vec![],
+        };
+        state.apply_block(&block).unwrap();
+
+        // Verify: balance reduced, burn tracked
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_comme(7));
+        assert_eq!(state.total_burned, Amount::from_comme(3).raw());
+        assert_eq!(state.circulating_supply(), Amount::from_comme(7).raw());
+    }
+
+    #[test]
+    fn burst_compute_insufficient_balance_fails() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let sender = state.accounts.get_or_create(addr(1));
+        sender.balance = Amount::from_comme(2);
+        state.total_emitted = Amount::from_comme(2).raw();
+
+        let block = Block {
+            header: BlockHeader {
+                height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32],
+                proof_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 2000,
+                producer: addr(0),
+                epoch: 0,
+                signature: vec![],
+            },
+            transactions: vec![Transaction {
+                from: addr(1),
+                nonce: 0,
+                kind: TxKind::BurstCompute {
+                    channel: commputer_core::proof::ResourceChannel::Gpu,
+                    burn_amount: Amount::from_comme(5), // More than balance
+                    job_hash: [0u8; 32],
+                },
+                signature: vec![],
+            }],
+            proof_summaries: vec![],
+        };
+        assert!(state.apply_block(&block).is_err());
+    }
 }

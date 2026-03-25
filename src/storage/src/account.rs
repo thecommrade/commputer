@@ -191,4 +191,42 @@ mod tests {
         assert_eq!(store.count_at_tier(HolderTier::Storage), 2); // 33 + 10
         assert_eq!(store.count_at_tier(HolderTier::Base), 3);    // All 3
     }
+
+    #[test]
+    fn grace_caps_at_10_years() {
+        let mut acct = Account::new(test_address(1));
+        acct.cumulative_uptime_secs = 20 * 365 * 24 * 3600; // 20 years
+        acct.grace_balance_secs = 20 * 365 * 24 * 3600;
+        // Grace should cap at 10 years
+        acct.refill_grace(1);
+        assert!(acct.grace_balance_secs <= Account::MAX_GRACE_SECS);
+    }
+
+    #[test]
+    fn grace_drains_to_zero_not_negative() {
+        let mut acct = Account::new(test_address(1));
+        acct.cumulative_uptime_secs = 100;
+        acct.grace_balance_secs = 100;
+        acct.drain_grace(200); // More than balance
+        assert_eq!(acct.grace_balance_secs, 0);
+    }
+
+    #[test]
+    fn refill_rate_2_to_1_exact() {
+        let mut acct = Account::new(test_address(1));
+        let one_year = 365 * 24 * 3600u64;
+        acct.cumulative_uptime_secs = one_year;
+        acct.grace_balance_secs = one_year;
+
+        // Drain 10 days
+        let ten_days = 10 * 24 * 3600u64;
+        acct.drain_grace(ten_days);
+        let after_drain = acct.grace_balance_secs;
+        assert_eq!(after_drain, one_year - ten_days);
+
+        // Refill 5 days (2:1 ratio should restore 10 days)
+        let five_days = 5 * 24 * 3600u64;
+        acct.refill_grace(five_days);
+        assert_eq!(acct.grace_balance_secs, one_year);
+    }
 }
