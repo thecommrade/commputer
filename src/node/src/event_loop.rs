@@ -130,6 +130,26 @@ impl EventLoop {
                 *peers_guard = peers;
             }
 
+            // Update recent blocks for explorer endpoint.
+            if let Ok(mut blk_guard) = rpc.blocks.try_lock() {
+                let height = self.state.blocks.height();
+                // Add any new blocks not yet tracked.
+                let start = if height > 100 { height - 100 } else { 0 };
+                for h in start..=height {
+                    if !blk_guard.contains_key(&h) {
+                        if let Some(block) = self.state.blocks.get_by_height(h) {
+                            if let Ok(json) = serde_json::to_value(block) {
+                                blk_guard.insert(h, json);
+                            }
+                        }
+                    }
+                }
+                // Prune blocks older than 100 from the RPC cache.
+                if height > 100 {
+                    blk_guard.retain(|&h, _| h >= height - 100);
+                }
+            }
+
             // Update mempool snapshot.
             if let Ok(mut mp_guard) = rpc.mempool.try_lock() {
                 *mp_guard = self.pending_txs.iter().map(|tx| {

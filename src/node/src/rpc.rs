@@ -59,6 +59,8 @@ pub struct RpcState {
     pub balances: Mutex<HashMap<String, BalanceInfo>>,
     /// Pending mempool transactions.
     pub mempool: Mutex<Vec<MempoolTxInfo>>,
+    /// Recent blocks by height (for the block explorer endpoint).
+    pub blocks: Mutex<HashMap<u64, serde_json::Value>>,
 }
 
 /// Response for a submitted transaction.
@@ -170,6 +172,25 @@ async fn get_mempool(
     Json(txs)
 }
 
+/// GET /block/:height — return block data by height.
+async fn get_block_by_height(
+    State(state): State<Arc<RpcState>>,
+    Path(height): Path<u64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let blocks = state.blocks.lock().await;
+    if let Some(block_json) = blocks.get(&height) {
+        (StatusCode::OK, Json(block_json.clone()))
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Block not found",
+                "height": height,
+            })),
+        )
+    }
+}
+
 /// GET /health — basic health check.
 async fn get_health(
     State(state): State<Arc<RpcState>>,
@@ -192,6 +213,7 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/peers", get(get_peers))
         .route("/balance/{address}", get(get_balance))
         .route("/mempool", get(get_mempool))
+        .route("/block/{height}", get(get_block_by_height))
         .route("/health", get(get_health))
         .with_state(rpc_state)
 }
@@ -249,6 +271,7 @@ mod tests {
             peers: Mutex::new(vec![]),
             balances: Mutex::new(HashMap::new()),
             mempool: Mutex::new(vec![]),
+            blocks: Mutex::new(HashMap::new()),
         });
         (state, rx)
     }
