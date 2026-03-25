@@ -5,7 +5,7 @@ use tracing::{info, debug};
 use commputer_core::block::{Block, BlockHash};
 use commputer_consensus::snowball::{SnowballParams, SnowballVoter};
 
-/// Messages exchanged between nodes for Snowball consensus.
+/// Messages exchanged between nodes for Snowball consensus and sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConsensusMessage {
     /// A block candidate for a given height.
@@ -21,6 +21,15 @@ pub enum ConsensusMessage {
     SnowballResponse {
         height: u64,
         preference: BlockHash,
+    },
+    /// Request a specific block by height (sync protocol).
+    BlockRequest {
+        height: u64,
+    },
+    /// Response to a block request.
+    BlockResponse {
+        block: Option<Block>,
+        requested_height: u64,
     },
 }
 

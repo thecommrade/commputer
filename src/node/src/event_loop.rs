@@ -433,6 +433,27 @@ impl EventLoop {
             ConsensusMessage::SnowballResponse { height, preference } => {
                 self.consensus.record_response(height, preference);
             }
+            ConsensusMessage::BlockRequest { height } => {
+                // Serve block from our chain if we have it.
+                let block = self.state.blocks.get_by_height(height).cloned();
+                let response = ConsensusMessage::BlockResponse {
+                    block,
+                    requested_height: height,
+                };
+                self.publish_consensus_message(&response);
+            }
+            ConsensusMessage::BlockResponse { block: Some(block), requested_height } => {
+                debug!("Received block response for height {}", requested_height);
+                let height = block.height();
+                if height == requested_height && !self.state.blocks.contains(&block.hash()) {
+                    self.consensus.add_candidate(block);
+                    self.consensus.try_finalize_round(height);
+                    self.try_apply_finalized(height);
+                }
+            }
+            ConsensusMessage::BlockResponse { block: None, requested_height } => {
+                debug!("Peer doesn't have block at height {}", requested_height);
+            }
         }
     }
 
@@ -901,6 +922,13 @@ impl EventLoop {
                 }
             }
         }
+    }
+
+    /// Request a block at a specific height from the network.
+    pub fn request_block(&mut self, height: u64) {
+        let msg = ConsensusMessage::BlockRequest { height };
+        self.publish_consensus_message(&msg);
+        debug!("Requested block at height {}", height);
     }
 
     /// Publish a ConsensusMessage on the consensus gossipsub topic.
