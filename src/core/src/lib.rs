@@ -14,6 +14,7 @@ pub mod testutil;
 pub mod merkle;
 pub mod qr;
 pub mod genesis;
+pub mod compute;
 pub mod tier_progress;
 pub mod l2;
 pub mod milestones;
