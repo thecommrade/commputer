@@ -498,6 +498,26 @@ refresh();setInterval(refresh,5000);
 
 // ── Feature 253: Fee estimator ──
 
+/// GET /nonce/:address — return current nonce for an address.
+async fn get_nonce(
+    State(state): State<Arc<RpcState>>,
+    Path(address): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let balances = state.balances.lock().await;
+    if let Some(info) = balances.get(&address) {
+        (StatusCode::OK, Json(serde_json::json!({
+            "address": address,
+            "nonce": info.nonce,
+        })))
+    } else {
+        // Account not on chain yet — nonce is 0.
+        (StatusCode::OK, Json(serde_json::json!({
+            "address": address,
+            "nonce": 0,
+        })))
+    }
+}
+
 /// GET /fee-estimate — recommend a transaction fee based on mempool fullness.
 async fn get_fee_estimate(
     State(state): State<Arc<RpcState>>,
@@ -625,6 +645,7 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/status", get(get_status))
         .route("/peers", get(get_peers))
         .route("/balance/{address}", get(get_balance))
+        .route("/nonce/{address}", get(get_nonce))
         .route("/mempool", get(get_mempool))
         .route("/block/{height}", get(get_block_by_height))
         .route("/receipt/{tx_hash}", get(get_receipt))
