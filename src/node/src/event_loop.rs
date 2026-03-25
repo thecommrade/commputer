@@ -606,6 +606,20 @@ impl EventLoop {
                     if let Ok(msg) = serde_json::from_slice::<ProofMessage>(&data) {
                         self.handle_proof_message(msg);
                     }
+                } else if topic == topics::TOPIC_PEER_ADDRS {
+                    // Feature 6: Handle peer address gossip.
+                    if let Ok(msg) = serde_json::from_slice::<commputer_network::message::NetworkMessage>(&data) {
+                        if let commputer_network::message::MessageKind::PeerResponse(peers) = msg.kind {
+                            for peer_info in peers {
+                                // Try to parse the address as a multiaddr and add to Kademlia.
+                                if let Ok(addr) = peer_info.address.parse::<libp2p::Multiaddr>() {
+                                    self.network.swarm.behaviour_mut().kademlia.add_address(
+                                        &propagation_source, addr,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -1730,8 +1744,14 @@ impl EventLoop {
 
         if let Ok(data) = serde_json::to_vec(&msg) {
             let compressed = commputer_network::compress(&data);
-            let topic = topics::consensus_topic();
-            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed) {
+            // Feature 6: Publish on dedicated peer_addrs topic.
+            let topic = topics::peer_addrs_topic();
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed.clone()) {
+                debug!("Failed to publish peer addrs: {}", e);
+            }
+            // Also publish on consensus topic for backward compatibility.
+            let topic_compat = topics::consensus_topic();
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic_compat, compressed) {
                 debug!("Failed to publish peer exchange: {}", e);
             }
         }

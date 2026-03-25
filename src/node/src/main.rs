@@ -866,6 +866,8 @@ async fn run_node(
         ws_broadcast: tokio::sync::broadcast::channel(256).0,
         is_testnet: testnet,
         faucet_claims: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        api_key: None,
+        rate_limits: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
