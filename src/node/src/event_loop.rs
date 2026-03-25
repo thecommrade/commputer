@@ -591,7 +591,15 @@ impl EventLoop {
                 debug!("Gossipsub message on topic: {} from {}", topic, propagation_source);
 
                 if topic == topics::TOPIC_BLOCKS {
-                    if let Ok(block) = serde_json::from_slice::<Block>(&data) {
+                    // Feature 7: Try to parse as BlockAnnounce first, then fall back to full block.
+                    if let Ok(announce) = serde_json::from_slice::<commputer_core::block::BlockAnnounce>(&data) {
+                        // Check if we already have this block.
+                        if !self.state.blocks.contains(&announce.hash) {
+                            // Request the full block via block request protocol.
+                            debug!("BlockAnnounce: need block {} at height {}", announce.hash, announce.height);
+                            self.request_block(announce.height);
+                        }
+                    } else if let Ok(block) = serde_json::from_slice::<Block>(&data) {
                         self.handle_received_block(block, propagation_source);
                     }
                 } else if topic == topics::TOPIC_TRANSACTIONS {
@@ -1461,9 +1469,14 @@ impl EventLoop {
         };
         self.publish_consensus_message(&candidate_msg);
 
-        // Also broadcast on the blocks topic for backward compatibility.
-        // Feature 173: Compress before publishing.
-        if let Ok(data) = serde_json::to_vec(&block) {
+        // Feature 7: Broadcast compact BlockAnnounce on the blocks topic instead of full block.
+        // Peers that need the full block will request it via the block request protocol.
+        let announce = commputer_core::block::BlockAnnounce {
+            hash: block.hash(),
+            height: block.height(),
+            producer: *self.wallet.address(),
+        };
+        if let Ok(data) = serde_json::to_vec(&announce) {
             let compressed = commputer_network::compress(&data);
             let topic = topics::block_topic();
             if let Err(e) = self
@@ -1473,7 +1486,7 @@ impl EventLoop {
                 .gossipsub
                 .publish(topic, compressed)
             {
-                warn!("Failed to broadcast block: {}", e);
+                warn!("Failed to broadcast block announce: {}", e);
             }
         }
 

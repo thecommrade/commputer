@@ -229,3 +229,15 @@ fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
 
     merkle_root(&next_level)
 }
+
+/// Feature 7: Compact block announcement — gossip hash + height + producer instead of full block.
+/// Peers check if they need the full block and request it via the block request protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockAnnounce {
+    /// Hash of the announced block.
+    pub hash: BlockHash,
+    /// Block height.
+    pub height: u64,
+    /// Block producer address.
+    pub producer: Address,
+}
