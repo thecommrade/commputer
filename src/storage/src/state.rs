@@ -437,6 +437,7 @@ mod tests {
                     amount: Amount::from_comme(33),
                 },
                 signature: vec![],
+                public_key: vec![],
             }],
             proof_summaries: vec![],
         };
@@ -476,6 +477,7 @@ mod tests {
                     job_hash: [0u8; 32],
                 },
                 signature: vec![],
+                public_key: vec![],
             }],
             proof_summaries: vec![],
         };
@@ -517,6 +519,7 @@ mod tests {
                     job_hash: [0u8; 32],
                 },
                 signature: vec![],
+                public_key: vec![],
             }],
             proof_summaries: vec![],
         };
@@ -558,6 +561,7 @@ mod tests {
                     job_hash: [0u8; 32],
                 },
                 signature: vec![],
+                public_key: vec![],
             }],
             proof_summaries: vec![],
         };
@@ -629,6 +633,7 @@ mod tests {
                         amount: Amount::from_comme(33),
                     },
                     signature: vec![],
+                    public_key: vec![],
                 }],
                 proof_summaries: vec![],
             };
@@ -693,6 +698,7 @@ mod tests {
                     amount: Amount::from_comme(10),
                 },
                 signature: vec![], // Empty — should be rejected
+                public_key: vec![],
             }],
             proof_summaries: vec![],
         };
@@ -720,6 +726,7 @@ mod tests {
                 amount: Amount::from_comme(10),
             },
             signature: vec![],
+            public_key: vec![],
         };
         sign_transaction(&mut tx, &wallet);
 

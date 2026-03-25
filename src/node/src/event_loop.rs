@@ -187,13 +187,15 @@ impl EventLoop {
     }
 
     fn handle_new_transaction(&mut self, tx: Transaction) {
-        // Basic validation before accepting into mempool
-        if tx.signature.len() != 64 {
-            debug!("Rejected transaction: invalid signature length");
-            return;
-        }
+        // Reject null sender
         if tx.from.0 == [0u8; 32] {
             debug!("Rejected transaction: null sender");
+            return;
+        }
+
+        // Full cryptographic signature verification
+        if !tx.verify() {
+            debug!("Rejected transaction: signature verification failed");
             return;
         }
 

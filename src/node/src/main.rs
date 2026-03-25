@@ -392,6 +392,7 @@ fn cmd_send(to: &str, amount: u64, testnet: bool) -> Result<()> {
             amount: send_amount,
         },
         signature: vec![],
+        public_key: vec![],
     };
     sign_transaction(&mut tx, &wallet);
 

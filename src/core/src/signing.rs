@@ -15,6 +15,7 @@ pub fn sign_transaction(tx: &mut Transaction, wallet: &Wallet) {
     let bytes = tx_signable_bytes(tx);
     let sig = wallet.sign(&bytes);
     tx.signature = sig.to_bytes().to_vec();
+    tx.public_key = wallet.public_key().to_bytes().to_vec();
 }
 
 pub fn verify_transaction(tx: &Transaction, public_key: &VerifyingKey) -> bool {
@@ -51,6 +52,7 @@ mod tests {
                 amount: Amount::from_comme(10),
             },
             signature: vec![],
+            public_key: vec![],
         };
 
         sign_transaction(&mut tx, &sender);
@@ -71,6 +73,7 @@ mod tests {
                 amount: Amount::from_comme(10),
             },
             signature: vec![],
+            public_key: vec![],
         };
 
         sign_transaction(&mut tx, &sender);

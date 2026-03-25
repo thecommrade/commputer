@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use borsh::{BorshDeserialize, BorshSerialize};
 use sha2::{Sha256, Digest};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use crate::identity::Address;
 use crate::token::Amount;
 use crate::proof::ResourceChannel;
@@ -88,6 +89,8 @@ pub struct Transaction {
     pub kind: TxKind,
     /// Signature over (from || nonce || kind).
     pub signature: Vec<u8>,
+    /// Sender's ed25519 public key (32 bytes). Required for signature verification.
+    pub public_key: Vec<u8>,
 }
 
 impl Transaction {
@@ -108,6 +111,37 @@ impl Transaction {
             | TxKind::MilestoneBurn { .. }
             | TxKind::CharitableDonation { .. }
         )
+    }
+
+    /// Verify the transaction's ed25519 signature using the embedded public key.
+    /// Returns true only if: public key is valid, matches the sender address, and signature checks out.
+    pub fn verify(&self) -> bool {
+        if self.public_key.len() != 32 || self.signature.len() != 64 {
+            return false;
+        }
+        let pk_bytes: &[u8; 32] = match self.public_key.as_slice().try_into() {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let vk = match VerifyingKey::from_bytes(pk_bytes) {
+            Ok(vk) => vk,
+            Err(_) => return false,
+        };
+        // Verify the public key matches the sender address (prevents key substitution)
+        if Address::from_public_key(&vk) != self.from {
+            return false;
+        }
+        let sig_bytes: &[u8; 64] = match self.signature.as_slice().try_into() {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let sig = Signature::from_bytes(sig_bytes);
+        // Sign over (from || nonce || kind)
+        let mut bytes = Vec::new();
+        borsh::BorshSerialize::serialize(&self.from, &mut bytes).unwrap();
+        borsh::BorshSerialize::serialize(&self.nonce, &mut bytes).unwrap();
+        borsh::BorshSerialize::serialize(&self.kind, &mut bytes).unwrap();
+        vk.verify(&bytes, &sig).is_ok()
     }
 
     /// The amount of $COMME burned by this transaction, if any.
