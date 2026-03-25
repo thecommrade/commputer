@@ -78,7 +78,7 @@ mod tests {
         let producer = Wallet::generate();
         let mut block = Block {
             header: BlockHeader {
-                height: 1,
+                protocol_version: 1, height: 1,
                 parent_hash: BlockHash::GENESIS,
                 tx_root: [0u8; 32],
                 proof_root: [0u8; 32],
@@ -105,7 +105,7 @@ mod tests {
         let producer = Wallet::generate();
         let mut block = Block {
             header: BlockHeader {
-                height: 1,
+                protocol_version: 1, height: 1,
                 parent_hash: BlockHash::GENESIS,
                 tx_root: [0u8; 32],
                 proof_root: [0u8; 32],
@@ -134,7 +134,7 @@ mod tests {
         let imposter = Wallet::generate();
         let mut block = Block {
             header: BlockHeader {
-                height: 1,
+                protocol_version: 1, height: 1,
                 parent_hash: BlockHash::GENESIS,
                 tx_root: [0u8; 32],
                 proof_root: [0u8; 32],

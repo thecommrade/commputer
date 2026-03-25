@@ -6,6 +6,8 @@ use crate::identity::Address;
 use crate::transaction::Transaction;
 use crate::proof::EpochProofSummary;
 
+fn default_protocol_version() -> u32 { CURRENT_PROTOCOL_VERSION }
+
 /// A 32-byte block hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord,
          Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -21,9 +23,15 @@ impl std::fmt::Display for BlockHash {
     }
 }
 
+/// Current consensus protocol version. Blocks with a different version are rejected.
+pub const CURRENT_PROTOCOL_VERSION: u32 = 1;
+
 /// Block header — the lightweight summary that gets hashed and gossiped.
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct BlockHeader {
+    /// Consensus protocol version (feature 123).
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: u32,
     /// Block height (0 = genesis).
     pub height: u64,
     /// Hash of the previous block.
@@ -59,6 +67,7 @@ impl BlockHeader {
     /// Compute the bytes that the producer signs: all header fields except signature.
     pub fn signable_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+        borsh::BorshSerialize::serialize(&self.protocol_version, &mut bytes).unwrap();
         borsh::BorshSerialize::serialize(&self.height, &mut bytes).unwrap();
         borsh::BorshSerialize::serialize(&self.parent_hash, &mut bytes).unwrap();
         borsh::BorshSerialize::serialize(&self.tx_root, &mut bytes).unwrap();

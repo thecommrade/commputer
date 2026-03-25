@@ -24,6 +24,7 @@ pub fn test_block(height: u64) -> Block {
 pub fn test_block_with_parent(height: u64, parent: BlockHash) -> Block {
     Block {
         header: BlockHeader {
+            protocol_version: 1,
             height,
             parent_hash: parent,
             tx_root: [0u8; 32],
@@ -44,6 +45,7 @@ pub fn test_block_with_parent(height: u64, parent: BlockHash) -> Block {
 pub fn test_block_with_producer(height: u64, producer: Address) -> Block {
     Block {
         header: BlockHeader {
+            protocol_version: 1,
             height,
             parent_hash: BlockHash::GENESIS,
             tx_root: [0u8; 32],
@@ -81,7 +83,7 @@ pub fn signed_transfer(wallet: &Wallet, to: Address, amount: u64, nonce: u64) ->
 pub fn genesis_block() -> Block {
     Block {
         header: BlockHeader {
-            height: 0,
+            protocol_version: 1, height: 0,
             parent_hash: BlockHash::GENESIS,
             tx_root: [0u8; 32],
             proof_root: [0u8; 32],

@@ -12,7 +12,7 @@ use std::time::Duration;
 fn test_block() -> Block {
     Block {
         header: BlockHeader {
-            height: 1,
+            protocol_version: 1, height: 1,
             parent_hash: BlockHash::GENESIS,
             tx_root: [0u8; 32],
             proof_root: [0u8; 32],
@@ -154,7 +154,7 @@ async fn fork_competing_blocks_propagate() {
 
     let block_a = Block {
         header: BlockHeader {
-            height: 1,
+            protocol_version: 1, height: 1,
             parent_hash: BlockHash::GENESIS,
             tx_root: [0u8; 32],
             proof_root: [0u8; 32],
@@ -171,7 +171,7 @@ async fn fork_competing_blocks_propagate() {
 
     let block_b = Block {
         header: BlockHeader {
-            height: 1,
+            protocol_version: 1, height: 1,
             parent_hash: BlockHash::GENESIS,
             tx_root: [0u8; 32],
             proof_root: [0u8; 32],

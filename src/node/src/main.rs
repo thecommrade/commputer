@@ -161,7 +161,7 @@ fn read_line(prompt: &str) -> String {
 fn create_genesis() -> Block {
     Block {
         header: BlockHeader {
-            height: 0,
+            protocol_version: 1, height: 0,
             parent_hash: BlockHash::GENESIS,
             tx_root: [0u8; 32],
             proof_root: [0u8; 32],

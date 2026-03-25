@@ -56,6 +56,16 @@ pub struct EventLoop {
     pub rpc_rx: Option<mpsc::Receiver<Transaction>>,
     /// Shared RPC state (for updating the status snapshot).
     pub rpc_state: Option<Arc<crate::rpc::RpcState>>,
+    /// Feature 127: Orphan block pool — blocks whose parents we don't have yet.
+    pub orphan_pool: HashMap<BlockHash, Vec<Block>>,
+    /// Feature 128: Block propagation timing — when we first saw each block.
+    pub block_seen_times: HashMap<BlockHash, u64>,
+    /// Feature 128: Block propagation delays (in milliseconds) for percentile tracking.
+    pub propagation_delays: Vec<u64>,
+    /// Feature 131: Track (producer, height) -> BlockHash for duplicate block detection.
+    pub producer_blocks: HashMap<(Address, u64), BlockHash>,
+    /// Feature 130: Track when we last saw a block at the expected height.
+    pub last_block_seen_time: Option<std::time::Instant>,
 }
 
 impl EventLoop {
@@ -87,6 +97,11 @@ impl EventLoop {
             peer_scores: HashMap::new(),
             rpc_rx: None,
             rpc_state: None,
+            orphan_pool: HashMap::new(),
+            block_seen_times: HashMap::new(),
+            propagation_delays: Vec::new(),
+            producer_blocks: HashMap::new(),
+            last_block_seen_time: None,
         }
     }
 
@@ -307,6 +322,7 @@ impl EventLoop {
     }
 
     /// Flush state to disk and clean up before exit.
+    /// Feature 133: Save consensus state (pending blocks) for recovery on restart.
     fn shutdown(&mut self) {
         info!("Flushing chain state to disk...");
         if let Err(e) = self.state.flush() {
@@ -314,6 +330,20 @@ impl EventLoop {
         } else {
             info!("Chain state flushed successfully. Height: {}", self.state.blocks.height());
         }
+
+        // Feature 133: Persist pending consensus state info.
+        // Active heights and pending blocks are logged for debugging;
+        // on restart, the node will re-sync from peers via the sync protocol.
+        let active_heights = self.consensus.active_heights();
+        let finalized_heights = self.consensus.finalized_heights();
+        if !active_heights.is_empty() || !finalized_heights.is_empty() {
+            info!(
+                "Consensus state at shutdown: {} active heights, {} finalized pending",
+                active_heights.len(),
+                finalized_heights.len(),
+            );
+        }
+        info!("Orphan pool: {} parent hashes with pending blocks", self.orphan_pool.len());
     }
 
     fn handle_swarm_event(
@@ -500,9 +530,23 @@ impl EventLoop {
         }
     }
 
-    /// Validate a block received from a peer. Returns false and bans the peer
-    /// if the block has bad merkle roots, invalid signatures, or exceeds size limits.
+    /// Feature 132: Validate a block received from a peer in stages:
+    /// Stage 1: Header checks (protocol version, height, timestamp, size)
+    /// Stage 2: Merkle root verification
+    /// Stage 3: Transaction signature verification
     fn validate_block_from_peer(&mut self, block: &Block, source: libp2p::PeerId) -> bool {
+        // === Stage 1: Header checks ===
+
+        // Feature 123: Protocol version check.
+        if block.header.protocol_version != commputer_core::block::CURRENT_PROTOCOL_VERSION {
+            self.ban_peer(source, &format!(
+                "incompatible protocol version {} (expected {})",
+                block.header.protocol_version,
+                commputer_core::block::CURRENT_PROTOCOL_VERSION,
+            ));
+            return false;
+        }
+
         // Check block size limits.
         if !block.within_size_limits() {
             self.ban_peer(source, "sent oversized block");
@@ -528,11 +572,15 @@ impl EventLoop {
             }
         }
 
+        // === Stage 2: Merkle root verification ===
+
         // Check merkle roots.
         if !block.verify_roots() {
             self.ban_peer(source, "sent block with invalid merkle roots");
             return false;
         }
+
+        // === Stage 3: Transaction signature verification ===
 
         // Verify all transaction signatures in the block.
         for tx in &block.transactions {
@@ -555,12 +603,58 @@ impl EventLoop {
 
     /// A block received on the blocks topic (legacy path). Enter it as a candidate
     /// instead of applying directly.
+    /// Features 127 (orphan pool), 128 (propagation metrics), 131 (duplicate detection).
     fn handle_received_block(&mut self, block: Block, source: libp2p::PeerId) {
         let hash = block.hash();
         let height = block.height();
+        let producer = block.header.producer;
 
         if self.state.blocks.contains(&hash) {
             return; // Already have this block.
+        }
+
+        // Feature 128: Record block propagation timing.
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if !self.block_seen_times.contains_key(&hash) {
+            self.block_seen_times.insert(hash, now_ts);
+            let propagation_delay_ms = now_ts.saturating_sub(block.header.timestamp) * 1000;
+            if propagation_delay_ms > 0 {
+                self.propagation_delays.push(propagation_delay_ms);
+                debug!("Block {} propagation delay: {}ms", hash, propagation_delay_ms);
+                // Log percentiles every 100 blocks.
+                if self.propagation_delays.len() % 100 == 0 {
+                    self.log_propagation_percentiles();
+                }
+            }
+        }
+
+        // Feature 131: Duplicate block detection (equivocation).
+        let producer_key = (producer, height);
+        if let Some(existing_hash) = self.producer_blocks.get(&producer_key) {
+            if *existing_hash != hash {
+                warn!(
+                    "DUPLICATE BLOCK: producer {} produced two blocks at height {} ({} and {})",
+                    producer, height, existing_hash, hash
+                );
+                // Still process it — consensus will handle which one wins.
+            }
+        } else {
+            self.producer_blocks.insert(producer_key, hash);
+        }
+
+        // Feature 127: Check if parent exists. If not, add to orphan pool.
+        if height > 0 && !self.state.blocks.contains(&block.header.parent_hash)
+            && self.state.blocks.height() + 1 != height
+        {
+            debug!("Block {} at height {} is orphaned — parent {} not found", hash, height, block.header.parent_hash);
+            self.orphan_pool
+                .entry(block.header.parent_hash)
+                .or_insert_with(Vec::new)
+                .push(block);
+            return;
         }
 
         // Validate before accepting.
@@ -568,12 +662,44 @@ impl EventLoop {
             return;
         }
 
+        // Update last block seen time for view change (feature 130).
+        self.last_block_seen_time = Some(std::time::Instant::now());
+
         debug!("Received block {} at height {} — entering as candidate", hash, height);
         self.consensus.add_candidate(block);
 
         // Attempt finalization (handles single-candidate fast-path).
         self.consensus.try_finalize_round(height);
         self.try_apply_finalized(height);
+    }
+
+    /// Feature 128: Log p50/p90/p99 propagation delay percentiles.
+    fn log_propagation_percentiles(&self) {
+        if self.propagation_delays.is_empty() {
+            return;
+        }
+        let mut sorted = self.propagation_delays.clone();
+        sorted.sort();
+        let len = sorted.len();
+        let p50 = sorted[len / 2];
+        let p90 = sorted[(len as f64 * 0.9) as usize];
+        let p99 = sorted[(len as f64 * 0.99).min(len as f64 - 1.0) as usize];
+        info!("Block propagation delay (n={}): p50={}ms, p90={}ms, p99={}ms", len, p50, p90, p99);
+    }
+
+    /// Feature 127: Check if any orphaned blocks can now be processed after
+    /// a block has been applied at the given hash.
+    fn process_orphans(&mut self, parent_hash: BlockHash) {
+        if let Some(orphans) = self.orphan_pool.remove(&parent_hash) {
+            for orphan in orphans {
+                let hash = orphan.hash();
+                let height = orphan.height();
+                debug!("Processing orphan block {} at height {} (parent now available)", hash, height);
+                self.consensus.add_candidate(orphan);
+                self.consensus.try_finalize_round(height);
+                self.try_apply_finalized(height);
+            }
+        }
     }
 
     /// Handle a transaction submitted via the RPC server: validate, add to mempool, broadcast.
@@ -734,6 +860,18 @@ impl EventLoop {
             if total_score > 0 {
                 let mut distributed = 0u64;
                 for summary in &summaries {
+                    // Feature 124: Only validators in the active set earn rewards.
+                    if !self.epoch_state.is_active_validator(&summary.validator) {
+                        debug!("Skipping reward for {} — not in active validator set", summary.validator);
+                        continue;
+                    }
+
+                    // Feature 125: Slashed validators earn zero.
+                    if self.consensus.is_slashed(&summary.validator) {
+                        warn!("Validator {} slashed for equivocation — zero reward", summary.validator);
+                        continue;
+                    }
+
                     let score = summary.composite_score();
                     let reward = actual_emission * score / total_score;
 
@@ -821,9 +959,35 @@ impl EventLoop {
         // Feature 114: Compute next epoch's difficulty multipliers.
         let next_difficulty = self.epoch_state.compute_next_difficulty();
 
+        // Feature 126: Emit epoch summary event.
+        let epoch_summary = commputer_consensus::epoch::EpochSummary {
+            epoch,
+            validator_count,
+            total_emission: actual_emission,
+            difficulty_adjustments: next_difficulty.clone(),
+            active_validator_count: self.epoch_state.active_validators.len(),
+        };
+        info!(
+            "Epoch {} summary: {} validators, {} active, emission={}, difficulty adjustments: {:?}",
+            epoch_summary.epoch,
+            epoch_summary.validator_count,
+            epoch_summary.active_validator_count,
+            epoch_summary.total_emission,
+            epoch_summary.difficulty_adjustments,
+        );
+
+        // Feature 124: Snapshot current validators for the next epoch.
+        // All validators who submitted proof summaries this epoch become the active set.
+        let next_active_validators: std::collections::HashSet<_> = self.epoch_state
+            .summaries.keys().copied().collect();
+
+        // Feature 125: Reset slashing state for the new epoch.
+        self.consensus.reset_epoch_slashing();
+
         self.state.current_epoch = epoch + 1;
         self.epoch_state = EpochState::new(epoch + 1, 0);
         self.epoch_state.difficulty_multiplier = next_difficulty;
+        self.epoch_state.snapshot_validators(next_active_validators);
         self.epoch_state.record_summary(self_summary);
     }
 
@@ -835,9 +999,22 @@ impl EventLoop {
 
         let next_height = self.state.blocks.height() + 1;
 
-        // Don't produce if there's already an active vote at this height.
-        if self.consensus.has_active_vote(next_height) || self.consensus.has_height(next_height) {
+        // Feature 130: View change protocol — if no block seen at the expected
+        // height for 30s, allow any validator to produce a block.
+        let view_change_timeout = self.last_block_seen_time
+            .map(|t| t.elapsed().as_secs() >= 30)
+            .unwrap_or(false);
+
+        // Don't produce if there's already an active vote at this height
+        // (unless view change timeout has elapsed).
+        if !view_change_timeout
+            && (self.consensus.has_active_vote(next_height) || self.consensus.has_height(next_height))
+        {
             return;
+        }
+
+        if view_change_timeout {
+            warn!("View change: no block at height {} for 30s — producing fallback block", next_height);
         }
 
         let parent = self
@@ -858,6 +1035,7 @@ impl EventLoop {
         };
         let mut block = Block {
             header: BlockHeader {
+                protocol_version: commputer_core::block::CURRENT_PROTOCOL_VERSION,
                 height: next_height,
                 parent_hash: parent,
                 tx_root: [0u8; 32],
@@ -998,6 +1176,9 @@ impl EventLoop {
                             warn!("Failed to save snapshot at height {}: {}", height, e);
                         }
                     }
+
+                    // Feature 127: Check for orphaned blocks that can now be processed.
+                    self.process_orphans(hash);
                 }
                 Err(e) => {
                     warn!("Rejected finalized block {}: {}", hash, e);

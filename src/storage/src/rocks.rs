@@ -173,6 +173,7 @@ mod tests {
     fn make_test_block(height: u64, parent: BlockHash) -> Block {
         Block {
             header: BlockHeader {
+                protocol_version: 1,
                 height,
                 parent_hash: parent,
                 tx_root: [0u8; 32],

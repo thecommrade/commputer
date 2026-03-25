@@ -1,13 +1,19 @@
 use std::path::Path;
 use commputer_core::block::Block;
 use commputer_core::token::TOTAL_SUPPLY;
-use commputer_core::transaction::TxKind;
+use commputer_core::transaction::{TxKind, Transaction};
 use commputer_core::compliance::NerfRate;
-use tracing::info;
+use tracing::{info, warn};
 use crate::account::AccountStore;
 use crate::blockstore::BlockStore;
 use crate::receipt::{AccountHistoryIndex, ReceiptStore, TxReceipt};
 use crate::rocks::{self, RocksStore};
+
+/// Feature 122: Finality depth — blocks older than this many confirmations cannot be reorged.
+pub const FINALITY_DEPTH: u64 = 10;
+
+/// Feature 135: Checkpoint interval — every N blocks is a checkpoint that cannot be reorged past.
+pub const CHECKPOINT_INTERVAL: u64 = 100;
 
 /// The full chain state — accounts, blocks, supply tracking.
 /// Optionally backed by RocksDB for persistence across restarts.
@@ -26,6 +32,8 @@ pub struct ChainState {
     pub receipts: ReceiptStore,
     /// Address -> tx hash reverse index.
     pub history: AccountHistoryIndex,
+    /// Feature 134: Cumulative CRS (composite resource score) for fork choice.
+    pub cumulative_score: u64,
     /// Optional RocksDB persistent layer. None = in-memory only (tests).
     rocks: Option<RocksStore>,
 }
@@ -40,6 +48,7 @@ impl std::fmt::Debug for ChainState {
             .field("total_burned", &self.total_burned)
             .field("nerf_rate", &self.nerf_rate)
             .field("current_epoch", &self.current_epoch)
+            .field("cumulative_score", &self.cumulative_score)
             .field("persistent", &self.rocks.is_some())
             .finish()
     }
@@ -61,6 +70,7 @@ impl ChainState {
             current_epoch: 0,
             receipts: ReceiptStore::new(),
             history: AccountHistoryIndex::new(),
+            cumulative_score: 0,
             rocks: None,
         }
     }
@@ -119,6 +129,7 @@ impl ChainState {
             current_epoch,
             receipts: ReceiptStore::new(),
             history: AccountHistoryIndex::new(),
+            cumulative_score: 0,
             rocks: Some(rocks),
         })
     }
@@ -420,6 +431,121 @@ impl ChainState {
         self.rocks.is_some()
     }
 
+    /// Feature 121/122/134/135: Attempt a chain reorganization if a competing
+    /// chain is longer (or equal length with higher cumulative score).
+    /// Returns orphaned transactions that should go back to the mempool.
+    /// Refuses to reorg past finality depth or checkpoints.
+    pub fn try_reorg(
+        &mut self,
+        competing_chain: Vec<Block>,
+        competing_score: u64,
+    ) -> Result<Vec<Transaction>, StateError> {
+        if competing_chain.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let our_height = self.blocks.height();
+        let their_height = competing_chain.last().map(|b| b.height()).unwrap_or(0);
+
+        // Must be longer, or equal length with higher cumulative score (feature 134).
+        let dominated = their_height > our_height
+            || (their_height == our_height && competing_score > self.cumulative_score);
+        if !dominated {
+            return Ok(vec![]);
+        }
+
+        // Find the fork point: lowest height in the competing chain.
+        let fork_height = competing_chain.first().map(|b| b.height()).unwrap_or(0);
+
+        // Feature 122: Refuse to reorg past finality depth.
+        if our_height >= FINALITY_DEPTH && fork_height < our_height.saturating_sub(FINALITY_DEPTH) {
+            warn!(
+                "Refusing reorg: fork point {} is below finality depth (current height {})",
+                fork_height, our_height
+            );
+            return Err(StateError::InvalidBlock(
+                "reorg blocked by finality depth".into(),
+            ));
+        }
+
+        // Feature 135: Refuse to reorg past checkpoint blocks.
+        // Any checkpoint between fork_height and our_height blocks the reorg.
+        let first_checkpoint_after_fork = if fork_height % CHECKPOINT_INTERVAL == 0 {
+            fork_height
+        } else {
+            (fork_height / CHECKPOINT_INTERVAL + 1) * CHECKPOINT_INTERVAL
+        };
+        if first_checkpoint_after_fork <= our_height {
+            warn!(
+                "Refusing reorg: checkpoint at height {} is between fork point {} and current height {}",
+                first_checkpoint_after_fork, fork_height, our_height
+            );
+            return Err(StateError::InvalidBlock(
+                "reorg blocked by checkpoint".into(),
+            ));
+        }
+
+        // Collect orphaned transactions from blocks being rolled back.
+        let mut orphaned_txs = Vec::new();
+        for h in (fork_height..=our_height).rev() {
+            if let Some(block) = self.get_block_by_height(h) {
+                orphaned_txs.extend(block.transactions.clone());
+            }
+        }
+
+        // Remove transactions that exist in the new chain (they're not orphaned).
+        let new_tx_hashes: std::collections::HashSet<_> = competing_chain
+            .iter()
+            .flat_map(|b| b.transactions.iter().map(|tx| tx.hash()))
+            .collect();
+        orphaned_txs.retain(|tx| !new_tx_hashes.contains(&tx.hash()));
+
+        // Roll back: rebuild state up to fork_height - 1.
+        // For simplicity, we rebuild the entire chain state from genesis.
+        // In production this would use snapshots.
+        let saved_rocks = self.rocks.take();
+        let _saved_epoch = self.current_epoch;
+        let _saved_emitted = self.total_emitted;
+        let _saved_burned = self.total_burned;
+
+        // Collect blocks before the fork point.
+        let mut pre_fork_blocks = Vec::new();
+        for h in 0..fork_height {
+            if let Some(block) = self.get_block_by_height(h) {
+                pre_fork_blocks.push(block);
+            }
+        }
+
+        // Reset state.
+        self.accounts = AccountStore::new();
+        self.blocks = BlockStore::new();
+        self.total_emitted = 0;
+        self.total_burned = 0;
+        self.cumulative_score = 0;
+
+        // Re-apply pre-fork blocks.
+        for block in &pre_fork_blocks {
+            self.apply_block(block)?;
+        }
+
+        // Apply the new competing chain.
+        for block in &competing_chain {
+            self.apply_block(block)?;
+        }
+
+        self.cumulative_score = competing_score;
+        self.rocks = saved_rocks;
+
+        info!(
+            "Chain reorganization complete: rolled back to height {}, applied {} new blocks (new height {})",
+            fork_height.saturating_sub(1),
+            competing_chain.len(),
+            self.blocks.height(),
+        );
+
+        Ok(orphaned_txs)
+    }
+
     /// Persist all meta counters to RocksDB.
     fn flush_meta(&self, rocks: &RocksStore) -> Result<(), StateError> {
         rocks.put_meta_u64(rocks::META_TOTAL_EMITTED, self.total_emitted)
@@ -496,7 +622,7 @@ mod tests {
     fn genesis_block() -> Block {
         Block {
             header: BlockHeader {
-                height: 0,
+                protocol_version: 1, height: 0,
                 parent_hash: BlockHash::GENESIS,
                 tx_root: [0u8; 32],
                 proof_root: [0u8; 32],
@@ -541,7 +667,7 @@ mod tests {
         // Transfer 33 COMME from addr(1) to addr(2).
         let block = Block {
             header: BlockHeader {
-                height: 1,
+                protocol_version: 1, height: 1,
                 parent_hash: state.blocks.latest().unwrap().hash(),
                 tx_root: [0u8; 32],
                 proof_root: [0u8; 32],
@@ -582,7 +708,7 @@ mod tests {
 
         let block = Block {
             header: BlockHeader {
-                height: 1,
+                protocol_version: 1, height: 1,
                 parent_hash: state.blocks.latest().unwrap().hash(),
                 tx_root: [0u8; 32],
                 proof_root: [0u8; 32],
@@ -626,7 +752,7 @@ mod tests {
         // Burst compute: burn 3 COMME
         let block = Block {
             header: BlockHeader {
-                height: 1,
+                protocol_version: 1, height: 1,
                 parent_hash: state.blocks.latest().unwrap().hash(),
                 tx_root: [0u8; 32],
                 proof_root: [0u8; 32],
@@ -670,7 +796,7 @@ mod tests {
 
         let block = Block {
             header: BlockHeader {
-                height: 1,
+                protocol_version: 1, height: 1,
                 parent_hash: state.blocks.latest().unwrap().hash(),
                 tx_root: [0u8; 32],
                 proof_root: [0u8; 32],
@@ -745,7 +871,7 @@ mod tests {
             // Build and apply a transfer block.
             let block = Block {
                 header: BlockHeader {
-                    height: 1,
+                    protocol_version: 1, height: 1,
                     parent_hash: genesis_hash,
                     tx_root: [0u8; 32],
                     proof_root: [0u8; 32],
@@ -812,7 +938,7 @@ mod tests {
 
         let block = Block {
             header: BlockHeader {
-                height: 1,
+                protocol_version: 1, height: 1,
                 parent_hash: state.blocks.latest().unwrap().hash(),
                 tx_root: [0u8; 32],
                 proof_root: [0u8; 32],
@@ -867,7 +993,7 @@ mod tests {
 
         let mut block = Block {
             header: BlockHeader {
-                height: 1,
+                protocol_version: 1, height: 1,
                 parent_hash: state.blocks.latest().unwrap().hash(),
                 tx_root: [0u8; 32],
                 proof_root: [0u8; 32],

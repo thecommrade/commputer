@@ -1,6 +1,6 @@
 use commputer_core::proof::{EpochProofSummary, ResourceChannel};
 use commputer_core::identity::Address;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Duration of one epoch in seconds.
 /// Epochs are the time window over which proof scores are aggregated
@@ -22,6 +22,9 @@ pub struct EpochState {
     /// Feature 114: Per-channel difficulty multiplier. Adjusted at epoch end
     /// based on proof pass rates.
     pub difficulty_multiplier: HashMap<ResourceChannel, f64>,
+    /// Feature 124: Active validator set for this epoch. Only these validators
+    /// can participate and earn rewards. Snapshotted at epoch transition.
+    pub active_validators: HashSet<Address>,
 }
 
 impl EpochState {
@@ -38,6 +41,7 @@ impl EpochState {
             summaries: HashMap::new(),
             demand,
             difficulty_multiplier,
+            active_validators: HashSet::new(),
         }
     }
 
@@ -96,6 +100,27 @@ impl EpochState {
     pub fn is_expired(&self, current_time: u64) -> bool {
         current_time >= self.start_time + EPOCH_DURATION_SECS
     }
+
+    /// Feature 124: Snapshot current validators as the active set for this epoch.
+    pub fn snapshot_validators(&mut self, validators: HashSet<Address>) {
+        self.active_validators = validators;
+    }
+
+    /// Feature 124: Check if a validator is in the active set for this epoch.
+    pub fn is_active_validator(&self, addr: &Address) -> bool {
+        // If active_validators is empty (genesis/bootstrap), allow all
+        self.active_validators.is_empty() || self.active_validators.contains(addr)
+    }
+}
+
+/// Feature 126: Epoch summary event emitted at epoch boundaries.
+#[derive(Debug, Clone)]
+pub struct EpochSummary {
+    pub epoch: u64,
+    pub validator_count: u64,
+    pub total_emission: u64,
+    pub difficulty_adjustments: HashMap<ResourceChannel, f64>,
+    pub active_validator_count: usize,
 }
 
 /// An epoch that has been finalized — immutable record of one hour of network activity.

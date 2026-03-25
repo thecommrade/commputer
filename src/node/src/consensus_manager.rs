@@ -1,9 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use serde::{Deserialize, Serialize};
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 
 use commputer_core::block::{Block, BlockHash};
+use commputer_core::identity::Address;
 use commputer_consensus::snowball::{SnowballParams, SnowballVoter};
+
+/// Feature 129: Consensus timeout — if no block finalized within this duration, force re-election.
+pub const CONSENSUS_TIMEOUT_SECS: u64 = 30;
 
 /// Messages exchanged between nodes for Snowball consensus and sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +57,12 @@ struct HeightState {
 pub struct ConsensusManager {
     heights: HashMap<u64, HeightState>,
     params: SnowballParams,
+    /// Feature 125: Track (validator, height) -> BlockHash to detect equivocation.
+    pub validator_blocks: HashMap<(Address, u64), BlockHash>,
+    /// Feature 125: Slashed validators for the current epoch — earn zero rewards.
+    pub slashed_validators: HashSet<Address>,
+    /// Feature 129: Track when each height started consensus.
+    pub height_start_time: HashMap<u64, Instant>,
 }
 
 impl ConsensusManager {
@@ -63,14 +74,36 @@ impl ConsensusManager {
                 quorum: 2,
                 decision_threshold: 5,
             },
+            validator_blocks: HashMap::new(),
+            slashed_validators: HashSet::new(),
+            height_start_time: HashMap::new(),
         }
     }
 
     /// Add a candidate block. Creates the voter for this height if needed.
     /// If there is only one candidate, it is immediately finalized.
+    /// Feature 125: Detects equivocation (same validator, same height, different hash).
     pub fn add_candidate(&mut self, block: Block) {
         let height = block.height();
         let hash = block.hash();
+        let producer = block.header.producer;
+
+        // Feature 125: Check for equivocation.
+        let key = (producer, height);
+        if let Some(existing_hash) = self.validator_blocks.get(&key) {
+            if *existing_hash != hash {
+                warn!(
+                    "EQUIVOCATION DETECTED: validator {} signed two different blocks at height {} ({} and {})",
+                    producer, height, existing_hash, hash
+                );
+                self.slashed_validators.insert(producer);
+            }
+        } else {
+            self.validator_blocks.insert(key, hash);
+        }
+
+        // Feature 129: Track height start time.
+        self.height_start_time.entry(height).or_insert_with(Instant::now);
 
         let state = self.heights.entry(height).or_insert_with(|| HeightState {
             voter: SnowballVoter::new(self.params.clone()),
@@ -104,6 +137,7 @@ impl ConsensusManager {
     /// Feed accumulated responses into the voter and reset for the next round.
     /// Also handles the single-candidate fast-path: if only one candidate exists,
     /// finalize immediately without requiring peer responses.
+    /// Feature 129: If elapsed > 30s, force re-election by finalizing on any candidate.
     /// Returns true if this round caused finalization.
     pub fn try_finalize_round(&mut self, height: u64) -> bool {
         if let Some(state) = self.heights.get_mut(&height) {
@@ -123,6 +157,22 @@ impl ConsensusManager {
                 return true;
             }
 
+            // Feature 129: Consensus timeout — force finalization after 30s.
+            if let Some(start) = self.height_start_time.get(&height) {
+                if start.elapsed().as_secs() >= CONSENSUS_TIMEOUT_SECS {
+                    // Force finalize on the current preference or first candidate.
+                    let hash = state.voter.preference()
+                        .unwrap_or_else(|| *state.candidates.keys().next().unwrap());
+                    let mut responses = HashMap::new();
+                    responses.insert(hash, self.params.sample_size);
+                    for _ in 0..self.params.decision_threshold {
+                        state.voter.record_round(&responses);
+                    }
+                    warn!("Consensus timeout at height {} — force-finalizing on {}", height, hash);
+                    return true;
+                }
+            }
+
             if state.round_responses.is_empty() {
                 return false;
             }
@@ -139,6 +189,17 @@ impl ConsensusManager {
         } else {
             false
         }
+    }
+
+    /// Feature 125: Check if a validator has been slashed for equivocation.
+    pub fn is_slashed(&self, addr: &Address) -> bool {
+        self.slashed_validators.contains(addr)
+    }
+
+    /// Feature 125: Reset slashing state at epoch boundary.
+    pub fn reset_epoch_slashing(&mut self) {
+        self.slashed_validators.clear();
+        self.validator_blocks.clear();
     }
 
     /// If the vote at `height` is finalized, return the winning block hash.
@@ -215,6 +276,7 @@ mod tests {
     fn make_test_block_with_producer(height: u64, producer: Address) -> Block {
         Block {
             header: BlockHeader {
+                protocol_version: 1,
                 height,
                 parent_hash: BlockHash::GENESIS,
                 tx_root: [0u8; 32],
