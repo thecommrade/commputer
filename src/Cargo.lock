@@ -634,6 +634,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "tokio",
  "tower",
@@ -647,6 +648,7 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "commputer-core",
+ "commputer-storage",
  "rand 0.8.5",
  "serde",
  "sha2",

@@ -18,6 +18,36 @@ pub struct L2StateCommitment {
     pub timestamp: u64,
 }
 
+/// The flagship L2 identifier that gets 51% capacity priority.
+pub const FLAGSHIP_L2_ID: &str = "commputer-analytics-l2";
+
+/// Extended L2 registration with height and flagship status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct L2RegistrationExtended {
+    pub l2_id: String,
+    pub operator: Address,
+    pub registered_at_height: u64,
+    pub is_flagship: bool,
+}
+
+impl L2RegistrationExtended {
+    /// Create a new registration, automatically detecting flagship status.
+    pub fn new(l2_id: String, operator: Address, height: u64) -> Self {
+        let is_flagship = is_flagship(&l2_id);
+        Self {
+            l2_id,
+            operator,
+            registered_at_height: height,
+            is_flagship,
+        }
+    }
+}
+
+/// Check if an L2 ID is the flagship L2.
+pub fn is_flagship(l2_id: &str) -> bool {
+    l2_id == FLAGSHIP_L2_ID
+}
+
 pub fn verify_commitment(commitment: &L2StateCommitment) -> bool {
     !commitment.l2_chain_id.is_empty() && commitment.state_root != [0u8; 32] && commitment.block_height > 0 && commitment.timestamp > 0
 }
@@ -36,4 +66,50 @@ mod tests {
     #[test] fn test_zero_height() { let mut c = commit(); c.block_height = 0; assert!(!verify_commitment(&c)); }
     #[test] fn test_zero_ts() { let mut c = commit(); c.timestamp = 0; assert!(!verify_commitment(&c)); }
     #[test] fn test_commit_serde() { let c = commit(); let j = serde_json::to_string(&c).unwrap(); let d: L2StateCommitment = serde_json::from_str(&j).unwrap(); assert_eq!(c, d); }
+
+    #[test]
+    fn test_flagship_detection() {
+        assert!(is_flagship("commputer-analytics-l2"));
+        assert!(!is_flagship("other-l2"));
+        assert!(!is_flagship(""));
+    }
+
+    #[test]
+    fn test_flagship_constant() {
+        assert_eq!(FLAGSHIP_L2_ID, "commputer-analytics-l2");
+    }
+
+    #[test]
+    fn test_l2_registration_extended_flagship() {
+        let reg = L2RegistrationExtended::new(
+            FLAGSHIP_L2_ID.to_string(),
+            addr(),
+            100,
+        );
+        assert!(reg.is_flagship);
+        assert_eq!(reg.registered_at_height, 100);
+    }
+
+    #[test]
+    fn test_l2_registration_extended_non_flagship() {
+        let reg = L2RegistrationExtended::new(
+            "custom-l2".to_string(),
+            addr(),
+            200,
+        );
+        assert!(!reg.is_flagship);
+        assert_eq!(reg.l2_id, "custom-l2");
+    }
+
+    #[test]
+    fn test_l2_registration_extended_serde() {
+        let reg = L2RegistrationExtended::new(
+            "test-l2".to_string(),
+            addr(),
+            50,
+        );
+        let json = serde_json::to_string(&reg).unwrap();
+        let decoded: L2RegistrationExtended = serde_json::from_str(&json).unwrap();
+        assert_eq!(reg, decoded);
+    }
 }
