@@ -183,6 +183,11 @@ impl EventLoop {
 
         info!("Event loop started. Listening for peers...");
 
+        // Set up graceful shutdown signal handler.
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ).expect("failed to register SIGTERM handler");
+
         loop {
             // Take the RPC receiver out to satisfy the borrow checker in select!
             let rpc_recv = async {
@@ -216,7 +221,27 @@ impl EventLoop {
                 _ = proof_interval.tick() => {
                     self.handle_proof_tick();
                 }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received SIGINT — shutting down gracefully");
+                    self.shutdown();
+                    return;
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM — shutting down gracefully");
+                    self.shutdown();
+                    return;
+                }
             }
+        }
+    }
+
+    /// Flush state to disk and clean up before exit.
+    fn shutdown(&mut self) {
+        info!("Flushing chain state to disk...");
+        if let Err(e) = self.state.flush() {
+            warn!("Failed to flush state on shutdown: {}", e);
+        } else {
+            info!("Chain state flushed successfully. Height: {}", self.state.blocks.height());
         }
     }
 
