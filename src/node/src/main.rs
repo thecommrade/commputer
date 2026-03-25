@@ -2,6 +2,15 @@ mod consensus_manager;
 mod event_loop;
 mod proof_manager;
 mod rpc;
+mod validation;
+mod faucet;
+mod testnet_genesis;
+mod wizard;
+mod watch;
+mod confirm;
+mod interactive;
+mod mining_stats;
+mod network_info;
 
 use std::path::PathBuf;
 use anyhow::Result;
