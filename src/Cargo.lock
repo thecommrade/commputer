@@ -617,6 +617,7 @@ dependencies = [
  "anyhow",
  "axum",
  "borsh",
+ "chrono",
  "clap",
  "commputer-consensus",
  "commputer-core",
@@ -628,6 +629,8 @@ dependencies = [
  "futures",
  "hex",
  "libp2p",
+ "rand 0.8.5",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",
@@ -670,6 +673,7 @@ dependencies = [
  "sha2",
  "sysinfo",
  "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]

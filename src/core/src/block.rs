@@ -56,6 +56,9 @@ pub struct BlockHeader {
     /// Feature 248: Checkpoint hash — full state root hash at checkpoint intervals (every 1000 blocks).
     #[serde(default)]
     pub checkpoint_hash: Option<[u8; 32]>,
+    /// Chain identifier (e.g., "commputer-testnet-1"). Empty string for backwards compat.
+    #[serde(default)]
+    pub chain_id: String,
 }
 
 /// Feature 248: Checkpoint interval for full state root hashing.
@@ -83,6 +86,7 @@ impl BlockHeader {
         borsh::BorshSerialize::serialize(&self.timestamp, &mut bytes).unwrap();
         borsh::BorshSerialize::serialize(&self.producer, &mut bytes).unwrap();
         borsh::BorshSerialize::serialize(&self.epoch, &mut bytes).unwrap();
+        borsh::BorshSerialize::serialize(&self.chain_id, &mut bytes).unwrap();
         bytes
     }
 

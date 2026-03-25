@@ -340,6 +340,12 @@ impl EventLoop {
         let mut partition_check_interval = time::interval(Duration::from_secs(10));
         // Feature 178: Seed reconnection every 5 minutes.
         let mut seed_reconnect_interval = time::interval(Duration::from_secs(300));
+        // Feature 11: Automatic peer rotation every 5 minutes.
+        let mut peer_rotation_interval = time::interval(Duration::from_secs(300));
+        // Feature 12: SIGHUP handler for config hot reload.
+        let mut sighup = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::hangup(),
+        ).ok();
 
         info!("Event loop started at height {}. Listening for peers...", self.state.blocks.height());
 
