@@ -111,6 +111,28 @@ AI was trained on the sum of human academic labor and then sold back to us. Scie
 
 The stated mission: become the default repository people choose — not because they care about crypto, but because it is the most reliable, permanent, uncensorable place to store the record of human knowledge. The most obvious choice.
 
+### Communal AI
+
+The long-term goal of the 51% compute allocation — beyond storage, communication, and the Humanities Archive — is to train and run AI that belongs to the people who power it.
+
+Not a company's AI. Not a government's AI. An AI trained on data the community votes to include, governed by the holders who contribute the resources that make it possible, and available to anyone the network can support.
+
+**How governance works:**
+
+Holders vote on the direction of the AI — what training data to use, what capabilities to prioritize, what guardrails to enforce. These votes happen on the main website alongside charitable votes. Holders vote proportionally, like shareholders in a company, except the company is a communal supercomputer and the shares are $COMME.
+
+**The kill switch:**
+
+If the community decides the AI is harmful — if it proves dangerous, if it's being misused, if the people who power the network simply don't want it anymore — they turn off their resource contributions and it stops. No board meeting. No corporate decision. The validators withdraw their compute and the AI goes offline. The power to create it and the power to end it live in the same hands.
+
+**Accessibility:**
+
+When the network is small, AI access requires holding 33 $COMME — the resources aren't sufficient to serve everyone. As the network grows and capacity increases, the threshold drops. The stated goal: eventually, anyone can use it. The timeline depends on the network, not a roadmap.
+
+**Training data governance:**
+
+The community votes on what data the AI is trained on. This is not a feature — it is a fundamental principle. The people who contribute the compute that trains the model decide what the model learns. No one else.
+
 ### $RAD
 Details to come when the time is right.
 
