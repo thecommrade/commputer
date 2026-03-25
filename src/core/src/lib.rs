@@ -9,8 +9,11 @@ pub mod error;
 pub mod wallet;
 pub mod keystore;
 pub mod signing;
+pub mod audit;
 pub mod testutil;
 pub mod merkle;
+pub mod qr;
+pub mod genesis;
 #[cfg(test)]
 mod fuzz_tests;
 
@@ -22,3 +25,4 @@ pub use token::{Amount, TOTAL_SUPPLY};
 pub use compliance::{ComplianceStatus, ComplianceVerdict};
 pub use tier::HolderTier;
 pub use wallet::Wallet;
+pub use genesis::GenesisConfig;
