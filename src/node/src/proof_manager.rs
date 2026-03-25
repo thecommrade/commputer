@@ -3,7 +3,8 @@ use commputer_core::proof::{
 };
 use commputer_core::identity::Address;
 use commputer_proofs::{
-    CpuProver, GpuProver, RamProver, BandwidthProver, ChallengeGenerator, ProofVerifier,
+    CpuProver, GpuProver, RamProver, BandwidthProver, StorageProver,
+    ChallengeGenerator, ProofVerifier,
 };
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
@@ -14,21 +15,29 @@ pub enum ProofMessage {
     Response(ProofResponse),
 }
 
+/// Default storage data size: 1 MB assigned to each validator.
+const STORAGE_DATA_SIZE: usize = 1_048_576;
+
 pub struct ProofManager {
     pending_challenges: HashMap<[u8; 32], ProofChallenge>,
     responses: Vec<ProofResponse>,
     our_address: Address,
     /// Current chain height, updated from the event loop.
     pub current_height: u64,
+    /// Our assigned storage data (generated deterministically from address).
+    storage_data: Vec<u8>,
 }
 
 impl ProofManager {
     pub fn new(our_address: Address) -> Self {
+        // Generate deterministic storage data from our address (serves as seed).
+        let storage_data = StorageProver::generate_test_data(&our_address.0, STORAGE_DATA_SIZE);
         Self {
             pending_challenges: HashMap::new(),
             responses: Vec::new(),
             our_address,
             current_height: 0,
+            storage_data,
         }
     }
 
@@ -67,14 +76,7 @@ impl ProofManager {
                 BandwidthProver::solve(challenge, self.our_address)
             }
             ResourceChannel::Storage => {
-                // Storage proofs need actual data; return a placeholder response.
-                ProofResponse {
-                    challenge_id: challenge.challenge_id,
-                    validator: self.our_address,
-                    result: vec![0u8; 32], // Placeholder
-                    compute_time_ms: 0,
-                    signature: vec![],
-                }
+                StorageProver::solve(challenge, &self.storage_data, self.our_address)
             }
         }
     }
