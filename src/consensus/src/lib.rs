@@ -3,6 +3,7 @@ pub mod dag;
 pub mod epoch;
 pub mod emission;
 pub mod anchor;
+pub mod job_assignment;
 pub mod burst_pricing;
 pub mod health;
 

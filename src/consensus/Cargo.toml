@@ -8,6 +8,7 @@ description = "Snowstorm consensus engine: Avalanche-style sampling over multi-c
 
 [dependencies]
 commputer-core = { workspace = true }
+commputer-storage = { workspace = true }
 serde = { workspace = true }
 borsh = { workspace = true }
 sha2 = { workspace = true }
