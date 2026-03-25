@@ -12,9 +12,10 @@ use std::time::Instant;
 /// during computation — there is no shortcut without the RAM.
 pub struct RamProver;
 
-/// Buffer size for tests: 1 MB.
-/// In production this would be set from the challenge payload (e.g. 256 MB).
-const TEST_BUFFER_BYTES: usize = 1024 * 1024; // 1 MB
+/// Minimum buffer to prove RAM was allocated. Tests use 1MB, production scales higher.
+const MIN_BUFFER_BYTES: usize = 1024 * 1024; // 1 MB
+/// Maximum buffer size cap (prevent OOM from malicious challenges).
+const MAX_BUFFER_BYTES: usize = 256 * 1024 * 1024; // 256 MB
 
 /// Number of random read accesses to perform.
 const READ_COUNT: usize = 1024;
@@ -27,10 +28,12 @@ impl RamProver {
         let start = Instant::now();
 
         // Payload layout: [4-byte required_mb (little-endian), then 32-byte seed]
-        // For testing we cap at TEST_BUFFER_BYTES to keep the suite fast.
+        let required_mb = u32::from_le_bytes(challenge.payload[..4].try_into().unwrap_or([1, 0, 0, 0]));
+        let buffer_size = ((required_mb as usize) * 1024 * 1024)
+            .clamp(MIN_BUFFER_BYTES, MAX_BUFFER_BYTES);
         let seed = &challenge.payload[4..];
 
-        let result = Self::memory_hard_hash(seed, TEST_BUFFER_BYTES);
+        let result = Self::memory_hard_hash(seed, buffer_size);
 
         let elapsed = start.elapsed();
 
@@ -43,10 +46,21 @@ impl RamProver {
         }
     }
 
-    /// Verify a RAM proof by recomputing (verifier uses same capped buffer size).
+    /// Verify a RAM proof by recomputing with the same parameters.
     pub fn verify(challenge: &ProofChallenge, response: &ProofResponse) -> bool {
+        let required_mb = u32::from_le_bytes(challenge.payload[..4].try_into().unwrap_or([1, 0, 0, 0]));
+        let buffer_size = ((required_mb as usize) * 1024 * 1024)
+            .clamp(MIN_BUFFER_BYTES, MAX_BUFFER_BYTES);
         let seed = &challenge.payload[4..];
-        let expected = Self::memory_hard_hash(seed, TEST_BUFFER_BYTES);
+        let expected = Self::memory_hard_hash(seed, buffer_size);
+
+        // Timing enforcement: if the prover was suspiciously fast, the RAM
+        // may not have been actually allocated (e.g., a cached lookup table).
+        // A 1MB fill+read should take at least ~0.5ms on real hardware.
+        if buffer_size >= MIN_BUFFER_BYTES && response.compute_time_ms == 0 {
+            return false; // Suspiciously instant
+        }
+
         expected[..] == response.result[..]
     }
 
