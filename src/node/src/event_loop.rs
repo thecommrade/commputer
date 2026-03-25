@@ -160,10 +160,10 @@ impl EventLoop {
 
         match event {
             SwarmEvent::Behaviour(CommpBehaviourEvent::Gossipsub(
-                gossipsub::Event::Message { message, .. }
+                gossipsub::Event::Message { propagation_source, message, .. }
             )) => {
                 let topic = message.topic.as_str();
-                debug!("Gossipsub message on topic: {}", topic);
+                debug!("Gossipsub message on topic: {} from {}", topic, propagation_source);
 
                 if topic == topics::TOPIC_BLOCKS {
                     if let Ok(block) = serde_json::from_slice::<Block>(&message.data) {
@@ -171,7 +171,7 @@ impl EventLoop {
                     }
                 } else if topic == topics::TOPIC_TRANSACTIONS {
                     if let Ok(tx) = serde_json::from_slice::<Transaction>(&message.data) {
-                        self.handle_new_transaction(tx);
+                        self.handle_new_transaction(tx, propagation_source);
                     }
                 } else if topic == topics::TOPIC_CONSENSUS {
                     if let Ok(msg) = serde_json::from_slice::<ConsensusMessage>(&message.data) {
@@ -287,7 +287,7 @@ impl EventLoop {
         self.update_rpc_status();
     }
 
-    fn handle_new_transaction(&mut self, tx: Transaction) {
+    fn handle_new_transaction(&mut self, tx: Transaction, source: libp2p::PeerId) {
         // Reject null sender
         if tx.from.0 == [0u8; 32] {
             debug!("Rejected transaction: null sender");
@@ -298,6 +298,21 @@ impl EventLoop {
         if !tx.verify() {
             debug!("Rejected transaction: signature verification failed");
             return;
+        }
+
+        // If this is a ValidatorRegister tx, link the sender address to the peer.
+        if matches!(tx.kind, commputer_core::transaction::TxKind::ValidatorRegister { .. }) {
+            let validator_addr = tx.from;
+            info!(
+                "Linking validator {} to peer {} via ValidatorRegister tx",
+                validator_addr, source
+            );
+            self.peer_validators.insert(source, validator_addr);
+
+            // If we already know this peer's IP, register with compliance checker.
+            if let Some(ip) = self.peer_ips.get(&source) {
+                self.compliance.register_node(validator_addr, ip.clone());
+            }
         }
 
         let hash = tx.hash();
