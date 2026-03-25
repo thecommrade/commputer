@@ -20,6 +20,7 @@ use commputer_validator::lifecycle::{ValidatorState, ValidatorStatus};
 use commputer_validator::compliance_check::ComplianceChecker;
 
 use crate::consensus_manager::{ConsensusManager, ConsensusMessage};
+use crate::proof_manager::{ProofManager, ProofMessage};
 
 pub struct EventLoop {
     pub state: ChainState,
@@ -31,6 +32,7 @@ pub struct EventLoop {
     pub compliance: ComplianceChecker,
     pub pending_txs: Vec<Transaction>,
     pub consensus: ConsensusManager,
+    pub proof_manager: ProofManager,
 }
 
 impl EventLoop {
@@ -40,6 +42,7 @@ impl EventLoop {
         network: CommpNetwork,
     ) -> Self {
         let epoch_state = EpochState::new(0, 0);
+        let our_address = *wallet.address();
         Self {
             state,
             wallet,
@@ -50,6 +53,7 @@ impl EventLoop {
             compliance: ComplianceChecker::new(),
             pending_txs: Vec::new(),
             consensus: ConsensusManager::new(),
+            proof_manager: ProofManager::new(our_address),
         }
     }
 
@@ -57,6 +61,7 @@ impl EventLoop {
         let mut epoch_interval = time::interval(Duration::from_secs(3600));
         let mut block_interval = time::interval(Duration::from_secs(2));
         let mut consensus_interval = time::interval(Duration::from_millis(500));
+        let mut proof_interval = time::interval(Duration::from_secs(300));
 
         info!("Event loop started. Listening for peers...");
 
@@ -73,6 +78,9 @@ impl EventLoop {
                 }
                 _ = consensus_interval.tick() => {
                     self.handle_consensus_tick();
+                }
+                _ = proof_interval.tick() => {
+                    self.handle_proof_tick();
                 }
             }
         }
@@ -103,6 +111,10 @@ impl EventLoop {
                 } else if topic == topics::TOPIC_CONSENSUS {
                     if let Ok(msg) = serde_json::from_slice::<ConsensusMessage>(&message.data) {
                         self.handle_consensus_message(msg);
+                    }
+                } else if topic == topics::TOPIC_PROOFS {
+                    if let Ok(msg) = serde_json::from_slice::<ProofMessage>(&message.data) {
+                        self.handle_proof_message(msg);
                     }
                 }
             }
@@ -225,6 +237,12 @@ impl EventLoop {
         let epoch_emission = self.emission.per_epoch_emission(validator_count);
         let remaining = self.state.remaining_supply();
         let actual_emission = epoch_emission.min(remaining);
+
+        // Finalize proof results and update epoch summaries
+        let proof_summaries = self.proof_manager.finalize_epoch();
+        for (_addr, summary) in &proof_summaries {
+            self.epoch_state.record_summary(summary.clone());
+        }
 
         if actual_emission > 0 {
             let _allocation =
@@ -437,6 +455,61 @@ impl EventLoop {
                 .publish(topic, data)
             {
                 debug!("Failed to publish consensus message: {}", e);
+            }
+        }
+    }
+
+    fn handle_proof_tick(&mut self) {
+        let seed = self.state.blocks.latest()
+            .map(|b| b.hash().0)
+            .unwrap_or([0u8; 32]);
+        let deadline = self.state.blocks.height() + 100;
+
+        // Challenge ourselves (in a real multi-node network, challenge all known validators)
+        let challenges = self.proof_manager.generate_challenges(
+            self.state.current_epoch, &seed, *self.wallet.address(), deadline,
+        );
+
+        for challenge in &challenges {
+            // Broadcast challenge
+            let msg = ProofMessage::Challenge(challenge.clone());
+            self.publish_proof_message(&msg);
+
+            // Solve if it's for us
+            if challenge.target == *self.wallet.address() {
+                let response = self.proof_manager.solve_challenge(challenge);
+                self.proof_manager.record_response(response.clone());
+                let resp_msg = ProofMessage::Response(response);
+                self.publish_proof_message(&resp_msg);
+            }
+        }
+
+        info!("Proof challenges issued and solved for epoch {}", self.state.current_epoch);
+    }
+
+    fn handle_proof_message(&mut self, msg: ProofMessage) {
+        match msg {
+            ProofMessage::Challenge(challenge) => {
+                if challenge.target == *self.wallet.address() {
+                    debug!("Received proof challenge for {:?}", challenge.channel);
+                    let response = self.proof_manager.solve_challenge(&challenge);
+                    self.proof_manager.record_response(response.clone());
+                    let resp_msg = ProofMessage::Response(response);
+                    self.publish_proof_message(&resp_msg);
+                }
+            }
+            ProofMessage::Response(response) => {
+                debug!("Received proof response from {:?}", response.validator);
+                self.proof_manager.record_response(response);
+            }
+        }
+    }
+
+    fn publish_proof_message(&mut self, msg: &ProofMessage) {
+        if let Ok(data) = serde_json::to_vec(msg) {
+            let topic = topics::proof_topic();
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, data) {
+                debug!("Failed to publish proof message: {}", e);
             }
         }
     }

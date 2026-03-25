@@ -1,5 +1,6 @@
 mod consensus_manager;
 mod event_loop;
+mod proof_manager;
 
 use std::path::PathBuf;
 use anyhow::Result;
