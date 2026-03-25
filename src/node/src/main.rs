@@ -50,6 +50,15 @@ enum Commands {
         /// Percentage of hardware resources to contribute (1-100)
         #[arg(long, default_value = "100")]
         contribution_percent: u8,
+        /// Feature 168: Enable relay protocol (for NAT traversal)
+        #[arg(long, default_value = "false")]
+        relay: bool,
+        /// Feature 178: Comma-separated seed node multiaddrs
+        #[arg(long, value_delimiter = ',')]
+        seeds: Vec<String>,
+        /// Feature 179: Comma-separated DNS seed domain names
+        #[arg(long, value_delimiter = ',')]
+        dns_seeds: Vec<String>,
     },
     /// Wallet management
     Wallet {
@@ -560,7 +569,16 @@ async fn cmd_balance(address: &str, rpc_port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16, contribution_percent: u8) -> Result<()> {
+async fn run_node(
+    testnet: bool,
+    log_level: String,
+    port: u16,
+    rpc_port: u16,
+    contribution_percent: u8,
+    relay: bool,
+    seeds: Vec<String>,
+    dns_seeds: Vec<String>,
+) -> Result<()> {
     // Initialize logging.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -661,10 +679,34 @@ async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16, co
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     info!("P2P peer ID: {}", network.local_peer_id);
 
-    // Connect to seed nodes.
+    // Feature 176: Log encryption status.
+    network.log_encryption_status();
+
+    // Connect to built-in seed nodes.
     let seeds_connected = network.connect_to_seeds();
     if seeds_connected > 0 {
-        info!("Connected to {} seed nodes", seeds_connected);
+        info!("Connected to {} built-in seed nodes", seeds_connected);
+    }
+
+    // Feature 178: Connect to custom seed nodes from CLI.
+    if !seeds.is_empty() {
+        let custom_connected = network.connect_to_custom_seeds(&seeds);
+        info!("Connected to {} custom seed nodes", custom_connected);
+    }
+
+    // Feature 179: Resolve DNS seed domains.
+    if !dns_seeds.is_empty() {
+        let dns_connected = network.resolve_dns_seeds(&dns_seeds, port);
+        info!("Connected to {} DNS seed nodes", dns_connected);
+    }
+
+    // Feature 166: Bootstrap Kademlia for peer discovery.
+    network.bootstrap_kademlia();
+
+    // Feature 168: Relay protocol detection and logging.
+    if relay {
+        info!("Relay mode enabled — will attempt circuit relay for NAT traversal");
+        info!("Note: full relay protocol not yet implemented, running in detection mode");
     }
 
     // Set up RPC server channel.
@@ -701,12 +743,17 @@ async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16, co
         }),
         compliance_stats: tokio::sync::Mutex::new(rpc::ComplianceDashboard::default()),
         anti_scale_metrics: tokio::sync::Mutex::new(rpc::AntiScaleDashboard::default()),
+        network_health: tokio::sync::Mutex::new(rpc::NetworkHealthDashboard::default()),
+        peer_quality: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
     let mut event_loop = EventLoop::new(state, wallet, network, hardware);
     event_loop.attach_rpc(tx_receiver, rpc_state.clone());
     event_loop.auto_register_validator(contribution_percent);
+
+    // Feature 178: Store custom seeds for periodic reconnection.
+    event_loop.custom_seeds = seeds;
 
     // Spawn RPC server in the background.
     tokio::spawn(rpc::start_rpc_server(rpc_port, rpc_state));
@@ -725,8 +772,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { testnet, log_level, port, rpc_port, contribution_percent } => {
-            run_node(testnet, log_level, port, rpc_port, contribution_percent).await?;
+        Commands::Run { testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds } => {
+            run_node(testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds).await?;
         }
         Commands::Wallet { action } => match action {
             WalletAction::Create { testnet } => cmd_wallet_create(testnet)?,

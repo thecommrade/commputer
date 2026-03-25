@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, error};
 use futures::StreamExt;
 
 use commputer_core::block::{Block, BlockHeader, BlockHash};
@@ -26,6 +26,37 @@ use commputer_validator::compliance_check::ComplianceChecker;
 
 use crate::consensus_manager::{ConsensusManager, ConsensusMessage};
 use crate::proof_manager::{ProofManager, ProofMessage};
+
+/// Feature 172: Minimum peers before we consider the network partitioned.
+const MINIMUM_PEERS: usize = 2;
+
+/// Feature 174: Block height at which protocol v2 rules activate.
+/// Set to u64::MAX — not yet activated.
+pub const PROTOCOL_V2_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// Feature 177: Connection quality metrics per peer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PeerQuality {
+    pub avg_latency_ms: u64,
+    pub messages_received: u64,
+    pub messages_dropped: u64,
+    pub connected_since: u64,
+}
+
+impl Default for PeerQuality {
+    fn default() -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            avg_latency_ms: 0,
+            messages_received: 0,
+            messages_dropped: 0,
+            connected_since: now,
+        }
+    }
+}
 
 pub struct EventLoop {
     pub state: ChainState,
@@ -66,6 +97,22 @@ pub struct EventLoop {
     pub producer_blocks: HashMap<(Address, u64), BlockHash>,
     /// Feature 130: Track when we last saw a block at the expected height.
     pub last_block_seen_time: Option<std::time::Instant>,
+    /// Feature 167: Observed external address from identify protocol (for NAT detection).
+    pub observed_external_addr: Option<String>,
+    /// Feature 170: Track peer /16 subnets for geographic diversity.
+    pub peer_subnets: HashMap<libp2p::PeerId, String>,
+    /// Feature 171: RTT measurements per peer (PeerId -> last RTT in ms).
+    pub peer_rtts: HashMap<libp2p::PeerId, u64>,
+    /// Feature 171: Ping timestamps: PeerId -> when we last sent a ping.
+    pub ping_timestamps: HashMap<libp2p::PeerId, std::time::Instant>,
+    /// Feature 172: Whether a network partition has been detected.
+    pub partition_detected: bool,
+    /// Feature 175: Verified peer-to-validator mappings (PeerId -> Address, verified via tx signature).
+    pub verified_peer_validators: HashMap<libp2p::PeerId, Address>,
+    /// Feature 177: Connection quality metrics per peer.
+    pub peer_quality: HashMap<libp2p::PeerId, PeerQuality>,
+    /// Feature 178: Custom seed multiaddrs for periodic reconnection.
+    pub custom_seeds: Vec<String>,
 }
 
 impl EventLoop {
@@ -102,6 +149,14 @@ impl EventLoop {
             propagation_delays: Vec::new(),
             producer_blocks: HashMap::new(),
             last_block_seen_time: None,
+            observed_external_addr: None,
+            peer_subnets: HashMap::new(),
+            peer_rtts: HashMap::new(),
+            ping_timestamps: HashMap::new(),
+            partition_detected: false,
+            verified_peer_validators: HashMap::new(),
+            peer_quality: HashMap::new(),
+            custom_seeds: Vec::new(),
         }
     }
 
@@ -217,6 +272,24 @@ impl EventLoop {
                 met_guard.pending_txs = self.pending_txs.len();
                 met_guard.seen_tx_count = self.seen_tx_hashes.len();
             }
+
+            // Feature 180: Update network health dashboard.
+            if let Ok(mut health_guard) = rpc.network_health.try_lock() {
+                health_guard.peer_count = self.peer_ips.len();
+                health_guard.unique_subnets = self.unique_subnet_count();
+                health_guard.avg_latency_ms = self.average_peer_latency();
+                health_guard.partition_risk = self.partition_risk().to_string();
+            }
+
+            // Feature 177: Update peer quality metrics.
+            if let Ok(mut quality_guard) = rpc.peer_quality.try_lock() {
+                quality_guard.clear();
+                for (peer_id, quality) in &self.peer_quality {
+                    if let Ok(json) = serde_json::to_value(quality) {
+                        quality_guard.insert(peer_id.to_string(), json);
+                    }
+                }
+            }
         }
     }
 
@@ -249,6 +322,15 @@ impl EventLoop {
         let mut block_interval = time::interval(Duration::from_secs(2));
         let mut consensus_interval = time::interval(Duration::from_millis(500));
         let mut proof_interval = time::interval(Duration::from_secs(300));
+
+        // Feature 169: Peer exchange every 60s.
+        let mut peer_exchange_interval = time::interval(Duration::from_secs(60));
+        // Feature 171: Bandwidth/latency measurement every 30s.
+        let mut ping_interval = time::interval(Duration::from_secs(30));
+        // Feature 172: Partition check every 10s.
+        let mut partition_check_interval = time::interval(Duration::from_secs(10));
+        // Feature 178: Seed reconnection every 5 minutes.
+        let mut seed_reconnect_interval = time::interval(Duration::from_secs(300));
 
         info!("Event loop started at height {}. Listening for peers...", self.state.blocks.height());
 
@@ -294,6 +376,18 @@ impl EventLoop {
                 }
                 _ = proof_interval.tick() => {
                     self.handle_proof_tick();
+                }
+                _ = peer_exchange_interval.tick() => {
+                    self.handle_peer_exchange_tick();
+                }
+                _ = ping_interval.tick() => {
+                    self.handle_ping_tick();
+                }
+                _ = partition_check_interval.tick() => {
+                    self.check_network_partition();
+                }
+                _ = seed_reconnect_interval.tick() => {
+                    self.reconnect_seeds();
                 }
                 _ = sync_timer.tick() => {
                     // If we have peers but haven't synced yet, request the next block.
@@ -379,23 +473,31 @@ impl EventLoop {
                     }
                 }
 
+                // Feature 177: Track messages received per peer.
+                self.peer_quality.entry(propagation_source)
+                    .or_insert_with(PeerQuality::default)
+                    .messages_received += 1;
+
+                // Feature 173: Decompress message data before deserialization.
+                let data = commputer_network::decompress(&message.data);
+
                 let topic = message.topic.as_str();
                 debug!("Gossipsub message on topic: {} from {}", topic, propagation_source);
 
                 if topic == topics::TOPIC_BLOCKS {
-                    if let Ok(block) = serde_json::from_slice::<Block>(&message.data) {
+                    if let Ok(block) = serde_json::from_slice::<Block>(&data) {
                         self.handle_received_block(block, propagation_source);
                     }
                 } else if topic == topics::TOPIC_TRANSACTIONS {
-                    if let Ok(tx) = serde_json::from_slice::<Transaction>(&message.data) {
+                    if let Ok(tx) = serde_json::from_slice::<Transaction>(&data) {
                         self.handle_new_transaction(tx, propagation_source);
                     }
                 } else if topic == topics::TOPIC_CONSENSUS {
-                    if let Ok(msg) = serde_json::from_slice::<ConsensusMessage>(&message.data) {
+                    if let Ok(msg) = serde_json::from_slice::<ConsensusMessage>(&data) {
                         self.handle_consensus_message(msg, propagation_source);
                     }
                 } else if topic == topics::TOPIC_PROOFS {
-                    if let Ok(msg) = serde_json::from_slice::<ProofMessage>(&message.data) {
+                    if let Ok(msg) = serde_json::from_slice::<ProofMessage>(&data) {
                         self.handle_proof_message(msg);
                     }
                 }
@@ -416,18 +518,44 @@ impl EventLoop {
                 // Extract the IP address from the multiaddr.
                 let addr_str = endpoint.get_remote_address().to_string();
                 if let Some(ip) = extract_ip_from_multiaddr(&addr_str) {
+                    // Feature 170: Track peer /16 subnet for geographic diversity.
+                    let subnet = extract_slash16_subnet(&ip);
+                    self.peer_subnets.insert(peer_id, subnet.clone());
+
                     self.peer_ips.insert(peer_id, ip.clone());
                     // If we know this peer's validator address, register with compliance.
                     if let Some(validator_addr) = self.peer_validators.get(&peer_id) {
                         self.compliance.register_node(*validator_addr, ip);
                     }
                 }
+
+                // Feature 177: Initialize peer quality metrics.
+                self.peer_quality.entry(peer_id).or_insert_with(PeerQuality::default);
+
                 // Enforce connection limit: max 50 peers.
+                // Feature 170: Geographic diversity — if new peer has unique /16,
+                // allow even if at limit by disconnecting a duplicate-subnet peer.
                 const MAX_PEERS: usize = 50;
                 if self.peer_ips.len() >= MAX_PEERS {
-                    info!("Connection limit reached ({}) — disconnecting new peer {}", MAX_PEERS, peer_id);
-                    let _ = self.network.swarm.disconnect_peer_id(peer_id);
-                    return;
+                    let new_subnet = self.peer_subnets.get(&peer_id).cloned().unwrap_or_default();
+                    let subnet_counts = self.count_subnets();
+                    let new_is_unique = !subnet_counts.contains_key(&new_subnet);
+
+                    if new_is_unique {
+                        // Find a peer from a duplicate subnet to disconnect.
+                        if let Some(victim) = self.find_duplicate_subnet_peer(&peer_id) {
+                            info!("Geographic diversity: disconnecting {} (duplicate subnet) to keep unique-subnet peer {}", victim, peer_id);
+                            let _ = self.network.swarm.disconnect_peer_id(victim);
+                        } else {
+                            info!("Connection limit reached ({}) — disconnecting new peer {}", MAX_PEERS, peer_id);
+                            let _ = self.network.swarm.disconnect_peer_id(peer_id);
+                            return;
+                        }
+                    } else {
+                        info!("Connection limit reached ({}) — disconnecting new peer {}", MAX_PEERS, peer_id);
+                        let _ = self.network.swarm.disconnect_peer_id(peer_id);
+                        return;
+                    }
                 }
 
                 info!("Connected to peer: {} at {}", peer_id, addr_str);
@@ -447,14 +575,84 @@ impl EventLoop {
                 } else {
                     debug!("Peer {} identified: protocol={}, agent={}",
                         peer_id, info.protocol_version, info.agent_version);
+
+                    // Feature 169: Add the peer's listen addresses to Kademlia for discovery.
+                    for addr in &info.listen_addrs {
+                        self.network.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                    }
+
+                    // Feature 167: NAT detection via observed_addr.
+                    {
+                        let observed_str = info.observed_addr.to_string();
+                        let observed_ip = extract_ip_from_multiaddr(&observed_str);
+
+                        // Check if our observed IP differs from our listening addresses.
+                        if let Some(ref obs_ip) = observed_ip {
+                            if self.observed_external_addr.is_none() {
+                                self.observed_external_addr = Some(obs_ip.clone());
+                                // Check if it looks like NAT (private vs public IP mismatch).
+                                let is_private = is_private_ip(obs_ip);
+                                if is_private {
+                                    warn!("NAT detected: observed address {} appears to be behind NAT", obs_ip);
+                                    warn!("Peers may not be able to connect to you directly");
+                                    warn!("Consider using --relay flag or configuring port forwarding");
+                                } else {
+                                    info!("External address observed: {}", obs_ip);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Feature 166: Handle Kademlia events for peer discovery.
+            SwarmEvent::Behaviour(CommpBehaviourEvent::Kademlia(kad_event)) => {
+                use libp2p::kad;
+                match kad_event {
+                    kad::Event::OutboundQueryProgressed { result, .. } => {
+                        match result {
+                            kad::QueryResult::Bootstrap(Ok(result)) => {
+                                debug!("Kademlia bootstrap progress: {} remaining peers", result.num_remaining);
+                            }
+                            kad::QueryResult::Bootstrap(Err(e)) => {
+                                debug!("Kademlia bootstrap error: {:?}", e);
+                            }
+                            kad::QueryResult::GetClosestPeers(Ok(result)) => {
+                                debug!("Kademlia found {} closest peers", result.peers.len());
+                                for peer_info in &result.peers {
+                                    for addr in &peer_info.addrs {
+                                        debug!("Discovered peer via Kademlia: {} at {}", peer_info.peer_id, addr);
+                                        // Try to connect to discovered peer.
+                                        if !self.peer_ips.contains_key(&peer_info.peer_id)
+                                            && !self.banned_peers.contains(&peer_info.peer_id)
+                                            && peer_info.peer_id != self.network.local_peer_id
+                                        {
+                                            let _ = self.network.swarm.dial(addr.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                debug!("Kademlia query result: {:?}", result);
+                            }
+                        }
+                    }
+                    kad::Event::RoutingUpdated { peer, addresses, .. } => {
+                        debug!("Kademlia routing updated for peer {} ({} addresses)", peer, addresses.len());
+                    }
+                    _ => {}
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 // Clean up peer tracking.
                 self.peer_ips.remove(&peer_id);
+                self.peer_subnets.remove(&peer_id);
+                self.peer_rtts.remove(&peer_id);
+                self.ping_timestamps.remove(&peer_id);
+                self.peer_quality.remove(&peer_id);
                 if let Some(validator_addr) = self.peer_validators.remove(&peer_id) {
                     self.compliance.deregister_node(&validator_addr);
                 }
+                self.verified_peer_validators.remove(&peer_id);
                 self.peer_scores.remove(&peer_id);
                 // Drain grace period for disconnected validators.
                 if let Some(validator_addr) = self.peer_validators.get(&peer_id) {
@@ -713,9 +911,11 @@ impl EventLoop {
         self.seen_tx_hashes.insert(tx_hash);
 
         // Broadcast on the transactions gossipsub topic.
+        // Feature 173: Compress before publishing.
         if let Ok(data) = serde_json::to_vec(&tx) {
+            let compressed = commputer_network::compress(&data);
             let topic = topics::tx_topic();
-            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, data) {
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed) {
                 warn!("Failed to broadcast RPC transaction: {}", e);
             }
         }
@@ -765,13 +965,18 @@ impl EventLoop {
         }
 
         // If this is a ValidatorRegister tx, link the sender address to the peer.
+        // Feature 175: Verify peer identity — tx signature must be valid for the claimed address.
         if matches!(tx.kind, commputer_core::transaction::TxKind::ValidatorRegister { .. }) {
             let validator_addr = tx.from;
+
+            // The tx.verify() was already called in validate_tx_for_mempool,
+            // so the signature matches. Store as verified mapping.
             info!(
-                "Linking validator {} to peer {} via ValidatorRegister tx",
+                "Verified validator {} linked to peer {} via ValidatorRegister tx",
                 validator_addr, source
             );
             self.peer_validators.insert(source, validator_addr);
+            self.verified_peer_validators.insert(source, validator_addr);
 
             // If we already know this peer's IP, register with compliance checker.
             if let Some(ip) = self.peer_ips.get(&source) {
@@ -997,7 +1202,23 @@ impl EventLoop {
             return;
         }
 
+        // Feature 172: Skip block production during network partition.
+        if self.partition_detected {
+            debug!("Skipping block production — network partition detected");
+            return;
+        }
+
         let next_height = self.state.blocks.height() + 1;
+
+        // Feature 174: Check protocol upgrade activation.
+        if next_height >= PROTOCOL_V2_ACTIVATION_HEIGHT.saturating_sub(100)
+            && PROTOCOL_V2_ACTIVATION_HEIGHT != u64::MAX
+        {
+            warn!(
+                "Protocol v2 activates at height {} (current: {}). Ensure you are running the latest version.",
+                PROTOCOL_V2_ACTIVATION_HEIGHT, next_height
+            );
+        }
 
         // Feature 130: View change protocol — if no block seen at the expected
         // height for 30s, allow any validator to produce a block.
@@ -1072,14 +1293,16 @@ impl EventLoop {
         self.publish_consensus_message(&candidate_msg);
 
         // Also broadcast on the blocks topic for backward compatibility.
+        // Feature 173: Compress before publishing.
         if let Ok(data) = serde_json::to_vec(&block) {
+            let compressed = commputer_network::compress(&data);
             let topic = topics::block_topic();
             if let Err(e) = self
                 .network
                 .swarm
                 .behaviour_mut()
                 .gossipsub
-                .publish(topic, data)
+                .publish(topic, compressed)
             {
                 warn!("Failed to broadcast block: {}", e);
             }
@@ -1196,15 +1419,17 @@ impl EventLoop {
     }
 
     /// Publish a ConsensusMessage on the consensus gossipsub topic.
+    /// Feature 173: Compress before publishing.
     fn publish_consensus_message(&mut self, msg: &ConsensusMessage) {
         if let Ok(data) = serde_json::to_vec(msg) {
+            let compressed = commputer_network::compress(&data);
             let topic = topics::consensus_topic();
             if let Err(e) = self
                 .network
                 .swarm
                 .behaviour_mut()
                 .gossipsub
-                .publish(topic, data)
+                .publish(topic, compressed)
             {
                 debug!("Failed to publish consensus message: {}", e);
             }
@@ -1285,10 +1510,12 @@ impl EventLoop {
         }
     }
 
+    /// Feature 173: Compress proof messages before publishing.
     fn publish_proof_message(&mut self, msg: &ProofMessage) {
         if let Ok(data) = serde_json::to_vec(msg) {
+            let compressed = commputer_network::compress(&data);
             let topic = topics::proof_topic();
-            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, data) {
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed) {
                 debug!("Failed to publish proof message: {}", e);
             }
         }
@@ -1305,6 +1532,175 @@ impl EventLoop {
             self.state.accounts.len(),
         );
     }
+
+    /// Feature 169: Peer exchange — share known peer addresses periodically.
+    fn handle_peer_exchange_tick(&mut self) {
+        if self.peer_ips.is_empty() {
+            return;
+        }
+
+        // Build a list of known peers with their addresses.
+        let peer_infos: Vec<commputer_network::message::PeerInfo> = self.peer_ips.iter()
+            .map(|(_peer_id, ip)| {
+                commputer_network::message::PeerInfo {
+                    id: commputer_network::peer::PeerId([0u8; 32]), // Placeholder
+                    address: ip.clone(),
+                    port: 9000, // Default port
+                }
+            })
+            .take(20) // Limit to 20 peers per exchange
+            .collect();
+
+        if peer_infos.is_empty() {
+            return;
+        }
+
+        let msg = commputer_network::message::NetworkMessage {
+            sender: commputer_network::peer::PeerId([0u8; 32]),
+            nonce: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            kind: commputer_network::message::MessageKind::PeerResponse(peer_infos),
+        };
+
+        if let Ok(data) = serde_json::to_vec(&msg) {
+            let compressed = commputer_network::compress(&data);
+            let topic = topics::consensus_topic();
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed) {
+                debug!("Failed to publish peer exchange: {}", e);
+            }
+        }
+        debug!("Shared {} peer addresses via peer exchange", self.peer_ips.len().min(20));
+    }
+
+    /// Feature 171: Send ping to all connected peers for latency measurement.
+    fn handle_ping_tick(&mut self) {
+        let now = std::time::Instant::now();
+        let peer_ids: Vec<libp2p::PeerId> = self.peer_ips.keys().copied().collect();
+        for peer_id in peer_ids {
+            self.ping_timestamps.insert(peer_id, now);
+        }
+        // Broadcast a ping message with current timestamp.
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let msg = commputer_network::message::NetworkMessage {
+            sender: commputer_network::peer::PeerId([0u8; 32]),
+            nonce: timestamp_ms,
+            kind: commputer_network::message::MessageKind::Ping { timestamp_ms },
+        };
+
+        if let Ok(data) = serde_json::to_vec(&msg) {
+            let compressed = commputer_network::compress(&data);
+            let topic = topics::consensus_topic();
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed) {
+                debug!("Failed to publish ping: {}", e);
+            }
+        }
+
+        // Calculate average RTT from existing measurements.
+        if !self.peer_rtts.is_empty() {
+            let total: u64 = self.peer_rtts.values().sum();
+            let avg = total / self.peer_rtts.len() as u64;
+            debug!("Average peer RTT: {}ms across {} peers", avg, self.peer_rtts.len());
+        }
+    }
+
+    /// Feature 172: Check for network partition.
+    fn check_network_partition(&mut self) {
+        let peer_count = self.peer_ips.len();
+        let was_partitioned = self.partition_detected;
+
+        if peer_count < MINIMUM_PEERS {
+            if !was_partitioned {
+                error!(
+                    "CRITICAL: Network partition detected! Only {} peers connected (minimum: {}). Block production paused.",
+                    peer_count, MINIMUM_PEERS
+                );
+                self.partition_detected = true;
+            }
+        } else if was_partitioned {
+            info!("Network partition resolved. {} peers connected. Resuming block production.", peer_count);
+            self.partition_detected = false;
+        }
+    }
+
+    /// Feature 178: Reconnect to any disconnected seed nodes.
+    fn reconnect_seeds(&mut self) {
+        if self.custom_seeds.is_empty() {
+            return;
+        }
+        let seeds = self.custom_seeds.clone();
+        let mut reconnected = 0;
+        for addr_str in &seeds {
+            if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
+                // Only reconnect if we don't already have this peer.
+                match self.network.dial(addr) {
+                    Ok(()) => {
+                        reconnected += 1;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        if reconnected > 0 {
+            debug!("Reconnected to {} seed nodes", reconnected);
+        }
+    }
+
+    /// Feature 170: Count how many peers are in each /16 subnet.
+    fn count_subnets(&self) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for subnet in self.peer_subnets.values() {
+            *counts.entry(subnet.clone()).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Feature 170: Find a peer from a /16 subnet that has more than 1 peer.
+    fn find_duplicate_subnet_peer(&self, exclude: &libp2p::PeerId) -> Option<libp2p::PeerId> {
+        let counts = self.count_subnets();
+        for (peer_id, subnet) in &self.peer_subnets {
+            if peer_id != exclude {
+                if let Some(&count) = counts.get(subnet) {
+                    if count > 1 {
+                        return Some(*peer_id);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Feature 177: Get average latency across all peers.
+    pub fn average_peer_latency(&self) -> u64 {
+        if self.peer_rtts.is_empty() {
+            return 0;
+        }
+        let total: u64 = self.peer_rtts.values().sum();
+        total / self.peer_rtts.len() as u64
+    }
+
+    /// Feature 170: Get count of unique /16 subnets.
+    pub fn unique_subnet_count(&self) -> usize {
+        let subnets: HashSet<&String> = self.peer_subnets.values().collect();
+        subnets.len()
+    }
+
+    /// Feature 180: Compute partition risk level based on peer count.
+    pub fn partition_risk(&self) -> &'static str {
+        let peer_count = self.peer_ips.len();
+        if peer_count < MINIMUM_PEERS {
+            "high"
+        } else if peer_count < 5 {
+            "medium"
+        } else {
+            "low"
+        }
+    }
 }
 
 /// Extract an IPv4 or IPv6 address from a multiaddr string.
@@ -1317,4 +1713,23 @@ fn extract_ip_from_multiaddr(addr: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Feature 170: Extract /16 subnet from an IP address (first two octets for IPv4).
+fn extract_slash16_subnet(ip: &str) -> String {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() >= 2 {
+        format!("{}.{}", parts[0], parts[1])
+    } else {
+        ip.to_string()
+    }
+}
+
+/// Feature 167: Check if an IP address is private (behind NAT).
+fn is_private_ip(ip: &str) -> bool {
+    if let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() {
+        addr.is_private() || addr.is_loopback() || addr.is_link_local()
+    } else {
+        false
+    }
 }

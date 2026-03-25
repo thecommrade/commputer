@@ -69,6 +69,10 @@ pub struct RpcState {
     pub compliance_stats: Mutex<ComplianceDashboard>,
     /// Feature 150: Anti-scale metrics.
     pub anti_scale_metrics: Mutex<AntiScaleDashboard>,
+    /// Feature 180: Network health dashboard data.
+    pub network_health: Mutex<NetworkHealthDashboard>,
+    /// Feature 177: Per-peer connection quality metrics.
+    pub peer_quality: Mutex<HashMap<String, serde_json::Value>>,
 }
 
 /// Response for a submitted transaction.
@@ -281,6 +285,31 @@ pub struct AntiScaleDashboard {
     pub largest_detected_clusters: Vec<(usize, String)>,
 }
 
+/// Feature 180: Network health dashboard response.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NetworkHealthDashboard {
+    pub peer_count: usize,
+    pub unique_subnets: usize,
+    pub avg_latency_ms: u64,
+    pub partition_risk: String,
+}
+
+/// GET /network — Feature 180: Network health dashboard.
+async fn get_network_health(
+    State(state): State<Arc<RpcState>>,
+) -> Json<NetworkHealthDashboard> {
+    let health = state.network_health.lock().await.clone();
+    Json(health)
+}
+
+/// GET /network/quality — Feature 177: Per-peer connection quality.
+async fn get_peer_quality(
+    State(state): State<Arc<RpcState>>,
+) -> Json<HashMap<String, serde_json::Value>> {
+    let quality = state.peer_quality.lock().await.clone();
+    Json(quality)
+}
+
 /// GET /compliance — Feature 142: network-wide compliance stats.
 async fn get_compliance(
     State(state): State<Arc<RpcState>>,
@@ -312,6 +341,8 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/health", get(get_health))
         .route("/compliance", get(get_compliance))
         .route("/anti-scale", get(get_anti_scale))
+        .route("/network", get(get_network_health))
+        .route("/network/quality", get(get_peer_quality))
         .with_state(rpc_state)
 }
 
@@ -376,6 +407,8 @@ mod tests {
             }),
             compliance_stats: Mutex::new(ComplianceDashboard::default()),
             anti_scale_metrics: Mutex::new(AntiScaleDashboard::default()),
+            network_health: Mutex::new(NetworkHealthDashboard::default()),
+            peer_quality: Mutex::new(HashMap::new()),
         });
         (state, rx)
     }

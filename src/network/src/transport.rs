@@ -3,6 +3,7 @@ use libp2p::{
     Multiaddr, PeerId as Libp2pPeerId, Swarm, SwarmBuilder,
 };
 use std::time::Duration;
+use tracing::{info, warn, debug};
 
 pub struct CommpNetwork {
     pub swarm: Swarm<CommpBehaviour>,
@@ -105,5 +106,86 @@ impl CommpNetwork {
             }
         }
         connected
+    }
+
+    /// Feature 178: Connect to custom seed nodes from CLI --seeds arg.
+    /// Returns the number of seeds successfully dialed.
+    pub fn connect_to_custom_seeds(&mut self, seeds: &[String]) -> usize {
+        let mut connected = 0;
+        for addr_str in seeds {
+            match addr_str.parse::<Multiaddr>() {
+                Ok(addr) => {
+                    match self.dial(addr) {
+                        Ok(()) => {
+                            info!("Dialed custom seed: {}", addr_str);
+                            connected += 1;
+                        }
+                        Err(e) => {
+                            warn!("Failed to dial custom seed {}: {}", addr_str, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Invalid custom seed multiaddr '{}': {}", addr_str, e);
+                }
+            }
+        }
+        connected
+    }
+
+    /// Feature 179: Resolve DNS seed domains (A records) and construct multiaddrs.
+    /// Each domain is resolved to IPs, and we dial /ip4/<ip>/tcp/9000 for each.
+    pub fn resolve_dns_seeds(&mut self, domains: &[String], port: u16) -> usize {
+        let mut connected = 0;
+        for domain in domains {
+            match std::net::ToSocketAddrs::to_socket_addrs(&(domain.as_str(), port)) {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        let multiaddr_str = match addr {
+                            std::net::SocketAddr::V4(v4) => {
+                                format!("/ip4/{}/tcp/{}", v4.ip(), v4.port())
+                            }
+                            std::net::SocketAddr::V6(v6) => {
+                                format!("/ip6/{}/tcp/{}", v6.ip(), v6.port())
+                            }
+                        };
+                        if let Ok(multiaddr) = multiaddr_str.parse::<Multiaddr>() {
+                            match self.dial(multiaddr) {
+                                Ok(()) => {
+                                    info!("Dialed DNS seed {} -> {}", domain, multiaddr_str);
+                                    connected += 1;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to dial DNS seed {} ({}): {}", domain, multiaddr_str, e);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to resolve DNS seed '{}': {}", domain, e);
+                }
+            }
+        }
+        connected
+    }
+
+    /// Feature 166: Trigger Kademlia bootstrap for peer discovery.
+    pub fn bootstrap_kademlia(&mut self) {
+        match self.swarm.behaviour_mut().kademlia.bootstrap() {
+            Ok(_query_id) => {
+                info!("Kademlia bootstrap initiated");
+            }
+            Err(e) => {
+                debug!("Kademlia bootstrap failed (may be no known peers yet): {:?}", e);
+            }
+        }
+    }
+
+    /// Feature 176: Log encryption status on startup.
+    pub fn log_encryption_status(&self) {
+        info!("P2P encryption: Noise protocol active");
+        info!("P2P transport: TCP + Yamux multiplexing");
+        info!("P2P protocol: /commputer/0.1.0");
     }
 }

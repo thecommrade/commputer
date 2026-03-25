@@ -17,3 +17,4 @@ thiserror = { workspace = true }
 rand = { workspace = true }
 hex = "0.4"
 libp2p = { workspace = true }
+flate2 = { workspace = true }
