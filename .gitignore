@@ -16,3 +16,5 @@ Thumbs.db
 .env
 *.key
 *.pem
+src/commputer-testnet/
+src/commputer-data/
