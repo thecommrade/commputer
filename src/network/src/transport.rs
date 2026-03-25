@@ -60,6 +60,9 @@ impl CommpNetwork {
                     identify,
                 })
             })?
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(Duration::from_secs(60))
+            })
             .build();
 
         let local_peer_id = *swarm.local_peer_id();
