@@ -1,6 +1,7 @@
 mod batch_jobs;
 mod capacity;
 mod compute_dashboard;
+mod compute_cli;
 mod compute_handler;
 mod compute_session;
 mod consensus_manager;
