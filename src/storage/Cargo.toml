@@ -13,6 +13,8 @@ borsh = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+serde_json = { workspace = true }
+hex = "0.4"
 rocksdb = { workspace = true }
 
 [dev-dependencies]

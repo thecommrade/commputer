@@ -695,8 +695,11 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "commputer-core",
+ "hex",
  "rocksdb",
  "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

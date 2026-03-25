@@ -960,6 +960,16 @@ impl EventLoop {
                 Ok(()) => {
                     info!("Finalized and applied block {} at height {}", hash, height);
                     self.print_status();
+
+                    // Auto-snapshot every 100 blocks.
+                    if height % 100 == 0 && height > 0 {
+                        let snap_path = std::path::PathBuf::from(
+                            format!("snapshot-{}.json", height)
+                        );
+                        if let Err(e) = self.state.save_snapshot(&snap_path) {
+                            warn!("Failed to save snapshot at height {}: {}", height, e);
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!("Rejected finalized block {}: {}", hash, e);

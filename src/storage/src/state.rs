@@ -138,6 +138,42 @@ impl ChainState {
         None
     }
 
+    /// Serialize the full state to a JSON snapshot.
+    pub fn snapshot(&self) -> serde_json::Value {
+        let accounts: Vec<serde_json::Value> = self.accounts.iter().map(|a| {
+            serde_json::json!({
+                "address": hex::encode(a.address.0),
+                "balance": a.balance.raw(),
+                "nonce": a.nonce,
+                "is_validator": a.is_validator,
+                "total_mined": a.total_mined.raw(),
+                "total_burned": a.total_burned.raw(),
+                "grace_balance_secs": a.grace_balance_secs,
+                "cumulative_uptime_secs": a.cumulative_uptime_secs,
+            })
+        }).collect();
+
+        serde_json::json!({
+            "height": self.blocks.height(),
+            "total_emitted": self.total_emitted,
+            "total_burned": self.total_burned,
+            "current_epoch": self.current_epoch,
+            "state_root": hex::encode(self.compute_state_root()),
+            "accounts": accounts,
+        })
+    }
+
+    /// Save a state snapshot to a file.
+    pub fn save_snapshot(&self, path: &std::path::Path) -> Result<(), StateError> {
+        let snap = self.snapshot();
+        let json = serde_json::to_string_pretty(&snap)
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        std::fs::write(path, json)
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        info!("State snapshot saved to {} at height {}", path.display(), self.blocks.height());
+        Ok(())
+    }
+
     /// Compute the state root from the current account store.
     pub fn compute_state_root(&self) -> [u8; 32] {
         self.accounts.compute_state_root()
