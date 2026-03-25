@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use axum::{
     Router,
     Json,
-    extract::{Path, State},
+    extract::{Path, State, ConnectInfo},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     http::StatusCode,
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
@@ -84,6 +86,10 @@ pub struct RpcState {
     pub is_testnet: bool,
     /// Feature 256: Faucet rate limiting (address_hex -> last_epoch_claimed).
     pub faucet_claims: Mutex<HashMap<String, u64>>,
+    /// Feature 15: Optional API key for RPC authentication. None = no auth required.
+    pub api_key: Option<String>,
+    /// Feature 16: Per-IP rate limiting — (request_count, window_start).
+    pub rate_limits: Mutex<HashMap<String, (u32, Instant)>>,
 }
 
 /// Response for a submitted transaction.
@@ -100,6 +106,40 @@ async fn submit_tx(
     State(state): State<Arc<RpcState>>,
     Json(tx): Json<Transaction>,
 ) -> (StatusCode, Json<SubmitTxResponse>) {
+    // Feature 17: Structural validation before signature check.
+    if tx.public_key.len() != 32 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SubmitTxResponse {
+                accepted: false,
+                tx_hash: String::new(),
+                error: Some("public_key must be 32 bytes".into()),
+            }),
+        );
+    }
+    if tx.signature.len() != 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SubmitTxResponse {
+                accepted: false,
+                tx_hash: String::new(),
+                error: Some("signature must be 64 bytes".into()),
+            }),
+        );
+    }
+    if let Some(ref memo) = tx.memo {
+        if memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SubmitTxResponse {
+                    accepted: false,
+                    tx_hash: String::new(),
+                    error: Some(format!("memo exceeds max length of {} bytes", commputer_core::transaction::Transaction::MAX_MEMO_LENGTH)),
+                }),
+            );
+        }
+    }
+
     // Basic validation before forwarding to event loop.
     if !tx.verify() {
         return (
@@ -158,14 +198,33 @@ async fn get_peers(
     Json(peers)
 }
 
+/// Feature 17: Validate hex address format (64 hex chars = 32 bytes).
+fn validate_address(address: &str) -> Result<(), String> {
+    if address.len() != 64 {
+        return Err(format!("address must be 64 hex characters, got {}", address.len()));
+    }
+    if !address.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("address contains non-hex characters".into());
+    }
+    Ok(())
+}
+
 /// GET /balance/:address — return account balance for the given hex address.
 async fn get_balance(
     State(state): State<Arc<RpcState>>,
     Path(address): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Feature 17: Input validation.
+    if let Err(msg) = validate_address(&address) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": msg,
+            "address": address,
+        })));
+    }
+
     let balances = state.balances.lock().await;
     if let Some(info) = balances.get(&address) {
-        (StatusCode::OK, Json(serde_json::to_value(info).unwrap()))
+        (StatusCode::OK, Json(serde_json::to_value(info).unwrap_or_default()))
     } else {
         (
             StatusCode::NOT_FOUND,
@@ -200,6 +259,16 @@ async fn get_block_by_height(
     State(state): State<Arc<RpcState>>,
     Path(height): Path<u64>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Feature 17: Validate height is reasonable (within u64 range already by type, check not absurdly high).
+    let current_height = state.status.lock().await.height;
+    if height > current_height + 1000 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "requested height is too far ahead of current chain height",
+            "requested": height,
+            "current_height": current_height,
+        })));
+    }
+
     let blocks = state.blocks.lock().await;
     if let Some(block_json) = blocks.get(&height) {
         (StatusCode::OK, Json(block_json.clone()))
@@ -503,6 +572,10 @@ async fn get_nonce(
     State(state): State<Arc<RpcState>>,
     Path(address): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Feature 17: Input validation.
+    if let Err(msg) = validate_address(&address) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+    }
     let balances = state.balances.lock().await;
     if let Some(info) = balances.get(&address) {
         (StatusCode::OK, Json(serde_json::json!({
@@ -637,6 +710,76 @@ async fn faucet(
     })))
 }
 
+// ── Feature 15: RPC API key authentication middleware ──
+
+/// Middleware that checks `X-API-Key` header against the configured key.
+/// Localhost (127.0.0.1) requests bypass auth. If no key is configured, all requests pass.
+async fn auth_middleware(
+    State(state): State<Arc<RpcState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if let Some(ref expected_key) = state.api_key {
+        // Bypass auth for localhost.
+        let is_localhost = req.extensions()
+            .get::<ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip().is_loopback())
+            .unwrap_or(true); // Default to allowing if we can't determine IP
+
+        if !is_localhost {
+            let provided = req.headers()
+                .get("X-API-Key")
+                .and_then(|v| v.to_str().ok());
+            if provided != Some(expected_key.as_str()) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "invalid or missing API key"})),
+                ).into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
+// ── Feature 16: RPC per-IP rate limiting middleware ──
+
+/// Maximum requests per IP per second.
+const RATE_LIMIT_MAX: u32 = 100;
+
+/// Middleware that enforces per-IP rate limiting: max 100 req/s.
+async fn rate_limit_middleware(
+    State(state): State<Arc<RpcState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let ip = req.extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    {
+        let mut limits = state.rate_limits.lock().await;
+        let now = Instant::now();
+        let entry = limits.entry(ip).or_insert((0, now));
+
+        // Reset counter if more than 1 second has passed.
+        if now.duration_since(entry.1).as_secs() >= 1 {
+            entry.0 = 0;
+            entry.1 = now;
+        }
+
+        entry.0 += 1;
+        if entry.0 > RATE_LIMIT_MAX {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "rate limit exceeded — max 100 requests per second"})),
+            ).into_response();
+        }
+    }
+
+    next.run(req).await
+}
+
 /// Build the axum router (exposed for testing).
 pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
     Router::new()
@@ -662,6 +805,8 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/fee-estimate", get(get_fee_estimate))
         .route("/rewards/{address}", get(get_pending_rewards))
         .route("/faucet", post(faucet))
+        .route_layer(middleware::from_fn_with_state(rpc_state.clone(), auth_middleware))
+        .route_layer(middleware::from_fn_with_state(rpc_state.clone(), rate_limit_middleware))
         .with_state(rpc_state)
 }
 
@@ -732,6 +877,8 @@ mod tests {
             ws_broadcast: broadcast::channel(256).0,
             is_testnet: true,
             faucet_claims: Mutex::new(HashMap::new()),
+            api_key: None,
+            rate_limits: Mutex::new(HashMap::new()),
         });
         (state, rx)
     }

@@ -591,6 +591,8 @@ impl ChainState {
                     )));
                 }
                 sender.is_validator = true;
+                // Feature 5: Record registration height for cooldown.
+                sender.validator_registered_height = Some(self.blocks.height());
                 sender.nonce += 1;
             }
 
