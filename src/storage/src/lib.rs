@@ -1,6 +1,7 @@
 pub mod account;
 pub mod blockstore;
 pub mod rocks;
+pub mod receipt;
 pub mod state;
 pub mod traits;
 

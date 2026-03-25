@@ -185,6 +185,10 @@ impl EventLoop {
                 }
             }
 
+            // Update receipts (only recent — last 1000).
+            // Note: we only add new receipts, don't re-sync everything each tick.
+            // Full receipt sync happens incrementally as blocks are finalized.
+
             // Update node metrics.
             if let Ok(mut met_guard) = rpc.metrics.try_lock() {
                 met_guard.height = self.state.blocks.height();
@@ -960,6 +964,20 @@ impl EventLoop {
                 Ok(()) => {
                     info!("Finalized and applied block {} at height {}", hash, height);
                     self.print_status();
+
+                    // Push receipts to RPC state.
+                    if let Some(ref rpc) = self.rpc_state {
+                        if let Ok(mut rcpt_guard) = rpc.receipts.try_lock() {
+                            for tx in &block.transactions {
+                                let tx_hash_hex = hex::encode(tx.hash().0);
+                                if let Some(receipt) = self.state.receipts.get(&tx.hash()) {
+                                    if let Ok(json) = serde_json::to_value(receipt) {
+                                        rcpt_guard.insert(tx_hash_hex, json);
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // Auto-snapshot every 100 blocks.
                     if height % 100 == 0 && height > 0 {

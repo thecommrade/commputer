@@ -61,6 +61,8 @@ pub struct RpcState {
     pub mempool: Mutex<Vec<MempoolTxInfo>>,
     /// Recent blocks by height (for the block explorer endpoint).
     pub blocks: Mutex<HashMap<u64, serde_json::Value>>,
+    /// Transaction receipts (tx_hash_hex -> receipt JSON).
+    pub receipts: Mutex<HashMap<String, serde_json::Value>>,
     /// Node metrics snapshot.
     pub metrics: Mutex<NodeMetrics>,
 }
@@ -229,6 +231,19 @@ async fn get_proof_status(
     }))
 }
 
+/// GET /receipt/:tx_hash — return transaction receipt.
+async fn get_receipt(
+    State(state): State<Arc<RpcState>>,
+    Path(tx_hash): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let receipts = state.receipts.lock().await;
+    if let Some(receipt) = receipts.get(&tx_hash) {
+        (StatusCode::OK, Json(receipt.clone()))
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Receipt not found", "tx_hash": tx_hash})))
+    }
+}
+
 /// GET /health — basic health check.
 async fn get_health(
     State(state): State<Arc<RpcState>>,
@@ -252,6 +267,7 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/balance/{address}", get(get_balance))
         .route("/mempool", get(get_mempool))
         .route("/block/{height}", get(get_block_by_height))
+        .route("/receipt/{tx_hash}", get(get_receipt))
         .route("/metrics", get(get_metrics))
         .route("/proofs/status", get(get_proof_status))
         .route("/health", get(get_health))
@@ -312,6 +328,7 @@ mod tests {
             balances: Mutex::new(HashMap::new()),
             mempool: Mutex::new(vec![]),
             blocks: Mutex::new(HashMap::new()),
+            receipts: Mutex::new(HashMap::new()),
             metrics: Mutex::new(NodeMetrics {
                 uptime_secs: 0, height: 0, epoch: 0, peers_connected: 0,
                 peers_banned: 0, blocks_produced: 0, pending_txs: 0, seen_tx_count: 0,

@@ -6,6 +6,7 @@ use commputer_core::compliance::NerfRate;
 use tracing::info;
 use crate::account::AccountStore;
 use crate::blockstore::BlockStore;
+use crate::receipt::{ReceiptStore, TxReceipt};
 use crate::rocks::{self, RocksStore};
 
 /// The full chain state — accounts, blocks, supply tracking.
@@ -21,6 +22,8 @@ pub struct ChainState {
     pub nerf_rate: NerfRate,
     /// Current epoch number.
     pub current_epoch: u64,
+    /// Transaction receipt store.
+    pub receipts: ReceiptStore,
     /// Optional RocksDB persistent layer. None = in-memory only (tests).
     rocks: Option<RocksStore>,
 }
@@ -54,6 +57,7 @@ impl ChainState {
             total_burned: 0,
             nerf_rate: NerfRate::INITIAL,
             current_epoch: 0,
+            receipts: ReceiptStore::new(),
             rocks: None,
         }
     }
@@ -110,6 +114,7 @@ impl ChainState {
             total_burned,
             nerf_rate: NerfRate { rate_bps: nerf_rate_bps },
             current_epoch,
+            receipts: ReceiptStore::new(),
             rocks: Some(rocks),
         })
     }
@@ -268,9 +273,17 @@ impl ChainState {
             }
         }
 
-        // Process transactions (same as apply_block).
-        for tx in &block.transactions {
+        // Process transactions and generate receipts.
+        let block_hash = block.hash();
+        for (i, tx) in block.transactions.iter().enumerate() {
             self.apply_transaction(tx)?;
+            self.receipts.insert(TxReceipt {
+                tx_hash: tx.hash(),
+                block_hash,
+                block_height: block.height(),
+                tx_index: i,
+                success: true,
+            });
         }
 
         // Store block.

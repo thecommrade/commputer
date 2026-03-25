@@ -675,6 +675,7 @@ async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16) ->
         balances: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         mempool: tokio::sync::Mutex::new(vec![]),
         blocks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        receipts: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         metrics: tokio::sync::Mutex::new(rpc::NodeMetrics {
             uptime_secs: 0,
             height: 0,
