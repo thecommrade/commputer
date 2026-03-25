@@ -28,7 +28,8 @@ use crate::consensus_manager::{ConsensusManager, ConsensusMessage};
 use crate::proof_manager::{ProofManager, ProofMessage};
 
 /// Feature 172: Minimum peers before we consider the network partitioned.
-const MINIMUM_PEERS: usize = 2;
+/// Item 2: Lowered to 1 — a node with 1 peer should still produce blocks.
+const MINIMUM_PEERS: usize = 1;
 
 /// Feature 174: Block height at which protocol v2 rules activate.
 /// Set to u64::MAX — not yet activated.
@@ -991,18 +992,20 @@ impl EventLoop {
         // === Stage 1: Header checks ===
 
         // Feature 123: Protocol version check.
+        // Item 1: Don't ban for version mismatch — peer may be running older software.
         if block.header.protocol_version != commputer_core::block::CURRENT_PROTOCOL_VERSION {
-            self.ban_peer(source, &format!(
-                "incompatible protocol version {} (expected {})",
-                block.header.protocol_version,
-                commputer_core::block::CURRENT_PROTOCOL_VERSION,
-            ));
+            warn!("Rejected block from {}: incompatible protocol version {} (expected {})",
+                source, block.header.protocol_version,
+                commputer_core::block::CURRENT_PROTOCOL_VERSION);
+            self.adjust_peer_score(source, -5);
             return false;
         }
 
         // Check block size limits.
+        // Item 1: Don't ban for oversized blocks — could be config mismatch.
         if !block.within_size_limits() {
-            self.ban_peer(source, "sent oversized block");
+            warn!("Rejected oversized block from {}", source);
+            self.adjust_peer_score(source, -20);
             return false;
         }
 
@@ -1018,9 +1021,11 @@ impl EventLoop {
         }
 
         // Timestamp must be >= parent block timestamp (no going backward).
+        // Item 1: Don't ban for timestamp issues — could be clock skew or chain divergence.
         if let Some(parent) = self.state.blocks.latest() {
             if block.header.timestamp < parent.header.timestamp {
-                self.ban_peer(source, "sent block with timestamp before parent");
+                warn!("Rejected block from {}: timestamp before parent ({} < {})",
+                    source, block.header.timestamp, parent.header.timestamp);
                 return false;
             }
         }
