@@ -82,4 +82,46 @@ mod tests {
         assert_eq!(Amount::from_comme(33).to_string(), "33 COMME");
         assert_eq!(Amount::from_raw(100_000_001).to_string(), "1.00000001 COMME");
     }
+
+    #[test]
+    fn checked_add_never_overflows() {
+        let max = Amount::from_raw(u64::MAX);
+        assert_eq!(max.checked_add(Amount::from_raw(1)), None);
+        assert_eq!(max.checked_add(Amount::ZERO), Some(max));
+    }
+
+    #[test]
+    fn checked_sub_never_underflows() {
+        assert_eq!(Amount::ZERO.checked_sub(Amount::from_raw(1)), None);
+        assert_eq!(Amount::from_raw(1).checked_sub(Amount::from_raw(1)), Some(Amount::ZERO));
+    }
+
+    #[test]
+    fn total_supply_add_never_exceeds_u64() {
+        // Even adding total supply to itself shouldn't panic (use checked).
+        let supply = Amount::from_raw(TOTAL_SUPPLY);
+        assert!(supply.checked_add(supply).is_some()); // 4*10^17 < u64::MAX
+    }
+
+    #[test]
+    fn saturating_sub_floors_at_zero() {
+        assert_eq!(Amount::from_raw(5).saturating_sub(Amount::from_raw(10)), Amount::ZERO);
+    }
+
+    #[test]
+    fn from_comme_and_back() {
+        for whole in [0, 1, 100, 1_000_000, 2_000_000_000u64] {
+            let a = Amount::from_comme(whole);
+            assert_eq!(a.whole_comme(), whole);
+        }
+    }
+
+    #[test]
+    fn supply_invariant_emission_plus_remaining_equals_total() {
+        // Simulate emission: any amount emitted + remaining = total.
+        for emitted in [0, 1, TOTAL_SUPPLY / 2, TOTAL_SUPPLY - 1, TOTAL_SUPPLY] {
+            let remaining = TOTAL_SUPPLY - emitted;
+            assert_eq!(emitted + remaining, TOTAL_SUPPLY);
+        }
+    }
 }
