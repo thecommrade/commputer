@@ -1491,13 +1491,14 @@ impl ChainState {
         Ok(())
     }
 
-    /// Persist all in-memory accounts to RocksDB.
+    /// Item 66: Persist all in-memory accounts to RocksDB using a single WriteBatch.
     fn flush_accounts(&self, rocks: &RocksStore) -> Result<(), StateError> {
+        let mut batch = rocks.new_write_batch();
         for account in self.accounts.iter() {
-            rocks.put_account(account)
-                .map_err(|e| StateError::StorageError(e.to_string()))?;
+            rocks.batch_put_account(&mut batch, account);
         }
-        Ok(())
+        rocks.write_batch(batch)
+            .map_err(|e| StateError::StorageError(e.to_string()))
     }
 }
 
