@@ -665,6 +665,21 @@ impl EventLoop {
 
                 self.state.emit(distributed);
 
+                // Warn on low remaining supply.
+                let remaining_pct = (self.state.remaining_supply() as f64
+                    / commputer_core::token::TOTAL_SUPPLY as f64) * 100.0;
+                if self.state.is_emergency_access() {
+                    warn!("EMERGENCY ACCESS MODE: circulating supply below 1M COMME — any contribution = full access");
+                }
+                if remaining_pct <= 1.0 {
+                    warn!("CRITICAL: Only {:.2}% of supply remaining ({} raw units)",
+                        remaining_pct, self.state.remaining_supply());
+                } else if remaining_pct <= 5.0 {
+                    warn!("WARNING: Only {:.2}% of supply remaining", remaining_pct);
+                } else if remaining_pct <= 10.0 {
+                    info!("Supply milestone: {:.2}% remaining", remaining_pct);
+                }
+
                 // Persist updated account balances
                 if let Err(e) = self.state.flush() {
                     warn!("Failed to flush state after epoch: {}", e);
