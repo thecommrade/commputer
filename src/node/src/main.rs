@@ -1,3 +1,4 @@
+mod consensus_manager;
 mod event_loop;
 
 use anyhow::Result;

@@ -507,6 +507,7 @@ dependencies = [
  "commputer-validator",
  "futures",
  "libp2p",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

@@ -19,6 +19,8 @@ use commputer_network::topics;
 use commputer_validator::lifecycle::{ValidatorState, ValidatorStatus};
 use commputer_validator::compliance_check::ComplianceChecker;
 
+use crate::consensus_manager::{ConsensusManager, ConsensusMessage};
+
 pub struct EventLoop {
     pub state: ChainState,
     pub wallet: Wallet,
@@ -28,6 +30,7 @@ pub struct EventLoop {
     pub validator: ValidatorState,
     pub compliance: ComplianceChecker,
     pub pending_txs: Vec<Transaction>,
+    pub consensus: ConsensusManager,
 }
 
 impl EventLoop {
@@ -46,12 +49,14 @@ impl EventLoop {
             validator: ValidatorState::new(),
             compliance: ComplianceChecker::new(),
             pending_txs: Vec::new(),
+            consensus: ConsensusManager::new(),
         }
     }
 
     pub async fn run(&mut self) {
         let mut epoch_interval = time::interval(Duration::from_secs(3600));
         let mut block_interval = time::interval(Duration::from_secs(2));
+        let mut consensus_interval = time::interval(Duration::from_millis(500));
 
         info!("Event loop started. Listening for peers...");
 
@@ -65,6 +70,9 @@ impl EventLoop {
                 }
                 _ = block_interval.tick() => {
                     self.handle_block_tick();
+                }
+                _ = consensus_interval.tick() => {
+                    self.handle_consensus_tick();
                 }
             }
         }
@@ -86,11 +94,15 @@ impl EventLoop {
 
                 if topic == topics::TOPIC_BLOCKS {
                     if let Ok(block) = serde_json::from_slice::<Block>(&message.data) {
-                        self.handle_new_block(block);
+                        self.handle_received_block(block);
                     }
                 } else if topic == topics::TOPIC_TRANSACTIONS {
                     if let Ok(tx) = serde_json::from_slice::<Transaction>(&message.data) {
                         self.handle_new_transaction(tx);
+                    }
+                } else if topic == topics::TOPIC_CONSENSUS {
+                    if let Ok(msg) = serde_json::from_slice::<ConsensusMessage>(&message.data) {
+                        self.handle_consensus_message(msg);
                     }
                 }
             }
@@ -110,7 +122,43 @@ impl EventLoop {
         }
     }
 
-    fn handle_new_block(&mut self, block: Block) {
+    /// Handle a consensus protocol message from a peer.
+    fn handle_consensus_message(&mut self, msg: ConsensusMessage) {
+        match msg {
+            ConsensusMessage::BlockCandidate { block } => {
+                let hash = block.hash();
+                let height = block.height();
+
+                if self.state.blocks.contains(&hash) {
+                    return; // Already finalized this block.
+                }
+
+                debug!("Received block candidate {} at height {}", hash, height);
+                self.consensus.add_candidate(block);
+
+                // Attempt finalization (handles single-candidate fast-path).
+                self.consensus.try_finalize_round(height);
+                self.try_apply_finalized(height);
+            }
+            ConsensusMessage::SnowballQuery { height, querier_preference: _ } => {
+                // Respond with our preference for this height.
+                if let Some(pref) = self.consensus.query_preference(height) {
+                    let response = ConsensusMessage::SnowballResponse {
+                        height,
+                        preference: pref,
+                    };
+                    self.publish_consensus_message(&response);
+                }
+            }
+            ConsensusMessage::SnowballResponse { height, preference } => {
+                self.consensus.record_response(height, preference);
+            }
+        }
+    }
+
+    /// A block received on the blocks topic (legacy path). Enter it as a candidate
+    /// instead of applying directly.
+    fn handle_received_block(&mut self, block: Block) {
         let hash = block.hash();
         let height = block.height();
 
@@ -118,15 +166,12 @@ impl EventLoop {
             return; // Already have this block.
         }
 
-        match self.state.apply_block(&block) {
-            Ok(()) => {
-                info!("Applied block {} at height {}", hash, height);
-                self.print_status();
-            }
-            Err(e) => {
-                warn!("Rejected block {}: {}", hash, e);
-            }
-        }
+        debug!("Received block {} at height {} — entering as candidate", hash, height);
+        self.consensus.add_candidate(block);
+
+        // Attempt finalization (handles single-candidate fast-path).
+        self.consensus.try_finalize_round(height);
+        self.try_apply_finalized(height);
     }
 
     fn handle_new_transaction(&mut self, tx: Transaction) {
@@ -179,7 +224,13 @@ impl EventLoop {
             return;
         }
 
-        let current_height = self.state.blocks.height();
+        let next_height = self.state.blocks.height() + 1;
+
+        // Don't produce if there's already an active vote at this height.
+        if self.consensus.has_active_vote(next_height) || self.consensus.has_height(next_height) {
+            return;
+        }
+
         let parent = self
             .state
             .blocks
@@ -190,7 +241,7 @@ impl EventLoop {
         // Create a new block with pending transactions.
         let block = Block {
             header: BlockHeader {
-                height: current_height + 1,
+                height: next_height,
                 parent_hash: parent,
                 tx_root: [0u8; 32],  // Simplified for now.
                 proof_root: [0u8; 32],
@@ -207,28 +258,100 @@ impl EventLoop {
             proof_summaries: vec![],
         };
 
-        // Apply and broadcast.
-        match self.state.apply_block(&block) {
-            Ok(()) => {
-                info!("Produced block at height {}", block.height());
+        info!("Produced block candidate at height {}", next_height);
 
-                // Broadcast via gossipsub.
-                if let Ok(data) = serde_json::to_vec(&block) {
-                    let topic = topics::block_topic();
-                    if let Err(e) = self
-                        .network
-                        .swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(topic, data)
-                    {
-                        warn!("Failed to broadcast block: {}", e);
-                    }
+        // Broadcast as BlockCandidate on the consensus topic.
+        let candidate_msg = ConsensusMessage::BlockCandidate {
+            block: block.clone(),
+        };
+        self.publish_consensus_message(&candidate_msg);
+
+        // Also broadcast on the blocks topic for backward compatibility.
+        if let Ok(data) = serde_json::to_vec(&block) {
+            let topic = topics::block_topic();
+            if let Err(e) = self
+                .network
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic, data)
+            {
+                warn!("Failed to broadcast block: {}", e);
+            }
+        }
+
+        // Enter our own block as a candidate and start the vote.
+        self.consensus.add_candidate(block);
+
+        // Attempt finalization (handles single-candidate fast-path).
+        self.consensus.try_finalize_round(next_height);
+        self.try_apply_finalized(next_height);
+    }
+
+    /// Consensus round tick (500ms): for each active height, publish a query
+    /// and attempt to finalize the round from accumulated responses.
+    fn handle_consensus_tick(&mut self) {
+        let active = self.consensus.active_heights();
+        for height in &active {
+            // Try to finalize from any responses accumulated so far.
+            self.consensus.try_finalize_round(*height);
+        }
+
+        // Apply any newly finalized blocks (in height order).
+        let mut finalized = self.consensus.finalized_heights();
+        finalized.sort();
+        for height in finalized {
+            self.try_apply_finalized(height);
+        }
+
+        // Publish queries for still-active heights.
+        let still_active = self.consensus.active_heights();
+        for height in still_active {
+            if let Some(pref) = self.consensus.query_preference(height) {
+                let query = ConsensusMessage::SnowballQuery {
+                    height,
+                    querier_preference: pref,
+                };
+                self.publish_consensus_message(&query);
+            }
+        }
+    }
+
+    /// If the consensus manager has a finalized block at `height`, apply it
+    /// to the chain state.
+    fn try_apply_finalized(&mut self, height: u64) {
+        // Only apply if this is the next expected height.
+        let expected = self.state.blocks.height() + 1;
+        if height != expected {
+            return;
+        }
+
+        if let Some(block) = self.consensus.take_finalized(height) {
+            let hash = block.hash();
+            match self.state.apply_block(&block) {
+                Ok(()) => {
+                    info!("Finalized and applied block {} at height {}", hash, height);
+                    self.print_status();
+                }
+                Err(e) => {
+                    warn!("Rejected finalized block {}: {}", hash, e);
                 }
             }
-            Err(e) => {
-                warn!("Failed to produce block: {}", e);
-                // Return transactions to pending.
+        }
+    }
+
+    /// Publish a ConsensusMessage on the consensus gossipsub topic.
+    fn publish_consensus_message(&mut self, msg: &ConsensusMessage) {
+        if let Ok(data) = serde_json::to_vec(msg) {
+            let topic = topics::consensus_topic();
+            if let Err(e) = self
+                .network
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(topic, data)
+            {
+                debug!("Failed to publish consensus message: {}", e);
             }
         }
     }
