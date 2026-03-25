@@ -2,6 +2,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use bip39::Mnemonic;
+use zeroize::Zeroize;
 use crate::identity::Address;
 use crate::error::CommpError;
 
@@ -73,6 +74,16 @@ impl Wallet {
     }
 }
 
+impl Drop for Wallet {
+    fn drop(&mut self) {
+        // Zeroize the signing key bytes to prevent key material from lingering in memory.
+        let mut key_bytes = self.signing_key.to_bytes();
+        key_bytes.zeroize();
+        // Overwrite the signing key with zeroed bytes.
+        self.signing_key = SigningKey::from_bytes(&key_bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +127,14 @@ mod tests {
     #[test]
     fn invalid_seed_phrase_returns_error() {
         assert!(Wallet::from_seed_phrase("not a valid seed phrase").is_err());
+    }
+
+    #[test]
+    fn wallet_drop_does_not_panic() {
+        // Verify that creating and dropping a wallet doesn't panic
+        // (exercises the Drop impl with zeroization).
+        let wallet = Wallet::generate();
+        let _addr = *wallet.address();
+        drop(wallet);
     }
 }
