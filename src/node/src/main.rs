@@ -1,9 +1,17 @@
+mod batch_jobs;
 mod capacity;
+mod compute_dashboard;
 mod compute_handler;
+mod compute_session;
 mod consensus_manager;
 mod event_loop;
+mod job_cancel;
 mod job_spec;
+mod native_executor;
 mod proof_manager;
+mod result_cache;
+mod tier_rate_limit;
+mod wasm_executor;
 mod rpc;
 mod validation;
 mod faucet;
