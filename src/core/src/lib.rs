@@ -9,6 +9,7 @@ pub mod error;
 pub mod wallet;
 pub mod keystore;
 pub mod signing;
+pub mod testutil;
 
 pub use block::{Block, BlockHeader, BlockHash};
 pub use transaction::{Transaction, TxHash};
