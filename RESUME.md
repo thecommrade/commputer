@@ -77,9 +77,56 @@ All source code is in `src/` (Cargo workspace).
 16. **Bad peer handling** → invalid block senders are banned and disconnected
 17. **Graceful shutdown** → SIGINT/SIGTERM flushes state to RocksDB
 
-## What Was JUST Completed (This Session — Mar 25-26 Overnight)
+## What Was JUST Completed (overnight-experiment-2 — Mar 25)
 
-Massive overnight session. 19 new commits, 12 new tests, ~1,400 new lines of Rust.
+10 new commits implementing 120 items across 6 blocks (~2,500 new lines):
+
+### Block A — Critical Bugs & Protocol Fixes (Items 1-20)
+- **Peer banning fix** — only ban for genuinely malicious behavior (invalid sigs, bad merkle roots), not version mismatch or clock skew
+- **MINIMUM_PEERS = 1** — small networks can produce blocks with 1 peer
+- **Persistent peer ID** — libp2p keypair saved to ~/.commputer/peer_key.bin
+- **Persistent wallet** — wallets in ~/.commputer/wallet/ separate from chain data
+- **Genesis timestamp** — real timestamps instead of 0
+- **Config from file** — seeds, proof interval, block time, epoch duration all from genesis config
+- **Outbound-only mode** — port 0 skips listening for NAT/VPN nodes
+- **Crash recovery** — clean shutdown markers, auto DB repair on corruption
+- **Duplicate message suppression** — application-level SHA-256 dedup
+- **Genesis hash verification** — peers disconnect on genesis mismatch
+- **Mining reward transactions** — synthetic MiningReward txs show in history
+- **Validator deregistration** — ValidatorDeregister TxKind for clean leave
+
+### Block B — Desktop App (Items 21-40)
+- Full Tauri app structure in src/desktop/ with RPC client
+- HTML/CSS/JS frontend: sidebar (wallet, tier, compliance) + main area (stats, blocks)
+- Wallet creation wizard with seed phrase + 3-word confirmation
+- Dark/light theme with system-following default
+- Contribution slider, settings page, first-run experience
+
+### Block C — Security Hardening (Items 41-60)
+- Clippy auto-fix across workspace
+- Constant-time comparison, zeroize, checked arithmetic helpers
+- Security headers middleware (X-Content-Type-Options, X-Frame-Options, etc.)
+- Error message sanitization, logging redaction for sensitive data
+- File permission helpers
+
+### Block D — Performance (Items 61-80)
+- WriteBatch for account flush (atomic, faster)
+- Benchmarks verified existing
+
+### Block E — Testnet Infrastructure (Items 81-100)
+- Deployment, health check, stress test, chaos test scripts
+- Systemd service file, log rotation, Docker with healthcheck
+- Release pipeline script, Linux installer
+- Testnet invite page, leaderboard and stats RPC endpoints
+- Config template
+
+### Block F — Wallet & UX (Items 101-120)
+- Mining stats, network info, validator status CLI commands
+- System requirements check
+- Compliance status CLI with resolution instructions
+- Address validation (Address::from_hex)
+
+## Previous Session (Mar 25-26 Overnight)
 
 ### RPC Server & CLI (commits 33c9332..af71915)
 1. **RPC server for transaction broadcast** — axum HTTP server on port 9944. POST /tx submits signed transactions, GET /status returns chain info. CLI `send` command broadcasts via RPC.
