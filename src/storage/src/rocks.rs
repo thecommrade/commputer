@@ -21,6 +21,8 @@ pub const META_NERF_RATE_BPS: &str = "nerf_rate_bps";
 pub const META_SCHEMA_VERSION: &str = "schema_version";
 /// Feature 186: Current schema version.
 pub const CURRENT_SCHEMA_VERSION: u64 = 1;
+/// Item 15: Clean shutdown marker key.
+pub const META_CLEAN_SHUTDOWN: &str = "clean_shutdown";
 
 /// Persistent storage layer backed by RocksDB.
 /// Used alongside in-memory stores — this is the durable layer.
@@ -34,6 +36,16 @@ pub struct RocksStore {
 }
 
 impl RocksStore {
+    /// Item 16: Attempt to repair a corrupted database before opening.
+    pub fn try_repair(path: &Path) {
+        tracing::info!("Attempting database repair at {}", path.display());
+        if let Err(e) = DB::repair(&Options::default(), path) {
+            tracing::warn!("Database repair failed: {}", e);
+        } else {
+            tracing::info!("Database repair completed successfully");
+        }
+    }
+
     /// Open or create a RocksDB store at the given filesystem path.
     pub fn open(path: &Path) -> Result<Self, rocksdb::Error> {
         let mut opts = Options::default();
@@ -64,10 +76,27 @@ impl RocksStore {
         // Feature 186: Run migrations on open.
         store.run_migrations()?;
 
+        // Item 15: Detect unclean shutdown.
+        let was_clean = store.get_meta_u64(META_CLEAN_SHUTDOWN)
+            .unwrap_or(None)
+            .unwrap_or(0) == 1;
+        if !was_clean {
+            tracing::warn!("Detected unclean shutdown — RocksDB WAL recovery in progress");
+        }
+        // Clear the clean shutdown marker (will be set again on clean shutdown).
+        let _ = store.put_meta_u64(META_CLEAN_SHUTDOWN, 0);
+
         // Feature 189: Verify WAL integrity.
         store.verify_wal();
 
         Ok(store)
+    }
+
+    /// Item 15: Mark a clean shutdown so next startup knows it was graceful.
+    pub fn mark_clean_shutdown(&self) {
+        if let Err(e) = self.put_meta_u64(META_CLEAN_SHUTDOWN, 1) {
+            tracing::warn!("Failed to mark clean shutdown: {}", e);
+        }
     }
 
     /// Feature 186: Run any needed database migrations.

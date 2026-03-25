@@ -120,6 +120,9 @@ pub struct EventLoop {
     /// Feature 20: Transaction signature verification cache.
     /// Capped at SIG_CACHE_MAX entries (LRU-style: clear when full).
     pub sig_cache: HashSet<TxHash>,
+    /// Item 18: Recent gossipsub message IDs for duplicate suppression.
+    /// Gossipsub has built-in dedup, but this catches application-level duplicates.
+    pub seen_message_ids: HashSet<[u8; 32]>,
     /// Feature 9: Pending epoch summary to include in the next block.
     pub pending_epoch_summary: Option<commputer_core::block::EpochSummary>,
 }
@@ -168,6 +171,7 @@ impl EventLoop {
             custom_seeds: Vec::new(),
             data_dir: None,
             sig_cache: HashSet::new(),
+            seen_message_ids: HashSet::new(),
             pending_epoch_summary: None,
         }
     }
@@ -511,6 +515,9 @@ impl EventLoop {
             info!("Chain state flushed successfully. Height: {}", self.state.blocks.height());
         }
 
+        // Item 15: Mark clean shutdown so next startup can detect crashes.
+        self.state.mark_clean_shutdown();
+
         // Feature 133: Persist pending consensus state info.
         // Active heights and pending blocks are logged for debugging;
         // on restart, the node will re-sync from peers via the sync protocol.
@@ -698,6 +705,20 @@ impl EventLoop {
                     .or_insert_with(PeerQuality::default)
                     .messages_received += 1;
 
+                // Item 18: Application-level duplicate message suppression.
+                {
+                    use sha2::{Sha256, Digest};
+                    let msg_hash: [u8; 32] = Sha256::digest(&message.data).into();
+                    if !self.seen_message_ids.insert(msg_hash) {
+                        debug!("Suppressing duplicate message from {}", propagation_source);
+                        return;
+                    }
+                    // Prune seen set periodically to avoid unbounded growth.
+                    if self.seen_message_ids.len() > 10_000 {
+                        self.seen_message_ids.clear();
+                    }
+                }
+
                 // Feature 173: Decompress message data before deserialization.
                 let data = commputer_network::decompress(&message.data);
 
@@ -817,6 +838,23 @@ impl EventLoop {
                 } else {
                     debug!("Peer {} identified: protocol={}, agent={}",
                         peer_id, info.protocol_version, info.agent_version);
+
+                    // Item 20: Genesis hash verification — check agent_version contains our genesis hash.
+                    // Agent version format: "commputer/<version>/<genesis_hash_hex_prefix>"
+                    if let Some(genesis_block) = self.state.blocks.get_by_height(0) {
+                        let our_genesis_hex = hex::encode(&genesis_block.hash().0[..8]);
+                        let agent_has_genesis = info.agent_version.contains(&our_genesis_hex);
+                        if info.agent_version.contains("commputer/") && !agent_has_genesis
+                            && !info.agent_version.contains("unknown")
+                        {
+                            warn!(
+                                "Peer {} has different genesis hash (agent: {}) — disconnecting",
+                                peer_id, info.agent_version
+                            );
+                            let _ = self.network.swarm.disconnect_peer_id(peer_id);
+                            return;
+                        }
+                    }
 
                     // Feature 169: Add the peer's listen addresses to Kademlia for discovery.
                     for addr in &info.listen_addrs {

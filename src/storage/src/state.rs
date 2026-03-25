@@ -199,8 +199,18 @@ impl ChainState {
     /// Open a persistent ChainState backed by RocksDB at the given path.
     /// Loads all state from disk into the in-memory stores.
     pub fn open(path: &Path) -> Result<Self, StateError> {
-        let rocks = RocksStore::open(path)
-            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        // Item 16: Try to open, and if it fails, attempt repair then retry.
+        let rocks = match RocksStore::open(path) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Database open failed: {}. Attempting repair...", e);
+                RocksStore::try_repair(path);
+                RocksStore::open(path)
+                    .map_err(|e2| StateError::StorageError(
+                        format!("database open failed after repair: {}", e2)
+                    ))?
+            }
+        };
 
         // Load meta counters.
         let total_emitted = rocks
@@ -267,6 +277,13 @@ impl ChainState {
             self.flush_to_rocks(rocks)?;
         }
         Ok(())
+    }
+
+    /// Item 15: Mark a clean shutdown in the database.
+    pub fn mark_clean_shutdown(&self) {
+        if let Some(ref rocks) = self.rocks {
+            rocks.mark_clean_shutdown();
+        }
     }
 
     /// Retrieve a block by height. Checks in-memory first, falls back to RocksDB.
