@@ -1,0 +1,19 @@
+{
+  "accounts": [
+    {
+      "address": "3243f8fdbd815d78be687b94dd075986c1ef1b458161553eae93c82378dfc081",
+      "balance": 375000,
+      "cumulative_uptime_secs": 3600,
+      "grace_balance_secs": 3600,
+      "is_validator": false,
+      "nonce": 0,
+      "total_burned": 0,
+      "total_mined": 375000
+    }
+  ],
+  "current_epoch": 1,
+  "height": 100,
+  "state_root": "cc36b981aa693a0c69bac356dd3c6508f100176835cc9a615723c42909f4e01a",
+  "total_burned": 0,
+  "total_emitted": 375000
+}
