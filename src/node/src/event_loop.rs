@@ -334,6 +334,27 @@ impl EventLoop {
     }
 
     pub async fn run(&mut self) {
+        // Feature 8: Load persisted mempool on startup.
+        if let Some(ref dir) = self.data_dir {
+            let mempool_path = dir.join("mempool.json");
+            if mempool_path.exists() {
+                match std::fs::read_to_string(&mempool_path) {
+                    Ok(json) => {
+                        match serde_json::from_str::<Vec<Transaction>>(&json) {
+                            Ok(txs) => {
+                                info!("Loaded {} pending transactions from mempool.json", txs.len());
+                                self.pending_txs.extend(txs);
+                            }
+                            Err(e) => warn!("Failed to parse mempool.json: {}", e),
+                        }
+                        // Remove the file after loading.
+                        let _ = std::fs::remove_file(&mempool_path);
+                    }
+                    Err(e) => warn!("Failed to read mempool.json: {}", e),
+                }
+            }
+        }
+
         let mut epoch_interval = time::interval(Duration::from_secs(3600));
         let mut block_interval = time::interval(Duration::from_secs(2));
         let mut consensus_interval = time::interval(Duration::from_millis(500));
@@ -473,6 +494,23 @@ impl EventLoop {
             );
         }
         info!("Orphan pool: {} parent hashes with pending blocks", self.orphan_pool.len());
+
+        // Feature 8: Persist pending transactions to mempool.json.
+        if !self.pending_txs.is_empty() {
+            if let Some(ref dir) = self.data_dir {
+                let mempool_path = dir.join("mempool.json");
+                match serde_json::to_string_pretty(&self.pending_txs) {
+                    Ok(json) => {
+                        if let Err(e) = std::fs::write(&mempool_path, json) {
+                            warn!("Failed to persist mempool: {}", e);
+                        } else {
+                            info!("Persisted {} pending transactions to {}", self.pending_txs.len(), mempool_path.display());
+                        }
+                    }
+                    Err(e) => warn!("Failed to serialize mempool: {}", e),
+                }
+            }
+        }
     }
 
     /// Feature 20: Maximum signature cache size.
