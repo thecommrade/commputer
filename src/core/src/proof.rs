@@ -99,17 +99,29 @@ pub struct EpochProofSummary {
 }
 
 impl EpochProofSummary {
-    /// Composite Resource Score with diversity weighting.
-    /// Used for emission allocation and Snowball anchor selection.
+    /// Composite Resource Score using sub-linear R^0.7 formula per channel.
+    /// This penalizes over-investment in a single channel (anti-warehouse).
+    /// Each channel score is raised to the power 0.7, then summed.
+    /// Diversity bonus adds up to 25% for contributing across all 5 channels.
     pub fn composite_score(&self) -> u64 {
-        let base = self.processing_score as u64
-            + self.gpu_score as u64
-            + self.storage_score as u64
-            + self.ram_score as u64
-            + self.bandwidth_score as u64;
+        let channels = [
+            self.processing_score as f64,
+            self.gpu_score as f64,
+            self.storage_score as f64,
+            self.ram_score as f64,
+            self.bandwidth_score as f64,
+        ];
 
-        // Diversity bonus: up to 50% boost for contributing across all channels.
-        let bonus = (base * self.diversity_bonus as u64) / 200;
-        base + bonus
+        // Sub-linear: R^0.7 per channel. A score of 100 -> 100^0.7 ≈ 25.1
+        // This means doubling resources gives less than double the score.
+        let base: f64 = channels.iter()
+            .map(|&r| if r > 0.0 { r.powf(0.7) } else { 0.0 })
+            .sum();
+
+        // Diversity bonus: up to 25% boost. diversity_bonus ranges 0-50.
+        let bonus = base * (self.diversity_bonus as f64 / 200.0);
+
+        // Scale to integer. Multiply by 100 for precision.
+        ((base + bonus) * 100.0).round() as u64
     }
 }
