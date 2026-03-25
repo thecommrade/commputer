@@ -567,6 +567,17 @@ async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16) ->
 
     print_banner();
 
+    // Validate configuration.
+    if port == rpc_port {
+        anyhow::bail!("P2P port ({}) and RPC port ({}) must be different", port, rpc_port);
+    }
+    if port < 1024 {
+        warn!("P2P port {} is below 1024 — may require root privileges", port);
+    }
+    if rpc_port < 1024 {
+        warn!("RPC port {} is below 1024 — may require root privileges", rpc_port);
+    }
+
     if testnet {
         info!("Running in TESTNET mode");
     }
