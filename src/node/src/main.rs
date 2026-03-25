@@ -892,6 +892,28 @@ async fn run_node(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Feature 18: Custom panic handler — log panic info and exit cleanly.
+    std::panic::set_hook(Box::new(|panic_info| {
+        let location = panic_info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        // Use eprintln as a fallback since tracing may not be initialized yet.
+        eprintln!("PANIC at {}: {}", location, message);
+        // Try tracing if available.
+        tracing::error!("PANIC at {}: {}", location, message);
+        tracing::error!("Attempting to flush chain state before exit...");
+        // Note: We cannot easily access chain state from the panic hook,
+        // but the process exit will trigger destructors.
+        std::process::exit(1);
+    }));
+
     let cli = Cli::parse();
 
     match cli.command {

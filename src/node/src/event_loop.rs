@@ -114,6 +114,11 @@ pub struct EventLoop {
     pub peer_quality: HashMap<libp2p::PeerId, PeerQuality>,
     /// Feature 178: Custom seed multiaddrs for periodic reconnection.
     pub custom_seeds: Vec<String>,
+    /// Feature 8: Data directory path for mempool persistence.
+    pub data_dir: Option<std::path::PathBuf>,
+    /// Feature 20: Transaction signature verification cache.
+    /// Capped at SIG_CACHE_MAX entries (LRU-style: clear when full).
+    pub sig_cache: HashSet<TxHash>,
 }
 
 impl EventLoop {
@@ -158,6 +163,8 @@ impl EventLoop {
             verified_peer_validators: HashMap::new(),
             peer_quality: HashMap::new(),
             custom_seeds: Vec::new(),
+            data_dir: None,
+            sig_cache: HashSet::new(),
         }
     }
 
@@ -466,6 +473,30 @@ impl EventLoop {
             );
         }
         info!("Orphan pool: {} parent hashes with pending blocks", self.orphan_pool.len());
+    }
+
+    /// Feature 20: Maximum signature cache size.
+    const SIG_CACHE_MAX: usize = 10_000;
+
+    /// Feature 20: Verify a transaction signature with caching.
+    /// Returns true if the signature is valid (or was previously verified).
+    pub fn verify_tx_cached(&mut self, tx: &Transaction) -> bool {
+        let tx_hash = tx.hash();
+        // Check cache first.
+        if self.sig_cache.contains(&tx_hash) {
+            return true;
+        }
+        // Perform full verification.
+        if tx.verify() {
+            // Add to cache; clear if at capacity (simple LRU approximation).
+            if self.sig_cache.len() >= Self::SIG_CACHE_MAX {
+                self.sig_cache.clear();
+            }
+            self.sig_cache.insert(tx_hash);
+            true
+        } else {
+            false
+        }
     }
 
     /// Feature 11: Automatic peer rotation — disconnect lowest-reputation peer
