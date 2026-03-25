@@ -270,7 +270,7 @@ impl ChainState {
             }
             sender.balance = sender.balance.checked_sub(fee_amount)
                 .ok_or(StateError::InsufficientBalance)?;
-            self.total_burned += tx.fee;
+            self.total_burned = self.total_burned.saturating_add(tx.fee);
         }
 
         match &tx.kind {
@@ -318,15 +318,15 @@ impl ChainState {
                 sender.total_burned = sender.total_burned.checked_add(*burn_amount)
                     .ok_or(StateError::Overflow)?;
                 sender.nonce += 1;
-                self.total_burned += burn_amount.raw();
+                self.total_burned = self.total_burned.saturating_add(burn_amount.raw());
             }
 
             TxKind::MilestoneBurn { burn_amount, .. } => {
-                self.total_burned += burn_amount.raw();
+                self.total_burned = self.total_burned.saturating_add(burn_amount.raw());
             }
 
             TxKind::CharitableDonation { burn_amount, .. } => {
-                self.total_burned += burn_amount.raw();
+                self.total_burned = self.total_burned.saturating_add(burn_amount.raw());
             }
 
             TxKind::StorageWill { contact_hashes, .. } => {
@@ -348,7 +348,7 @@ impl ChainState {
 
     /// Record emission for an epoch (mining rewards distributed to validators).
     pub fn emit(&mut self, amount: u64) {
-        self.total_emitted += amount;
+        self.total_emitted = self.total_emitted.saturating_add(amount);
     }
 
     /// Whether this ChainState is backed by persistent storage.
