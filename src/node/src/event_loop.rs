@@ -329,6 +329,25 @@ impl EventLoop {
             return false;
         }
 
+        // Timestamp validation: reject blocks >30s in the future.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if block.header.timestamp > now + 30 {
+            warn!("Rejected block from {}: timestamp too far in future ({} vs now {})",
+                source, block.header.timestamp, now);
+            return false; // Don't ban — could be clock skew.
+        }
+
+        // Timestamp must be >= parent block timestamp (no going backward).
+        if let Some(parent) = self.state.blocks.latest() {
+            if block.header.timestamp < parent.header.timestamp {
+                self.ban_peer(source, "sent block with timestamp before parent");
+                return false;
+            }
+        }
+
         // Check merkle roots.
         if !block.verify_roots() {
             self.ban_peer(source, "sent block with invalid merkle roots");
