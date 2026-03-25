@@ -16,3 +16,4 @@ rand = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 hex = "0.4"
+bip39 = "2"
