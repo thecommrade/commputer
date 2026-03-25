@@ -8,6 +8,7 @@ pub mod tier;
 pub mod error;
 pub mod wallet;
 pub mod keystore;
+pub mod signing;
 
 pub use block::{Block, BlockHeader, BlockHash};
 pub use transaction::{Transaction, TxHash};
