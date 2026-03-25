@@ -1403,6 +1403,24 @@ impl EventLoop {
                                     )
                                     .unwrap_or(account.total_mined);
                                 distributed += effective_reward;
+
+                                // Item 13: Create synthetic mining reward tx for history.
+                                let reward_tx = Transaction {
+                                    from: Address([0u8; 32]), // Protocol-issued
+                                    nonce: 0,
+                                    kind: commputer_core::transaction::TxKind::MiningReward {
+                                        to: summary.validator,
+                                        amount: commputer_core::token::Amount::from_raw(effective_reward),
+                                        epoch,
+                                    },
+                                    fee: 0,
+                                    public_key: vec![],
+                                    signature: vec![],
+                                    memo: None,
+                                    timelock: None,
+                                };
+                                // Add to current block's pending txs so it shows in history.
+                                self.pending_txs.push(reward_tx);
                             }
                         }
                     }

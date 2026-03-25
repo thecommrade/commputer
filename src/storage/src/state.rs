@@ -814,6 +814,28 @@ impl ChainState {
                 }
                 sender.nonce += 1;
             }
+
+            TxKind::MiningReward { to, amount, .. } => {
+                // Item 13: Mining reward — protocol-issued, no nonce or fee.
+                // The actual balance change happens in the epoch processing;
+                // this tx just records it for history visibility.
+                let recipient = self.accounts.get_or_create(*to);
+                let _ = recipient; // Already credited in epoch processing.
+                let _ = amount;
+            }
+
+            TxKind::ValidatorDeregister => {
+                // Item 14: Clean validator deregistration.
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "cannot deregister: not a validator".into(),
+                    ));
+                }
+                sender.is_validator = false;
+                sender.validator_registered_height = None;
+                sender.nonce += 1;
+                info!("Validator {} deregistered cleanly", tx.from);
+            }
         }
 
         Ok(())
