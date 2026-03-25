@@ -20,6 +20,8 @@ pub mod l2;
 pub mod milestones;
 pub mod charitable;
 pub mod carbon;
+pub mod l2_client;
+pub mod tier_access;
 #[cfg(test)]
 mod fuzz_tests;
 

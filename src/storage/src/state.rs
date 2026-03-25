@@ -770,6 +770,50 @@ impl ChainState {
                 }
                 sender.nonce += 1;
             }
+
+            TxKind::SubmitJob { comme_budget, .. } => {
+                // Feature 52: Submit a compute job — verify budget and burn.
+                if comme_budget.raw() < commputer_core::compute::MIN_JOB_BUDGET {
+                    return Err(StateError::InvalidBlock(format!(
+                        "compute job budget {} below minimum {}",
+                        comme_budget.raw(),
+                        commputer_core::compute::MIN_JOB_BUDGET
+                    )));
+                }
+                let sender_balance = sender.balance;
+                if sender_balance.raw() < comme_budget.raw() {
+                    return Err(StateError::InsufficientBalance);
+                }
+                sender.balance = sender_balance.checked_sub(*comme_budget)
+                    .ok_or(StateError::InsufficientBalance)?;
+                sender.nonce += 1;
+                self.total_burned = self.total_burned.saturating_add(comme_budget.raw());
+            }
+
+            TxKind::ClaimJob { .. } => {
+                // Feature 53: Validator claims a pending compute job.
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can claim compute jobs".into(),
+                    ));
+                }
+                sender.nonce += 1;
+            }
+
+            TxKind::CompleteJob { .. } => {
+                // Feature 54: Executor submits result hash.
+                sender.nonce += 1;
+            }
+
+            TxKind::DisputeJob { .. } => {
+                // Feature 55: Verifier disputes a job result.
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can dispute compute jobs".into(),
+                    ));
+                }
+                sender.nonce += 1;
+            }
         }
 
         Ok(())
@@ -807,6 +851,44 @@ impl ChainState {
                 sender.total_burned = sender.total_burned.checked_add(*burn_amount)
                     .ok_or(StateError::Overflow)?;
                 self.total_burned = self.total_burned.saturating_add(burn_amount.raw());
+            }
+            TxKind::SubmitJob { comme_budget, .. } => {
+                // Feature 52: SubmitJob in batch — verify budget and burn.
+                if comme_budget.raw() < commputer_core::compute::MIN_JOB_BUDGET {
+                    return Err(StateError::InvalidBlock(format!(
+                        "compute job budget {} below minimum {}",
+                        comme_budget.raw(),
+                        commputer_core::compute::MIN_JOB_BUDGET
+                    )));
+                }
+                let sender = self.accounts.get_or_create(from);
+                if sender.balance.raw() < comme_budget.raw() {
+                    return Err(StateError::InsufficientBalance);
+                }
+                sender.balance = sender.balance.checked_sub(*comme_budget)
+                    .ok_or(StateError::InsufficientBalance)?;
+                self.total_burned = self.total_burned.saturating_add(comme_budget.raw());
+            }
+            TxKind::ClaimJob { .. } => {
+                // Feature 53: ClaimJob in batch — verify validator.
+                let sender = self.accounts.get_or_create(from);
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can claim compute jobs".into(),
+                    ));
+                }
+            }
+            TxKind::CompleteJob { .. } => {
+                // Feature 54: CompleteJob in batch — no-op beyond nonce (handled at batch level).
+            }
+            TxKind::DisputeJob { .. } => {
+                // Feature 55: DisputeJob in batch — verify validator.
+                let sender = self.accounts.get_or_create(from);
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can dispute compute jobs".into(),
+                    ));
+                }
             }
             // Nested batches are not allowed.
             TxKind::Batch { .. } => {
