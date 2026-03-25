@@ -357,6 +357,14 @@ impl EventLoop {
                         self.compliance.register_node(*validator_addr, ip);
                     }
                 }
+                // Enforce connection limit: max 50 peers.
+                const MAX_PEERS: usize = 50;
+                if self.peer_ips.len() >= MAX_PEERS {
+                    info!("Connection limit reached ({}) — disconnecting new peer {}", MAX_PEERS, peer_id);
+                    let _ = self.network.swarm.disconnect_peer_id(peer_id);
+                    return;
+                }
+
                 info!("Connected to peer: {} at {}", peer_id, addr_str);
                 // Initialize peer reputation score.
                 self.peer_scores.entry(peer_id).or_insert(100);
