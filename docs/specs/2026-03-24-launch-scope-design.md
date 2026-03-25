@@ -32,6 +32,7 @@ Commputer launches with two things: the $COMME token and a crypto analytics plat
 - **Access:** Hold 1+ $COMME → click "Analytics" in the desktop app → you're in
 - The founder's L2 contribution — how the anonymous founder earns
 - Improves as the network grows (more contributors = more compute = better analytics)
+- **Launch caveat:** At early network size, 51% of pooled compute is minimal. The analytics platform runs on founder infrastructure at launch and progressively leverages communal compute as the network grows. The 51% allocation is the protocol rule from day one; utilization ramps with scale.
 
 ## The User Experience
 
@@ -39,10 +40,28 @@ Single flow, no complexity:
 
 1. Download the desktop app (Windows, Mac, Linux)
 2. Install it. Wallet is generated automatically.
-3. Slide the resource bar (1-100%): "how much of your computer do you want to contribute?"
+3. Slide the resource bar (2-100%): "how much of your computer do you want to contribute?"
 4. App runs in the background. User earns $COMME.
 5. At 1 $COMME, the "Analytics" button activates. Click it. Full platform access.
 6. Continue mining. Spend $COMME on burst compute (burns). Trade on market. Hold for future tier unlocks.
+
+**Alternative path ("Earn It"):** A user contributing 100% of a reference-level desktop gets full analytics access immediately, no $COMME required. The app detects full contribution and unlocks access while the node is running. This path ensures the product is never priced out.
+
+## Wallet & Key Management
+
+- On first launch, the app generates an Ed25519 keypair
+- Private key stored in an encrypted keystore file on disk (password-protected)
+- User is shown a 24-word seed phrase on first run and prompted to write it down
+- Seed phrase can recover the wallet on any machine
+- Key export/import supported for migration between devices
+- **No custodial recovery.** If you lose your seed phrase and your device, the wallet is gone. The whitepaper is honest about this.
+
+## Network Bootstrap & Discovery
+
+- **Seed nodes:** The founder runs 2-3 seed nodes with known public addresses, hardcoded into the app
+- **Peer exchange:** Once connected to a seed node, the node requests and receives peer lists, building its local peer table organically
+- **DNS discovery (fast-follow):** DNS TXT records pointing to active seed nodes, allowing seed rotation without app updates
+- **Epochs:** 1 hour per epoch. Proof scores aggregated and emission distributed at epoch boundaries.
 
 ## Architecture
 
@@ -80,7 +99,7 @@ Seven crates, already scaffolded:
 - Gossip protocol for block propagation and consensus messages
 - DHT for data/storage layer and job routing
 - libp2p Rust implementation
-- NAT traversal for home desktops behind routers
+- **NAT traversal (known risk):** Home desktops are behind routers. libp2p provides hole-punching and relay support, but success rates vary across consumer routers. At launch, nodes with UPnP-capable routers or manually forwarded ports will have the best connectivity. Founder-operated relay nodes provide fallback for nodes that can't punch through. Full relay infrastructure is a fast-follow.
 
 ## Protocol Rules at Launch
 
@@ -98,7 +117,8 @@ All items below are roadmap, stated honestly in the whitepaper:
 
 | Feature | Trigger |
 |---------|---------|
-| Email / communication (free) | Network maturity + infrastructure |
+| Email tier (5 $COMME) | Deferred; HolderTier enum will be extended when email infrastructure ships |
+| Communication (free) | Network maturity + infrastructure |
 | Storage allocation (10 $COMME) | Sufficient network storage capacity |
 | Compute allocation (20 $COMME) | Sufficient network compute capacity |
 | AI access (33 $COMME) | Communal AI development or pooled purchasing |
@@ -115,7 +135,7 @@ All items below are roadmap, stated honestly in the whitepaper:
 - A user holding 1 $COMME can access the analytics platform through the app
 - Burns are happening (burst compute purchases)
 - Supply is visibly shrinking on a public dashboard
-- Anti-scale enforcement catches and nerfs multi-node operators
+- Anti-scale enforcement detects same-IP-range multi-node operators (basic detection at launch; behavioral analysis and fingerprinting improve over time)
 
 ## Non-Goals for v0.1
 
