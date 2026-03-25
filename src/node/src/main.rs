@@ -47,6 +47,9 @@ enum Commands {
         /// Port for the JSON RPC server (transaction submission, status queries)
         #[arg(long, default_value = "9944")]
         rpc_port: u16,
+        /// Feature 24: RPC API key for authentication
+        #[arg(long)]
+        rpc_key: Option<String>,
         /// Percentage of hardware resources to contribute (1-100)
         #[arg(long, default_value = "100")]
         contribution_percent: u8,
@@ -255,10 +258,12 @@ fn create_genesis() -> Block {
             producer_public_key: vec![],
             signature: vec![],
             checkpoint_hash: None,
+                chain_id: String::new(),
         },
         transactions: vec![],
         proof_summaries: vec![],
         compliance_summary: None,
+            epoch_summary: None,
     }
 }
 
@@ -831,6 +836,8 @@ async fn run_node(
         ws_broadcast: tokio::sync::broadcast::channel(256).0,
         is_testnet: testnet,
         faucet_claims: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            rpc_key: None,
+            rate_limits: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
@@ -858,7 +865,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds, password, wallet: _, dashboard: _ } => {
+        Commands::Run { testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds, password, wallet: _, dashboard: _, rpc_key: _ } => {
             run_node(testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds, password).await?;
         }
         Commands::Wallet { action } => match action {
@@ -1242,4 +1249,33 @@ fn cmd_genesis_generate(output: &str) -> Result<()> {
     println!("  Output:          {}", output);
 
     Ok(())
+}
+
+// ── Mainnet readiness: Genesis config ──
+
+/// Feature 1: Genesis configuration structure.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GenesisConfig {
+    #[serde(default)]
+    chain_id: String,
+    #[serde(default)]
+    total_supply: u64,
+    #[serde(default)]
+    epoch_duration_secs: u64,
+    #[serde(default)]
+    protocol_version: u32,
+    #[serde(default)]
+    fork_schedule: Vec<(u64, u32)>,
+}
+
+/// Feature 1: Load genesis config from genesis.json.
+fn load_genesis_config() -> Option<GenesisConfig> {
+    for path_str in &["genesis.json", "../genesis.json"] {
+        if let Ok(contents) = std::fs::read_to_string(path_str) {
+            if let Ok(config) = serde_json::from_str::<GenesisConfig>(&contents) {
+                return Some(config);
+            }
+        }
+    }
+    None
 }

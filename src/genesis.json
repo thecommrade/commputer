@@ -1,0 +1,31 @@
+{
+  "chain_id": "commputer-testnet-1",
+  "total_supply": 200000000000000000,
+  "epoch_duration_secs": 3600,
+  "emission": {
+    "base_rate_per_day_raw": 9000000,
+    "floor_rate_per_day_raw": 1000000,
+    "curve_start_validators": 10000
+  },
+  "channel_floors_bps": {
+    "Processing": 1000,
+    "Gpu": 1000,
+    "Storage": 1000,
+    "Ram": 500,
+    "Bandwidth": 500
+  },
+  "reference_node_specs": {
+    "cpu_model": "AMD Ryzen 9 7950X",
+    "cpu_cores": 16,
+    "ram_total_mb": 65536,
+    "gpu_model": "NVIDIA RTX 4090",
+    "gpu_vram_mb": 24576,
+    "storage_total_mb": 2000000,
+    "network_speed_mbps": 1000
+  },
+  "initial_nerf_percent": 80,
+  "minimum_fee_raw": 100000,
+  "minimum_stake_raw": 10000000,
+  "protocol_version": 1,
+  "fork_schedule": []
+}

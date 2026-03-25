@@ -93,10 +93,12 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![],
             proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
         };
 
         sign_block(&mut block, &producer);
@@ -122,10 +124,12 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![],
             proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
         };
 
         sign_block(&mut block, &producer);
@@ -153,10 +157,12 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![],
             proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
         };
 
         // Sign with imposter's key — should fail because key doesn't match producer address.

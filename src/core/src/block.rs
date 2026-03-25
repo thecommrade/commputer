@@ -56,6 +56,10 @@ pub struct BlockHeader {
     /// Feature 248: Checkpoint hash — full state root hash at checkpoint intervals (every 1000 blocks).
     #[serde(default)]
     pub checkpoint_hash: Option<[u8; 32]>,
+    /// Feature 2: Chain identifier.
+    #[serde(default)]
+    #[borsh(skip)]
+    pub chain_id: String,
 }
 
 /// Feature 248: Checkpoint interval for full state root hashing.
@@ -129,6 +133,10 @@ pub struct Block {
     /// Feature 146: Compliance summary included by block producers.
     #[serde(default)]
     pub compliance_summary: Option<ComplianceSummary>,
+    /// Feature 14: Epoch summary included at epoch boundaries.
+    #[serde(default)]
+    #[borsh(skip)]
+    pub epoch_summary: Option<EpochSummaryData>,
 }
 
 impl Block {
@@ -224,4 +232,65 @@ fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     }
 
     merkle_root(&next_level)
+}
+
+// ── Mainnet readiness additions ──
+
+/// Feature 2: Default chain ID for testnet.
+pub const CHAIN_ID_TESTNET: &str = "commputer-testnet-1";
+
+/// Feature 23: Dust limit — minimum transfer amount.
+pub const DUST_LIMIT: u64 = 100_000;
+
+/// Feature 8: Minimum stake for validators (0.1 COMME = 10_000_000 raw).
+pub const MINIMUM_STAKE: u64 = 10_000_000;
+
+/// Feature 22: Account creation cost multiplier (10x minimum fee).
+pub const ACCOUNT_CREATION_FEE_MULTIPLIER: u64 = 10;
+
+/// Feature 4: Hard fork schedule — maps block height to required protocol version.
+/// Empty for now — no forks scheduled.
+pub const FORK_SCHEDULE: &[(u64, u32)] = &[];
+
+/// Feature 4: Check required protocol version at a given block height.
+pub fn required_version_at_height(height: u64) -> u32 {
+    let mut version = 1u32;
+    for &(fork_height, fork_version) in FORK_SCHEDULE {
+        if height >= fork_height {
+            version = fork_version;
+        }
+    }
+    version
+}
+
+/// Feature 14: Serializable epoch summary data included in blocks at epoch boundaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochSummaryData {
+    pub epoch: u64,
+    pub validator_count: u64,
+    pub total_emission: u64,
+    pub active_validator_count: u64,
+}
+
+/// Feature 12: Header-only message for compact block propagation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockHeaderOnly {
+    pub header: BlockHeader,
+}
+
+/// Feature 18: Compact block — header + tx hashes for efficient propagation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactBlock {
+    pub header: BlockHeader,
+    pub tx_hashes: Vec<[u8; 32]>,
+}
+
+impl Block {
+    /// Feature 18: Create a compact block representation (header + tx hashes).
+    pub fn to_compact(&self) -> CompactBlock {
+        CompactBlock {
+            header: self.header.clone(),
+            tx_hashes: self.transactions.iter().map(|tx| tx.hash().0).collect(),
+        }
+    }
 }

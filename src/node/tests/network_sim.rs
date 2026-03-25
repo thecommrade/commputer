@@ -30,10 +30,12 @@ fn genesis_block() -> Block {
             producer_public_key: vec![],
             signature: vec![],
             checkpoint_hash: None,
+                chain_id: String::new(),
         },
         transactions: vec![],
         proof_summaries: vec![],
         compliance_summary: None,
+            epoch_summary: None,
     }
 }
 
@@ -52,10 +54,12 @@ fn make_block(height: u64, parent: BlockHash, producer: Address) -> Block {
             producer_public_key: vec![],
             signature: vec![],
             checkpoint_hash: None,
+                chain_id: String::new(),
         },
         transactions: vec![],
         proof_summaries: vec![],
         compliance_summary: None,
+            epoch_summary: None,
     }
 }
 
@@ -79,10 +83,12 @@ fn make_block_with_txs(
             producer_public_key: vec![],
             signature: vec![],
             checkpoint_hash: None,
+                chain_id: String::new(),
         },
         transactions: txs,
         proof_summaries: vec![],
         compliance_summary: None,
+            epoch_summary: None,
     }
 }
 

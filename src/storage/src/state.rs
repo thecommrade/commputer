@@ -524,6 +524,12 @@ impl ChainState {
 
         match &tx.kind {
             TxKind::Transfer { to, amount } => {
+                // Feature 23: Dust limit — reject transfers below minimum.
+                if amount.raw() < commputer_core::block::DUST_LIMIT {
+                    return Err(StateError::InvalidBlock(
+                        format!("transfer amount {} below dust limit {}", amount.raw(), commputer_core::block::DUST_LIMIT)
+                    ));
+                }
                 let sender_balance = sender.balance;
                 if sender_balance.raw() < amount.raw() {
                     return Err(StateError::InsufficientBalance);
@@ -552,6 +558,13 @@ impl ChainState {
             }
 
             TxKind::ValidatorRegister { .. } => {
+                // Feature 8: Minimum stake for validators (0.1 COMME).
+                if sender.balance.raw() < commputer_core::block::MINIMUM_STAKE {
+                    return Err(StateError::InvalidBlock(format!(
+                        "validator registration requires minimum stake of {} raw units, have {}",
+                        commputer_core::block::MINIMUM_STAKE, sender.balance.raw()
+                    )));
+                }
                 sender.is_validator = true;
                 sender.nonce += 1;
             }
@@ -719,6 +732,12 @@ impl ChainState {
     ) -> Result<(), StateError> {
         match op {
             TxKind::Transfer { to, amount } => {
+                // Feature 23: Dust limit — reject transfers below minimum.
+                if amount.raw() < commputer_core::block::DUST_LIMIT {
+                    return Err(StateError::InvalidBlock(
+                        format!("transfer amount {} below dust limit {}", amount.raw(), commputer_core::block::DUST_LIMIT)
+                    ));
+                }
                 let sender = self.accounts.get_or_create(from);
                 if sender.balance.raw() < amount.raw() {
                     return Err(StateError::InsufficientBalance);
@@ -1375,10 +1394,12 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![],
             proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
         }
     }
 
@@ -1422,6 +1443,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -1438,6 +1460,7 @@ mod tests {
             }],
             proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
         };
         state.apply_block(&block).unwrap();
 
@@ -1467,6 +1490,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -1484,6 +1508,7 @@ mod tests {
             }],
             proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
         };
         state.apply_block(&block).unwrap();
 
@@ -1515,6 +1540,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -1532,6 +1558,7 @@ mod tests {
             }],
             proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
         };
         state.apply_block(&block).unwrap();
 
@@ -1563,6 +1590,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -1580,6 +1608,7 @@ mod tests {
             }],
             proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
         };
         assert!(state.apply_block(&block).is_err());
     }
@@ -1642,6 +1671,7 @@ mod tests {
                     producer_public_key: vec![],
                     signature: vec![],
                     checkpoint_hash: None,
+                chain_id: String::new(),
                 },
                 transactions: vec![Transaction {
                     from: addr(1),
@@ -1658,6 +1688,7 @@ mod tests {
                 }],
                 proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
             };
             state.apply_block(&block).unwrap();
             // Flush accounts (apply_block persists blocks and meta, but
@@ -1713,6 +1744,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -1729,6 +1761,7 @@ mod tests {
             }],
             proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
         };
         assert!(state.apply_block_validated(&block).is_err());
     }
@@ -1774,10 +1807,12 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![tx],
             proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
         };
         // Compute correct merkle roots before validation.
         block.header.tx_root = block.compute_tx_root();
@@ -1901,10 +1936,12 @@ mod tests {
                     producer_public_key: vec![],
                     signature: vec![],
                     checkpoint_hash: None,
+                chain_id: String::new(),
                 },
                 transactions: vec![],
                 proof_summaries: vec![],
                 compliance_summary: None,
+            epoch_summary: None,
             };
             state.apply_block(&block).unwrap();
         }
@@ -1994,6 +2031,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -2012,6 +2050,7 @@ mod tests {
             }],
             proof_summaries: vec![],
             compliance_summary: None,
+            epoch_summary: None,
         };
 
         state.apply_block(&block).unwrap();

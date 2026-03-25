@@ -82,6 +82,10 @@ pub struct RpcState {
     pub ws_broadcast: broadcast::Sender<String>,
     /// Feature 256: Whether testnet mode is active (enables faucet).
     pub is_testnet: bool,
+    /// Feature 24: RPC API key for authentication. If set, require X-API-Key header.
+    pub rpc_key: Option<String>,
+    /// Feature 25: Rate limit tracking per IP (ip_str -> (count, window_start_secs)).
+    pub rate_limits: Mutex<HashMap<String, (u64, u64)>>,
     /// Feature 256: Faucet rate limiting (address_hex -> last_epoch_claimed).
     pub faucet_claims: Mutex<HashMap<String, u64>>,
 }
@@ -711,6 +715,8 @@ mod tests {
             ws_broadcast: broadcast::channel(256).0,
             is_testnet: true,
             faucet_claims: Mutex::new(HashMap::new()),
+            rpc_key: None,
+            rate_limits: Mutex::new(HashMap::new()),
         });
         (state, rx)
     }
