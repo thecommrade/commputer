@@ -71,3 +71,9 @@ commputer-network = { path = "network" }
 commputer-proofs = { path = "proofs" }
 commputer-validator = { path = "validator" }
 commputer-storage = { path = "storage" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
