@@ -242,6 +242,31 @@ fn read_line(prompt: &str) -> String {
 }
 
 fn create_genesis() -> Block {
+    create_genesis_for_dir(None)
+}
+
+fn create_genesis_for_dir(data_dir: Option<&std::path::Path>) -> Block {
+    // Try to load genesis config from data directory.
+    let _genesis_config = if let Some(dir) = data_dir {
+        let genesis_path = dir.join("genesis.json");
+        if genesis_path.exists() {
+            match commputer_core::genesis::load_genesis(&genesis_path) {
+                Ok(config) => {
+                    info!("Loaded genesis config from {}", genesis_path.display());
+                    config
+                }
+                Err(e) => {
+                    warn!("Failed to load genesis.json: {}. Using defaults.", e);
+                    commputer_core::genesis::default_genesis()
+                }
+            }
+        } else {
+            commputer_core::genesis::default_genesis()
+        }
+    } else {
+        commputer_core::genesis::default_genesis()
+    };
+
     Block {
         header: BlockHeader {
             protocol_version: 1, height: 0,
