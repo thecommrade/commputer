@@ -119,6 +119,8 @@ pub struct EventLoop {
     /// Feature 20: Transaction signature verification cache.
     /// Capped at SIG_CACHE_MAX entries (LRU-style: clear when full).
     pub sig_cache: HashSet<TxHash>,
+    /// Feature 9: Pending epoch summary to include in the next block.
+    pub pending_epoch_summary: Option<commputer_core::block::EpochSummary>,
 }
 
 impl EventLoop {
@@ -165,6 +167,7 @@ impl EventLoop {
             custom_seeds: Vec::new(),
             data_dir: None,
             sig_cache: HashSet::new(),
+            pending_epoch_summary: None,
         }
     }
 
@@ -383,9 +386,15 @@ impl EventLoop {
         let mut sync_timer = time::interval(Duration::from_secs(5));
 
         // Set up graceful shutdown signal handler.
-        let mut sigterm = tokio::signal::unix::signal(
+        let mut sigterm = match tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
-        ).expect("failed to register SIGTERM handler");
+        ) {
+            Ok(sig) => Some(sig),
+            Err(e) => {
+                warn!("Failed to register SIGTERM handler: {}", e);
+                None
+            }
+        };
 
         loop {
             // Take the RPC receiver out to satisfy the borrow checker in select!
@@ -462,7 +471,13 @@ impl EventLoop {
                     self.shutdown();
                     return;
                 }
-                _ = sigterm.recv() => {
+                _ = async {
+                    if let Some(ref mut sig) = sigterm {
+                        sig.recv().await
+                    } else {
+                        std::future::pending::<Option<()>>().await
+                    }
+                } => {
                     info!("Received SIGTERM — shutting down gracefully");
                     self.shutdown();
                     return;
@@ -1414,6 +1429,26 @@ impl EventLoop {
         // Feature 125: Reset slashing state for the new epoch.
         self.consensus.reset_epoch_slashing();
 
+        // Feature 9: Create epoch summary to include in next block.
+        let compliant_count = self.state.accounts.iter()
+            .filter(|a| a.is_validator && a.compliance == commputer_core::compliance::ComplianceStatus::Compliant)
+            .count() as u64;
+        let nerfed_count = self.state.accounts.iter()
+            .filter(|a| a.is_validator && a.compliance != commputer_core::compliance::ComplianceStatus::Compliant)
+            .count() as u64;
+        let proof_scores_total: u64 = self.epoch_state.summaries.values()
+            .map(|s| s.composite_score())
+            .sum();
+        self.pending_epoch_summary = Some(commputer_core::block::EpochSummary {
+            epoch,
+            total_emission: actual_emission,
+            total_burned: self.state.total_burned,
+            validator_count,
+            proof_scores_total,
+            compliant_count,
+            nerfed_count,
+        });
+
         self.state.current_epoch = epoch + 1;
         self.epoch_state = EpochState::new(epoch + 1, 0);
         self.epoch_state.difficulty_multiplier = next_difficulty;
@@ -1514,6 +1549,8 @@ impl EventLoop {
             transactions: txs,
             proof_summaries: vec![],
             compliance_summary: None,
+            // Feature 9: Include epoch summary if one is pending from the last epoch tick.
+            epoch_summary: self.pending_epoch_summary.take(),
         };
 
         // Compute and set merkle roots and state root.
@@ -1524,7 +1561,9 @@ impl EventLoop {
         // Feature 248: Set checkpoint hash at checkpoint intervals.
         if next_height % commputer_core::block::CHECKPOINT_HASH_INTERVAL == 0 && next_height > 0 {
             block.header.checkpoint_hash = Some(self.state.compute_state_root());
-            info!("Checkpoint at height {}: state root = {}", next_height, hex::encode(block.header.checkpoint_hash.unwrap()));
+            if let Some(ref hash) = block.header.checkpoint_hash {
+                info!("Checkpoint at height {}: state root = {}", next_height, hex::encode(hash));
+            }
         }
 
         // Sign the block header with our wallet key.

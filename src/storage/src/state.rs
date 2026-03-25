@@ -1419,7 +1419,7 @@ mod tests {
             },
             transactions: vec![],
             proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
         }
     }
 
@@ -1479,7 +1479,7 @@ mod tests {
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         state.apply_block(&block).unwrap();
 
@@ -1530,7 +1530,7 @@ mod tests {
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         state.apply_block(&block).unwrap();
 
@@ -1579,7 +1579,7 @@ mod tests {
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         state.apply_block(&block).unwrap();
 
@@ -1628,7 +1628,7 @@ mod tests {
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         assert!(state.apply_block(&block).is_err());
     }
@@ -1707,7 +1707,7 @@ mod tests {
                     timelock: None,
                 }],
                 proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
             };
             state.apply_block(&block).unwrap();
             // Flush accounts (apply_block persists blocks and meta, but
@@ -1782,7 +1782,7 @@ mod tests {
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         assert!(state.apply_block_validated(&block).is_err());
     }
@@ -1832,7 +1832,7 @@ mod tests {
             },
             transactions: vec![tx],
             proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         // Compute correct merkle roots before validation.
         block.header.tx_root = block.compute_tx_root();
@@ -1960,7 +1960,7 @@ mod tests {
                 },
                 transactions: vec![],
                 proof_summaries: vec![],
-                compliance_summary: None,
+                compliance_summary: None, epoch_summary: None,
             };
             state.apply_block(&block).unwrap();
         }
@@ -2068,7 +2068,7 @@ mod tests {
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
 
         state.apply_block(&block).unwrap();
@@ -2178,7 +2178,7 @@ mod tests {
                 fee: 100_000, signature: vec![], public_key: vec![],
                 memo: None, timelock: None,
             }],
-            proof_summaries: vec![], compliance_summary: None,
+            proof_summaries: vec![], compliance_summary: None, epoch_summary: None,
         };
         let result = state.apply_block(&block);
         assert!(result.is_err(), "Dust transfer should be rejected");
@@ -2208,7 +2208,7 @@ mod tests {
                 fee: 100_000, // below ACCOUNT_CREATION_FEE
                 signature: vec![], public_key: vec![], memo: None, timelock: None,
             }],
-            proof_summaries: vec![], compliance_summary: None,
+            proof_summaries: vec![], compliance_summary: None, epoch_summary: None,
         };
         let result = state.apply_block(&block);
         assert!(result.is_err(), "Transfer to new account with low fee should fail");
@@ -2245,7 +2245,7 @@ mod tests {
                 signature: vec![], public_key: vec![], memo: None, timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         let result = state.apply_block(&block);
         assert!(result.is_err(), "Validator register with insufficient stake should fail");
@@ -2274,7 +2274,7 @@ mod tests {
                 signature: vec![], public_key: vec![], memo: None, timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         state.apply_block(&block2).expect("Validator register with sufficient stake should succeed");
         assert!(state.accounts.get(&sender_addr).unwrap().is_validator);

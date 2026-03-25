@@ -133,6 +133,10 @@ pub struct Block {
     /// Feature 146: Compliance summary included by block producers.
     #[serde(default)]
     pub compliance_summary: Option<ComplianceSummary>,
+    /// Feature 9: Epoch summary included at epoch boundaries.
+    #[serde(default)]
+    #[borsh(skip)]
+    pub epoch_summary: Option<EpochSummary>,
 }
 
 impl Block {
@@ -240,4 +244,23 @@ pub struct BlockAnnounce {
     pub height: u64,
     /// Block producer address.
     pub producer: Address,
+}
+
+/// Feature 9: Epoch summary included at epoch boundaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpochSummary {
+    /// Epoch number this summary covers.
+    pub epoch: u64,
+    /// Total emission during this epoch (raw units).
+    pub total_emission: u64,
+    /// Total burned during this epoch (raw units).
+    pub total_burned: u64,
+    /// Number of active validators during this epoch.
+    pub validator_count: u64,
+    /// Sum of composite proof scores across all validators.
+    pub proof_scores_total: u64,
+    /// Number of compliant validators.
+    pub compliant_count: u64,
+    /// Number of nerfed validators.
+    pub nerfed_count: u64,
 }

@@ -230,14 +230,20 @@ fn wallet_path_named(testnet: bool, name: &str) -> PathBuf {
 fn read_password(prompt: &str) -> String {
     eprint!("{}", prompt);
     let mut password = String::new();
-    std::io::stdin().read_line(&mut password).unwrap();
+    if let Err(e) = std::io::stdin().read_line(&mut password) {
+        warn!("Failed to read password from stdin: {}", e);
+        return String::new();
+    }
     password.trim().to_string()
 }
 
 fn read_line(prompt: &str) -> String {
     eprint!("{}", prompt);
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
+    if let Err(e) = std::io::stdin().read_line(&mut input) {
+        warn!("Failed to read input from stdin: {}", e);
+        return String::new();
+    }
     input.trim().to_string()
 }
 
@@ -284,7 +290,7 @@ fn create_genesis_for_dir(data_dir: Option<&std::path::Path>) -> Block {
         },
         transactions: vec![],
         proof_summaries: vec![],
-        compliance_summary: None,
+        compliance_summary: None, epoch_summary: None,
     }
 }
 

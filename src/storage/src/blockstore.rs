@@ -116,7 +116,7 @@ mod tests {
             },
             transactions: vec![],
             proof_summaries: vec![],
-            compliance_summary: None,
+            compliance_summary: None, epoch_summary: None,
         }
     }
 

@@ -33,7 +33,7 @@ fn genesis_block() -> Block {
         },
         transactions: vec![],
         proof_summaries: vec![],
-        compliance_summary: None,
+        compliance_summary: None, epoch_summary: None,
     }
 }
 
@@ -55,7 +55,7 @@ fn make_block(height: u64, parent: BlockHash, producer: Address) -> Block {
         },
         transactions: vec![],
         proof_summaries: vec![],
-        compliance_summary: None,
+        compliance_summary: None, epoch_summary: None,
     }
 }
 
@@ -82,7 +82,7 @@ fn make_block_with_txs(
         },
         transactions: txs,
         proof_summaries: vec![],
-        compliance_summary: None,
+        compliance_summary: None, epoch_summary: None,
     }
 }
 
