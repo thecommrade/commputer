@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use axum::{
     Router,
     Json,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -11,6 +12,26 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
 use commputer_core::transaction::Transaction;
+
+/// Information about a connected peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub peer_id: String,
+    pub ip: Option<String>,
+    pub validator_address: Option<String>,
+    pub compliance_status: Option<String>,
+}
+
+/// Account balance info returned by the balance endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalanceInfo {
+    pub address: String,
+    pub balance: u64,
+    pub tier: String,
+    pub nonce: u64,
+    pub is_validator: bool,
+    pub total_mined: u64,
+}
 
 /// Snapshot of chain status, populated by the event loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +53,10 @@ pub struct RpcState {
     pub tx_sender: mpsc::Sender<Transaction>,
     /// Latest chain status snapshot (updated by event loop).
     pub status: Mutex<ChainStatus>,
+    /// Connected peer information (updated by event loop).
+    pub peers: Mutex<Vec<PeerInfo>>,
+    /// Account balance lookup callback — stores (address_hex -> BalanceInfo).
+    pub balances: Mutex<HashMap<String, BalanceInfo>>,
 }
 
 /// Response for a submitted transaction.
@@ -98,11 +123,40 @@ async fn get_status(
     Json(status)
 }
 
+/// GET /peers — return connected peer information.
+async fn get_peers(
+    State(state): State<Arc<RpcState>>,
+) -> Json<Vec<PeerInfo>> {
+    let peers = state.peers.lock().await.clone();
+    Json(peers)
+}
+
+/// GET /balance/:address — return account balance for the given hex address.
+async fn get_balance(
+    State(state): State<Arc<RpcState>>,
+    Path(address): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let balances = state.balances.lock().await;
+    if let Some(info) = balances.get(&address) {
+        (StatusCode::OK, Json(serde_json::to_value(info).unwrap()))
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Account not found on chain",
+                "address": address,
+            })),
+        )
+    }
+}
+
 /// Build the axum router (exposed for testing).
 pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
     Router::new()
         .route("/tx", post(submit_tx))
         .route("/status", get(get_status))
+        .route("/peers", get(get_peers))
+        .route("/balance/{address}", get(get_balance))
         .with_state(rpc_state)
 }
 
@@ -156,6 +210,8 @@ mod tests {
                 epoch: 1,
                 pending_txs: 0,
             }),
+            peers: Mutex::new(vec![]),
+            balances: Mutex::new(HashMap::new()),
         });
         (state, rx)
     }

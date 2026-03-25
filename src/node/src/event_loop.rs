@@ -101,9 +101,45 @@ impl EventLoop {
                 epoch: self.state.current_epoch,
                 pending_txs: self.pending_txs.len(),
             };
-            // Use try_lock to avoid blocking the event loop.
             if let Ok(mut guard) = rpc.status.try_lock() {
                 *guard = snapshot;
+            }
+
+            // Update peer info.
+            if let Ok(mut peers_guard) = rpc.peers.try_lock() {
+                let mut peers = Vec::new();
+                for (peer_id, ip) in &self.peer_ips {
+                    let validator_address = self.peer_validators.get(peer_id)
+                        .map(|a| hex::encode(a.0));
+                    let compliance_status = validator_address.as_ref().and_then(|_| {
+                        self.peer_validators.get(peer_id).map(|addr| {
+                            format!("{:?}", self.compliance.check(addr))
+                        })
+                    });
+                    peers.push(crate::rpc::PeerInfo {
+                        peer_id: peer_id.to_string(),
+                        ip: Some(ip.clone()),
+                        validator_address,
+                        compliance_status,
+                    });
+                }
+                *peers_guard = peers;
+            }
+
+            // Update balance info for all accounts.
+            if let Ok(mut bal_guard) = rpc.balances.try_lock() {
+                bal_guard.clear();
+                for account in self.state.accounts.iter() {
+                    let addr_hex = hex::encode(account.address.0);
+                    bal_guard.insert(addr_hex.clone(), crate::rpc::BalanceInfo {
+                        address: addr_hex,
+                        balance: account.balance.raw(),
+                        tier: format!("{:?}", account.tier()),
+                        nonce: account.nonce,
+                        is_validator: account.is_validator,
+                        total_mined: account.total_mined.raw(),
+                    });
+                }
             }
         }
     }

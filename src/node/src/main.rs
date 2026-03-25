@@ -58,6 +58,20 @@ enum Commands {
         #[arg(long, default_value = "true")]
         testnet: bool,
     },
+    /// Show connected peers and their status (queries running node via RPC)
+    Peers {
+        /// RPC port of the running node
+        #[arg(long, default_value = "9944")]
+        rpc_port: u16,
+    },
+    /// Show balance and tier for an address (queries running node via RPC)
+    Balance {
+        /// Address to look up (hex)
+        address: String,
+        /// RPC port of the running node
+        #[arg(long, default_value = "9944")]
+        rpc_port: u16,
+    },
     /// Send COMME to another address
     Send {
         /// Recipient address (hex)
@@ -442,6 +456,89 @@ async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result
     Ok(())
 }
 
+async fn cmd_peers(rpc_port: u16) -> Result<()> {
+    let url = format!("http://127.0.0.1:{}/peers", rpc_port);
+    let client = reqwest::Client::new();
+
+    match client.get(&url).send().await {
+        Ok(resp) => {
+            let peers: Vec<rpc::PeerInfo> = resp.json().await
+                .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+
+            println!();
+            if peers.is_empty() {
+                println!("No connected peers.");
+            } else {
+                println!("Connected peers ({}):", peers.len());
+                println!();
+                for peer in &peers {
+                    println!("  Peer: {}", peer.peer_id);
+                    if let Some(ref ip) = peer.ip {
+                        println!("    IP:         {}", ip);
+                    }
+                    if let Some(ref addr) = peer.validator_address {
+                        println!("    Validator:  {}", addr);
+                    }
+                    if let Some(ref status) = peer.compliance_status {
+                        println!("    Compliance: {}", status);
+                    }
+                    println!();
+                }
+            }
+        }
+        Err(e) => {
+            anyhow::bail!("Could not reach node at {} — is it running?\n  Error: {}", url, e);
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_balance(address: &str, rpc_port: u16) -> Result<()> {
+    // Validate address format.
+    let addr_bytes = hex::decode(address)
+        .map_err(|e| anyhow::anyhow!("Invalid address (expected hex): {}", e))?;
+    if addr_bytes.len() != 32 {
+        anyhow::bail!("Address must be 32 bytes (64 hex characters), got {} bytes.", addr_bytes.len());
+    }
+
+    let url = format!("http://127.0.0.1:{}/balance/{}", rpc_port, address);
+    let client = reqwest::Client::new();
+
+    match client.get(&url).send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                let info: rpc::BalanceInfo = resp.json().await
+                    .map_err(|e| anyhow::anyhow!("Failed to parse response: {}", e))?;
+
+                let whole = info.balance / commputer_core::token::UNITS_PER_COMME;
+                let mined_whole = info.total_mined / commputer_core::token::UNITS_PER_COMME;
+
+                println!();
+                println!("  Address:      {}", info.address);
+                println!("  Balance:      {} COMME", whole);
+                println!("  Tier:         {}", info.tier);
+                println!("  Nonce:        {}", info.nonce);
+                println!("  Validator:    {}", if info.is_validator { "yes" } else { "no" });
+                println!("  Total mined:  {} COMME", mined_whole);
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                println!();
+                if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                    println!("  {}", err);
+                } else {
+                    println!("  Account not found on chain.");
+                }
+            }
+        }
+        Err(e) => {
+            anyhow::bail!("Could not reach node at {} — is it running?\n  Error: {}", url, e);
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16) -> Result<()> {
     // Initialize logging.
     tracing_subscriber::fmt()
@@ -546,6 +643,8 @@ async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16) ->
     let rpc_state = std::sync::Arc::new(rpc::RpcState {
         tx_sender,
         status: tokio::sync::Mutex::new(initial_status),
+        peers: tokio::sync::Mutex::new(vec![]),
+        balances: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
@@ -580,6 +679,8 @@ async fn main() -> Result<()> {
             WalletAction::Export { testnet } => cmd_wallet_export(testnet)?,
         },
         Commands::Status { testnet } => cmd_status(testnet)?,
+        Commands::Peers { rpc_port } => cmd_peers(rpc_port).await?,
+        Commands::Balance { address, rpc_port } => cmd_balance(&address, rpc_port).await?,
         Commands::Send { to, amount, testnet, rpc_port } => {
             cmd_send(&to, amount, testnet, rpc_port).await?;
         }
