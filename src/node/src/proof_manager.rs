@@ -18,6 +18,8 @@ pub struct ProofManager {
     pending_challenges: HashMap<[u8; 32], ProofChallenge>,
     responses: Vec<ProofResponse>,
     our_address: Address,
+    /// Current chain height, updated from the event loop.
+    pub current_height: u64,
 }
 
 impl ProofManager {
@@ -26,6 +28,7 @@ impl ProofManager {
             pending_challenges: HashMap::new(),
             responses: Vec::new(),
             our_address,
+            current_height: 0,
         }
     }
 
@@ -117,7 +120,15 @@ impl ProofManager {
             // Check each response against its challenge.
             for resp in responses {
                 if let Some(challenge) = self.pending_challenges.get(&resp.challenge_id) {
-                    let verdict = ProofVerifier::verify(challenge, resp);
+                    // Check if response came after the deadline.
+                    let timed_out = challenge.deadline_block > 0
+                        && self.current_height > challenge.deadline_block;
+
+                    let verdict = if timed_out {
+                        ProofVerdict::TimedOut
+                    } else {
+                        ProofVerifier::verify(challenge, resp)
+                    };
                     let score = match verdict {
                         ProofVerdict::Valid => 100,
                         ProofVerdict::Suspicious => 50,

@@ -875,6 +875,8 @@ impl EventLoop {
     }
 
     fn handle_proof_tick(&mut self) {
+        // Keep proof manager aware of current chain height for timeout detection.
+        self.proof_manager.current_height = self.state.blocks.height();
         let seed = self.state.blocks.latest()
             .map(|b| b.hash().0)
             .unwrap_or([0u8; 32]);
