@@ -846,6 +846,9 @@ async fn run_node(
     event_loop.auto_register_validator(contribution_percent);
 
     // Feature 178: Store custom seeds for periodic reconnection.
+    // Mark as seed connector if custom seeds were provided — this node
+    // must connect to a peer before producing blocks to prevent chain forks.
+    event_loop.is_seed_connector = !seeds.is_empty();
     event_loop.custom_seeds = seeds;
 
     // Spawn RPC server in the background.

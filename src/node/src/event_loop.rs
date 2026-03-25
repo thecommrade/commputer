@@ -114,6 +114,11 @@ pub struct EventLoop {
     pub peer_quality: HashMap<libp2p::PeerId, PeerQuality>,
     /// Feature 178: Custom seed multiaddrs for periodic reconnection.
     pub custom_seeds: Vec<String>,
+    /// Whether this node has ever successfully connected to a peer.
+    /// Non-seed nodes must not produce blocks until they've connected at least once.
+    pub has_ever_connected: bool,
+    /// Whether this node was started with --seeds (i.e., it's not a seed node).
+    pub is_seed_connector: bool,
 }
 
 impl EventLoop {
@@ -158,6 +163,8 @@ impl EventLoop {
             verified_peer_validators: HashMap::new(),
             peer_quality: HashMap::new(),
             custom_seeds: Vec::new(),
+            has_ever_connected: false,
+            is_seed_connector: false,
         }
     }
 
@@ -520,6 +527,12 @@ impl EventLoop {
                 );
             }
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                // Mark that we've connected to at least one peer.
+                if !self.has_ever_connected {
+                    info!("First peer connection established — node is now eligible to produce blocks");
+                    self.has_ever_connected = true;
+                    self.partition_detected = false;
+                }
                 // Reject connections from banned peers.
                 if self.banned_peers.contains(&peer_id) {
                     info!("Rejecting connection from banned peer {}", peer_id);
@@ -1296,6 +1309,13 @@ impl EventLoop {
     fn handle_block_tick(&mut self) {
         // Only produce blocks if we're a registered validator.
         if self.validator.status() != ValidatorStatus::Active {
+            return;
+        }
+
+        // Non-seed nodes must connect to at least one peer before producing blocks.
+        // This prevents chain forks from nodes that start producing before syncing.
+        if self.is_seed_connector && !self.has_ever_connected {
+            debug!("Waiting for first peer connection before producing blocks");
             return;
         }
 
