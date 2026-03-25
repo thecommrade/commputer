@@ -1,0 +1,17 @@
+[package]
+name = "commputer-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Commputer desktop application — Tauri-based GUI for the node"
+
+[dependencies]
+commputer-core = { workspace = true }
+commputer-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+dirs = "5"

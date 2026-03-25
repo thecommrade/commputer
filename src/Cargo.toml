@@ -9,6 +9,7 @@ members = [
     "validator",
     "storage",
     "sim",
+    "desktop",
 ]
 
 [workspace.package]
