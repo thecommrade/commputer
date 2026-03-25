@@ -13,6 +13,19 @@ fn tx_signable_bytes(tx: &Transaction) -> Vec<u8> {
     bytes
 }
 
+/// Produce signable bytes for a transaction that include a chain_id,
+/// preventing replay attacks across different chains/networks.
+pub fn tx_signable_bytes_with_chain_id(tx: &Transaction, chain_id: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    // Prefix with chain_id so signatures are chain-specific
+    chain_id.serialize(&mut bytes).unwrap();
+    tx.from.serialize(&mut bytes).unwrap();
+    tx.nonce.serialize(&mut bytes).unwrap();
+    tx.kind.serialize(&mut bytes).unwrap();
+    tx.fee.serialize(&mut bytes).unwrap();
+    bytes
+}
+
 /// Sign a transaction with the sender's wallet key.
 pub fn sign_transaction(tx: &mut Transaction, wallet: &Wallet) {
     let bytes = tx_signable_bytes(tx);
@@ -162,6 +175,30 @@ mod tests {
         // Sign with imposter's key — should fail because key doesn't match producer address.
         sign_block(&mut block, &imposter);
         assert!(!block.header.verify_signature(&imposter.public_key().to_bytes()));
+    }
+
+    #[test]
+    fn different_chain_ids_produce_different_bytes() {
+        let sender = Wallet::generate();
+        let recipient = Address([1u8; 32]);
+        let tx = Transaction {
+            from: *sender.address(),
+            nonce: 0,
+            kind: TxKind::Transfer {
+                to: recipient,
+                amount: Amount::from_comme(10),
+            },
+            fee: 0,
+            signature: vec![],
+            public_key: vec![],
+            memo: None,
+            timelock: None,
+        };
+        let bytes_mainnet = super::tx_signable_bytes_with_chain_id(&tx, "commputer-mainnet");
+        let bytes_testnet = super::tx_signable_bytes_with_chain_id(&tx, "commputer-testnet");
+        let bytes_no_chain = super::tx_signable_bytes(&tx);
+        assert_ne!(bytes_mainnet, bytes_testnet);
+        assert_ne!(bytes_mainnet, bytes_no_chain);
     }
 
     #[test]
