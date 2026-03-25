@@ -38,6 +38,9 @@ pub struct Account {
     /// Feature 185: Whether this account is currently in hot storage (in-memory).
     #[serde(default = "default_true")]
     pub is_hot: bool,
+    /// Feature 5: Block height at which this validator was registered.
+    #[serde(default)]
+    pub validator_registered_height: Option<u64>,
 }
 
 fn default_true() -> bool { true }
@@ -59,6 +62,7 @@ impl Account {
             last_active_epoch: 0,
             storage_used_bytes: 0,
             is_hot: true,
+            validator_registered_height: None,
         }
     }
 

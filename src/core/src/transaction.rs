@@ -102,10 +102,48 @@ pub enum TxKind {
         signers: Vec<Vec<u8>>,
         signatures: Vec<Vec<u8>>,
     },
+
+    /// Feature 52: Submit a compute job to the network. Burns comme_budget.
+    SubmitJob {
+        job_spec_hash: [u8; 32],
+        resources: crate::compute::ResourceRequirements,
+        max_duration_secs: u64,
+        comme_budget: Amount,
+        l2_id: Option<String>,
+    },
+
+    /// Feature 53: Validator claims a pending compute job.
+    ClaimJob {
+        job_id: [u8; 32],
+    },
+
+    /// Feature 54: Executor submits result hash for a compute job.
+    CompleteJob {
+        job_id: [u8; 32],
+        result_hash: [u8; 32],
+    },
+
+    /// Feature 55: Verifier disputes a job result.
+    DisputeJob {
+        job_id: [u8; 32],
+        evidence_hash: [u8; 32],
+    },
 }
 
 /// Minimum transaction fee in raw units (0.0001 COMME = 100_000 raw units).
 pub const MINIMUM_FEE: u64 = 100_000;
+
+/// Feature 13: Account creation cost — new accounts require a higher fee (0.001 COMME).
+pub const ACCOUNT_CREATION_FEE: u64 = 1_000_000;
+
+/// Feature 14: Dust limit — transfers below this amount are rejected (0.0001 COMME).
+pub const DUST_LIMIT: u64 = 10_000;
+
+/// Minimum balance required to register as a validator (0.1 COMME = 10_000_000 raw units).
+pub const MINIMUM_VALIDATOR_STAKE: u64 = 10_000_000;
+
+/// Number of blocks a newly registered validator must wait before participating in consensus.
+pub const VALIDATOR_COOLDOWN_BLOCKS: u64 = 10;
 
 /// A signed transaction on the Commputer network.
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -142,9 +180,10 @@ impl Transaction {
         match &self.kind {
             TxKind::BurstCompute { .. }
             | TxKind::MilestoneBurn { .. }
-            | TxKind::CharitableDonation { .. } => true,
+            | TxKind::CharitableDonation { .. }
+            | TxKind::SubmitJob { .. } => true,
             TxKind::Batch { operations } => operations.iter().any(|op| matches!(op,
-                TxKind::BurstCompute { .. } | TxKind::MilestoneBurn { .. } | TxKind::CharitableDonation { .. }
+                TxKind::BurstCompute { .. } | TxKind::MilestoneBurn { .. } | TxKind::CharitableDonation { .. } | TxKind::SubmitJob { .. }
             )),
             _ => false,
         }
@@ -188,6 +227,7 @@ impl Transaction {
             TxKind::BurstCompute { burn_amount, .. } => *burn_amount,
             TxKind::MilestoneBurn { burn_amount, .. } => *burn_amount,
             TxKind::CharitableDonation { burn_amount, .. } => *burn_amount,
+            TxKind::SubmitJob { comme_budget, .. } => *comme_budget,
             TxKind::Batch { operations } => {
                 let mut total = Amount::ZERO;
                 for op in operations {
@@ -196,6 +236,9 @@ impl Transaction {
                         | TxKind::MilestoneBurn { burn_amount, .. }
                         | TxKind::CharitableDonation { burn_amount, .. } => {
                             total = total.checked_add(*burn_amount).unwrap_or(total);
+                        }
+                        TxKind::SubmitJob { comme_budget, .. } => {
+                            total = total.checked_add(*comme_budget).unwrap_or(total);
                         }
                         _ => {}
                     }

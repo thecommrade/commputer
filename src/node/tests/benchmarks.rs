@@ -31,13 +31,11 @@ fn genesis_block() -> Block {
             epoch: 0,
             producer_public_key: vec![],
             signature: vec![],
-            checkpoint_hash: None,
-                chain_id: String::new(),
+            checkpoint_hash: None, chain_id: "test".to_string(),
         },
         transactions: vec![],
         proof_summaries: vec![],
-        compliance_summary: None,
-            epoch_summary: None,
+        compliance_summary: None, epoch_summary: None,
     }
 }
 
@@ -61,13 +59,11 @@ fn feature_204_benchmarks() {
                 epoch: 0,
                 producer_public_key: vec![],
                 signature: vec![],
-                checkpoint_hash: None,
-                chain_id: String::new(),
+                checkpoint_hash: None, chain_id: "test".to_string(),
             },
             transactions: vec![],
             proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         sign_block(&mut block, &wallet);
 
@@ -164,13 +160,11 @@ fn feature_204_benchmarks() {
                     epoch: 0,
                     producer_public_key: vec![],
                     signature: vec![],
-                    checkpoint_hash: None,
-                chain_id: String::new(),
+                    checkpoint_hash: None, chain_id: "test".to_string(),
                 },
                 transactions: vec![],
                 proof_summaries: vec![],
-                compliance_summary: None,
-            epoch_summary: None,
+                compliance_summary: None, epoch_summary: None,
             };
             state.apply_block(&block).unwrap();
         }
@@ -234,13 +228,11 @@ fn feature_206_stress_test_transactions() {
                 epoch: 0,
                 producer_public_key: vec![],
                 signature: vec![],
-                checkpoint_hash: None,
-                chain_id: String::new(),
+                checkpoint_hash: None, chain_id: "test".to_string(),
             },
             transactions: chunk.to_vec(),
             proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         state.apply_block(&block).unwrap();
         block_height += 1;

@@ -161,7 +161,10 @@ impl ConsensusManager {
 
             // Single-candidate fast-path: no need for multi-round voting.
             if state.candidates.len() == 1 {
-                let hash = *state.candidates.keys().next().unwrap();
+                let hash = match state.candidates.keys().next() {
+                    Some(h) => *h,
+                    None => return false,
+                };
                 let mut responses = HashMap::new();
                 responses.insert(hash, self.params.sample_size);
                 for _ in 0..self.params.decision_threshold {
@@ -175,8 +178,11 @@ impl ConsensusManager {
             if let Some(start) = self.height_start_time.get(&height) {
                 if start.elapsed().as_secs() >= CONSENSUS_TIMEOUT_SECS {
                     // Force finalize on the current preference or first candidate.
-                    let hash = state.voter.preference()
-                        .unwrap_or_else(|| *state.candidates.keys().next().unwrap());
+                    let hash = match state.voter.preference()
+                        .or_else(|| state.candidates.keys().next().copied()) {
+                        Some(h) => h,
+                        None => return false, // no candidates at all
+                    };
                     let mut responses = HashMap::new();
                     responses.insert(hash, self.params.sample_size);
                     for _ in 0..self.params.decision_threshold {
@@ -306,8 +312,7 @@ mod tests {
             },
             transactions: vec![],
             proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
         }
     }
 

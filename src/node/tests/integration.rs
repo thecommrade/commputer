@@ -22,13 +22,11 @@ fn test_block() -> Block {
             epoch: 0,
             producer_public_key: vec![],
             signature: vec![],
-            checkpoint_hash: None,
-                chain_id: String::new(),
+            checkpoint_hash: None, chain_id: String::new(),
         },
         transactions: vec![],
         proof_summaries: vec![],
-        compliance_summary: None,
-            epoch_summary: None,
+        compliance_summary: None, epoch_summary: None,
     }
 }
 
@@ -168,13 +166,11 @@ async fn fork_competing_blocks_propagate() {
             epoch: 0,
             producer_public_key: vec![],
             signature: vec![],
-            checkpoint_hash: None,
-                chain_id: String::new(),
+            checkpoint_hash: None, chain_id: String::new(),
         },
         transactions: vec![],
         proof_summaries: vec![],
-        compliance_summary: None,
-            epoch_summary: None,
+        compliance_summary: None, epoch_summary: None,
     };
 
     let block_b = Block {
@@ -189,13 +185,11 @@ async fn fork_competing_blocks_propagate() {
             epoch: 0,
             producer_public_key: vec![],
             signature: vec![],
-            checkpoint_hash: None,
-                chain_id: String::new(),
+            checkpoint_hash: None, chain_id: String::new(),
         },
         transactions: vec![],
         proof_summaries: vec![],
-        compliance_summary: None,
-            epoch_summary: None,
+        compliance_summary: None, epoch_summary: None,
     };
 
     let hash_a = block_a.hash();

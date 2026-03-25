@@ -29,8 +29,9 @@ axum = { workspace = true }
 reqwest = { workspace = true }
 flate2 = { workspace = true }
 tar = "0.4"
-rayon = "1.11.0"
+rayon = "1"
 rand.workspace = true
+chrono = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

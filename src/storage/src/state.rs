@@ -90,6 +90,19 @@ impl Default for RetentionPolicy {
     }
 }
 
+/// Feature 10: Per-validator performance tracking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ValidatorPerformance {
+    /// Number of blocks produced by this validator.
+    pub blocks_produced: u64,
+    /// Number of proof challenges passed.
+    pub proofs_passed: u64,
+    /// Total uptime in seconds.
+    pub uptime_secs: u64,
+    /// Last block height at which this validator was active.
+    pub last_active_height: u64,
+}
+
 /// Feature 122: Finality depth — blocks older than this many confirmations cannot be reorged.
 pub const FINALITY_DEPTH: u64 = 10;
 
@@ -133,6 +146,8 @@ pub struct ChainState {
     pub retention_policy: RetentionPolicy,
     /// Feature 182: Snapshot height (the height at which the latest snapshot was taken).
     pub snapshot_height: u64,
+    /// Feature 10: Per-validator performance history.
+    pub validator_performance: HashMap<Address, ValidatorPerformance>,
 }
 
 // Manual Debug impl since RocksStore doesn't derive Debug.
@@ -150,6 +165,7 @@ impl std::fmt::Debug for ChainState {
             .field("state_diffs", &self.state_diffs.len())
             .field("archived_accounts", &self.archived_accounts.len())
             .field("snapshot_height", &self.snapshot_height)
+            .field("validator_performance", &self.validator_performance.len())
             .finish()
     }
 }
@@ -176,6 +192,7 @@ impl ChainState {
             archived_accounts: HashMap::new(),
             retention_policy: RetentionPolicy::default(),
             snapshot_height: 0,
+            validator_performance: HashMap::new(),
         }
     }
 
@@ -239,6 +256,7 @@ impl ChainState {
             archived_accounts: HashMap::new(),
             retention_policy: RetentionPolicy::default(),
             snapshot_height: 0,
+            validator_performance: HashMap::new(),
         })
     }
 
@@ -387,6 +405,13 @@ impl ChainState {
             self.state_diffs.insert(block.height(), diff);
         }
 
+        // Feature 10: Track validator performance for block producer.
+        if block.height() > 0 {
+            let perf = self.validator_performance.entry(block.header.producer).or_default();
+            perf.blocks_produced += 1;
+            perf.last_active_height = block.height();
+        }
+
         // Store block.
         self.blocks.put(block.clone());
 
@@ -421,6 +446,16 @@ impl ChainState {
                     return Err(StateError::InvalidBlock("parent hash mismatch".into()));
                 }
             }
+        }
+
+        // Verify chain_id (allow empty for backwards compat).
+        if !block.header.chain_id.is_empty()
+            && block.header.chain_id != commputer_core::genesis::TESTNET_CHAIN_ID
+            && block.header.chain_id != commputer_core::genesis::MAINNET_CHAIN_ID
+        {
+            return Err(StateError::InvalidBlock(format!(
+                "invalid chain_id: {}", block.header.chain_id
+            )));
         }
 
         // Verify merkle roots match block contents.
@@ -496,6 +531,26 @@ impl ChainState {
             }
         }
 
+        // Feature 14: Reject dust transfers before taking mutable borrow on sender.
+        if let TxKind::Transfer { amount, .. } = &tx.kind {
+            if amount.raw() < commputer_core::transaction::DUST_LIMIT {
+                return Err(StateError::InvalidBlock(format!(
+                    "transfer amount {} below dust limit of {}",
+                    amount.raw(), commputer_core::transaction::DUST_LIMIT,
+                )));
+            }
+        }
+        // Feature 13: Account creation cost — check before mutable sender borrow.
+        if let TxKind::Transfer { to, .. } = &tx.kind {
+            let recipient_exists = self.accounts.get(to).is_some();
+            if !recipient_exists && tx.fee < commputer_core::transaction::ACCOUNT_CREATION_FEE {
+                return Err(StateError::InvalidBlock(format!(
+                    "transfer to new account requires fee >= {} (account creation cost), got {}",
+                    commputer_core::transaction::ACCOUNT_CREATION_FEE, tx.fee,
+                )));
+            }
+        }
+
         let current_epoch = self.current_epoch;
         let sender = self.accounts.get_or_create(tx.from);
         // Feature 183: Mark sender as active.
@@ -558,14 +613,17 @@ impl ChainState {
             }
 
             TxKind::ValidatorRegister { .. } => {
-                // Feature 8: Minimum stake for validators (0.1 COMME).
-                if sender.balance.raw() < commputer_core::block::MINIMUM_STAKE {
+                // Feature 4: Check minimum validator stake.
+                if sender.balance.raw() < commputer_core::transaction::MINIMUM_VALIDATOR_STAKE {
                     return Err(StateError::InvalidBlock(format!(
-                        "validator registration requires minimum stake of {} raw units, have {}",
-                        commputer_core::block::MINIMUM_STAKE, sender.balance.raw()
+                        "insufficient balance for validator registration: need {} raw, have {}",
+                        commputer_core::transaction::MINIMUM_VALIDATOR_STAKE,
+                        sender.balance.raw(),
                     )));
                 }
                 sender.is_validator = true;
+                // Feature 5: Record registration height for cooldown.
+                sender.validator_registered_height = Some(self.blocks.height());
                 sender.nonce += 1;
             }
 
@@ -718,6 +776,50 @@ impl ChainState {
                 }
                 sender.nonce += 1;
             }
+
+            TxKind::SubmitJob { comme_budget, .. } => {
+                // Feature 52: Submit a compute job — verify budget and burn.
+                if comme_budget.raw() < commputer_core::compute::MIN_JOB_BUDGET {
+                    return Err(StateError::InvalidBlock(format!(
+                        "compute job budget {} below minimum {}",
+                        comme_budget.raw(),
+                        commputer_core::compute::MIN_JOB_BUDGET
+                    )));
+                }
+                let sender_balance = sender.balance;
+                if sender_balance.raw() < comme_budget.raw() {
+                    return Err(StateError::InsufficientBalance);
+                }
+                sender.balance = sender_balance.checked_sub(*comme_budget)
+                    .ok_or(StateError::InsufficientBalance)?;
+                sender.nonce += 1;
+                self.total_burned = self.total_burned.saturating_add(comme_budget.raw());
+            }
+
+            TxKind::ClaimJob { .. } => {
+                // Feature 53: Validator claims a pending compute job.
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can claim compute jobs".into(),
+                    ));
+                }
+                sender.nonce += 1;
+            }
+
+            TxKind::CompleteJob { .. } => {
+                // Feature 54: Executor submits result hash.
+                sender.nonce += 1;
+            }
+
+            TxKind::DisputeJob { .. } => {
+                // Feature 55: Verifier disputes a job result.
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can dispute compute jobs".into(),
+                    ));
+                }
+                sender.nonce += 1;
+            }
         }
 
         Ok(())
@@ -761,6 +863,44 @@ impl ChainState {
                 sender.total_burned = sender.total_burned.checked_add(*burn_amount)
                     .ok_or(StateError::Overflow)?;
                 self.total_burned = self.total_burned.saturating_add(burn_amount.raw());
+            }
+            TxKind::SubmitJob { comme_budget, .. } => {
+                // Feature 52: SubmitJob in batch — verify budget and burn.
+                if comme_budget.raw() < commputer_core::compute::MIN_JOB_BUDGET {
+                    return Err(StateError::InvalidBlock(format!(
+                        "compute job budget {} below minimum {}",
+                        comme_budget.raw(),
+                        commputer_core::compute::MIN_JOB_BUDGET
+                    )));
+                }
+                let sender = self.accounts.get_or_create(from);
+                if sender.balance.raw() < comme_budget.raw() {
+                    return Err(StateError::InsufficientBalance);
+                }
+                sender.balance = sender.balance.checked_sub(*comme_budget)
+                    .ok_or(StateError::InsufficientBalance)?;
+                self.total_burned = self.total_burned.saturating_add(comme_budget.raw());
+            }
+            TxKind::ClaimJob { .. } => {
+                // Feature 53: ClaimJob in batch — verify validator.
+                let sender = self.accounts.get_or_create(from);
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can claim compute jobs".into(),
+                    ));
+                }
+            }
+            TxKind::CompleteJob { .. } => {
+                // Feature 54: CompleteJob in batch — no-op beyond nonce (handled at batch level).
+            }
+            TxKind::DisputeJob { .. } => {
+                // Feature 55: DisputeJob in batch — verify validator.
+                let sender = self.accounts.get_or_create(from);
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can dispute compute jobs".into(),
+                    ));
+                }
             }
             // Nested batches are not allowed.
             TxKind::Batch { .. } => {
@@ -1398,8 +1538,7 @@ mod tests {
             },
             transactions: vec![],
             proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
         }
     }
 
@@ -1452,19 +1591,22 @@ mod tests {
                     to: addr(2),
                     amount: Amount::from_comme(33),
                 },
-                fee: 0,
+                fee: commputer_core::transaction::ACCOUNT_CREATION_FEE, // new account requires creation fee
                 signature: vec![],
                 public_key: vec![],
                 memo: None,
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         state.apply_block(&block).unwrap();
 
-        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_comme(67));
+        // Sender: 100 COMME - 33 COMME - account_creation_fee (burned)
+        let expected_sender_raw = Amount::from_comme(100).raw()
+            - Amount::from_comme(33).raw()
+            - commputer_core::transaction::ACCOUNT_CREATION_FEE;
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(expected_sender_raw));
         assert_eq!(state.accounts.get(&addr(2)).unwrap().balance, Amount::from_comme(33));
     }
 
@@ -1507,8 +1649,7 @@ mod tests {
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         state.apply_block(&block).unwrap();
 
@@ -1557,8 +1698,7 @@ mod tests {
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         state.apply_block(&block).unwrap();
 
@@ -1607,8 +1747,7 @@ mod tests {
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         assert!(state.apply_block(&block).is_err());
     }
@@ -1671,7 +1810,7 @@ mod tests {
                     producer_public_key: vec![],
                     signature: vec![],
                     checkpoint_hash: None,
-                chain_id: String::new(),
+                    chain_id: "test".to_string(),
                 },
                 transactions: vec![Transaction {
                     from: addr(1),
@@ -1680,15 +1819,14 @@ mod tests {
                         to: addr(2),
                         amount: Amount::from_comme(33),
                     },
-                    fee: 0,
+                    fee: commputer_core::transaction::ACCOUNT_CREATION_FEE,
                     signature: vec![],
                     public_key: vec![],
                     memo: None,
                     timelock: None,
                 }],
                 proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
             };
             state.apply_block(&block).unwrap();
             // Flush accounts (apply_block persists blocks and meta, but
@@ -1701,9 +1839,12 @@ mod tests {
             let state = ChainState::open(dir.path()).unwrap();
             assert_eq!(state.blocks.height(), 1);
             assert_eq!(state.blocks.len(), 2);
+            let expected_sender_raw = Amount::from_comme(100).raw()
+                - Amount::from_comme(33).raw()
+                - commputer_core::transaction::ACCOUNT_CREATION_FEE;
             assert_eq!(
                 state.accounts.get(&addr(1)).unwrap().balance,
-                Amount::from_comme(67),
+                Amount::from_raw(expected_sender_raw),
             );
             assert_eq!(
                 state.accounts.get(&addr(2)).unwrap().balance,
@@ -1760,8 +1901,7 @@ mod tests {
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         assert!(state.apply_block_validated(&block).is_err());
     }
@@ -1786,7 +1926,7 @@ mod tests {
                 to: addr(2),
                 amount: Amount::from_comme(10),
             },
-            fee: 0,
+            fee: commputer_core::transaction::ACCOUNT_CREATION_FEE,
             signature: vec![],
             public_key: vec![],
             memo: None,
@@ -1811,8 +1951,7 @@ mod tests {
             },
             transactions: vec![tx],
             proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
         // Compute correct merkle roots before validation.
         block.header.tx_root = block.compute_tx_root();
@@ -1936,12 +2075,11 @@ mod tests {
                     producer_public_key: vec![],
                     signature: vec![],
                     checkpoint_hash: None,
-                chain_id: String::new(),
+                    chain_id: "test".to_string(),
                 },
                 transactions: vec![],
                 proof_summaries: vec![],
-                compliance_summary: None,
-            epoch_summary: None,
+                compliance_summary: None, epoch_summary: None,
             };
             state.apply_block(&block).unwrap();
         }
@@ -2049,8 +2187,7 @@ mod tests {
                 timelock: None,
             }],
             proof_summaries: vec![],
-            compliance_summary: None,
-            epoch_summary: None,
+            compliance_summary: None, epoch_summary: None,
         };
 
         state.apply_block(&block).unwrap();
@@ -2133,5 +2270,132 @@ mod tests {
         assert!(contact_hashes.contains(&[1u8; 32]));
         assert!(contact_hashes.contains(&[2u8; 32]));
         assert!(contact_hashes.contains(&[3u8; 32]));
+    }
+
+    #[test]
+    fn feature_14_dust_limit_rejects_tiny_transfer() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let sender = state.accounts.get_or_create(addr(1));
+        sender.balance = Amount::from_comme(100);
+        // Pre-create recipient so account creation fee is not the issue.
+        let _recipient = state.accounts.get_or_create(addr(2));
+
+        let block = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                timestamp: 2000, producer: addr(0), epoch: 0,
+                producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
+                chain_id: String::new(),
+            },
+            transactions: vec![Transaction {
+                from: addr(1), nonce: 0,
+                kind: TxKind::Transfer { to: addr(2), amount: Amount::from_raw(5_000) },
+                fee: 100_000, signature: vec![], public_key: vec![],
+                memo: None, timelock: None,
+            }],
+            proof_summaries: vec![], compliance_summary: None, epoch_summary: None,
+        };
+        let result = state.apply_block(&block);
+        assert!(result.is_err(), "Dust transfer should be rejected");
+        assert!(result.unwrap_err().to_string().contains("dust limit"));
+    }
+
+    #[test]
+    fn feature_13_account_creation_cost() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let sender = state.accounts.get_or_create(addr(1));
+        sender.balance = Amount::from_comme(100);
+
+        let block = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                timestamp: 2000, producer: addr(0), epoch: 0,
+                producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
+                chain_id: String::new(),
+            },
+            transactions: vec![Transaction {
+                from: addr(1), nonce: 0,
+                kind: TxKind::Transfer { to: addr(99), amount: Amount::from_comme(1) },
+                fee: 100_000, // below ACCOUNT_CREATION_FEE
+                signature: vec![], public_key: vec![], memo: None, timelock: None,
+            }],
+            proof_summaries: vec![], compliance_summary: None, epoch_summary: None,
+        };
+        let result = state.apply_block(&block);
+        assert!(result.is_err(), "Transfer to new account with low fee should fail");
+        assert!(result.unwrap_err().to_string().contains("account creation cost"));
+    }
+
+    #[test]
+    fn validator_register_requires_minimum_stake() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        // Fund sender with less than MINIMUM_VALIDATOR_STAKE.
+        let sender_addr = addr(1);
+        let acct = state.accounts.get_or_create(sender_addr);
+        acct.balance = Amount::from_raw(commputer_core::transaction::MINIMUM_VALIDATOR_STAKE - 1);
+
+        let block = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                timestamp: 2000, producer: addr(0), epoch: 0,
+                producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
+                chain_id: String::new(),
+            },
+            transactions: vec![Transaction {
+                from: sender_addr,
+                nonce: 0,
+                kind: TxKind::ValidatorRegister {
+                    hardware_fingerprint_hash: [0u8; 32],
+                    contribution_percent: 100,
+                },
+                fee: 0,
+                signature: vec![], public_key: vec![], memo: None, timelock: None,
+            }],
+            proof_summaries: vec![],
+            compliance_summary: None, epoch_summary: None,
+        };
+        let result = state.apply_block(&block);
+        assert!(result.is_err(), "Validator register with insufficient stake should fail");
+
+        // Now fund with enough and try again.
+        let acct = state.accounts.get_or_create(sender_addr);
+        acct.balance = Amount::from_raw(commputer_core::transaction::MINIMUM_VALIDATOR_STAKE);
+
+        let block2 = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                timestamp: 3000, producer: addr(0), epoch: 0,
+                producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
+                chain_id: String::new(),
+            },
+            transactions: vec![Transaction {
+                from: sender_addr,
+                nonce: 0,
+                kind: TxKind::ValidatorRegister {
+                    hardware_fingerprint_hash: [0u8; 32],
+                    contribution_percent: 100,
+                },
+                fee: 0,
+                signature: vec![], public_key: vec![], memo: None, timelock: None,
+            }],
+            proof_summaries: vec![],
+            compliance_summary: None, epoch_summary: None,
+        };
+        state.apply_block(&block2).expect("Validator register with sufficient stake should succeed");
+        assert!(state.accounts.get(&sender_addr).unwrap().is_validator);
     }
 }

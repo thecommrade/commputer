@@ -36,12 +36,11 @@ pub fn test_block_with_parent(height: u64, parent: BlockHash) -> Block {
             producer_public_key: vec![],
             signature: vec![],
             checkpoint_hash: None,
-                chain_id: String::new(),
+            chain_id: "test".to_string(),
         },
         transactions: vec![],
         proof_summaries: vec![],
-        compliance_summary: None,
-            epoch_summary: None,
+        compliance_summary: None, epoch_summary: None,
     }
 }
 
@@ -61,12 +60,11 @@ pub fn test_block_with_producer(height: u64, producer: Address) -> Block {
             producer_public_key: vec![],
             signature: vec![],
             checkpoint_hash: None,
-                chain_id: String::new(),
+            chain_id: "test".to_string(),
         },
         transactions: vec![],
         proof_summaries: vec![],
-        compliance_summary: None,
-            epoch_summary: None,
+        compliance_summary: None, epoch_summary: None,
     }
 }
 
@@ -104,11 +102,10 @@ pub fn genesis_block() -> Block {
             producer_public_key: vec![],
             signature: vec![],
             checkpoint_hash: None,
-                chain_id: String::new(),
+            chain_id: "test".to_string(),
         },
         transactions: vec![],
         proof_summaries: vec![],
-        compliance_summary: None,
-            epoch_summary: None,
+        compliance_summary: None, epoch_summary: None,
     }
 }

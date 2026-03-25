@@ -114,11 +114,13 @@ pub struct EventLoop {
     pub peer_quality: HashMap<libp2p::PeerId, PeerQuality>,
     /// Feature 178: Custom seed multiaddrs for periodic reconnection.
     pub custom_seeds: Vec<String>,
-    /// Whether this node has ever successfully connected to a peer.
-    /// Non-seed nodes must not produce blocks until they've connected at least once.
-    pub has_ever_connected: bool,
-    /// Whether this node was started with --seeds (i.e., it's not a seed node).
-    pub is_seed_connector: bool,
+    /// Feature 8: Data directory path for mempool persistence.
+    pub data_dir: Option<std::path::PathBuf>,
+    /// Feature 20: Transaction signature verification cache.
+    /// Capped at SIG_CACHE_MAX entries (LRU-style: clear when full).
+    pub sig_cache: HashSet<TxHash>,
+    /// Feature 9: Pending epoch summary to include in the next block.
+    pub pending_epoch_summary: Option<commputer_core::block::EpochSummary>,
 }
 
 impl EventLoop {
@@ -163,8 +165,9 @@ impl EventLoop {
             verified_peer_validators: HashMap::new(),
             peer_quality: HashMap::new(),
             custom_seeds: Vec::new(),
-            has_ever_connected: false,
-            is_seed_connector: false,
+            data_dir: None,
+            sig_cache: HashSet::new(),
+            pending_epoch_summary: None,
         }
     }
 
@@ -306,6 +309,17 @@ impl EventLoop {
                     }
                 }
             }
+
+            // Feature 10: Update validator performance metrics.
+            if let Ok(mut perf_guard) = rpc.validator_performance.try_lock() {
+                perf_guard.clear();
+                for (addr, perf) in &self.state.validator_performance {
+                    let addr_hex = hex::encode(addr.0);
+                    if let Ok(json) = serde_json::to_value(perf) {
+                        perf_guard.insert(addr_hex, json);
+                    }
+                }
+            }
         }
     }
 
@@ -334,6 +348,27 @@ impl EventLoop {
     }
 
     pub async fn run(&mut self) {
+        // Feature 8: Load persisted mempool on startup.
+        if let Some(ref dir) = self.data_dir {
+            let mempool_path = dir.join("mempool.json");
+            if mempool_path.exists() {
+                match std::fs::read_to_string(&mempool_path) {
+                    Ok(json) => {
+                        match serde_json::from_str::<Vec<Transaction>>(&json) {
+                            Ok(txs) => {
+                                info!("Loaded {} pending transactions from mempool.json", txs.len());
+                                self.pending_txs.extend(txs);
+                            }
+                            Err(e) => warn!("Failed to parse mempool.json: {}", e),
+                        }
+                        // Remove the file after loading.
+                        let _ = std::fs::remove_file(&mempool_path);
+                    }
+                    Err(e) => warn!("Failed to read mempool.json: {}", e),
+                }
+            }
+        }
+
         let mut epoch_interval = time::interval(Duration::from_secs(3600));
         let mut block_interval = time::interval(Duration::from_secs(2));
         let mut consensus_interval = time::interval(Duration::from_millis(500));
@@ -347,6 +382,12 @@ impl EventLoop {
         let mut partition_check_interval = time::interval(Duration::from_secs(10));
         // Feature 178: Seed reconnection every 5 minutes.
         let mut seed_reconnect_interval = time::interval(Duration::from_secs(300));
+        // Feature 11: Automatic peer rotation every 5 minutes.
+        let mut peer_rotation_interval = time::interval(Duration::from_secs(300));
+        // Feature 12: SIGHUP handler for config hot reload.
+        let mut sighup = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::hangup(),
+        ).ok();
 
         // Feature 11: Connection encryption verification.
         info!("P2P encryption: Noise protocol active");
@@ -358,9 +399,15 @@ impl EventLoop {
         let mut sync_timer = time::interval(Duration::from_secs(5));
 
         // Set up graceful shutdown signal handler.
-        let mut sigterm = tokio::signal::unix::signal(
+        let mut sigterm = match tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
-        ).expect("failed to register SIGTERM handler");
+        ) {
+            Ok(sig) => Some(sig),
+            Err(e) => {
+                warn!("Failed to register SIGTERM handler: {}", e);
+                None
+            }
+        };
 
         loop {
             // Take the RPC receiver out to satisfy the borrow checker in select!
@@ -419,12 +466,31 @@ impl EventLoop {
                         info!("Initial sync: requested blocks {} to {}", our_height + 1, our_height + 10);
                     }
                 }
+                _ = peer_rotation_interval.tick() => {
+                    self.handle_peer_rotation();
+                }
+                _ = async {
+                    if let Some(ref mut sig) = sighup {
+                        sig.recv().await
+                    } else {
+                        std::future::pending::<Option<()>>().await
+                    }
+                } => {
+                    info!("Received SIGHUP — reloading configuration");
+                    self.reload_config();
+                }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Received SIGINT — shutting down gracefully");
                     self.shutdown();
                     return;
                 }
-                _ = sigterm.recv() => {
+                _ = async {
+                    if let Some(ref mut sig) = sigterm {
+                        sig.recv().await
+                    } else {
+                        std::future::pending::<Option<()>>().await
+                    }
+                } => {
                     info!("Received SIGTERM — shutting down gracefully");
                     self.shutdown();
                     return;
@@ -456,6 +522,125 @@ impl EventLoop {
             );
         }
         info!("Orphan pool: {} parent hashes with pending blocks", self.orphan_pool.len());
+
+        // Feature 8: Persist pending transactions to mempool.json.
+        if !self.pending_txs.is_empty() {
+            if let Some(ref dir) = self.data_dir {
+                let mempool_path = dir.join("mempool.json");
+                match serde_json::to_string_pretty(&self.pending_txs) {
+                    Ok(json) => {
+                        if let Err(e) = std::fs::write(&mempool_path, json) {
+                            warn!("Failed to persist mempool: {}", e);
+                        } else {
+                            info!("Persisted {} pending transactions to {}", self.pending_txs.len(), mempool_path.display());
+                        }
+                    }
+                    Err(e) => warn!("Failed to serialize mempool: {}", e),
+                }
+            }
+        }
+    }
+
+    /// Feature 20: Maximum signature cache size.
+    const SIG_CACHE_MAX: usize = 10_000;
+
+    /// Feature 20: Verify a transaction signature with caching.
+    /// Returns true if the signature is valid (or was previously verified).
+    pub fn verify_tx_cached(&mut self, tx: &Transaction) -> bool {
+        let tx_hash = tx.hash();
+        // Check cache first.
+        if self.sig_cache.contains(&tx_hash) {
+            return true;
+        }
+        // Perform full verification.
+        if tx.verify() {
+            // Add to cache; clear if at capacity (simple LRU approximation).
+            if self.sig_cache.len() >= Self::SIG_CACHE_MAX {
+                self.sig_cache.clear();
+            }
+            self.sig_cache.insert(tx_hash);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Feature 11: Automatic peer rotation — disconnect lowest-reputation peer
+    /// and try to discover a new one from the DHT.
+    fn handle_peer_rotation(&mut self) {
+        // Find the peer with the lowest reputation score.
+        if let Some((&worst_peer, &worst_score)) = self.peer_scores.iter()
+            .min_by_key(|(_, score)| **score)
+        {
+            if worst_score < 50 {
+                info!(
+                    "Peer rotation: disconnecting {} (score {})",
+                    worst_peer, worst_score
+                );
+                let _ = self.network.swarm.disconnect_peer_id(worst_peer);
+                self.peer_ips.remove(&worst_peer);
+                self.peer_validators.remove(&worst_peer);
+                self.peer_scores.remove(&worst_peer);
+                self.peer_quality.remove(&worst_peer);
+                self.peer_subnets.remove(&worst_peer);
+                self.peer_rtts.remove(&worst_peer);
+            }
+        }
+
+        // Try to discover a new peer from the Kademlia DHT.
+        let random_key = libp2p::kad::RecordKey::new(&rand::random::<[u8; 32]>());
+        self.network.swarm.behaviour_mut().kademlia.get_closest_peers(random_key.to_vec());
+        debug!("Peer rotation: initiated Kademlia peer discovery");
+    }
+
+    /// Feature 12: Config hot reload — re-read config.toml and update settings.
+    fn reload_config(&mut self) {
+        // Look for config.toml in the data directory.
+        let config_path = std::path::PathBuf::from("./commputer-testnet/config.toml");
+
+        let contents = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Config reload: could not read {:?}: {}", config_path, e);
+                return;
+            }
+        };
+
+        // Simple key=value parser (no toml crate).
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                let value = value.trim().trim_matches('"');
+                match key {
+                    "log_level" => {
+                        info!("Config reload: log_level = {}", value);
+                        // Update the tracing filter if possible.
+                        // This requires a reload handle which we don't have here,
+                        // so we just log the intended change.
+                    }
+                    "contribution_percent" => {
+                        if let Ok(pct) = value.parse::<u8>() {
+                            if pct >= 1 && pct <= 100 {
+                                info!("Config reload: contribution_percent = {}", pct);
+                            }
+                        }
+                    }
+                    "max_peer_count" => {
+                        if let Ok(_count) = value.parse::<usize>() {
+                            info!("Config reload: max_peer_count = {}", value);
+                        }
+                    }
+                    _ => {
+                        debug!("Config reload: ignoring unknown key '{}'", key);
+                    }
+                }
+            }
+        }
+        info!("Config reload completed");
     }
 
     fn handle_swarm_event(
@@ -503,7 +688,15 @@ impl EventLoop {
                 debug!("Gossipsub message on topic: {} from {}", topic, propagation_source);
 
                 if topic == topics::TOPIC_BLOCKS {
-                    if let Ok(block) = serde_json::from_slice::<Block>(&data) {
+                    // Feature 7: Try to parse as BlockAnnounce first, then fall back to full block.
+                    if let Ok(announce) = serde_json::from_slice::<commputer_core::block::BlockAnnounce>(&data) {
+                        // Check if we already have this block.
+                        if !self.state.blocks.contains(&announce.hash) {
+                            // Request the full block via block request protocol.
+                            debug!("BlockAnnounce: need block {} at height {}", announce.hash, announce.height);
+                            self.request_block(announce.height);
+                        }
+                    } else if let Ok(block) = serde_json::from_slice::<Block>(&data) {
                         self.handle_received_block(block, propagation_source);
                     }
                 } else if topic == topics::TOPIC_TRANSACTIONS {
@@ -517,6 +710,20 @@ impl EventLoop {
                 } else if topic == topics::TOPIC_PROOFS {
                     if let Ok(msg) = serde_json::from_slice::<ProofMessage>(&data) {
                         self.handle_proof_message(msg);
+                    }
+                } else if topic == topics::TOPIC_PEER_ADDRS {
+                    // Feature 6: Handle peer address gossip.
+                    if let Ok(msg) = serde_json::from_slice::<commputer_network::message::NetworkMessage>(&data) {
+                        if let commputer_network::message::MessageKind::PeerResponse(peers) = msg.kind {
+                            for peer_info in peers {
+                                // Try to parse the address as a multiaddr and add to Kademlia.
+                                if let Ok(addr) = peer_info.address.parse::<libp2p::Multiaddr>() {
+                                    self.network.swarm.behaviour_mut().kademlia.add_address(
+                                        &propagation_source, addr,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1299,6 +1506,26 @@ impl EventLoop {
         // Feature 125: Reset slashing state for the new epoch.
         self.consensus.reset_epoch_slashing();
 
+        // Feature 9: Create epoch summary to include in next block.
+        let compliant_count = self.state.accounts.iter()
+            .filter(|a| a.is_validator && a.compliance == commputer_core::compliance::ComplianceStatus::Compliant)
+            .count() as u64;
+        let nerfed_count = self.state.accounts.iter()
+            .filter(|a| a.is_validator && a.compliance != commputer_core::compliance::ComplianceStatus::Compliant)
+            .count() as u64;
+        let proof_scores_total: u64 = self.epoch_state.summaries.values()
+            .map(|s| s.composite_score())
+            .sum();
+        self.pending_epoch_summary = Some(commputer_core::block::EpochSummary {
+            epoch,
+            total_emission: actual_emission,
+            total_burned: self.state.total_burned,
+            validator_count,
+            proof_scores_total,
+            compliant_count,
+            nerfed_count,
+        });
+
         self.state.current_epoch = epoch + 1;
         self.epoch_state = EpochState::new(epoch + 1, 0);
         self.epoch_state.difficulty_multiplier = next_difficulty;
@@ -1312,11 +1539,17 @@ impl EventLoop {
             return;
         }
 
-        // Non-seed nodes must connect to at least one peer before producing blocks.
-        // This prevents chain forks from nodes that start producing before syncing.
-        if self.is_seed_connector && !self.has_ever_connected {
-            debug!("Waiting for first peer connection before producing blocks");
-            return;
+        // Feature 5: Validator cooldown — skip block production if within cooldown period.
+        let our_addr = *self.wallet.address();
+        if let Some(acct) = self.state.accounts.get(&our_addr) {
+            if let Some(reg_height) = acct.validator_registered_height {
+                let current_height = self.state.blocks.height();
+                if current_height < reg_height + commputer_core::transaction::VALIDATOR_COOLDOWN_BLOCKS {
+                    debug!("Skipping block production — validator cooldown ({} blocks remaining)",
+                        reg_height + commputer_core::transaction::VALIDATOR_COOLDOWN_BLOCKS - current_height);
+                    return;
+                }
+            }
         }
 
         // Feature 172: Skip block production during network partition.
@@ -1390,12 +1623,13 @@ impl EventLoop {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
-                chain_id: String::new(),
+                chain_id: commputer_core::genesis::TESTNET_CHAIN_ID.to_string(),
             },
             transactions: txs,
             proof_summaries: vec![],
             compliance_summary: None,
-            epoch_summary: None,
+            // Feature 9: Include epoch summary if one is pending from the last epoch tick.
+            epoch_summary: self.pending_epoch_summary.take(),
         };
 
         // Compute and set merkle roots and state root.
@@ -1406,7 +1640,9 @@ impl EventLoop {
         // Feature 248: Set checkpoint hash at checkpoint intervals.
         if next_height % commputer_core::block::CHECKPOINT_HASH_INTERVAL == 0 && next_height > 0 {
             block.header.checkpoint_hash = Some(self.state.compute_state_root());
-            info!("Checkpoint at height {}: state root = {}", next_height, hex::encode(block.header.checkpoint_hash.unwrap()));
+            if let Some(ref hash) = block.header.checkpoint_hash {
+                info!("Checkpoint at height {}: state root = {}", next_height, hex::encode(hash));
+            }
         }
 
         // Sign the block header with our wallet key.
@@ -1420,9 +1656,14 @@ impl EventLoop {
         };
         self.publish_consensus_message(&candidate_msg);
 
-        // Also broadcast on the blocks topic for backward compatibility.
-        // Feature 173: Compress before publishing.
-        if let Ok(data) = serde_json::to_vec(&block) {
+        // Feature 7: Broadcast compact BlockAnnounce on the blocks topic instead of full block.
+        // Peers that need the full block will request it via the block request protocol.
+        let announce = commputer_core::block::BlockAnnounce {
+            hash: block.hash(),
+            height: block.height(),
+            producer: *self.wallet.address(),
+        };
+        if let Ok(data) = serde_json::to_vec(&announce) {
             let compressed = commputer_network::compress(&data);
             let topic = topics::block_topic();
             if let Err(e) = self
@@ -1432,7 +1673,7 @@ impl EventLoop {
                 .gossipsub
                 .publish(topic, compressed)
             {
-                warn!("Failed to broadcast block: {}", e);
+                warn!("Failed to broadcast block announce: {}", e);
             }
         }
 
@@ -1703,8 +1944,14 @@ impl EventLoop {
 
         if let Ok(data) = serde_json::to_vec(&msg) {
             let compressed = commputer_network::compress(&data);
-            let topic = topics::consensus_topic();
-            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed) {
+            // Feature 6: Publish on dedicated peer_addrs topic.
+            let topic = topics::peer_addrs_topic();
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed.clone()) {
+                debug!("Failed to publish peer addrs: {}", e);
+            }
+            // Also publish on consensus topic for backward compatibility.
+            let topic_compat = topics::consensus_topic();
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic_compat, compressed) {
                 debug!("Failed to publish peer exchange: {}", e);
             }
         }

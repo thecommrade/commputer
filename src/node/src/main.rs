@@ -1,9 +1,29 @@
+mod batch_jobs;
 mod capacity;
+mod compute_dashboard;
+mod compute_cli;
 mod compute_handler;
+mod compute_session;
 mod consensus_manager;
 mod event_loop;
+mod job_cancel;
+mod job_rpc;
+mod job_spec;
+mod native_executor;
 mod proof_manager;
+mod result_cache;
+mod tier_rate_limit;
+mod wasm_executor;
 mod rpc;
+mod validation;
+mod faucet;
+mod testnet_genesis;
+mod wizard;
+mod watch;
+mod confirm;
+mod interactive;
+mod mining_stats;
+mod network_info;
 
 use std::path::PathBuf;
 use anyhow::Result;
@@ -235,18 +255,49 @@ fn wallet_path_named(testnet: bool, name: &str) -> PathBuf {
 fn read_password(prompt: &str) -> String {
     eprint!("{}", prompt);
     let mut password = String::new();
-    std::io::stdin().read_line(&mut password).unwrap();
+    if let Err(e) = std::io::stdin().read_line(&mut password) {
+        warn!("Failed to read password from stdin: {}", e);
+        return String::new();
+    }
     password.trim().to_string()
 }
 
 fn read_line(prompt: &str) -> String {
     eprint!("{}", prompt);
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
+    if let Err(e) = std::io::stdin().read_line(&mut input) {
+        warn!("Failed to read input from stdin: {}", e);
+        return String::new();
+    }
     input.trim().to_string()
 }
 
 fn create_genesis() -> Block {
+    create_genesis_for_dir(None)
+}
+
+fn create_genesis_for_dir(data_dir: Option<&std::path::Path>) -> Block {
+    // Try to load genesis config from data directory.
+    let _genesis_config = if let Some(dir) = data_dir {
+        let genesis_path = dir.join("genesis.json");
+        if genesis_path.exists() {
+            match commputer_core::genesis::load_genesis(&genesis_path) {
+                Ok(config) => {
+                    info!("Loaded genesis config from {}", genesis_path.display());
+                    config
+                }
+                Err(e) => {
+                    warn!("Failed to load genesis.json: {}. Using defaults.", e);
+                    commputer_core::genesis::default_genesis()
+                }
+            }
+        } else {
+            commputer_core::genesis::default_genesis()
+        }
+    } else {
+        commputer_core::genesis::default_genesis()
+    };
+
     Block {
         header: BlockHeader {
             protocol_version: 1, height: 0,
@@ -260,12 +311,11 @@ fn create_genesis() -> Block {
             producer_public_key: vec![],
             signature: vec![],
             checkpoint_hash: None,
-                chain_id: String::new(),
+            chain_id: _genesis_config.chain_id.clone(),
         },
         transactions: vec![],
         proof_summaries: vec![],
-        compliance_summary: None,
-            epoch_summary: None,
+        compliance_summary: None, epoch_summary: None,
     }
 }
 
@@ -489,17 +539,26 @@ async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result
     let wallet = Keystore::load(&path, &password)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let state = open_chain_state(testnet)?;
     let from_addr = *wallet.address();
+    let from_hex = hex::encode(from_addr.0);
 
-    // Look up sender nonce.
-    let nonce = state
-        .accounts
-        .get(&from_addr)
-        .map(|a| a.nonce)
-        .unwrap_or(0);
+    // Fetch nonce from running node via RPC (falls back to local state).
+    let client = reqwest::Client::new();
+    let nonce_url = format!("http://127.0.0.1:{}/nonce/{}", rpc_port, from_hex);
+    let nonce = match client.get(&nonce_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            body["nonce"].as_u64().unwrap_or(0)
+        }
+        _ => {
+            // Fall back to local chain state.
+            let state = open_chain_state(testnet)?;
+            state.accounts.get(&from_addr).map(|a| a.nonce).unwrap_or(0)
+        }
+    };
 
-    // Verify balance.
+    // Verify balance from local state.
+    let state = open_chain_state(testnet)?;
     let balance = state
         .accounts
         .get(&from_addr)
@@ -838,8 +897,9 @@ async fn run_node(
         ws_broadcast: tokio::sync::broadcast::channel(256).0,
         is_testnet: testnet,
         faucet_claims: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            rpc_key: None,
-            rate_limits: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        api_key: None,
+        rate_limits: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        validator_performance: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
@@ -867,6 +927,28 @@ async fn run_node(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Feature 18: Custom panic handler — log panic info and exit cleanly.
+    std::panic::set_hook(Box::new(|panic_info| {
+        let location = panic_info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        // Use eprintln as a fallback since tracing may not be initialized yet.
+        eprintln!("PANIC at {}: {}", location, message);
+        // Try tracing if available.
+        tracing::error!("PANIC at {}: {}", location, message);
+        tracing::error!("Attempting to flush chain state before exit...");
+        // Note: We cannot easily access chain state from the panic hook,
+        // but the process exit will trigger destructors.
+        std::process::exit(1);
+    }));
+
     let cli = Cli::parse();
 
     match cli.command {

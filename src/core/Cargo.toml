@@ -21,4 +21,4 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 serde_json = { workspace = true }
 sysinfo = "0.32"
-zeroize = "1.8.2"
+zeroize = "1"

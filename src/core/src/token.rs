@@ -67,6 +67,35 @@ impl std::fmt::Display for Amount {
     }
 }
 
+/// Formats an `Amount` with thousand separators (commas) for readability.
+///
+/// # Examples
+/// ```
+/// use commputer_core::token::{Amount, format_with_commas};
+/// assert_eq!(format_with_commas(Amount::from_comme(1234567)), "1,234,567 COMME");
+/// ```
+pub fn format_with_commas(amount: Amount) -> String {
+    let whole = amount.0 / UNITS_PER_COMME;
+    let frac = amount.0 % UNITS_PER_COMME;
+
+    // Format whole part with commas
+    let whole_str = whole.to_string();
+    let mut with_commas = String::new();
+    for (i, c) in whole_str.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            with_commas.push(',');
+        }
+        with_commas.push(c);
+    }
+    let whole_formatted: String = with_commas.chars().rev().collect();
+
+    if frac == 0 {
+        format!("{} COMME", whole_formatted)
+    } else {
+        format!("{}.{:08} COMME", whole_formatted, frac)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +160,29 @@ mod tests {
             let remaining = TOTAL_SUPPLY - emitted;
             assert_eq!(emitted + remaining, TOTAL_SUPPLY);
         }
+    }
+
+    #[test]
+    fn format_with_commas_whole() {
+        assert_eq!(format_with_commas(Amount::from_comme(0)), "0 COMME");
+        assert_eq!(format_with_commas(Amount::from_comme(999)), "999 COMME");
+        assert_eq!(format_with_commas(Amount::from_comme(1000)), "1,000 COMME");
+        assert_eq!(format_with_commas(Amount::from_comme(1234567)), "1,234,567 COMME");
+        assert_eq!(
+            format_with_commas(Amount::from_comme(2_000_000_000)),
+            "2,000,000,000 COMME"
+        );
+    }
+
+    #[test]
+    fn format_with_commas_fractional() {
+        assert_eq!(
+            format_with_commas(Amount::from_raw(100_000_001)),
+            "1.00000001 COMME"
+        );
+        assert_eq!(
+            format_with_commas(Amount::from_raw(123_456_789_000_000)),
+            "1,234,567.89000000 COMME"
+        );
     }
 }
