@@ -7,6 +7,7 @@ pub mod traits;
 pub mod data_store;
 pub mod job_pool;
 pub mod pricing_history;
+pub mod job_billing;
 pub mod job_results;
 pub mod usage_analytics;
 
