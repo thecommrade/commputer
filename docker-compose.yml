@@ -1,0 +1,51 @@
+version: "3.8"
+
+services:
+  node1:
+    build: .
+    container_name: commputer-node1
+    command: ["run", "--testnet", "--p2p-port", "9000", "--rpc-port", "9944"]
+    ports:
+      - "9000:9000"
+      - "9944:9944"
+    volumes:
+      - node1-data:/data
+    networks:
+      - commputer-net
+
+  node2:
+    build: .
+    container_name: commputer-node2
+    command: ["run", "--testnet", "--p2p-port", "9000", "--rpc-port", "9944", "--seed", "node1:9000"]
+    ports:
+      - "9001:9000"
+      - "9945:9944"
+    volumes:
+      - node2-data:/data
+    networks:
+      - commputer-net
+    depends_on:
+      - node1
+
+  node3:
+    build: .
+    container_name: commputer-node3
+    command: ["run", "--testnet", "--p2p-port", "9000", "--rpc-port", "9944", "--seed", "node1:9000"]
+    ports:
+      - "9002:9000"
+      - "9946:9944"
+    volumes:
+      - node3-data:/data
+    networks:
+      - commputer-net
+    depends_on:
+      - node1
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  commputer-net:
+    driver: bridge
