@@ -191,6 +191,19 @@ mod tests {
     }
 
     #[test]
+    fn epoch_reward_distribution() {
+        let schedule = EmissionSchedule::new();
+        let validator_count = 10;
+        let epoch_emission = schedule.per_epoch_emission(validator_count);
+        let per_validator = epoch_emission / validator_count;
+        assert!(per_validator > 0);
+        // Epoch is 1/24 of a day
+        let daily = schedule.per_validator_daily_rate(validator_count);
+        let expected_epoch = daily / 24;
+        assert_eq!(per_validator, expected_epoch);
+    }
+
+    #[test]
     fn demand_weighted_surplus() {
         let total = 1_000_000u64;
         let mut demand = HashMap::new();

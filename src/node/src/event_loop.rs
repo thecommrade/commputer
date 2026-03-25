@@ -222,32 +222,85 @@ impl EventLoop {
             return;
         }
 
-        // Calculate emission for this epoch.
         let epoch_emission = self.emission.per_epoch_emission(validator_count);
-
-        // Don't emit more than remaining supply.
         let remaining = self.state.remaining_supply();
         let actual_emission = epoch_emission.min(remaining);
 
         if actual_emission > 0 {
-            // Demand-weighted allocation across channels.
             let _allocation =
                 ChannelAllocation::from_demand(actual_emission, &self.epoch_state.demand);
 
-            info!(
-                "Epoch {} complete: {} validators, emitting {} COMME across channels",
-                epoch,
-                validator_count,
-                actual_emission / UNITS_PER_COMME,
-            );
+            // Distribute rewards based on composite resource score
+            let summaries: Vec<_> = self.epoch_state.summaries.values().cloned().collect();
+            let total_score: u64 = summaries.iter().map(|s| s.composite_score()).sum();
 
-            // Record emission.
-            self.state.emit(actual_emission);
+            if total_score > 0 {
+                let mut distributed = 0u64;
+                for summary in &summaries {
+                    let score = summary.composite_score();
+                    let reward = actual_emission * score / total_score;
+
+                    if reward > 0 {
+                        // Check compliance — nerfed validators earn less
+                        let compliance = self.compliance.check(&summary.validator);
+                        let effective_reward = match compliance {
+                            commputer_core::compliance::ComplianceStatus::Compliant => reward,
+                            _ => {
+                                let multiplier = self.state.nerf_rate.reward_multiplier();
+                                (reward as f64 * multiplier).round() as u64
+                            }
+                        };
+
+                        if effective_reward > 0 {
+                            let account = self.state.accounts.get_or_create(summary.validator);
+                            if let Some(new_balance) = account.balance.checked_add(
+                                commputer_core::token::Amount::from_raw(effective_reward),
+                            ) {
+                                account.balance = new_balance;
+                                account.total_mined = account
+                                    .total_mined
+                                    .checked_add(
+                                        commputer_core::token::Amount::from_raw(effective_reward),
+                                    )
+                                    .unwrap_or(account.total_mined);
+                                distributed += effective_reward;
+                            }
+                        }
+                    }
+                }
+
+                info!(
+                    "Epoch {} complete: {} validators, emitted {:.4} COMME, distributed to {} accounts",
+                    epoch,
+                    validator_count,
+                    distributed as f64 / UNITS_PER_COMME as f64,
+                    summaries.len(),
+                );
+
+                self.state.emit(distributed);
+
+                // Persist updated account balances
+                if let Err(e) = self.state.flush() {
+                    warn!("Failed to flush state after epoch: {}", e);
+                }
+            }
         }
 
-        // Start new epoch.
+        // Re-register ourselves for the next epoch
+        let self_summary = commputer_core::proof::EpochProofSummary {
+            validator: *self.wallet.address(),
+            epoch: epoch + 1,
+            processing_score: 100,
+            gpu_score: 100,
+            storage_score: 100,
+            ram_score: 100,
+            bandwidth_score: 100,
+            diversity_bonus: 50,
+        };
+
         self.state.current_epoch = epoch + 1;
         self.epoch_state = EpochState::new(epoch + 1, 0);
+        self.epoch_state.record_summary(self_summary);
     }
 
     fn handle_block_tick(&mut self) {
