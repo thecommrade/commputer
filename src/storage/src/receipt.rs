@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use commputer_core::identity::Address;
 use commputer_core::transaction::TxHash;
 use commputer_core::block::BlockHash;
 use std::collections::HashMap;
@@ -38,6 +39,39 @@ impl ReceiptStore {
 
     pub fn is_empty(&self) -> bool {
         self.receipts.is_empty()
+    }
+}
+
+/// Reverse index: address -> list of tx hashes involving that address.
+/// Tracks both sent and received transactions.
+#[derive(Debug, Default)]
+pub struct AccountHistoryIndex {
+    index: HashMap<Address, Vec<TxHash>>,
+}
+
+impl AccountHistoryIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that a transaction involves the given address (sender or recipient).
+    pub fn record(&mut self, address: Address, tx_hash: TxHash) {
+        self.index.entry(address).or_default().push(tx_hash);
+    }
+
+    /// Get all tx hashes involving the given address.
+    pub fn get(&self, address: &Address) -> &[TxHash] {
+        self.index.get(address).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Get the N most recent tx hashes for an address.
+    pub fn recent(&self, address: &Address, n: usize) -> Vec<TxHash> {
+        let all = self.get(address);
+        if all.len() <= n {
+            all.to_vec()
+        } else {
+            all[all.len() - n..].to_vec()
+        }
     }
 }
 

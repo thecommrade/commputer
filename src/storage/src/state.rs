@@ -6,7 +6,7 @@ use commputer_core::compliance::NerfRate;
 use tracing::info;
 use crate::account::AccountStore;
 use crate::blockstore::BlockStore;
-use crate::receipt::{ReceiptStore, TxReceipt};
+use crate::receipt::{AccountHistoryIndex, ReceiptStore, TxReceipt};
 use crate::rocks::{self, RocksStore};
 
 /// The full chain state — accounts, blocks, supply tracking.
@@ -24,6 +24,8 @@ pub struct ChainState {
     pub current_epoch: u64,
     /// Transaction receipt store.
     pub receipts: ReceiptStore,
+    /// Address -> tx hash reverse index.
+    pub history: AccountHistoryIndex,
     /// Optional RocksDB persistent layer. None = in-memory only (tests).
     rocks: Option<RocksStore>,
 }
@@ -58,6 +60,7 @@ impl ChainState {
             nerf_rate: NerfRate::INITIAL,
             current_epoch: 0,
             receipts: ReceiptStore::new(),
+            history: AccountHistoryIndex::new(),
             rocks: None,
         }
     }
@@ -115,6 +118,7 @@ impl ChainState {
             nerf_rate: NerfRate { rate_bps: nerf_rate_bps },
             current_epoch,
             receipts: ReceiptStore::new(),
+            history: AccountHistoryIndex::new(),
             rocks: Some(rocks),
         })
     }
@@ -277,13 +281,19 @@ impl ChainState {
         let block_hash = block.hash();
         for (i, tx) in block.transactions.iter().enumerate() {
             self.apply_transaction(tx)?;
+            let tx_hash = tx.hash();
             self.receipts.insert(TxReceipt {
-                tx_hash: tx.hash(),
+                tx_hash,
                 block_hash,
                 block_height: block.height(),
                 tx_index: i,
                 success: true,
             });
+            // Record in address history index.
+            self.history.record(tx.from, tx_hash);
+            if let commputer_core::transaction::TxKind::Transfer { to, .. } = &tx.kind {
+                self.history.record(*to, tx_hash);
+            }
         }
 
         // Store block.
