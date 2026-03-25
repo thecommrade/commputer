@@ -282,6 +282,21 @@ impl EventLoop {
                 }
                 info!("Connected to peer: {} at {}", peer_id, addr_str);
             }
+            SwarmEvent::Behaviour(CommpBehaviourEvent::Identify(
+                libp2p::identify::Event::Received { peer_id, info, .. }
+            )) => {
+                // Check protocol compatibility.
+                if !info.protocol_version.starts_with("/commputer/") {
+                    warn!(
+                        "Peer {} runs incompatible protocol '{}' — disconnecting",
+                        peer_id, info.protocol_version
+                    );
+                    let _ = self.network.swarm.disconnect_peer_id(peer_id);
+                } else {
+                    debug!("Peer {} identified: protocol={}, agent={}",
+                        peer_id, info.protocol_version, info.agent_version);
+                }
+            }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 // Clean up peer tracking.
                 self.peer_ips.remove(&peer_id);
