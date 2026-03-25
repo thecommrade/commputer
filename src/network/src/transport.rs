@@ -67,15 +67,40 @@ impl CommpNetwork {
         let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?;
         swarm.listen_on(listen_addr)?;
 
-        Ok(Self {
+        let mut network = Self {
             swarm,
             local_peer_id,
-        })
+        };
+
+        for topic in crate::topics::all_topics() {
+            network.swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+        }
+
+        Ok(network)
     }
 
     /// Dial a remote peer at the given multiaddr.
     pub fn dial(&mut self, addr: Multiaddr) -> Result<(), Box<dyn std::error::Error>> {
         self.swarm.dial(addr)?;
         Ok(())
+    }
+}
+
+/// Founder-operated seed nodes. Replace with real addresses at launch.
+pub const SEED_NODES: &[&str] = &[
+    // Format: /ip4/<IP>/tcp/<PORT>/p2p/<PEER_ID>
+];
+
+impl CommpNetwork {
+    pub fn connect_to_seeds(&mut self) -> usize {
+        let mut connected = 0;
+        for addr_str in SEED_NODES {
+            if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                if self.dial(addr).is_ok() {
+                    connected += 1;
+                }
+            }
+        }
+        connected
     }
 }
