@@ -25,3 +25,6 @@ anyhow = { workspace = true }
 hex = "0.4"
 axum = { workspace = true }
 reqwest = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

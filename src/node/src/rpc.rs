@@ -6,14 +6,14 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
 use commputer_core::transaction::Transaction;
 
 /// Snapshot of chain status, populated by the event loop.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainStatus {
     pub height: u64,
     pub total_supply: u64,
@@ -35,12 +35,12 @@ pub struct RpcState {
 }
 
 /// Response for a submitted transaction.
-#[derive(Serialize)]
-struct SubmitTxResponse {
-    accepted: bool,
-    tx_hash: String,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubmitTxResponse {
+    pub accepted: bool,
+    pub tx_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
 /// POST /tx — submit a signed transaction.
@@ -98,15 +98,20 @@ async fn get_status(
     Json(status)
 }
 
+/// Build the axum router (exposed for testing).
+pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
+    Router::new()
+        .route("/tx", post(submit_tx))
+        .route("/status", get(get_status))
+        .with_state(rpc_state)
+}
+
 /// Start the RPC server on the given port.
 pub async fn start_rpc_server(
     rpc_port: u16,
     rpc_state: Arc<RpcState>,
 ) {
-    let app = Router::new()
-        .route("/tx", post(submit_tx))
-        .route("/status", get(get_status))
-        .with_state(rpc_state);
+    let app = build_router(rpc_state);
 
     let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", rpc_port)).await {
         Ok(l) => l,
@@ -120,5 +125,168 @@ pub async fn start_rpc_server(
 
     if let Err(e) = axum::serve(listener, app).await {
         warn!("RPC server error: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use commputer_core::identity::Address;
+    use commputer_core::token::Amount;
+    use commputer_core::transaction::{Transaction, TxKind};
+    use commputer_core::wallet::Wallet;
+    use commputer_core::signing::sign_transaction;
+
+    fn make_rpc_state() -> (Arc<RpcState>, mpsc::Receiver<Transaction>) {
+        let (tx_sender, rx) = mpsc::channel(16);
+        let state = Arc::new(RpcState {
+            tx_sender,
+            status: Mutex::new(ChainStatus {
+                height: 42,
+                total_supply: 2_000_000_000,
+                emitted: 1000,
+                burned: 50,
+                circulating: 950,
+                remaining: 1_999_999_000,
+                accounts: 3,
+                epoch: 1,
+                pending_txs: 0,
+            }),
+        });
+        (state, rx)
+    }
+
+    fn make_signed_tx() -> Transaction {
+        let wallet = Wallet::generate();
+        let to = Address([1u8; 32]);
+        let mut tx = Transaction {
+            from: *wallet.address(),
+            nonce: 0,
+            kind: TxKind::Transfer {
+                to,
+                amount: Amount::from_comme(10),
+            },
+            signature: vec![],
+            public_key: vec![],
+        };
+        sign_transaction(&mut tx, &wallet);
+        tx
+    }
+
+    #[tokio::test]
+    async fn submit_signed_tx_accepted() {
+        let (state, mut rx) = make_rpc_state();
+        let app = build_router(state);
+        let tx = make_signed_tx();
+        let body = serde_json::to_vec(&tx).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tx")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let result: SubmitTxResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(result.accepted);
+        assert!(!result.tx_hash.is_empty());
+        assert!(result.error.is_none());
+
+        // Verify the transaction was forwarded to the channel.
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received.hash(), tx.hash());
+    }
+
+    #[tokio::test]
+    async fn submit_unsigned_tx_rejected() {
+        let (state, _rx) = make_rpc_state();
+        let app = build_router(state);
+
+        // Transaction with no signature.
+        let tx = Transaction {
+            from: Address([2u8; 32]),
+            nonce: 0,
+            kind: TxKind::Transfer {
+                to: Address([3u8; 32]),
+                amount: Amount::from_comme(5),
+            },
+            signature: vec![],
+            public_key: vec![],
+        };
+        let body = serde_json::to_vec(&tx).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tx")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let result: SubmitTxResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(!result.accepted);
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_bad_signature_rejected() {
+        let (state, _rx) = make_rpc_state();
+        let app = build_router(state);
+
+        let wallet = Wallet::generate();
+        // Valid-length but wrong signature.
+        let tx = Transaction {
+            from: *wallet.address(),
+            nonce: 0,
+            kind: TxKind::Transfer {
+                to: Address([4u8; 32]),
+                amount: Amount::from_comme(1),
+            },
+            signature: vec![0u8; 64],
+            public_key: wallet.public_key().to_bytes().to_vec(),
+        };
+        let body = serde_json::to_vec(&tx).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tx")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_status_returns_chain_info() {
+        let (state, _rx) = make_rpc_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let status: ChainStatus = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(status.height, 42);
+        assert_eq!(status.epoch, 1);
+        assert_eq!(status.accounts, 3);
     }
 }
