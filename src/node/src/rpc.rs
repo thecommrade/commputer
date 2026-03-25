@@ -61,6 +61,8 @@ pub struct RpcState {
     pub mempool: Mutex<Vec<MempoolTxInfo>>,
     /// Recent blocks by height (for the block explorer endpoint).
     pub blocks: Mutex<HashMap<u64, serde_json::Value>>,
+    /// Node metrics snapshot.
+    pub metrics: Mutex<NodeMetrics>,
 }
 
 /// Response for a submitted transaction.
@@ -191,6 +193,27 @@ async fn get_block_by_height(
     }
 }
 
+/// Node metrics response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeMetrics {
+    pub uptime_secs: u64,
+    pub height: u64,
+    pub epoch: u64,
+    pub peers_connected: usize,
+    pub peers_banned: usize,
+    pub blocks_produced: u64,
+    pub pending_txs: usize,
+    pub seen_tx_count: usize,
+}
+
+/// GET /metrics — return node metrics.
+async fn get_metrics(
+    State(state): State<Arc<RpcState>>,
+) -> Json<NodeMetrics> {
+    let metrics = state.metrics.lock().await.clone();
+    Json(metrics)
+}
+
 /// GET /health — basic health check.
 async fn get_health(
     State(state): State<Arc<RpcState>>,
@@ -214,6 +237,7 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/balance/{address}", get(get_balance))
         .route("/mempool", get(get_mempool))
         .route("/block/{height}", get(get_block_by_height))
+        .route("/metrics", get(get_metrics))
         .route("/health", get(get_health))
         .with_state(rpc_state)
 }
@@ -272,6 +296,10 @@ mod tests {
             balances: Mutex::new(HashMap::new()),
             mempool: Mutex::new(vec![]),
             blocks: Mutex::new(HashMap::new()),
+            metrics: Mutex::new(NodeMetrics {
+                uptime_secs: 0, height: 0, epoch: 0, peers_connected: 0,
+                peers_banned: 0, blocks_produced: 0, pending_txs: 0, seen_tx_count: 0,
+            }),
         });
         (state, rx)
     }

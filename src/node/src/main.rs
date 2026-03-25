@@ -651,6 +651,16 @@ async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16) ->
         balances: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         mempool: tokio::sync::Mutex::new(vec![]),
         blocks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        metrics: tokio::sync::Mutex::new(rpc::NodeMetrics {
+            uptime_secs: 0,
+            height: 0,
+            epoch: 0,
+            peers_connected: 0,
+            peers_banned: 0,
+            blocks_produced: 0,
+            pending_txs: 0,
+            seen_tx_count: 0,
+        }),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).

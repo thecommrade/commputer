@@ -184,6 +184,16 @@ impl EventLoop {
                     });
                 }
             }
+
+            // Update node metrics.
+            if let Ok(mut met_guard) = rpc.metrics.try_lock() {
+                met_guard.height = self.state.blocks.height();
+                met_guard.epoch = self.state.current_epoch;
+                met_guard.peers_connected = self.peer_ips.len();
+                met_guard.peers_banned = self.banned_peers.len();
+                met_guard.pending_txs = self.pending_txs.len();
+                met_guard.seen_tx_count = self.seen_tx_hashes.len();
+            }
         }
     }
 
