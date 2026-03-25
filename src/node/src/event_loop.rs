@@ -175,9 +175,41 @@ impl EventLoop {
     }
 
     fn handle_new_transaction(&mut self, tx: Transaction) {
+        // Basic validation before accepting into mempool
+        if tx.signature.len() != 64 {
+            debug!("Rejected transaction: invalid signature length");
+            return;
+        }
+        if tx.from.0 == [0u8; 32] {
+            debug!("Rejected transaction: null sender");
+            return;
+        }
+
         let hash = tx.hash();
-        debug!("Received transaction: {:?}", hash);
+        debug!("Accepted transaction into mempool: {:?}", hash);
         self.pending_txs.push(tx);
+    }
+
+    pub fn auto_register_validator(&mut self, contribution_percent: u8) {
+        self.validator.register(contribution_percent);
+
+        // Register ourselves in the epoch state so we count as a validator
+        let summary = commputer_core::proof::EpochProofSummary {
+            validator: *self.wallet.address(),
+            epoch: self.state.current_epoch,
+            processing_score: 100,
+            gpu_score: 100,
+            storage_score: 100,
+            ram_score: 100,
+            bandwidth_score: 100,
+            diversity_bonus: 50,
+        };
+        self.epoch_state.record_summary(summary);
+
+        info!(
+            "Registered as validator at {}% contribution",
+            contribution_percent,
+        );
     }
 
     fn handle_epoch_tick(&mut self) {

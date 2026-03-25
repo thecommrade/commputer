@@ -498,6 +498,7 @@ async fn run_node(testnet: bool, log_level: String, port: u16) -> Result<()> {
 
     // Create and run event loop.
     let mut event_loop = EventLoop::new(state, wallet, network);
+    event_loop.auto_register_validator(100);
     event_loop.run().await;
 
     Ok(())
