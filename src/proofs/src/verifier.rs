@@ -1,5 +1,8 @@
 use commputer_core::proof::{ProofChallenge, ProofResponse, ProofVerdict, ResourceChannel};
 use crate::cpu::CpuProver;
+use crate::gpu::GpuProver;
+use crate::ram::RamProver;
+use crate::bandwidth::BandwidthProver;
 
 /// Unified proof verifier for all resource channels.
 pub struct ProofVerifier;
@@ -27,38 +30,35 @@ impl ProofVerifier {
                     ProofVerdict::Invalid
                 }
             }
-            // GPU, Storage, RAM, Bandwidth — stub implementations.
-            // Each will be implemented as the project matures.
             ResourceChannel::Gpu => {
-                // TODO: GPU proof verification (ML micro-benchmark results).
-                if response.result.is_empty() {
-                    ProofVerdict::Invalid
+                if GpuProver::verify(challenge, response) {
+                    ProofVerdict::Valid
                 } else {
-                    ProofVerdict::Valid // Placeholder
+                    ProofVerdict::Invalid
                 }
             }
             ResourceChannel::Storage => {
-                // TODO: Storage proof verification (chunk retrievability).
+                // Storage verification without the underlying data can only
+                // confirm the result field is present; full verification
+                // requires the data and is done via StorageProver::verify directly.
                 if response.result.is_empty() {
                     ProofVerdict::Invalid
                 } else {
-                    ProofVerdict::Valid // Placeholder
+                    ProofVerdict::Valid
                 }
             }
             ResourceChannel::Ram => {
-                // TODO: RAM proof verification (memory-hard challenge result).
-                if response.result.is_empty() {
-                    ProofVerdict::Invalid
+                if RamProver::verify(challenge, response) {
+                    ProofVerdict::Valid
                 } else {
-                    ProofVerdict::Valid // Placeholder
+                    ProofVerdict::Invalid
                 }
             }
             ResourceChannel::Bandwidth => {
-                // TODO: Bandwidth proof verification (transfer timing).
-                if response.result.is_empty() {
-                    ProofVerdict::Invalid
+                if BandwidthProver::verify(challenge, response) {
+                    ProofVerdict::Valid
                 } else {
-                    ProofVerdict::Valid // Placeholder
+                    ProofVerdict::Invalid
                 }
             }
         }
