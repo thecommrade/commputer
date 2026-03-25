@@ -1,9 +1,9 @@
 # Commputer Development Resume Document
 
-**Last updated:** 2026-03-26 (overnight session)
-**Last session test count:** 125 passing, 0 failing
-**Commits:** 52
-**Lines of Rust:** ~8,600
+**Last updated:** 2026-03-26 (overnight session, continued)
+**Last session test count:** 131 passing, 0 failing
+**Commits:** 72
+**Lines of Rust:** ~9,000
 
 ## What This Is
 
@@ -111,6 +111,22 @@ Massive overnight session. 19 new commits, 12 new tests, ~1,400 new lines of Rus
 
 ### Testing (commits 0d49dbd..93fa4b6)
 21. **Fork resolution tests** — unit tests for two ConsensusManagers converging, minority block losing. Integration test for competing block propagation via gossipsub.
+
+### Continuation Session (commits 0532953..0ead767)
+22. **Peer reputation scoring** — numeric scores (-100 to 200), auto-ban below -50, reward valid blocks.
+23. **Connection limit** — max 50 peers, new connections rejected when at capacity.
+24. **Block request/response protocol** — BlockRequest/BlockResponse messages for sync.
+25. **Initial sync protocol** — on startup with peers, request next 10 blocks to catch up.
+26. **Node metrics RPC** — GET /metrics returns height, epoch, peers, pending txs, banned count.
+27. **Proof status RPC** — GET /proofs/status returns channel info.
+28. **Export-chain CLI** — commputer export-chain dumps state to JSON.
+29. **Verify-chain CLI** — walks entire chain, verifies merkle roots and signatures.
+30. **Grace period tracking** — refill on epoch tick, drain on peer disconnect.
+31. **RocksDB block fallback** — ChainState::get_block_by_height falls back to RocksDB for pruned blocks.
+32. **Tier change logging** — log when transfers cause tier threshold crossings.
+33. **Integer overflow audit** — saturating_add for total_emitted/total_burned.
+34. **Config validation** — port collision check, privileged port warnings.
+35. **Test fixtures library** — commputer_core::testutil with shared helpers.
 
 ## What's Next (IMMEDIATE — Pick Up Here)
 
