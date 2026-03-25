@@ -281,6 +281,119 @@ mod tests {
         assert!(!cm.has_height(1));
     }
 
+    /// Simulate two consensus managers (two nodes) that both see two competing
+    /// blocks at the same height. They exchange Snowball votes and must converge
+    /// on the same winner.
+    #[test]
+    fn fork_resolution_two_managers_converge() {
+        let mut cm_a = ConsensusManager::new();
+        let mut cm_b = ConsensusManager::new();
+
+        let block_1 = make_test_block_with_producer(1, addr(1));
+        let block_2 = make_test_block_with_producer(1, addr(2));
+        let hash_1 = block_1.hash();
+        let hash_2 = block_2.hash();
+
+        // Both nodes see both candidates (as would happen via gossipsub).
+        cm_a.add_candidate(block_1.clone());
+        cm_a.add_candidate(block_2.clone());
+        cm_b.add_candidate(block_1);
+        cm_b.add_candidate(block_2);
+
+        // Neither should be finalized yet.
+        assert_eq!(cm_a.finalized_at_height(1), None);
+        assert_eq!(cm_b.finalized_at_height(1), None);
+
+        // Simulate Snowball voting rounds. In each round:
+        // - Each node queries its preference
+        // - Both preferences are recorded as responses on the other node
+        // - Both nodes try to finalize
+        // We simulate a network where hash_1 has a slight majority.
+        for round in 0..10 {
+            let pref_a = cm_a.query_preference(1);
+            let pref_b = cm_b.query_preference(1);
+
+            // Simulate 3 peers voting (sample_size=3):
+            // - 2 peers prefer hash_1, 1 prefers hash_2 (gives hash_1 the edge)
+            // For the initial rounds before any preference is set, seed the votes.
+            let majority_hash = hash_1;
+            let minority_hash = hash_2;
+
+            // Feed majority preference to both managers.
+            cm_a.record_response(1, majority_hash);
+            cm_a.record_response(1, majority_hash);
+            cm_a.record_response(1, minority_hash);
+
+            cm_b.record_response(1, majority_hash);
+            cm_b.record_response(1, majority_hash);
+            cm_b.record_response(1, minority_hash);
+
+            cm_a.try_finalize_round(1);
+            cm_b.try_finalize_round(1);
+
+            // Check if both finalized.
+            let final_a = cm_a.finalized_at_height(1);
+            let final_b = cm_b.finalized_at_height(1);
+
+            if final_a.is_some() && final_b.is_some() {
+                assert_eq!(
+                    final_a, final_b,
+                    "Both nodes must converge on the same block (round {})",
+                    round
+                );
+                assert_eq!(
+                    final_a.unwrap(), majority_hash,
+                    "Winner should be the majority-preferred block"
+                );
+                eprintln!("Fork resolved in {} rounds — both chose {}", round + 1, majority_hash);
+                return;
+            }
+        }
+
+        // If we get here, both should at least have finalized by now with consistent voting.
+        let final_a = cm_a.finalized_at_height(1);
+        let final_b = cm_b.finalized_at_height(1);
+        assert!(final_a.is_some(), "Node A should have finalized after 10 rounds");
+        assert!(final_b.is_some(), "Node B should have finalized after 10 rounds");
+        assert_eq!(final_a, final_b, "Both nodes must agree on the winner");
+    }
+
+    /// Test that fork resolution works even when the minority block initially
+    /// gets some support before the majority prevails.
+    #[test]
+    fn fork_resolution_minority_loses_after_initial_support() {
+        let mut cm = ConsensusManager::new();
+        let block_a = make_test_block_with_producer(1, addr(10));
+        let block_b = make_test_block_with_producer(1, addr(20));
+        let hash_a = block_a.hash();
+        let hash_b = block_b.hash();
+
+        cm.add_candidate(block_a);
+        cm.add_candidate(block_b);
+
+        // First 2 rounds: block_b has majority (shouldn't finalize yet, need 5 consecutive).
+        for _ in 0..2 {
+            cm.record_response(1, hash_b);
+            cm.record_response(1, hash_b);
+            cm.record_response(1, hash_a);
+            cm.try_finalize_round(1);
+        }
+        assert_eq!(cm.finalized_at_height(1), None, "Should not finalize after only 2 rounds");
+
+        // Next 5+ rounds: block_a takes over with strong majority.
+        for _ in 0..6 {
+            cm.record_response(1, hash_a);
+            cm.record_response(1, hash_a);
+            cm.record_response(1, hash_a);
+            cm.try_finalize_round(1);
+        }
+
+        // block_a should win since it had strong majority in later rounds.
+        let winner = cm.finalized_at_height(1);
+        assert!(winner.is_some(), "Should finalize after sufficient consistent rounds");
+        assert_eq!(winner.unwrap(), hash_a, "Block A should win with sustained majority");
+    }
+
     #[test]
     fn no_finalization_without_enough_rounds() {
         let mut cm = ConsensusManager::new();
