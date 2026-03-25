@@ -85,6 +85,23 @@ pub enum TxKind {
         /// Hash of the compliance proof data.
         proof_hash: [u8; 32],
     },
+
+    /// Feature 246: Batch multiple operations into a single transaction.
+    Batch {
+        operations: Vec<TxKind>,
+    },
+
+    /// Feature 258: Key rotation — allow validators to rotate signing key.
+    KeyRotation {
+        new_public_key: Vec<u8>,
+    },
+
+    /// Feature 259: Multi-signature transaction.
+    MultiSig {
+        threshold: u8,
+        signers: Vec<Vec<u8>>,
+        signatures: Vec<Vec<u8>>,
+    },
 }
 
 /// Minimum transaction fee in raw units (0.0001 COMME = 100_000 raw units).
@@ -102,6 +119,12 @@ pub struct Transaction {
     pub signature: Vec<u8>,
     /// Sender's ed25519 public key (32 bytes). Required for signature verification.
     pub public_key: Vec<u8>,
+    /// Feature 251: Optional memo (max 256 bytes).
+    #[serde(default)]
+    pub memo: Option<Vec<u8>>,
+    /// Feature 260: Optional timelock — transaction valid only after this block height.
+    #[serde(default)]
+    pub timelock: Option<u64>,
 }
 
 impl Transaction {
@@ -116,12 +139,15 @@ impl Transaction {
 
     /// Whether this transaction burns $COMME.
     pub fn is_burn(&self) -> bool {
-        matches!(
-            self.kind,
+        match &self.kind {
             TxKind::BurstCompute { .. }
             | TxKind::MilestoneBurn { .. }
-            | TxKind::CharitableDonation { .. }
-        )
+            | TxKind::CharitableDonation { .. } => true,
+            TxKind::Batch { operations } => operations.iter().any(|op| matches!(op,
+                TxKind::BurstCompute { .. } | TxKind::MilestoneBurn { .. } | TxKind::CharitableDonation { .. }
+            )),
+            _ => false,
+        }
     }
 
     /// Verify the transaction's ed25519 signature using the embedded public key.
@@ -162,7 +188,27 @@ impl Transaction {
             TxKind::BurstCompute { burn_amount, .. } => *burn_amount,
             TxKind::MilestoneBurn { burn_amount, .. } => *burn_amount,
             TxKind::CharitableDonation { burn_amount, .. } => *burn_amount,
+            TxKind::Batch { operations } => {
+                let mut total = Amount::ZERO;
+                for op in operations {
+                    match op {
+                        TxKind::BurstCompute { burn_amount, .. }
+                        | TxKind::MilestoneBurn { burn_amount, .. }
+                        | TxKind::CharitableDonation { burn_amount, .. } => {
+                            total = total.checked_add(*burn_amount).unwrap_or(total);
+                        }
+                        _ => {}
+                    }
+                }
+                total
+            }
             _ => Amount::ZERO,
         }
     }
+
+    /// Feature 251: Maximum memo length in bytes.
+    pub const MAX_MEMO_LENGTH: usize = 256;
+
+    /// Feature 246: Maximum batch size.
+    pub const MAX_BATCH_SIZE: usize = 10;
 }

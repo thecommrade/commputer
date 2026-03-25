@@ -21,22 +21,27 @@ pub struct ReceiptStore {
 }
 
 impl ReceiptStore {
+    /// Create an empty receipt store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Insert a transaction receipt.
     pub fn insert(&mut self, receipt: TxReceipt) {
         self.receipts.insert(receipt.tx_hash, receipt);
     }
 
+    /// Look up a receipt by transaction hash.
     pub fn get(&self, tx_hash: &TxHash) -> Option<&TxReceipt> {
         self.receipts.get(tx_hash)
     }
 
+    /// Number of stored receipts.
     pub fn len(&self) -> usize {
         self.receipts.len()
     }
 
+    /// Returns true if no receipts are stored.
     pub fn is_empty(&self) -> bool {
         self.receipts.is_empty()
     }

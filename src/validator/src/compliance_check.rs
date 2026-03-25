@@ -90,6 +90,7 @@ pub struct ComplianceChecker {
 }
 
 impl ComplianceChecker {
+    /// Create an empty compliance checker.
     pub fn new() -> Self {
         Self::default()
     }

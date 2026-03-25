@@ -88,6 +88,7 @@ impl Account {
         self.grace_balance_secs = self.grace_balance_secs.saturating_sub(offline_secs);
     }
 
+    /// Refill grace balance at 2:1 ratio (5 days online = 10 days restored).
     pub fn refill_grace(&mut self, online_secs: u64) {
         // Refill at 2:1 (5 days online restores 10 days drained).
         let refill = online_secs * 2;
@@ -121,22 +122,27 @@ pub struct AccountStore {
 }
 
 impl AccountStore {
+    /// Create an empty account store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Look up an account by address.
     pub fn get(&self, address: &Address) -> Option<&Account> {
         self.accounts.get(address)
     }
 
+    /// Get a mutable reference to an account.
     pub fn get_mut(&mut self, address: &Address) -> Option<&mut Account> {
         self.accounts.get_mut(address)
     }
 
+    /// Get or create an account for the given address.
     pub fn get_or_create(&mut self, address: Address) -> &mut Account {
         self.accounts.entry(address).or_insert_with(|| Account::new(address))
     }
 
+    /// Insert or update an account.
     pub fn put(&mut self, account: Account) {
         self.accounts.insert(account.address, account);
     }
@@ -149,10 +155,12 @@ impl AccountStore {
     }
 
     /// Total accounts.
+    /// Total number of accounts.
     pub fn len(&self) -> usize {
         self.accounts.len()
     }
 
+    /// Returns true if no accounts exist.
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty()
     }

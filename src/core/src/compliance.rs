@@ -85,6 +85,7 @@ pub enum ComplianceFlag {
 
 /// Verdict from a compliance review.
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+/// Verdict from a compliance review, including resolution steps.
 pub struct ComplianceVerdict {
     pub validator: Address,
     pub epoch: u64,

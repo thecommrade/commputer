@@ -5,6 +5,8 @@ use bip39::Mnemonic;
 use crate::identity::Address;
 use crate::error::CommpError;
 
+/// A Commputer wallet backed by an ed25519 signing key.
+/// Supports BIP39 seed phrase generation and recovery.
 pub struct Wallet {
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
@@ -12,6 +14,7 @@ pub struct Wallet {
 }
 
 impl Wallet {
+    /// Generate a new wallet with a random ed25519 keypair.
     pub fn generate() -> Self {
         let mut secret_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut secret_bytes);
@@ -54,13 +57,17 @@ impl Wallet {
         Ok(Self::from_secret_bytes(secret_bytes))
     }
 
+    /// Returns this wallet's on-chain address.
     pub fn address(&self) -> &Address { &self.address }
+    /// Returns the public verifying key.
     pub fn public_key(&self) -> &VerifyingKey { &self.verifying_key }
 
+    /// Sign arbitrary bytes with this wallet's private key.
     pub fn sign(&self, message: &[u8]) -> Signature {
         self.signing_key.sign(message)
     }
 
+    /// Verify a signature against this wallet's public key.
     pub fn verify(&self, message: &[u8], signature: &Signature) -> bool {
         self.verifying_key.verify(message, signature).is_ok()
     }

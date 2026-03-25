@@ -122,3 +122,45 @@ What it may **never** fund:
 **Humanities Archive** — A permanent, decentralized repository of human knowledge. Academic papers, history, science, art, photographs. Free to anyone. No login, no token, no contribution required. Hosted on reserved flagship compute.
 
 **L2** — Layer 2 applications and services built on top of the Commputer L1 chain. The founder's crypto analytics platform is one such L2. The mechanism through which developers (including the founder) earn revenue.
+
+## Implementation Terms
+
+**Epoch** — A 1-hour (3600 second) time window over which proof scores are aggregated and emission is distributed.
+
+**Anchor** — The validator selected to produce a block for a given round. Selected via VRF-weighted lottery based on Composite Resource Score.
+
+**Composite Resource Score (CRS)** — A validator's aggregate score across all five proof channels, using the sub-linear R^0.7 formula with diversity bonus.
+
+**Finality Depth** — 10 blocks. Blocks older than this cannot be reorganized.
+
+**Checkpoint** — Every 100 blocks, a checkpoint is created that cannot be reorganized past.
+
+**Keystore** — An AES-256-GCM encrypted file storing the wallet's seed phrase. Key derived from password via Argon2id.
+
+**Mempool** — The pool of pending transactions waiting to be included in a block. Fee-sorted with size limits.
+
+**State Root** — A merkle root hash of all account states, included in each block header for light client verification.
+
+**Merkle Proof** — A cryptographic proof that a transaction is included in a block, using sibling hashes along the path from leaf to root.
+
+**Cooldown** — A 3-epoch period of zero rewards triggered by a resource spike detection. Prevents hot-swapping hardware.
+
+**Suspicion Score** — A 0-100 score computed from multiple anti-scale signals (subnet, fingerprint, behavior, geography). Higher means more suspicious.
+
+**Schema Version** — RocksDB schema version number, auto-migrated on database open.
+
+**Write Batch** — An atomic RocksDB operation that commits multiple key-value writes in a single transaction.
+
+**Column Family** — A logical partition within RocksDB. Commputer uses: blocks, block_heights, accounts, meta, archived_accounts.
+
+**Hot Storage** — Accounts kept in memory for fast access. Active accounts are hot.
+
+**Cold Storage** — Accounts archived to RocksDB only (not in memory). Inactive accounts after 100 epochs.
+
+**Archival** — Accounts with zero balance and no activity for 1000 epochs are archived to cold storage.
+
+**State Diff** — A record of all account balance and nonce changes caused by a single block. Used for rollback and debugging.
+
+**Retention Policy** — Configuration for how long different data types are kept. Proof results: 100 epochs. Snapshots: last 10.
+
+**Will Event** — A notification triggered when a contributor's grace period is about to expire, alerting designated contacts.

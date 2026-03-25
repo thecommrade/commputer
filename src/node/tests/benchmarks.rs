@@ -31,6 +31,7 @@ fn genesis_block() -> Block {
             epoch: 0,
             producer_public_key: vec![],
             signature: vec![],
+            checkpoint_hash: None,
         },
         transactions: vec![],
         proof_summaries: vec![],
@@ -58,6 +59,7 @@ fn feature_204_benchmarks() {
                 epoch: 0,
                 producer_public_key: vec![],
                 signature: vec![],
+                checkpoint_hash: None,
             },
             transactions: vec![],
             proof_summaries: vec![],
@@ -92,6 +94,8 @@ fn feature_204_benchmarks() {
             fee: 100_000,
             signature: vec![],
             public_key: vec![],
+            memo: None,
+            timelock: None,
         };
         sign_transaction(&mut tx, &wallet);
 
@@ -156,6 +160,7 @@ fn feature_204_benchmarks() {
                     epoch: 0,
                     producer_public_key: vec![],
                     signature: vec![],
+                    checkpoint_hash: None,
                 },
                 transactions: vec![],
                 proof_summaries: vec![],
@@ -199,6 +204,8 @@ fn feature_206_stress_test_transactions() {
             fee: 0,
             signature: vec![],
             public_key: vec![],
+            memo: None,
+            timelock: None,
         };
         transactions.push(tx);
     }
@@ -221,6 +228,7 @@ fn feature_206_stress_test_transactions() {
                 epoch: 0,
                 producer_public_key: vec![],
                 signature: vec![],
+                checkpoint_hash: None,
             },
             transactions: chunk.to_vec(),
             proof_summaries: vec![],

@@ -53,7 +53,13 @@ pub struct BlockHeader {
     pub producer_public_key: Vec<u8>,
     /// Signature of the producer over the header fields.
     pub signature: Vec<u8>,
+    /// Feature 248: Checkpoint hash — full state root hash at checkpoint intervals (every 1000 blocks).
+    #[serde(default)]
+    pub checkpoint_hash: Option<[u8; 32]>,
 }
+
+/// Feature 248: Checkpoint interval for full state root hashing.
+pub const CHECKPOINT_HASH_INTERVAL: u64 = 1000;
 
 impl BlockHeader {
     /// Compute the hash of this header.
@@ -126,14 +132,17 @@ pub struct Block {
 }
 
 impl Block {
+    /// Returns the hash of this block (delegated to header).
     pub fn hash(&self) -> BlockHash {
         self.header.hash()
     }
 
+    /// Returns the block height.
     pub fn height(&self) -> u64 {
         self.header.height
     }
 
+    /// Returns true if this is the genesis block (height 0, zero parent hash).
     pub fn is_genesis(&self) -> bool {
         self.header.height == 0 && self.header.parent_hash == BlockHash::GENESIS
     }

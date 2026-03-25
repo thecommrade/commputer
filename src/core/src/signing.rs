@@ -13,6 +13,7 @@ fn tx_signable_bytes(tx: &Transaction) -> Vec<u8> {
     bytes
 }
 
+/// Sign a transaction with the sender's wallet key.
 pub fn sign_transaction(tx: &mut Transaction, wallet: &Wallet) {
     let bytes = tx_signable_bytes(tx);
     let sig = wallet.sign(&bytes);
@@ -28,6 +29,7 @@ pub fn sign_block(block: &mut Block, wallet: &Wallet) {
     block.header.signature = sig.to_bytes().to_vec();
 }
 
+/// Verify a transaction's signature against the given public key.
 pub fn verify_transaction(tx: &Transaction, public_key: &VerifyingKey) -> bool {
     if tx.signature.len() != 64 {
         return false;
@@ -64,6 +66,8 @@ mod tests {
             fee: 0,
             signature: vec![],
             public_key: vec![],
+            memo: None,
+            timelock: None,
         };
 
         sign_transaction(&mut tx, &sender);
@@ -88,6 +92,7 @@ mod tests {
                 epoch: 0,
                 producer_public_key: vec![],
                 signature: vec![],
+                checkpoint_hash: None,
             },
             transactions: vec![],
             proof_summaries: vec![],
@@ -116,6 +121,7 @@ mod tests {
                 epoch: 0,
                 producer_public_key: vec![],
                 signature: vec![],
+                checkpoint_hash: None,
             },
             transactions: vec![],
             proof_summaries: vec![],
@@ -146,6 +152,7 @@ mod tests {
                 epoch: 0,
                 producer_public_key: vec![],
                 signature: vec![],
+                checkpoint_hash: None,
             },
             transactions: vec![],
             proof_summaries: vec![],
@@ -172,6 +179,8 @@ mod tests {
             fee: 0,
             signature: vec![],
             public_key: vec![],
+            memo: None,
+            timelock: None,
         };
 
         sign_transaction(&mut tx, &sender);

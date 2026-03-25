@@ -5,11 +5,13 @@ use libp2p::{
 use std::time::Duration;
 use tracing::{info, warn, debug};
 
+/// The Commputer P2P network built on libp2p with gossipsub, Kademlia, and identify.
 pub struct CommpNetwork {
     pub swarm: Swarm<CommpBehaviour>,
     pub local_peer_id: Libp2pPeerId,
 }
 
+/// Combined libp2p behaviour: gossipsub for broadcast, Kademlia for DHT, identify for handshake.
 #[derive(libp2p::swarm::NetworkBehaviour)]
 pub struct CommpBehaviour {
     pub gossipsub: gossipsub::Behaviour,
@@ -96,6 +98,7 @@ pub const SEED_NODES: &[&str] = &[
 ];
 
 impl CommpNetwork {
+    /// Dial all built-in seed nodes. Returns the number successfully dialed.
     pub fn connect_to_seeds(&mut self) -> usize {
         let mut connected = 0;
         for addr_str in SEED_NODES {

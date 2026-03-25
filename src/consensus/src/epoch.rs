@@ -28,6 +28,7 @@ pub struct EpochState {
 }
 
 impl EpochState {
+    /// Create a new epoch state with default demand and difficulty.
     pub fn new(epoch: u64, start_time: u64) -> Self {
         let mut demand = HashMap::new();
         let mut difficulty_multiplier = HashMap::new();

@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+/// All error types that can occur in the Commputer protocol.
 #[derive(Error, Debug)]
 pub enum CommpError {
     #[error("invalid block: {0}")]

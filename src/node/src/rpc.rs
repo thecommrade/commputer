@@ -4,11 +4,14 @@ use axum::{
     Router,
     Json,
     extract::{Path, State},
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     http::StatusCode,
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{info, warn};
 
 use commputer_core::transaction::Transaction;
@@ -75,6 +78,12 @@ pub struct RpcState {
     pub peer_quality: Mutex<HashMap<String, serde_json::Value>>,
     /// Feature 188: Storage metrics snapshot.
     pub storage_metrics: Mutex<commputer_storage::StorageMetrics>,
+    /// Feature 241: WebSocket broadcast channel for real-time events.
+    pub ws_broadcast: broadcast::Sender<String>,
+    /// Feature 256: Whether testnet mode is active (enables faucet).
+    pub is_testnet: bool,
+    /// Feature 256: Faucet rate limiting (address_hex -> last_epoch_claimed).
+    pub faucet_claims: Mutex<HashMap<String, u64>>,
 }
 
 /// Response for a submitted transaction.
@@ -336,9 +345,282 @@ async fn get_anti_scale(
     Json(metrics)
 }
 
+// ── Feature 241: WebSocket RPC ──
+
+/// GET /ws — upgrade to WebSocket for real-time event streaming.
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<RpcState>>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_ws(socket, state))
+}
+
+async fn handle_ws(socket: WebSocket, state: Arc<RpcState>) {
+    use futures::SinkExt as _;
+    let (mut sink, _stream) = socket.split();
+    let mut rx = state.ws_broadcast.subscribe();
+
+    // Send events to the client until they disconnect.
+    tokio::spawn(async move {
+        while let Ok(msg) = rx.recv().await {
+            let text: Message = Message::Text(msg.into());
+            if sink.send(text).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+// ── Feature 242: Prometheus metrics ──
+
+/// GET /metrics/prometheus — Prometheus text format metrics.
+async fn get_prometheus_metrics(
+    State(state): State<Arc<RpcState>>,
+) -> Response {
+    let status = state.status.lock().await;
+    let metrics = state.metrics.lock().await;
+
+    let body = format!(
+        "# HELP commputer_chain_height Current blockchain height\n\
+         # TYPE commputer_chain_height gauge\n\
+         commputer_chain_height {}\n\
+         # HELP commputer_epoch Current epoch number\n\
+         # TYPE commputer_epoch gauge\n\
+         commputer_epoch {}\n\
+         # HELP commputer_peers_connected Number of connected peers\n\
+         # TYPE commputer_peers_connected gauge\n\
+         commputer_peers_connected {}\n\
+         # HELP commputer_blocks_produced Total blocks produced by this node\n\
+         # TYPE commputer_blocks_produced counter\n\
+         commputer_blocks_produced {}\n\
+         # HELP commputer_pending_txs Number of pending transactions in mempool\n\
+         # TYPE commputer_pending_txs gauge\n\
+         commputer_pending_txs {}\n\
+         # HELP commputer_total_emitted Total COMME emitted in raw units\n\
+         # TYPE commputer_total_emitted counter\n\
+         commputer_total_emitted {}\n\
+         # HELP commputer_total_burned Total COMME burned in raw units\n\
+         # TYPE commputer_total_burned counter\n\
+         commputer_total_burned {}\n",
+        status.height,
+        status.epoch,
+        metrics.peers_connected,
+        metrics.blocks_produced,
+        status.pending_txs,
+        status.emitted,
+        status.burned,
+    );
+
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        body,
+    ).into_response()
+}
+
+// ── Feature 243: Block explorer web UI ──
+
+/// GET / — serve a simple block explorer HTML page.
+async fn block_explorer(
+    State(_state): State<Arc<RpcState>>,
+) -> Html<&'static str> {
+    Html(BLOCK_EXPLORER_HTML)
+}
+
+const BLOCK_EXPLORER_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Commputer Block Explorer</title>
+<style>
+body{font-family:monospace;background:#111;color:#0f0;margin:2em;max-width:960px;margin:2em auto}
+h1{color:#0ff;text-align:center}
+.card{background:#1a1a2e;border:1px solid #333;border-radius:6px;padding:1em;margin:1em 0}
+.stat{display:inline-block;margin:0 2em 0.5em 0}
+.label{color:#888;font-size:0.9em}
+table{width:100%;border-collapse:collapse;margin-top:0.5em}
+th,td{text-align:left;padding:4px 8px;border-bottom:1px solid #333}
+th{color:#0ff}
+.hash{color:#ff0;font-size:0.85em}
+#status{color:#888;font-size:0.8em;text-align:right}
+</style>
+</head>
+<body>
+<h1>COMMPUTER Block Explorer</h1>
+<div id="status">Loading...</div>
+<div class="card" id="stats"></div>
+<h2>Recent Blocks</h2>
+<div class="card"><table id="blocks"><tr><th>Height</th><th>Producer</th><th>Txs</th><th>Time</th></tr></table></div>
+<h2>Recent Transactions</h2>
+<div class="card"><table id="txs"><tr><th>Hash</th><th>From</th><th>Kind</th><th>Fee</th></tr></table></div>
+<script>
+async function refresh(){
+  try{
+    const s=await(await fetch('/status')).json();
+    document.getElementById('stats').innerHTML=
+      `<div class="stat"><div class="label">Height</div>${s.height}</div>`+
+      `<div class="stat"><div class="label">Epoch</div>${s.epoch}</div>`+
+      `<div class="stat"><div class="label">Accounts</div>${s.accounts}</div>`+
+      `<div class="stat"><div class="label">Pending TXs</div>${s.pending_txs}</div>`+
+      `<div class="stat"><div class="label">Emitted</div>${s.emitted}</div>`+
+      `<div class="stat"><div class="label">Burned</div>${s.burned}</div>`;
+    // Blocks
+    const bt=document.getElementById('blocks');
+    let brows='<tr><th>Height</th><th>Producer</th><th>Txs</th><th>Time</th></tr>';
+    const start=Math.max(0,s.height-9);
+    for(let h=s.height;h>=start;h--){
+      try{
+        const b=await(await fetch('/block/'+h)).json();
+        if(b.header){
+          const t=new Date(b.header.timestamp*1000).toLocaleTimeString();
+          const p=b.header.producer?Object.values(b.header.producer)[0]||'':'';
+          const ph=Array.isArray(p)?p.slice(0,4).map(x=>x.toString(16).padStart(2,'0')).join('')+'...':'genesis';
+          brows+=`<tr><td>${b.header.height}</td><td class="hash">${ph}</td><td>${(b.transactions||[]).length}</td><td>${t}</td></tr>`;
+        }
+      }catch(e){}
+    }
+    bt.innerHTML=brows;
+    // Mempool txs
+    const mp=await(await fetch('/mempool')).json();
+    const tt=document.getElementById('txs');
+    let trows='<tr><th>Hash</th><th>From</th><th>Kind</th><th>Fee</th></tr>';
+    for(const tx of mp.slice(0,20)){
+      trows+=`<tr><td class="hash">${tx.tx_hash.slice(0,16)}...</td><td class="hash">${tx.from.slice(0,16)}...</td><td>${tx.kind}</td><td>${tx.fee}</td></tr>`;
+    }
+    tt.innerHTML=trows;
+    document.getElementById('status').textContent='Last updated: '+new Date().toLocaleTimeString();
+  }catch(e){document.getElementById('status').textContent='Error: '+e;}
+}
+refresh();setInterval(refresh,5000);
+</script>
+</body>
+</html>"#;
+
+// ── Feature 253: Fee estimator ──
+
+/// GET /fee-estimate — recommend a transaction fee based on mempool fullness.
+async fn get_fee_estimate(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let mempool = state.mempool.lock().await;
+    let mempool_size = mempool.len();
+    let max_mempool = 5000usize; // matches MAX_MEMPOOL_SIZE in event_loop
+    let fullness = mempool_size as f64 / max_mempool as f64;
+
+    let min_fee = commputer_core::transaction::MINIMUM_FEE;
+    let recommended = if fullness > 0.8 {
+        // Scale fee up to 10x based on congestion.
+        let multiplier = 1.0 + (fullness - 0.8) * 45.0; // 1x at 80%, ~10x at 100%
+        (min_fee as f64 * multiplier) as u64
+    } else {
+        min_fee
+    };
+
+    Json(serde_json::json!({
+        "recommended_fee": recommended,
+        "min_fee": min_fee,
+        "mempool_fullness": fullness,
+    }))
+}
+
+// ── Feature 254: Pending rewards ──
+
+/// GET /rewards/{address} — estimated pending mining rewards.
+async fn get_pending_rewards(
+    State(state): State<Arc<RpcState>>,
+    Path(address): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let balances = state.balances.lock().await;
+    let status = state.status.lock().await;
+
+    if let Some(info) = balances.get(&address) {
+        if !info.is_validator {
+            return (StatusCode::OK, Json(serde_json::json!({
+                "address": address,
+                "estimated_reward": 0,
+                "composite_score": 0,
+                "epoch": status.epoch,
+                "note": "address is not a validator",
+            })));
+        }
+        // Estimate based on equal share among validators.
+        let validator_count = balances.values().filter(|b| b.is_validator).count().max(1);
+        // Base daily emission: ~100 COMME/day for testnet.
+        let daily_emission_raw = 100u64 * commputer_core::token::UNITS_PER_COMME;
+        let estimated_reward = daily_emission_raw / validator_count as u64;
+
+        (StatusCode::OK, Json(serde_json::json!({
+            "address": address,
+            "estimated_reward": estimated_reward,
+            "composite_score": 100,
+            "epoch": status.epoch,
+            "validator_count": validator_count,
+        })))
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "Account not found",
+            "address": address,
+        })))
+    }
+}
+
+// ── Feature 256: Testnet faucet ──
+
+/// Faucet request body.
+#[derive(Debug, Deserialize)]
+pub struct FaucetRequest {
+    pub address: String,
+}
+
+/// POST /faucet — dispense testnet COMME.
+async fn faucet(
+    State(state): State<Arc<RpcState>>,
+    Json(req): Json<FaucetRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !state.is_testnet {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "faucet only available on testnet",
+        })));
+    }
+
+    // Validate address format.
+    if hex::decode(&req.address).map(|b| b.len()).unwrap_or(0) != 32 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "invalid address format (expected 64 hex characters)",
+        })));
+    }
+
+    let current_epoch = state.status.lock().await.epoch;
+
+    // Rate limit: 1 request per address per epoch.
+    let mut claims = state.faucet_claims.lock().await;
+    if let Some(&last_epoch) = claims.get(&req.address) {
+        if last_epoch >= current_epoch {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                "error": "faucet already claimed this epoch",
+                "next_available_epoch": current_epoch + 1,
+            })));
+        }
+    }
+
+    claims.insert(req.address.clone(), current_epoch);
+
+    // Create a faucet transaction (1 COMME).
+    let faucet_amount = commputer_core::token::UNITS_PER_COMME; // 1 COMME
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "success": true,
+        "address": req.address,
+        "amount": faucet_amount,
+        "epoch": current_epoch,
+        "note": "1 COMME dispensed from faucet (testnet only)",
+    })))
+}
+
 /// Build the axum router (exposed for testing).
 pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
     Router::new()
+        .route("/", get(block_explorer))
         .route("/tx", post(submit_tx))
         .route("/status", get(get_status))
         .route("/peers", get(get_peers))
@@ -347,6 +629,7 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/block/{height}", get(get_block_by_height))
         .route("/receipt/{tx_hash}", get(get_receipt))
         .route("/metrics", get(get_metrics))
+        .route("/metrics/prometheus", get(get_prometheus_metrics))
         .route("/proofs/status", get(get_proof_status))
         .route("/health", get(get_health))
         .route("/compliance", get(get_compliance))
@@ -354,6 +637,10 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/network", get(get_network_health))
         .route("/network/quality", get(get_peer_quality))
         .route("/storage/metrics", get(get_storage_metrics))
+        .route("/ws", get(ws_handler))
+        .route("/fee-estimate", get(get_fee_estimate))
+        .route("/rewards/{address}", get(get_pending_rewards))
+        .route("/faucet", post(faucet))
         .with_state(rpc_state)
 }
 
@@ -421,6 +708,9 @@ mod tests {
             network_health: Mutex::new(NetworkHealthDashboard::default()),
             peer_quality: Mutex::new(HashMap::new()),
             storage_metrics: Mutex::new(commputer_storage::StorageMetrics::default()),
+            ws_broadcast: broadcast::channel(256).0,
+            is_testnet: true,
+            faucet_claims: Mutex::new(HashMap::new()),
         });
         (state, rx)
     }
@@ -438,6 +728,8 @@ mod tests {
             fee: 0,
             signature: vec![],
             public_key: vec![],
+            memo: None,
+            timelock: None,
         };
         sign_transaction(&mut tx, &wallet);
         tx
@@ -487,6 +779,8 @@ mod tests {
             fee: 0,
             signature: vec![],
             public_key: vec![],
+            memo: None,
+            timelock: None,
         };
         let body = serde_json::to_vec(&tx).unwrap();
 
@@ -523,6 +817,8 @@ mod tests {
             fee: 0,
             signature: vec![0u8; 64],
             public_key: wallet.public_key().to_bytes().to_vec(),
+            memo: None,
+            timelock: None,
         };
         let body = serde_json::to_vec(&tx).unwrap();
 

@@ -9,6 +9,7 @@ use sha2::{Sha256, Digest};
 pub struct Address(pub [u8; 32]);
 
 impl Address {
+    /// Derive an address from an ed25519 public key via SHA-256.
     pub fn from_public_key(key: &VerifyingKey) -> Self {
         let hash = Sha256::digest(key.as_bytes());
         let mut addr = [0u8; 32];

@@ -32,22 +32,27 @@ pub struct PeerStore {
 }
 
 impl PeerStore {
+    /// Create an empty peer store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Add or update a peer.
     pub fn add(&mut self, info: PeerInfo) {
         self.peers.insert(info.id, info);
     }
 
+    /// Look up a peer by ID.
     pub fn get(&self, id: &PeerId) -> Option<&PeerInfo> {
         self.peers.get(id)
     }
 
+    /// Get a mutable reference to a peer.
     pub fn get_mut(&mut self, id: &PeerId) -> Option<&mut PeerInfo> {
         self.peers.get_mut(id)
     }
 
+    /// Remove a peer from the store.
     pub fn remove(&mut self, id: &PeerId) {
         self.peers.remove(id);
     }
@@ -68,10 +73,12 @@ impl PeerStore {
     }
 
     /// Total known peers.
+    /// Total known peers.
     pub fn len(&self) -> usize {
         self.peers.len()
     }
 
+    /// Returns true if no peers are known.
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
     }

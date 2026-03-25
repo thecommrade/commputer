@@ -42,6 +42,7 @@ pub struct Dag {
 }
 
 impl Dag {
+    /// Create an empty DAG with tip tracking for all five channels.
     pub fn new() -> Self {
         let mut tips = HashMap::new();
         for channel in ResourceChannel::ALL {
@@ -115,10 +116,12 @@ impl Dag {
     }
 
     /// Total number of vertices in the DAG.
+    /// Total number of vertices in the DAG.
     pub fn len(&self) -> usize {
         self.vertices.len()
     }
 
+    /// Returns true if the DAG contains no vertices.
     pub fn is_empty(&self) -> bool {
         self.vertices.is_empty()
     }

@@ -1,11 +1,12 @@
 //! Merkle proof generation and verification for light client support.
 //! Features 212-213.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 
 /// A merkle inclusion proof: a list of sibling hashes with direction indicators.
 /// `true` means the sibling is on the right; `false` means left.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MerkleProof {
     pub siblings: Vec<(bool, [u8; 32])>,
 }

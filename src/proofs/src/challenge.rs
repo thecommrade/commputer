@@ -124,7 +124,8 @@ impl ChallengeGenerator {
         }
     }
 
-    /// Legacy payload generation (no difficulty scaling).
+    /// Legacy payload generation without difficulty scaling.
+    #[allow(dead_code)]
     fn generate_payload(challenge_id: &[u8; 32], channel: &ResourceChannel) -> Vec<u8> {
         Self::generate_payload_with_difficulty(challenge_id, channel, 1.0)
     }

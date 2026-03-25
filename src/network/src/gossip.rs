@@ -17,6 +17,7 @@ pub struct GossipRouter {
 }
 
 impl GossipRouter {
+    /// Create a router with default fanout (8) and seen cache (100k).
     pub fn new() -> Self {
         Self {
             seen: HashSet::new(),
@@ -25,6 +26,7 @@ impl GossipRouter {
         }
     }
 
+    /// Set the fan-out count (peers to forward each message to).
     pub fn with_fanout(mut self, fanout: usize) -> Self {
         self.fanout = fanout;
         self

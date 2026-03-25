@@ -2,8 +2,11 @@ use serde::{Deserialize, Serialize};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 /// Total supply: 2 billion $COMME, represented in smallest unit (1 COMME = 10^8 units).
+/// Number of decimal places in the smallest unit.
 pub const DECIMALS: u8 = 8;
+/// Raw units per 1 $COMME (10^8).
 pub const UNITS_PER_COMME: u64 = 100_000_000;
+/// Total fixed supply: 2 billion $COMME in raw units.
 pub const TOTAL_SUPPLY: u64 = 2_000_000_000 * UNITS_PER_COMME;
 
 /// Token amount in smallest units. All arithmetic is done in these units
@@ -13,6 +16,7 @@ pub const TOTAL_SUPPLY: u64 = 2_000_000_000 * UNITS_PER_COMME;
 pub struct Amount(u64);
 
 impl Amount {
+    /// Zero amount constant.
     pub const ZERO: Self = Self(0);
 
     /// Create from raw smallest units.
@@ -25,6 +29,7 @@ impl Amount {
         Self(whole * UNITS_PER_COMME)
     }
 
+    /// Returns the raw unit value.
     pub const fn raw(&self) -> u64 {
         self.0
     }
@@ -34,14 +39,17 @@ impl Amount {
         self.0 / UNITS_PER_COMME
     }
 
+    /// Add two amounts, returning `None` on overflow.
     pub fn checked_add(self, other: Self) -> Option<Self> {
         self.0.checked_add(other.0).map(Self)
     }
 
+    /// Subtract, returning `None` if the result would be negative.
     pub fn checked_sub(self, other: Self) -> Option<Self> {
         self.0.checked_sub(other.0).map(Self)
     }
 
+    /// Subtract, clamping at zero instead of underflowing.
     pub fn saturating_sub(self, other: Self) -> Self {
         Self(self.0.saturating_sub(other.0))
     }

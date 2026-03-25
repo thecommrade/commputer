@@ -59,6 +59,15 @@ enum Commands {
         /// Feature 179: Comma-separated DNS seed domain names
         #[arg(long, value_delimiter = ',')]
         dns_seeds: Vec<String>,
+        /// Feature 244: Wallet password for non-interactive decrypt
+        #[arg(long)]
+        password: Option<String>,
+        /// Feature 245: Select wallet by name (default: "default")
+        #[arg(long, default_value = "default")]
+        wallet: String,
+        /// Feature 255: Enable terminal dashboard (continuously updating status)
+        #[arg(long, default_value = "false")]
+        dashboard: bool,
     },
     /// Wallet management
     Wallet {
@@ -124,6 +133,22 @@ enum Commands {
         #[arg(long, default_value = "true")]
         testnet: bool,
     },
+    /// Feature 245: List all wallets
+    WalletList {
+        #[arg(long, default_value = "true")]
+        testnet: bool,
+    },
+    /// Feature 252: Address book management
+    Address {
+        #[command(subcommand)]
+        action: AddressAction,
+    },
+    /// Feature 257: Generate a genesis block interactively
+    GenesisGenerate {
+        /// Output file path for the genesis block
+        #[arg(default_value = "genesis.json")]
+        output: String,
+    },
     /// Send COMME to another address
     Send {
         /// Recipient address (hex)
@@ -162,6 +187,25 @@ enum WalletAction {
     },
 }
 
+/// Feature 252: Address book actions.
+#[derive(Subcommand, Debug)]
+enum AddressAction {
+    /// Add a labeled address
+    Add {
+        /// Label for the address
+        label: String,
+        /// Address in hex
+        address: String,
+    },
+    /// List all saved addresses
+    List,
+    /// Remove a labeled address
+    Remove {
+        /// Label to remove
+        label: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -176,6 +220,11 @@ fn data_dir(testnet: bool) -> PathBuf {
 
 fn wallet_path(testnet: bool) -> PathBuf {
     data_dir(testnet).join("wallet.json")
+}
+
+/// Feature 245: Get the path for a named wallet.
+fn wallet_path_named(testnet: bool, name: &str) -> PathBuf {
+    data_dir(testnet).join("wallets").join(format!("{}.json", name))
 }
 
 fn read_password(prompt: &str) -> String {
@@ -205,6 +254,7 @@ fn create_genesis() -> Block {
             epoch: 0,
             producer_public_key: vec![],
             signature: vec![],
+            checkpoint_hash: None,
         },
         transactions: vec![],
         proof_summaries: vec![],
@@ -469,6 +519,8 @@ async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result
         fee: commputer_core::transaction::MINIMUM_FEE,
         signature: vec![],
         public_key: vec![],
+        memo: None,
+        timelock: None,
     };
     sign_transaction(&mut tx, &wallet);
 
@@ -603,6 +655,7 @@ async fn run_node(
     relay: bool,
     seeds: Vec<String>,
     dns_seeds: Vec<String>,
+    password: Option<String>,
 ) -> Result<()> {
     // Initialize logging.
     tracing_subscriber::fmt()
@@ -678,11 +731,15 @@ async fn run_node(
         warn!("  EMERGENCY ACCESS MODE: supply below 1M COMME");
     }
 
-    // Load or create wallet.
+    // Load or create wallet. Feature 244: support --password flag for non-interactive decrypt.
     let wallet_file = wallet_path(testnet);
     let wallet = if wallet_file.exists() {
-        let password = read_password("Wallet password: ");
-        Keystore::load(&wallet_file, &password)
+        let pw = if let Some(ref pw) = password {
+            pw.clone()
+        } else {
+            read_password("Wallet password: ")
+        };
+        Keystore::load(&wallet_file, &pw)
             .map_err(|e| anyhow::anyhow!("{}", e))?
     } else {
         info!("No wallet found — generating ephemeral wallet for this session.");
@@ -771,6 +828,9 @@ async fn run_node(
         network_health: tokio::sync::Mutex::new(rpc::NetworkHealthDashboard::default()),
         peer_quality: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         storage_metrics: tokio::sync::Mutex::new(commputer_storage::StorageMetrics::default()),
+        ws_broadcast: tokio::sync::broadcast::channel(256).0,
+        is_testnet: testnet,
+        faucet_claims: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
@@ -798,8 +858,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds } => {
-            run_node(testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds).await?;
+        Commands::Run { testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds, password, wallet: _, dashboard: _ } => {
+            run_node(testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds, password).await?;
         }
         Commands::Wallet { action } => match action {
             WalletAction::Create { testnet } => cmd_wallet_create(testnet)?,
@@ -876,6 +936,15 @@ async fn main() -> Result<()> {
         }
         Commands::RebuildIndexes { testnet } => {
             cmd_rebuild_indexes(testnet)?;
+        }
+        Commands::WalletList { testnet } => {
+            cmd_wallet_list(testnet)?;
+        }
+        Commands::Address { action } => {
+            cmd_address(action)?;
+        }
+        Commands::GenesisGenerate { output } => {
+            cmd_genesis_generate(&output)?;
         }
         Commands::Send { to, amount, testnet, rpc_port } => {
             cmd_send(&to, amount, testnet, rpc_port).await?;
@@ -994,6 +1063,183 @@ fn cmd_rebuild_indexes(testnet: bool) -> Result<()> {
     println!("  Receipts rebuilt:        {}", receipts);
     println!("  History entries rebuilt:  {}", history);
     println!("Index rebuild complete.");
+
+    Ok(())
+}
+
+// ── Feature 245: Multi-wallet support ──
+
+fn cmd_wallet_list(testnet: bool) -> Result<()> {
+    let wallets_dir = data_dir(testnet).join("wallets");
+    let legacy = wallet_path(testnet);
+
+    println!();
+    println!("Wallets:");
+
+    if legacy.exists() {
+        println!("  default ({})", legacy.display());
+    }
+
+    if wallets_dir.exists() {
+        for entry in std::fs::read_dir(&wallets_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                let name = path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                println!("  {} ({})", name, path.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Feature 252: Address book ──
+
+fn address_book_path() -> PathBuf {
+    PathBuf::from("./commputer-testnet/address_book.json")
+}
+
+fn load_address_book() -> std::collections::HashMap<String, String> {
+    let path = address_book_path();
+    if path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(book) = serde_json::from_str(&data) {
+                return book;
+            }
+        }
+    }
+    std::collections::HashMap::new()
+}
+
+fn save_address_book(book: &std::collections::HashMap<String, String>) -> Result<()> {
+    let path = address_book_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(book)?;
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+fn cmd_address(action: AddressAction) -> Result<()> {
+    match action {
+        AddressAction::Add { label, address } => {
+            // Validate address.
+            let addr_bytes = hex::decode(&address)
+                .map_err(|e| anyhow::anyhow!("Invalid address (expected hex): {}", e))?;
+            if addr_bytes.len() != 32 {
+                anyhow::bail!("Address must be 32 bytes (64 hex characters).");
+            }
+            let mut book = load_address_book();
+            book.insert(label.clone(), address.clone());
+            save_address_book(&book)?;
+            println!("Added: {} -> {}", label, address);
+        }
+        AddressAction::List => {
+            let book = load_address_book();
+            if book.is_empty() {
+                println!("Address book is empty.");
+            } else {
+                println!();
+                println!("Address book:");
+                for (label, address) in &book {
+                    println!("  {} -> {}", label, address);
+                }
+            }
+        }
+        AddressAction::Remove { label } => {
+            let mut book = load_address_book();
+            if book.remove(&label).is_some() {
+                save_address_book(&book)?;
+                println!("Removed: {}", label);
+            } else {
+                println!("Label '{}' not found in address book.", label);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Feature 257: Genesis block ceremony tool ──
+
+fn cmd_genesis_generate(output: &str) -> Result<()> {
+    println!();
+    println!("Commputer Genesis Block Generator");
+    println!("==================================");
+    println!();
+
+    let total_supply_str = read_line("Total supply (COMME) [2000000000]: ");
+    let total_supply: u64 = if total_supply_str.is_empty() {
+        2_000_000_000
+    } else {
+        total_supply_str.parse().unwrap_or(2_000_000_000)
+    };
+
+    let epoch_duration_str = read_line("Epoch duration (seconds) [3600]: ");
+    let epoch_duration: u64 = if epoch_duration_str.is_empty() {
+        3600
+    } else {
+        epoch_duration_str.parse().unwrap_or(3600)
+    };
+
+    let emission_rate_str = read_line("Initial emission rate (COMME/day) [100]: ");
+    let emission_rate: u64 = if emission_rate_str.is_empty() {
+        100
+    } else {
+        emission_rate_str.parse().unwrap_or(100)
+    };
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let zero32 = vec![0u8; 32];
+    let genesis = serde_json::json!({
+        "header": {
+            "protocol_version": 1,
+            "height": 0,
+            "parent_hash": zero32,
+            "tx_root": zero32,
+            "proof_root": zero32,
+            "state_root": zero32,
+            "timestamp": timestamp,
+            "producer": zero32,
+            "epoch": 0,
+            "producer_public_key": [],
+            "signature": [],
+            "checkpoint_hash": null,
+        },
+        "transactions": [],
+        "proof_summaries": [],
+        "compliance_summary": null,
+        "config": {
+            "total_supply": total_supply,
+            "epoch_duration_secs": epoch_duration,
+            "initial_emission_rate": emission_rate,
+            "channel_floors": {
+                "processing": 0.20,
+                "gpu": 0.15,
+                "storage": 0.15,
+                "ram": 0.15,
+                "bandwidth": 0.10,
+            },
+        },
+    });
+
+    let json = serde_json::to_string_pretty(&genesis)?;
+    std::fs::write(output, &json)?;
+
+    println!();
+    println!("Genesis block generated:");
+    println!("  Total supply:    {} COMME", total_supply);
+    println!("  Epoch duration:  {} seconds", epoch_duration);
+    println!("  Emission rate:   {} COMME/day", emission_rate);
+    println!("  Timestamp:       {}", timestamp);
+    println!("  Output:          {}", output);
 
     Ok(())
 }

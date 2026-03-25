@@ -20,6 +20,7 @@ pub struct EmissionSchedule {
 }
 
 impl EmissionSchedule {
+    /// Create the default emission schedule with launch parameters.
     pub fn new() -> Self {
         Self {
             // 0.09 COMME/day = 9_000_000 raw units/day

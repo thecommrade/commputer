@@ -40,6 +40,7 @@ pub struct SnowballVoter {
 }
 
 impl SnowballVoter {
+    /// Create a new voter with the given consensus parameters.
     pub fn new(params: SnowballParams) -> Self {
         Self {
             params,
@@ -50,6 +51,7 @@ impl SnowballVoter {
         }
     }
 
+    /// Create a voter with the default Snowball parameters.
     pub fn with_default_params() -> Self {
         Self::new(SnowballParams::default())
     }

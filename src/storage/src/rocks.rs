@@ -34,6 +34,7 @@ pub struct RocksStore {
 }
 
 impl RocksStore {
+    /// Open or create a RocksDB store at the given filesystem path.
     pub fn open(path: &Path) -> Result<Self, rocksdb::Error> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -103,6 +104,7 @@ impl RocksStore {
 
     // ── Block operations ──
 
+    /// Persist a block to RocksDB and update the height index.
     pub fn put_block(&self, block: &Block) -> Result<(), rocksdb::Error> {
         let hash = block.hash();
         let height = block.height();
@@ -123,6 +125,7 @@ impl RocksStore {
         Ok(())
     }
 
+    /// Retrieve a block by hash from RocksDB.
     pub fn get_block(&self, hash: &BlockHash) -> Result<Option<Block>, rocksdb::Error> {
         let cf = self.db.cf_handle(CF_BLOCKS).unwrap();
         match self.db.get_cf(&cf, hash.0)? {
@@ -135,6 +138,7 @@ impl RocksStore {
         }
     }
 
+    /// Retrieve a block by height via the height index.
     pub fn get_block_by_height(&self, height: u64) -> Result<Option<Block>, rocksdb::Error> {
         let cf_heights = self.db.cf_handle(CF_BLOCK_HEIGHTS).unwrap();
         match self.db.get_cf(&cf_heights, height.to_le_bytes())? {
@@ -149,6 +153,7 @@ impl RocksStore {
 
     // ── Account operations ──
 
+    /// Persist an account to RocksDB.
     pub fn put_account(&self, account: &Account) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle(CF_ACCOUNTS).unwrap();
         let encoded =
@@ -156,6 +161,7 @@ impl RocksStore {
         self.db.put_cf(&cf, account.address.0, &encoded)
     }
 
+    /// Retrieve an account by address from RocksDB.
     pub fn get_account(&self, address: &Address) -> Result<Option<Account>, rocksdb::Error> {
         let cf = self.db.cf_handle(CF_ACCOUNTS).unwrap();
         match self.db.get_cf(&cf, address.0)? {
@@ -203,11 +209,13 @@ impl RocksStore {
 
     // ── Meta operations ──
 
+    /// Store a u64 metadata value.
     pub fn put_meta_u64(&self, key: &str, value: u64) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle(CF_META).unwrap();
         self.db.put_cf(&cf, key.as_bytes(), value.to_le_bytes())
     }
 
+    /// Retrieve a u64 metadata value.
     pub fn get_meta_u64(&self, key: &str) -> Result<Option<u64>, rocksdb::Error> {
         let cf = self.db.cf_handle(CF_META).unwrap();
         let start = std::time::Instant::now();
@@ -345,6 +353,7 @@ mod tests {
                 epoch: 0,
                 producer_public_key: vec![],
                 signature: vec![],
+                checkpoint_hash: None,
             },
             transactions: vec![],
             proof_summaries: vec![],

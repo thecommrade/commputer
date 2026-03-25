@@ -35,6 +35,7 @@ pub struct ProofChannelStats {
 /// Default storage data size: 1 MB assigned to each validator.
 const STORAGE_DATA_SIZE: usize = 1_048_576;
 
+/// Manages proof challenge generation, solving, and epoch finalization for all 5 channels.
 pub struct ProofManager {
     pending_challenges: HashMap<[u8; 32], ProofChallenge>,
     responses: Vec<ProofResponse>,
@@ -50,6 +51,7 @@ pub struct ProofManager {
 }
 
 impl ProofManager {
+    /// Create a new proof manager for the given validator address.
     pub fn new(our_address: Address) -> Self {
         // Generate deterministic storage data from our address (serves as seed).
         let storage_data = StorageProver::generate_test_data(&our_address.0, STORAGE_DATA_SIZE);

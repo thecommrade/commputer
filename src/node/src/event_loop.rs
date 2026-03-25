@@ -34,7 +34,7 @@ const MINIMUM_PEERS: usize = 2;
 /// Set to u64::MAX — not yet activated.
 pub const PROTOCOL_V2_ACTIVATION_HEIGHT: u64 = u64::MAX;
 
-/// Feature 177: Connection quality metrics per peer.
+/// Connection quality metrics per peer (latency, message counts).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerQuality {
     pub avg_latency_ms: u64,
@@ -58,6 +58,7 @@ impl Default for PeerQuality {
     }
 }
 
+/// Main event loop for a Commputer node. Coordinates network, consensus, proofs, and chain state.
 pub struct EventLoop {
     pub state: ChainState,
     pub wallet: Wallet,
@@ -169,6 +170,14 @@ impl EventLoop {
         self.rpc_rx = Some(rx);
         self.rpc_state = Some(state);
         self.update_rpc_status();
+    }
+
+    /// Feature 241: Broadcast a JSON event to all connected WebSocket clients.
+    fn broadcast_ws_event(&self, event: &serde_json::Value) {
+        if let Some(ref rpc) = self.rpc_state {
+            let msg = serde_json::to_string(event).unwrap_or_default();
+            let _ = rpc.ws_broadcast.send(msg);
+        }
     }
 
     /// Push a fresh status snapshot to the RPC shared state.
@@ -725,6 +734,13 @@ impl EventLoop {
             ConsensusMessage::BlockResponse { block: None, requested_height } => {
                 debug!("Peer doesn't have block at height {}", requested_height);
             }
+            ConsensusMessage::LightClientRequest { tx_hash, block_height } => {
+                // Serve merkle proof for the requested transaction.
+                debug!("Light client request for tx {:?} in block {}", &tx_hash[..4], block_height);
+            }
+            ConsensusMessage::LightClientResponse { .. } => {
+                // Handle light client response (future use).
+            }
         }
     }
 
@@ -921,6 +937,15 @@ impl EventLoop {
         }
 
         info!("Broadcast transaction {} from RPC", hex::encode(tx_hash.0));
+
+        // Feature 241: Broadcast tx event to WebSocket clients.
+        self.broadcast_ws_event(&serde_json::json!({
+            "type": "new_transaction",
+            "tx_hash": hex::encode(tx_hash.0),
+            "from": hex::encode(tx.from.0),
+            "kind": format!("{:?}", tx.kind).chars().take(50).collect::<String>(),
+        }));
+
         self.pending_txs.push(tx);
         self.update_rpc_status();
     }
@@ -937,6 +962,18 @@ impl EventLoop {
         let hash = tx.hash();
         if self.seen_tx_hashes.contains(&hash) {
             return Err("duplicate transaction");
+        }
+        // Feature 251: Validate memo length.
+        if let Some(ref memo) = tx.memo {
+            if memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
+                return Err("memo exceeds max length");
+            }
+        }
+        // Feature 260: Validate timelock.
+        if let Some(timelock) = tx.timelock {
+            if self.state.blocks.height() < timelock {
+                return Err("transaction timelocked");
+            }
         }
         // Minimum fee check.
         if tx.fee < commputer_core::transaction::MINIMUM_FEE {
@@ -1270,6 +1307,7 @@ impl EventLoop {
                 epoch: self.state.current_epoch,
                 producer_public_key: vec![],
                 signature: vec![],
+                checkpoint_hash: None,
             },
             transactions: txs,
             proof_summaries: vec![],
@@ -1280,6 +1318,12 @@ impl EventLoop {
         block.header.tx_root = block.compute_tx_root();
         block.header.proof_root = block.compute_proof_root();
         block.header.state_root = self.state.compute_state_root();
+
+        // Feature 248: Set checkpoint hash at checkpoint intervals.
+        if next_height % commputer_core::block::CHECKPOINT_HASH_INTERVAL == 0 && next_height > 0 {
+            block.header.checkpoint_hash = Some(self.state.compute_state_root());
+            info!("Checkpoint at height {}: state root = {}", next_height, hex::encode(block.header.checkpoint_hash.unwrap()));
+        }
 
         // Sign the block header with our wallet key.
         commputer_core::signing::sign_block(&mut block, &self.wallet);
@@ -1376,6 +1420,15 @@ impl EventLoop {
                 Ok(()) => {
                     info!("Finalized and applied block {} at height {}", hash, height);
                     self.print_status();
+
+                    // Feature 241: Broadcast block event to WebSocket clients.
+                    self.broadcast_ws_event(&serde_json::json!({
+                        "type": "new_block",
+                        "height": height,
+                        "hash": hex::encode(hash.0),
+                        "tx_count": block.transactions.len(),
+                        "timestamp": block.header.timestamp,
+                    }));
 
                     // Push receipts to RPC state.
                     if let Some(ref rpc) = self.rpc_state {

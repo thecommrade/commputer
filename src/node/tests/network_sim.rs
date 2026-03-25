@@ -29,6 +29,7 @@ fn genesis_block() -> Block {
             epoch: 0,
             producer_public_key: vec![],
             signature: vec![],
+            checkpoint_hash: None,
         },
         transactions: vec![],
         proof_summaries: vec![],
@@ -50,6 +51,7 @@ fn make_block(height: u64, parent: BlockHash, producer: Address) -> Block {
             epoch: height / 100,
             producer_public_key: vec![],
             signature: vec![],
+            checkpoint_hash: None,
         },
         transactions: vec![],
         proof_summaries: vec![],
@@ -76,6 +78,7 @@ fn make_block_with_txs(
             epoch: height / 100,
             producer_public_key: vec![],
             signature: vec![],
+            checkpoint_hash: None,
         },
         transactions: txs,
         proof_summaries: vec![],
@@ -392,6 +395,8 @@ fn feature_220_full_protocol_integration() {
                 fee: 0,
                 signature: vec![],
                 public_key: vec![],
+                memo: None,
+                timelock: None,
             }]
         } else {
             vec![]

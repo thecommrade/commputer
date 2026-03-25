@@ -10,10 +10,12 @@ pub struct BlockStore {
 }
 
 impl BlockStore {
+    /// Create an empty block store.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Store a block, updating the height index.
     pub fn put(&mut self, block: Block) {
         let hash = block.hash();
         let height = block.height();
@@ -24,16 +26,19 @@ impl BlockStore {
         self.blocks.insert(hash, block);
     }
 
+    /// Retrieve a block by its hash.
     pub fn get(&self, hash: &BlockHash) -> Option<&Block> {
         self.blocks.get(hash)
     }
 
+    /// Retrieve a block by its height.
     pub fn get_by_height(&self, height: u64) -> Option<&Block> {
         self.height_index
             .get(&height)
             .and_then(|hash| self.blocks.get(hash))
     }
 
+    /// Returns the block at the highest known height.
     pub fn latest(&self) -> Option<&Block> {
         if self.blocks.is_empty() {
             None
@@ -42,18 +47,22 @@ impl BlockStore {
         }
     }
 
+    /// Returns the latest block height.
     pub fn height(&self) -> u64 {
         self.latest_height
     }
 
+    /// Total number of blocks in memory.
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
 
+    /// Returns true if no blocks are stored.
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
 
+    /// Returns true if a block with the given hash exists in the store.
     pub fn contains(&self, hash: &BlockHash) -> bool {
         self.blocks.contains_key(hash)
     }
@@ -103,6 +112,7 @@ mod tests {
                 epoch: 0,
                 producer_public_key: vec![],
                 signature: vec![],
+                checkpoint_hash: None,
             },
             transactions: vec![],
             proof_summaries: vec![],

@@ -19,6 +19,7 @@ pub enum ResourceChannel {
 }
 
 impl ResourceChannel {
+    /// All five resource channels.
     pub const ALL: [Self; 5] = [
         Self::Processing,
         Self::Gpu,

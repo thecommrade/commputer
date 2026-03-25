@@ -35,6 +35,7 @@ pub fn test_block_with_parent(height: u64, parent: BlockHash) -> Block {
             epoch: 0,
             producer_public_key: vec![],
             signature: vec![],
+            checkpoint_hash: None,
         },
         transactions: vec![],
         proof_summaries: vec![],
@@ -57,6 +58,7 @@ pub fn test_block_with_producer(height: u64, producer: Address) -> Block {
             epoch: 0,
             producer_public_key: vec![],
             signature: vec![],
+            checkpoint_hash: None,
         },
         transactions: vec![],
         proof_summaries: vec![],
@@ -76,6 +78,8 @@ pub fn signed_transfer(wallet: &Wallet, to: Address, amount: u64, nonce: u64) ->
         fee: crate::transaction::MINIMUM_FEE,
         signature: vec![],
         public_key: vec![],
+        memo: None,
+        timelock: None,
     };
     sign_transaction(&mut tx, wallet);
     tx
@@ -95,6 +99,7 @@ pub fn genesis_block() -> Block {
             epoch: 0,
             producer_public_key: vec![],
             signature: vec![],
+            checkpoint_hash: None,
         },
         transactions: vec![],
         proof_summaries: vec![],

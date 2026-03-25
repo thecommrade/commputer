@@ -3,7 +3,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tracing::{info, debug, warn};
 
-use commputer_core::block::{Block, BlockHash};
+use commputer_core::block::{Block, BlockHash, BlockHeader};
 use commputer_core::identity::Address;
 use commputer_consensus::snowball::{SnowballParams, SnowballVoter};
 
@@ -36,6 +36,19 @@ pub enum ConsensusMessage {
         block: Option<Block>,
         requested_height: u64,
     },
+
+    /// Feature 247: Light client request — request merkle proof for a tx in a block.
+    LightClientRequest {
+        tx_hash: [u8; 32],
+        block_height: u64,
+    },
+
+    /// Feature 247: Light client response — return the proof and block header.
+    LightClientResponse {
+        block_header: Option<BlockHeader>,
+        merkle_proof: Option<commputer_core::merkle::MerkleProof>,
+        tx_hash: [u8; 32],
+    },
 }
 
 /// Per-height voting state: the voter plus all candidate blocks.
@@ -66,6 +79,7 @@ pub struct ConsensusManager {
 }
 
 impl ConsensusManager {
+    /// Create a new consensus manager with default Snowball parameters.
     pub fn new() -> Self {
         Self {
             heights: HashMap::new(),
@@ -287,6 +301,7 @@ mod tests {
                 epoch: 0,
                 producer_public_key: vec![],
                 signature: vec![],
+                checkpoint_hash: None,
             },
             transactions: vec![],
             proof_summaries: vec![],
