@@ -1430,7 +1430,7 @@ mod tests {
                     to: addr(2),
                     amount: Amount::from_comme(33),
                 },
-                fee: 0,
+                fee: commputer_core::transaction::ACCOUNT_CREATION_FEE, // new account requires creation fee
                 signature: vec![],
                 public_key: vec![],
                 memo: None,
@@ -1441,7 +1441,11 @@ mod tests {
         };
         state.apply_block(&block).unwrap();
 
-        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_comme(67));
+        // Sender: 100 COMME - 33 COMME - account_creation_fee (burned)
+        let expected_sender_raw = Amount::from_comme(100).raw()
+            - Amount::from_comme(33).raw()
+            - commputer_core::transaction::ACCOUNT_CREATION_FEE;
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(expected_sender_raw));
         assert_eq!(state.accounts.get(&addr(2)).unwrap().balance, Amount::from_comme(33));
     }
 
@@ -1650,7 +1654,7 @@ mod tests {
                         to: addr(2),
                         amount: Amount::from_comme(33),
                     },
-                    fee: 0,
+                    fee: commputer_core::transaction::ACCOUNT_CREATION_FEE,
                     signature: vec![],
                     public_key: vec![],
                     memo: None,
@@ -1670,9 +1674,12 @@ mod tests {
             let state = ChainState::open(dir.path()).unwrap();
             assert_eq!(state.blocks.height(), 1);
             assert_eq!(state.blocks.len(), 2);
+            let expected_sender_raw = Amount::from_comme(100).raw()
+                - Amount::from_comme(33).raw()
+                - commputer_core::transaction::ACCOUNT_CREATION_FEE;
             assert_eq!(
                 state.accounts.get(&addr(1)).unwrap().balance,
-                Amount::from_comme(67),
+                Amount::from_raw(expected_sender_raw),
             );
             assert_eq!(
                 state.accounts.get(&addr(2)).unwrap().balance,
@@ -1753,7 +1760,7 @@ mod tests {
                 to: addr(2),
                 amount: Amount::from_comme(10),
             },
-            fee: 0,
+            fee: commputer_core::transaction::ACCOUNT_CREATION_FEE,
             signature: vec![],
             public_key: vec![],
             memo: None,

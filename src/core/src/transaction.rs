@@ -107,6 +107,12 @@ pub enum TxKind {
 /// Minimum transaction fee in raw units (0.0001 COMME = 100_000 raw units).
 pub const MINIMUM_FEE: u64 = 100_000;
 
+/// Feature 13: Account creation cost — new accounts require a higher fee (0.001 COMME).
+pub const ACCOUNT_CREATION_FEE: u64 = 1_000_000;
+
+/// Feature 14: Dust limit — transfers below this amount are rejected (0.0001 COMME).
+pub const DUST_LIMIT: u64 = 10_000;
+
 /// A signed transaction on the Commputer network.
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Transaction {
