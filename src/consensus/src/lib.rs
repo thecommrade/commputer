@@ -9,6 +9,7 @@ pub mod dispute;
 pub mod job_pricing;
 pub mod burst_pricing;
 pub mod health;
+pub mod resource_reservation;
 
 pub use snowball::SnowballVoter;
 pub use dag::{Dag, DagVertex};
