@@ -302,6 +302,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![],
             proof_summaries: vec![],

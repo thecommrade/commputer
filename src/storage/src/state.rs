@@ -1681,6 +1681,7 @@ mod tests {
                     producer_public_key: vec![],
                     signature: vec![],
                     checkpoint_hash: None,
+                    chain_id: "test".to_string(),
                 },
                 transactions: vec![Transaction {
                     from: addr(1),
@@ -1945,6 +1946,7 @@ mod tests {
                     producer_public_key: vec![],
                     signature: vec![],
                     checkpoint_hash: None,
+                    chain_id: "test".to_string(),
                 },
                 transactions: vec![],
                 proof_summaries: vec![],

@@ -280,6 +280,7 @@ fn create_genesis_for_dir(data_dir: Option<&std::path::Path>) -> Block {
             producer_public_key: vec![],
             signature: vec![],
             checkpoint_hash: None,
+            chain_id: _genesis_config.chain_id.clone(),
         },
         transactions: vec![],
         proof_summaries: vec![],

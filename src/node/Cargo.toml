@@ -29,7 +29,7 @@ reqwest = { workspace = true }
 flate2 = { workspace = true }
 tar = "0.4"
 rayon = "1"
-rand = { workspace = true }
+rand.workspace = true
 chrono = { workspace = true }
 
 [dev-dependencies]
