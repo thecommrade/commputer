@@ -84,6 +84,8 @@ pub struct RpcState {
     pub ws_broadcast: broadcast::Sender<String>,
     /// Feature 256: Whether testnet mode is active (enables faucet).
     pub is_testnet: bool,
+    /// Feature 10: Validator performance data.
+    pub validator_performance: Mutex<HashMap<String, serde_json::Value>>,
     /// Feature 256: Faucet rate limiting (address_hex -> last_epoch_claimed).
     pub faucet_claims: Mutex<HashMap<String, u64>>,
     /// Feature 15: Optional API key for RPC authentication. None = no auth required.
@@ -565,6 +567,22 @@ refresh();setInterval(refresh,5000);
 </body>
 </html>"#;
 
+/// GET /validator/:address/performance — return validator performance metrics.
+async fn get_validator_performance(
+    State(state): State<Arc<RpcState>>,
+    Path(address): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let perf = state.validator_performance.lock().await;
+    if let Some(data) = perf.get(&address) {
+        (StatusCode::OK, Json(data.clone()))
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "No performance data for validator",
+            "address": address,
+        })))
+    }
+}
+
 // ── Feature 253: Fee estimator ──
 
 /// GET /nonce/:address — return current nonce for an address.
@@ -789,6 +807,7 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/peers", get(get_peers))
         .route("/balance/{address}", get(get_balance))
         .route("/nonce/{address}", get(get_nonce))
+        .route("/validator/{address}/performance", get(get_validator_performance))
         .route("/mempool", get(get_mempool))
         .route("/block/{height}", get(get_block_by_height))
         .route("/receipt/{tx_hash}", get(get_receipt))
@@ -879,6 +898,7 @@ mod tests {
             faucet_claims: Mutex::new(HashMap::new()),
             api_key: None,
             rate_limits: Mutex::new(HashMap::new()),
+            validator_performance: Mutex::new(HashMap::new()),
         });
         (state, rx)
     }

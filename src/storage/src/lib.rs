@@ -10,6 +10,6 @@ pub use blockstore::BlockStore;
 pub use rocks::RocksStore;
 pub use state::{
     ChainState, StateDiff, AccountDiff, WillEvent, WillEventType,
-    RetentionPolicy, StorageMetrics,
+    RetentionPolicy, StorageMetrics, ValidatorPerformance,
 };
 pub use traits::Storage;

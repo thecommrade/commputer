@@ -309,6 +309,17 @@ impl EventLoop {
                     }
                 }
             }
+
+            // Feature 10: Update validator performance metrics.
+            if let Ok(mut perf_guard) = rpc.validator_performance.try_lock() {
+                perf_guard.clear();
+                for (addr, perf) in &self.state.validator_performance {
+                    let addr_hex = hex::encode(addr.0);
+                    if let Ok(json) = serde_json::to_value(perf) {
+                        perf_guard.insert(addr_hex, json);
+                    }
+                }
+            }
         }
     }
 

@@ -178,9 +178,11 @@ impl ConsensusManager {
             if let Some(start) = self.height_start_time.get(&height) {
                 if start.elapsed().as_secs() >= CONSENSUS_TIMEOUT_SECS {
                     // Force finalize on the current preference or first candidate.
-                    let hash = state.voter.preference()
-                        .or_else(|| state.candidates.keys().next().copied())
-                        .unwrap_or_default();
+                    let hash = match state.voter.preference()
+                        .or_else(|| state.candidates.keys().next().copied()) {
+                        Some(h) => h,
+                        None => return false, // no candidates at all
+                    };
                     let mut responses = HashMap::new();
                     responses.insert(hash, self.params.sample_size);
                     for _ in 0..self.params.decision_threshold {

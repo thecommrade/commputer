@@ -120,7 +120,7 @@ impl RocksStore {
         let cf_blocks = self.cf(CF_BLOCKS);
         self.db.put_cf(&cf_blocks, hash.0, &encoded)?;
 
-        let cf_heights = self.db.cf_handle(CF_BLOCK_HEIGHTS).unwrap();
+        let cf_heights = self.cf(CF_BLOCK_HEIGHTS);
         self.db.put_cf(&cf_heights, height.to_le_bytes(), hash.0)?;
 
         // Update chain_height meta if this block is higher.
@@ -147,7 +147,7 @@ impl RocksStore {
 
     /// Retrieve a block by height via the height index.
     pub fn get_block_by_height(&self, height: u64) -> Result<Option<Block>, rocksdb::Error> {
-        let cf_heights = self.db.cf_handle(CF_BLOCK_HEIGHTS).unwrap();
+        let cf_heights = self.cf(CF_BLOCK_HEIGHTS);
         match self.db.get_cf(&cf_heights, height.to_le_bytes())? {
             Some(hash_bytes) => {
                 let mut hash = [0u8; 32];
@@ -162,7 +162,7 @@ impl RocksStore {
 
     /// Persist an account to RocksDB.
     pub fn put_account(&self, account: &Account) -> Result<(), rocksdb::Error> {
-        let cf = self.db.cf_handle(CF_ACCOUNTS).unwrap();
+        let cf = self.cf(CF_ACCOUNTS);
         let encoded =
             borsh::to_vec(account).expect("account borsh serialization should not fail");
         self.db.put_cf(&cf, account.address.0, &encoded)
@@ -170,7 +170,7 @@ impl RocksStore {
 
     /// Retrieve an account by address from RocksDB.
     pub fn get_account(&self, address: &Address) -> Result<Option<Account>, rocksdb::Error> {
-        let cf = self.db.cf_handle(CF_ACCOUNTS).unwrap();
+        let cf = self.cf(CF_ACCOUNTS);
         match self.db.get_cf(&cf, address.0)? {
             Some(data) => {
                 let account: Account = borsh::from_slice(&data)
@@ -183,7 +183,7 @@ impl RocksStore {
 
     /// Iterate all accounts in the database.
     pub fn all_accounts(&self) -> Vec<Account> {
-        let cf = self.db.cf_handle(CF_ACCOUNTS).unwrap();
+        let cf = self.cf(CF_ACCOUNTS);
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         let mut accounts = Vec::new();
         for item in iter {
@@ -198,7 +198,7 @@ impl RocksStore {
 
     /// Iterate all blocks in the database (by height order).
     pub fn all_blocks_by_height(&self) -> Vec<Block> {
-        let cf_heights = self.db.cf_handle(CF_BLOCK_HEIGHTS).unwrap();
+        let cf_heights = self.cf(CF_BLOCK_HEIGHTS);
         let cf_blocks = self.cf(CF_BLOCKS);
         let iter = self.db.iterator_cf(&cf_heights, rocksdb::IteratorMode::Start);
         let mut blocks = Vec::new();
@@ -243,14 +243,14 @@ impl RocksStore {
 
     /// Archive an account to cold storage.
     pub fn put_archived_account(&self, account: &Account) -> Result<(), rocksdb::Error> {
-        let cf = self.db.cf_handle(CF_ARCHIVED).unwrap();
+        let cf = self.cf(CF_ARCHIVED);
         let encoded = borsh::to_vec(account).expect("account borsh serialization should not fail");
         self.db.put_cf(&cf, account.address.0, &encoded)
     }
 
     /// Retrieve an archived account.
     pub fn get_archived_account(&self, address: &Address) -> Result<Option<Account>, rocksdb::Error> {
-        let cf = self.db.cf_handle(CF_ARCHIVED).unwrap();
+        let cf = self.cf(CF_ARCHIVED);
         match self.db.get_cf(&cf, address.0)? {
             Some(data) => {
                 let account: Account = borsh::from_slice(&data)
@@ -263,13 +263,13 @@ impl RocksStore {
 
     /// Remove an archived account (after export or cleanup).
     pub fn delete_archived_account(&self, address: &Address) -> Result<(), rocksdb::Error> {
-        let cf = self.db.cf_handle(CF_ARCHIVED).unwrap();
+        let cf = self.cf(CF_ARCHIVED);
         self.db.delete_cf(&cf, address.0)
     }
 
     /// Count archived accounts.
     pub fn archived_account_count(&self) -> usize {
-        let cf = self.db.cf_handle(CF_ARCHIVED).unwrap();
+        let cf = self.cf(CF_ARCHIVED);
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         iter.count()
     }
@@ -283,7 +283,7 @@ impl RocksStore {
 
     /// Add an account write to a batch.
     pub fn batch_put_account(&self, batch: &mut WriteBatch, account: &Account) {
-        let cf = self.db.cf_handle(CF_ACCOUNTS).unwrap();
+        let cf = self.cf(CF_ACCOUNTS);
         let encoded = borsh::to_vec(account).expect("account borsh serialization should not fail");
         batch.put_cf(&cf, account.address.0, &encoded);
     }
@@ -295,7 +295,7 @@ impl RocksStore {
         let encoded = borsh::to_vec(block).expect("block borsh serialization should not fail");
         let cf_blocks = self.cf(CF_BLOCKS);
         batch.put_cf(&cf_blocks, hash.0, &encoded);
-        let cf_heights = self.db.cf_handle(CF_BLOCK_HEIGHTS).unwrap();
+        let cf_heights = self.cf(CF_BLOCK_HEIGHTS);
         batch.put_cf(&cf_heights, height.to_le_bytes(), hash.0);
     }
 

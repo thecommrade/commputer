@@ -90,6 +90,19 @@ impl Default for RetentionPolicy {
     }
 }
 
+/// Feature 10: Per-validator performance tracking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ValidatorPerformance {
+    /// Number of blocks produced by this validator.
+    pub blocks_produced: u64,
+    /// Number of proof challenges passed.
+    pub proofs_passed: u64,
+    /// Total uptime in seconds.
+    pub uptime_secs: u64,
+    /// Last block height at which this validator was active.
+    pub last_active_height: u64,
+}
+
 /// Feature 122: Finality depth — blocks older than this many confirmations cannot be reorged.
 pub const FINALITY_DEPTH: u64 = 10;
 
@@ -133,6 +146,8 @@ pub struct ChainState {
     pub retention_policy: RetentionPolicy,
     /// Feature 182: Snapshot height (the height at which the latest snapshot was taken).
     pub snapshot_height: u64,
+    /// Feature 10: Per-validator performance history.
+    pub validator_performance: HashMap<Address, ValidatorPerformance>,
 }
 
 // Manual Debug impl since RocksStore doesn't derive Debug.
@@ -150,6 +165,7 @@ impl std::fmt::Debug for ChainState {
             .field("state_diffs", &self.state_diffs.len())
             .field("archived_accounts", &self.archived_accounts.len())
             .field("snapshot_height", &self.snapshot_height)
+            .field("validator_performance", &self.validator_performance.len())
             .finish()
     }
 }
@@ -176,6 +192,7 @@ impl ChainState {
             archived_accounts: HashMap::new(),
             retention_policy: RetentionPolicy::default(),
             snapshot_height: 0,
+            validator_performance: HashMap::new(),
         }
     }
 
@@ -239,6 +256,7 @@ impl ChainState {
             archived_accounts: HashMap::new(),
             retention_policy: RetentionPolicy::default(),
             snapshot_height: 0,
+            validator_performance: HashMap::new(),
         })
     }
 
@@ -385,6 +403,13 @@ impl ChainState {
         }
         if !diff.changes.is_empty() {
             self.state_diffs.insert(block.height(), diff);
+        }
+
+        // Feature 10: Track validator performance for block producer.
+        if block.height() > 0 {
+            let perf = self.validator_performance.entry(block.header.producer).or_default();
+            perf.blocks_produced += 1;
+            perf.last_active_height = block.height();
         }
 
         // Store block.
