@@ -171,6 +171,48 @@ impl ChainState {
         Ok(())
     }
 
+    /// Apply a block to the chain state, first verifying that all transactions
+    /// have a structurally valid 64-byte signature. Use this for blocks received
+    /// from the network. The original `apply_block` remains for genesis and tests.
+    pub fn apply_block_validated(&mut self, block: &Block) -> Result<(), StateError> {
+        // Verify block height.
+        if block.height() > 0 {
+            let expected = self.blocks.height() + 1;
+            if block.height() != expected {
+                return Err(StateError::InvalidHeight { expected, got: block.height() });
+            }
+        }
+
+        // Verify all transaction signatures are present and structurally valid.
+        for tx in &block.transactions {
+            if tx.signature.is_empty() {
+                return Err(StateError::InvalidSignature("empty signature".into()));
+            }
+            if tx.signature.len() != 64 {
+                return Err(StateError::InvalidSignature(
+                    format!("invalid signature length: expected 64, got {}", tx.signature.len())
+                ));
+            }
+        }
+
+        // Process transactions (same as apply_block).
+        for tx in &block.transactions {
+            self.apply_transaction(tx)?;
+        }
+
+        // Store block.
+        self.blocks.put(block.clone());
+
+        // Persist to RocksDB if enabled.
+        if let Some(ref rocks) = self.rocks {
+            rocks.put_block(block)
+                .map_err(|e| StateError::StorageError(e.to_string()))?;
+            self.flush_meta(rocks)?;
+        }
+
+        Ok(())
+    }
+
     /// Apply a single transaction to the state.
     fn apply_transaction(
         &mut self,
@@ -312,6 +354,8 @@ pub enum StateError {
     Overflow,
     #[error("storage error: {0}")]
     StorageError(String),
+    #[error("invalid signature: {0}")]
+    InvalidSignature(String),
 }
 
 #[cfg(test)]
@@ -619,5 +663,81 @@ mod tests {
         assert_eq!(state.blocks.height(), 0);
         // flush is a no-op for in-memory.
         state.flush().unwrap();
+    }
+
+    #[test]
+    fn unsigned_transaction_rejected_by_validated() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let sender = state.accounts.get_or_create(addr(1));
+        sender.balance = Amount::from_comme(100);
+
+        let block = Block {
+            header: BlockHeader {
+                height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32],
+                proof_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 2000,
+                producer: addr(0),
+                epoch: 0,
+                signature: vec![],
+            },
+            transactions: vec![Transaction {
+                from: addr(1),
+                nonce: 0,
+                kind: TxKind::Transfer {
+                    to: addr(2),
+                    amount: Amount::from_comme(10),
+                },
+                signature: vec![], // Empty — should be rejected
+            }],
+            proof_summaries: vec![],
+        };
+        assert!(state.apply_block_validated(&block).is_err());
+    }
+
+    #[test]
+    fn signed_transaction_accepted_by_validated() {
+        use commputer_core::wallet::Wallet;
+        use commputer_core::signing::sign_transaction;
+
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let wallet = Wallet::generate();
+        let sender_addr = *wallet.address();
+        let sender = state.accounts.get_or_create(sender_addr);
+        sender.balance = Amount::from_comme(100);
+
+        let mut tx = Transaction {
+            from: sender_addr,
+            nonce: 0,
+            kind: TxKind::Transfer {
+                to: addr(2),
+                amount: Amount::from_comme(10),
+            },
+            signature: vec![],
+        };
+        sign_transaction(&mut tx, &wallet);
+
+        let block = Block {
+            header: BlockHeader {
+                height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32],
+                proof_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 2000,
+                producer: addr(0),
+                epoch: 0,
+                signature: vec![],
+            },
+            transactions: vec![tx],
+            proof_summaries: vec![],
+        };
+        assert!(state.apply_block_validated(&block).is_ok());
     }
 }

@@ -328,7 +328,7 @@ impl EventLoop {
 
         if let Some(block) = self.consensus.take_finalized(height) {
             let hash = block.hash();
-            match self.state.apply_block(&block) {
+            match self.state.apply_block_validated(&block) {
                 Ok(()) => {
                     info!("Finalized and applied block {} at height {}", hash, height);
                     self.print_status();
