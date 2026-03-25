@@ -418,6 +418,14 @@ impl EventLoop {
                     self.compliance.deregister_node(&validator_addr);
                 }
                 self.peer_scores.remove(&peer_id);
+                // Drain grace period for disconnected validators.
+                if let Some(validator_addr) = self.peer_validators.get(&peer_id) {
+                    if let Some(account) = self.state.accounts.get_mut(validator_addr) {
+                        // Drain 1 epoch's worth of grace (3600s) on disconnect.
+                        account.drain_grace(3600);
+                        debug!("Drained grace for disconnected validator {}", validator_addr);
+                    }
+                }
                 info!("Disconnected from peer: {}", peer_id);
             }
             _ => {}
@@ -778,6 +786,14 @@ impl EventLoop {
                     warn!("Failed to flush state after epoch: {}", e);
                 }
             }
+        }
+
+        // Refill grace period for our own validator (1 epoch = 3600s online).
+        {
+            let our_addr = *self.wallet.address();
+            let account = self.state.accounts.get_or_create(our_addr);
+            account.cumulative_uptime_secs += 3600;
+            account.refill_grace(3600);
         }
 
         // Re-register ourselves for the next epoch
