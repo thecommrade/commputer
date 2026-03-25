@@ -74,6 +74,11 @@ enum Commands {
         #[arg(long, default_value = "9944")]
         rpc_port: u16,
     },
+    /// Verify the entire chain (all blocks, merkle roots, signatures)
+    VerifyChain {
+        #[arg(long, default_value = "true")]
+        testnet: bool,
+    },
     /// Export chain state to a JSON file for debugging
     ExportChain {
         /// Output file path
@@ -712,6 +717,40 @@ async fn main() -> Result<()> {
         Commands::Status { testnet } => cmd_status(testnet)?,
         Commands::Peers { rpc_port } => cmd_peers(rpc_port).await?,
         Commands::Balance { address, rpc_port } => cmd_balance(&address, rpc_port).await?,
+        Commands::VerifyChain { testnet } => {
+            let state = open_chain_state(testnet)?;
+            let height = state.blocks.height();
+            println!("Verifying chain from height 0 to {}...", height);
+            let mut errors = 0u64;
+            for h in 0..=height {
+                if let Some(block) = state.blocks.get_by_height(h) {
+                    // Verify merkle roots.
+                    if !block.verify_roots() {
+                        println!("  ERROR at height {}: merkle root mismatch", h);
+                        errors += 1;
+                    }
+                    // Verify producer signature (skip genesis).
+                    if h > 0 && !block.verify_producer_signature() {
+                        println!("  ERROR at height {}: invalid producer signature", h);
+                        errors += 1;
+                    }
+                    // Verify all transaction signatures.
+                    for (i, tx) in block.transactions.iter().enumerate() {
+                        if !tx.verify() {
+                            println!("  ERROR at height {}, tx {}: invalid signature", h, i);
+                            errors += 1;
+                        }
+                    }
+                } else {
+                    println!("  WARNING: block at height {} not in memory", h);
+                }
+            }
+            if errors == 0 {
+                println!("Chain verified: {} blocks, 0 errors.", height + 1);
+            } else {
+                println!("Chain verification found {} errors in {} blocks.", errors, height + 1);
+            }
+        }
         Commands::ExportChain { output, testnet } => {
             let state = open_chain_state(testnet)?;
             let export = serde_json::json!({
