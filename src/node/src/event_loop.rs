@@ -321,8 +321,14 @@ impl EventLoop {
     }
 
     /// Validate a block received from a peer. Returns false and bans the peer
-    /// if the block has bad merkle roots or invalid transaction signatures.
+    /// if the block has bad merkle roots, invalid signatures, or exceeds size limits.
     fn validate_block_from_peer(&mut self, block: &Block, source: libp2p::PeerId) -> bool {
+        // Check block size limits.
+        if !block.within_size_limits() {
+            self.ban_peer(source, "sent oversized block");
+            return false;
+        }
+
         // Check merkle roots.
         if !block.verify_roots() {
             self.ban_peer(source, "sent block with invalid merkle roots");
@@ -591,8 +597,15 @@ impl EventLoop {
             .map(|b| b.hash())
             .unwrap_or(BlockHash::GENESIS);
 
-        // Create a new block with pending transactions.
-        let txs = std::mem::take(&mut self.pending_txs);
+        // Create a new block with pending transactions (capped to block size limit).
+        let mut all_txs = std::mem::take(&mut self.pending_txs);
+        let txs: Vec<Transaction> = if all_txs.len() > commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK {
+            let overflow = all_txs.split_off(commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK);
+            self.pending_txs = overflow; // Put excess back in mempool.
+            all_txs
+        } else {
+            all_txs
+        };
         let mut block = Block {
             header: BlockHeader {
                 height: next_height,

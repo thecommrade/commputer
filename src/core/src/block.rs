@@ -98,6 +98,12 @@ impl BlockHeader {
     }
 }
 
+/// Maximum number of transactions per block.
+pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 500;
+
+/// Maximum serialized block size in bytes (1 MB).
+pub const MAX_BLOCK_SIZE_BYTES: usize = 1_048_576;
+
 /// A full block containing header, transactions, and proof summaries.
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Block {
@@ -152,6 +158,15 @@ impl Block {
             return true;
         }
         self.header.verify_signature(&self.header.producer_public_key)
+    }
+
+    /// Check if the block exceeds size limits.
+    pub fn within_size_limits(&self) -> bool {
+        if self.transactions.len() > MAX_TRANSACTIONS_PER_BLOCK {
+            return false;
+        }
+        let encoded = serde_json::to_vec(self).unwrap_or_default();
+        encoded.len() <= MAX_BLOCK_SIZE_BYTES
     }
 
     /// Verify that the header's tx_root and proof_root match the actual contents.
