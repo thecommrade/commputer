@@ -174,6 +174,8 @@ This is not governance. It is math. Code, not votes.
 
 Commputer does not create e-waste. There are no ASICs. No GPU farms. No warehouses burning electricity. The network is powered by machines that already exist, contributing resources they are not currently using. The marginal environmental cost of Commputer is near zero.
 
+This extends to AI. Training and running large models today requires massive datacenters consuming megawatts of power, cooled by millions of gallons of water, housed in buildings that displace communities. Commputer's approach to AI eliminates the need for datacenters entirely. The compute comes from millions of ordinary machines each contributing a small slice. No new hardware manufactured. No new buildings constructed. No new power plants needed. The AI runs on what already exists — distributed, efficient, and accountable to the people who power it rather than the corporation that owns the building.
+
 ---
 
 ## 7. Tokenomics
