@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Commputer — A Communal Supercomputer</title>
+    <meta name="description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources. $COMME. Scale hurts. Patience rewards.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <nav id="nav">
+        <div class="nav-inner">
+            <a href="#" class="nav-logo">COMMPUTER</a>
+            <div class="nav-links">
+                <a href="#dashboard">Dashboard</a>
+                <a href="#whitepaper">Whitepaper</a>
+                <a href="#download">Download</a>
+                <a href="#explorer">Explorer</a>
+                <a href="#start">Get Started</a>
+            </div>
+        </div>
+    </nav>
+
+    <main>
+        <!-- HERO -->
+        <section id="hero">
+            <div class="hero-text">
+                <h1>COMMPUTER</h1>
+                <p class="tagline">A communal supercomputer for the people, by the people.</p>
+                <p class="subtitle">Give a little of your computer. Earn $COMME. Own a piece of a machine that grows forever.</p>
+                <div class="hero-actions">
+                    <a href="#download" class="btn-primary">Download Node</a>
+                    <a href="#start" class="btn-secondary">Get Started</a>
+                </div>
+            </div>
+        </section>
+
+        <!-- DASHBOARD -->
+        <section id="dashboard">
+            <h2>// Network Status</h2>
+            <div class="status-badge" id="status-badge">
+                <span class="status-dot offline"></span>
+                <span id="status-text">Connecting...</span>
+            </div>
+            <div class="stats-grid">
+                <div class="stat">
+                    <span class="stat-label">BLOCK HEIGHT</span>
+                    <span class="stat-value" id="stat-height">—</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">VALIDATORS</span>
+                    <span class="stat-value" id="stat-validators">—</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">EPOCH</span>
+                    <span class="stat-value" id="stat-epoch">—</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">CIRCULATING</span>
+                    <span class="stat-value" id="stat-circulating">—</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">TOTAL BURNED</span>
+                    <span class="stat-value" id="stat-burned">—</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">REMAINING SUPPLY</span>
+                    <span class="stat-value" id="stat-remaining">—</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">PENDING TXS</span>
+                    <span class="stat-value" id="stat-pending">—</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">NERF %</span>
+                    <span class="stat-value" id="stat-nerf">80</span>
+                </div>
+            </div>
+            <p class="stat-note" id="stat-note">Last updated: never</p>
+        </section>
+
+        <!-- WHAT IS THIS -->
+        <section id="what">
+            <h2>// What Is This</h2>
+            <div class="content-block">
+                <p>Commputer is a Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources.</p>
+                <p>No datacenters. No mining farms. No e-waste. Your existing computer is enough.</p>
+                <p>Contribute a small slice of your machine's idle resources. Earn $COMME. The more people join, the more powerful everyone's share becomes.</p>
+            </div>
+            <div class="principles">
+                <div class="principle">
+                    <h3>Scale Hurts</h3>
+                    <p>One desktop at 100% is the ceiling. Warehouses get punished. The protocol rewards regular people, not corporations.</p>
+                </div>
+                <div class="principle">
+                    <h3>Burns Everything</h3>
+                    <p>2 billion $COMME. Fixed supply. Dual burn mechanism. Every transaction fee, every compute job, every milestone — burned. Supply only goes down.</p>
+                </div>
+                <div class="principle">
+                    <h3>Patience Rewards</h3>
+                    <p>Your product gets better with age. As the network grows, your share of the communal computer grows with it. The wine of technology.</p>
+                </div>
+                <div class="principle">
+                    <h3>For Everyone</h3>
+                    <p>No VCs. No influencer deals. Anonymous founder. Word of mouth only. The product is the marketing.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- WHITEPAPER -->
+        <section id="whitepaper">
+            <h2>// Whitepaper</h2>
+            <div class="content-block">
+                <p>The complete protocol specification, tokenomics, and vision for Commputer.</p>
+                <div class="whitepaper-actions">
+                    <a href="whitepaper.html" class="btn-primary">Read Online</a>
+                    <a href="commputer-whitepaper.pdf" class="btn-secondary">Download PDF</a>
+                </div>
+            </div>
+        </section>
+
+        <!-- DOWNLOAD -->
+        <section id="download">
+            <h2>// Download</h2>
+            <div class="content-block">
+                <div id="download-detected">
+                    <p>Detected: <strong id="detected-os">Unknown</strong></p>
+                    <a href="#" class="btn-primary" id="download-btn">Download for your platform</a>
+                </div>
+                <div class="install-command">
+                    <p>Or install via terminal:</p>
+                    <div class="code-block">
+                        <code>curl -sSf https://commputer.xyz/install.sh | sh</code>
+                        <button class="copy-btn" onclick="copyText('curl -sSf https://commputer.xyz/install.sh | sh')">copy</button>
+                    </div>
+                </div>
+                <details class="other-platforms">
+                    <summary>All platforms</summary>
+                    <table class="download-table">
+                        <tr><td>Linux x86_64</td><td><a href="#">commputer-linux-x86_64</a></td><td class="hash">sha256: —</td></tr>
+                        <tr><td>Linux aarch64</td><td><a href="#">commputer-linux-aarch64</a></td><td class="hash">sha256: —</td></tr>
+                        <tr><td>macOS x86_64</td><td><a href="#">commputer-macos-x86_64</a></td><td class="hash">sha256: —</td></tr>
+                        <tr><td>macOS aarch64</td><td><a href="#">commputer-macos-aarch64</a></td><td class="hash">sha256: —</td></tr>
+                    </table>
+                </details>
+            </div>
+        </section>
+
+        <!-- EXPLORER -->
+        <section id="explorer">
+            <h2>// Block Explorer</h2>
+            <div class="explorer-search">
+                <input type="text" id="explorer-input" placeholder="Search by block height, tx hash, or address...">
+                <button class="btn-primary" onclick="explorerSearch()">Search</button>
+            </div>
+            <div id="explorer-result"></div>
+            <div id="recent-blocks">
+                <h3>Recent Blocks</h3>
+                <table class="blocks-table" id="blocks-table">
+                    <thead>
+                        <tr><th>Height</th><th>Hash</th><th>Time</th><th>Txs</th></tr>
+                    </thead>
+                    <tbody id="blocks-tbody">
+                        <tr><td colspan="4" class="empty">Connecting to network...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- GET STARTED -->
+        <section id="start">
+            <h2>// Get Started</h2>
+            <div class="steps">
+                <div class="step">
+                    <span class="step-num">01</span>
+                    <h3>Download</h3>
+                    <p>Get the node binary for your platform. One file, no dependencies.</p>
+                    <div class="code-block">
+                        <code>curl -sSf https://commputer.xyz/install.sh | sh</code>
+                        <button class="copy-btn" onclick="copyText('curl -sSf https://commputer.xyz/install.sh | sh')">copy</button>
+                    </div>
+                </div>
+                <div class="step">
+                    <span class="step-num">02</span>
+                    <h3>Create Wallet</h3>
+                    <p>Generate your wallet. Write down the seed phrase. This is your identity.</p>
+                    <div class="code-block">
+                        <code>commputer wallet create</code>
+                        <button class="copy-btn" onclick="copyText('commputer wallet create')">copy</button>
+                    </div>
+                </div>
+                <div class="step">
+                    <span class="step-num">03</span>
+                    <h3>Start Contributing</h3>
+                    <p>Run the node. Choose how much of your computer to contribute. Start earning.</p>
+                    <div class="code-block">
+                        <code>commputer run --contribution 50</code>
+                        <button class="copy-btn" onclick="copyText('commputer run --contribution 50')">copy</button>
+                    </div>
+                </div>
+                <div class="step">
+                    <span class="step-num">04</span>
+                    <h3>Earn $COMME</h3>
+                    <p>Your idle resources contribute to the communal supercomputer. You earn $COMME for every proof you complete. Check your balance anytime.</p>
+                    <div class="code-block">
+                        <code>commputer wallet show</code>
+                        <button class="copy-btn" onclick="copyText('commputer wallet show')">copy</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="faq">
+                <h3>FAQ</h3>
+                <details>
+                    <summary>What does it cost?</summary>
+                    <p>Nothing. You contribute idle resources your computer isn't using. Electricity cost is typically under $5/month.</p>
+                </details>
+                <details>
+                    <summary>How much will I earn?</summary>
+                    <p>Depends on network size and your hardware. At launch, a single desktop earns approximately 0.09 $COMME per day. As the network grows, the rate adjusts — but so does the value of what you earn.</p>
+                </details>
+                <details>
+                    <summary>Is it safe?</summary>
+                    <p>Open source. Verify yourself. The node runs in user space with no elevated permissions. It only uses the resources you allocate.</p>
+                </details>
+                <details>
+                    <summary>What happens if I turn off my computer?</summary>
+                    <p>You stop earning while offline. Your balance and wallet are safe. The network has a grace period system — long-time contributors have built-up tolerance for downtime.</p>
+                </details>
+                <details>
+                    <summary>Who built this?</summary>
+                    <p>An anonymous founder. No company. No investors. The code is the product. The community is the team.</p>
+                </details>
+            </div>
+        </section>
+
+        <!-- FOOTER -->
+        <footer>
+            <div class="footer-inner">
+                <p class="footer-motto">A communal supercomputer for the people, by the people.</p>
+                <p class="footer-motto-sub">The wine of technology. Patience will reward you.</p>
+                <div class="footer-links">
+                    <a href="https://github.com/thecommrade/commputer">GitHub</a>
+                    <a href="whitepaper.html">Whitepaper</a>
+                    <a href="#">Twitter</a>
+                </div>
+                <p class="footer-copy">$COMME &middot; 2B supply &middot; burn-heavy &middot; scale hurts</p>
+            </div>
+        </footer>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>
