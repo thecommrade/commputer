@@ -10,6 +10,9 @@ pub mod wallet;
 pub mod keystore;
 pub mod signing;
 pub mod testutil;
+pub mod merkle;
+#[cfg(test)]
+mod fuzz_tests;
 
 pub use block::{Block, BlockHeader, BlockHash};
 pub use transaction::{Transaction, TxHash};

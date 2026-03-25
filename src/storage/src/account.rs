@@ -338,6 +338,102 @@ mod tests {
         assert_eq!(store.compute_state_root(), [0u8; 32]);
     }
 
+    // Feature 208: Tier threshold test — accounts at exact tier boundaries
+    #[test]
+    fn feature_208_exact_tier_boundaries() {
+        use commputer_core::token::UNITS_PER_COMME;
+
+        let cases = vec![
+            // (raw_amount, expected_tier)
+            // 0.99 COMME -> None
+            (UNITS_PER_COMME * 99 / 100, HolderTier::None),
+            // 1.0 COMME -> Base
+            (UNITS_PER_COMME, HolderTier::Base),
+            // 9.99 COMME -> Base
+            (UNITS_PER_COMME * 999 / 100, HolderTier::Base),
+            // 10.0 COMME -> Storage
+            (UNITS_PER_COMME * 10, HolderTier::Storage),
+            // 19.99 COMME -> Storage
+            (UNITS_PER_COMME * 1999 / 100, HolderTier::Storage),
+            // 20.0 COMME -> Compute
+            (UNITS_PER_COMME * 20, HolderTier::Compute),
+            // 32.99 COMME -> Compute
+            (UNITS_PER_COMME * 3299 / 100, HolderTier::Compute),
+            // 33.0 COMME -> Full
+            (UNITS_PER_COMME * 33, HolderTier::Full),
+        ];
+
+        for (raw, expected) in cases {
+            let mut acct = Account::new(test_address(1));
+            acct.balance = Amount::from_raw(raw);
+            assert_eq!(
+                acct.tier(),
+                expected,
+                "Balance {} raw ({} whole COMME) should be tier {:?}",
+                raw,
+                raw / UNITS_PER_COMME,
+                expected
+            );
+        }
+    }
+
+    // Feature 207: Grace period comprehensive math test
+    #[test]
+    fn feature_207_grace_period_patterns() {
+        let one_day = 24 * 3600u64;
+        let one_year = 365 * one_day;
+
+        // Pattern 1: 100% uptime for 1 year, then 6 months offline
+        {
+            let mut acct = Account::new(test_address(1));
+            acct.cumulative_uptime_secs = one_year;
+            acct.grace_balance_secs = one_year;
+
+            // 6 months offline drains 1:1
+            let six_months = one_year / 2;
+            acct.drain_grace(six_months);
+            assert_eq!(acct.grace_balance_secs, one_year - six_months);
+
+            // Then 3 months online restores 6 months (2:1 refill)
+            let three_months = one_year / 4;
+            acct.refill_grace(three_months);
+            // Should be back to full (capped by cumulative_uptime_secs)
+            assert_eq!(acct.grace_balance_secs, one_year);
+        }
+
+        // Pattern 2: Weekend warrior — 5 days offline, 2 online, repeat
+        {
+            let mut acct = Account::new(test_address(2));
+            acct.cumulative_uptime_secs = one_year;
+            acct.grace_balance_secs = one_year;
+
+            for _week in 0..52 {
+                // 5 days offline (drain 1:1)
+                acct.drain_grace(5 * one_day);
+                // 2 days online (refill 2:1 = 4 days of grace)
+                acct.refill_grace(2 * one_day);
+            }
+            // Net loss per week: 5 - 4 = 1 day of grace
+            // After 52 weeks: lost 52 days of grace
+            let expected = one_year - 52 * one_day;
+            assert_eq!(acct.grace_balance_secs, expected);
+        }
+
+        // Pattern 3: 11 years online, verify cap at 10 years
+        {
+            let mut acct = Account::new(test_address(3));
+            let eleven_years = 11 * one_year;
+            acct.cumulative_uptime_secs = eleven_years;
+            acct.grace_balance_secs = 0;
+
+            // Refill with 11 years of online time
+            acct.refill_grace(eleven_years);
+            // Should cap at MAX_GRACE_SECS (10 years)
+            assert_eq!(acct.grace_balance_secs, Account::MAX_GRACE_SECS);
+            assert!(acct.grace_balance_secs <= 10 * one_year);
+        }
+    }
+
     #[test]
     fn refill_rate_2_to_1_exact() {
         let mut acct = Account::new(test_address(1));

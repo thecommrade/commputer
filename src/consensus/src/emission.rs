@@ -203,6 +203,66 @@ mod tests {
         assert_eq!(per_validator, expected_epoch);
     }
 
+    // Feature 200: Emission curve integration test — verify 2B cap never exceeded
+    #[test]
+    fn feature_200_emission_curve_2b_cap() {
+        let schedule = EmissionSchedule::new();
+        let mut total_emitted: u64 = 0;
+        let total_supply = commputer_core::token::TOTAL_SUPPLY;
+
+        // Simulate many epochs at various validator counts
+        // 24 epochs per day, 365 days per year, 10 years
+        let validator_counts = [100, 1_000, 10_000, 50_000, 100_000, 500_000, 1_000_000];
+        for &count in &validator_counts {
+            // Simulate 1 year at this validator count (24 * 365 = 8760 epochs)
+            for _ in 0..8760 {
+                let epoch_emission = schedule.per_epoch_emission(count);
+                total_emitted = total_emitted.saturating_add(epoch_emission);
+
+                // Never exceed total supply
+                assert!(
+                    total_emitted <= total_supply,
+                    "Emission exceeded 2B cap at {} validators: {} > {}",
+                    count,
+                    total_emitted,
+                    total_supply
+                );
+            }
+        }
+
+        // Verify floor rate is respected even at massive scale
+        let floor_daily = UNITS_PER_COMME / 100; // 0.01 COMME/day
+        let rate_at_billion = schedule.per_validator_daily_rate(1_000_000_000);
+        assert!(
+            rate_at_billion >= floor_daily,
+            "Floor rate not respected at 1B validators: {} < {}",
+            rate_at_billion,
+            floor_daily
+        );
+    }
+
+    // Feature 217: Gold standard test — verify reference node yields ~33 COMME/year
+    #[test]
+    fn feature_217_gold_standard_reference_node() {
+        let schedule = EmissionSchedule::new();
+        // At launch (few validators, below curve start), daily rate = 0.09 COMME
+        let daily = schedule.per_validator_daily_rate(1);
+        let yearly = daily * 365;
+        let yearly_comme = yearly / UNITS_PER_COMME;
+
+        // Gold standard: 0.3225 troy oz / 10.03g of gold in 2026
+        // Base emission: 0.09 COMME/day -> ~32.85 COMME/year
+        assert!(
+            yearly_comme >= 32 && yearly_comme <= 34,
+            "Expected ~33 COMME/year at launch, got {}",
+            yearly_comme
+        );
+
+        // Verify the exact daily rate in raw units
+        let expected_daily = (UNITS_PER_COMME * 9) / 100; // 0.09 COMME = 9_000_000 units
+        assert_eq!(daily, expected_daily, "Daily rate should be exactly 0.09 COMME");
+    }
+
     #[test]
     fn demand_weighted_surplus() {
         let total = 1_000_000u64;

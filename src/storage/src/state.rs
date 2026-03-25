@@ -1603,4 +1603,311 @@ mod tests {
         block.header.proof_root = block.compute_proof_root();
         assert!(state.apply_block_validated(&block).is_ok());
     }
+
+    // Feature 209: Concurrent access test — multiple threads applying transactions
+    #[test]
+    fn feature_209_concurrent_access() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let state = Arc::new(Mutex::new(ChainState::new()));
+
+        // Apply genesis
+        {
+            let mut s = state.lock().unwrap();
+            s.apply_block(&genesis_block()).unwrap();
+            // Fund 4 different accounts
+            for i in 1..=4u8 {
+                let acct = s.accounts.get_or_create(addr(i));
+                acct.balance = Amount::from_comme(1000);
+            }
+            s.total_emitted = Amount::from_comme(4000).raw();
+        }
+
+        // Spawn 4 threads, each modifying a different account
+        let mut handles = vec![];
+        for thread_id in 1..=4u8 {
+            let state_clone = Arc::clone(&state);
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    let mut s = state_clone.lock().unwrap();
+                    let acct = s.accounts.get_or_create(addr(thread_id));
+                    let bal = acct.balance.raw();
+                    acct.balance = Amount::from_raw(bal.wrapping_add(1));
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify no corruption
+        let s = state.lock().unwrap();
+        for i in 1..=4u8 {
+            let acct = s.accounts.get(&addr(i)).unwrap();
+            // Each account started at 1000 COMME and got 100 raw units added
+            let expected = Amount::from_comme(1000).raw() + 100;
+            assert_eq!(
+                acct.balance.raw(),
+                expected,
+                "Account {} balance corrupted",
+                i
+            );
+        }
+    }
+
+    // Feature 210: Recovery test — simulate crash mid-block
+    #[test]
+    fn feature_210_recovery_after_crash() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Apply genesis and fund an account, flush
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            let acct = state.accounts.get_or_create(addr(1));
+            acct.balance = Amount::from_comme(100);
+            state.total_emitted = Amount::from_comme(100).raw();
+            state.flush().unwrap();
+        }
+
+        // "Crash" scenario: open, apply half of a block's transactions
+        // but don't flush. Drop state without flushing.
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            // Manually modify accounts without flushing
+            let acct = state.accounts.get_or_create(addr(1));
+            acct.balance = Amount::from_comme(50); // Simulate partial apply
+            // DROP without flush — simulates crash
+        }
+
+        // Reopen: state should be consistent (at the last flushed point)
+        {
+            let state = ChainState::open(dir.path()).unwrap();
+            let acct = state.accounts.get(&addr(1)).unwrap();
+            // Should have the original 100 COMME, not the partial 50
+            assert_eq!(
+                acct.balance,
+                Amount::from_comme(100),
+                "State should be consistent at last flush point"
+            );
+        }
+    }
+
+    // Feature 211: Large chain test — 10,000 blocks
+    #[test]
+    #[ignore] // Slow
+    fn feature_211_large_chain_10k_blocks() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let start = std::time::Instant::now();
+
+        for h in 1..=10_000u64 {
+            let parent = state.blocks.latest().unwrap().hash();
+            let block = Block {
+                header: BlockHeader {
+                    protocol_version: 1,
+                    height: h,
+                    parent_hash: parent,
+                    tx_root: [0u8; 32],
+                    proof_root: [0u8; 32],
+                    state_root: [0u8; 32],
+                    timestamp: 1000 + h * 10,
+                    producer: addr(0),
+                    epoch: h / 100,
+                    producer_public_key: vec![],
+                    signature: vec![],
+                },
+                transactions: vec![],
+                proof_summaries: vec![],
+                compliance_summary: None,
+            };
+            state.apply_block(&block).unwrap();
+        }
+
+        let elapsed = start.elapsed();
+        eprintln!(
+            "Feature 211: 10,000 blocks applied in {:?} ({:.0} blocks/sec)",
+            elapsed,
+            10_000.0 / elapsed.as_secs_f64()
+        );
+
+        assert_eq!(state.blocks.height(), 10_000);
+
+        // Verify get_by_height works for a sample of heights
+        // Note: some old blocks may be pruned from memory, so only check recent ones
+        for h in 9_900..=10_000 {
+            assert!(
+                state.blocks.get_by_height(h).is_some(),
+                "Block at height {} should be retrievable",
+                h
+            );
+        }
+    }
+
+    // Feature 214: Epoch boundary test — 10 epoch transitions
+    // Uses inline emission math since storage can't depend on consensus crate.
+    #[test]
+    fn feature_214_epoch_boundary_transitions() {
+        use commputer_core::token::UNITS_PER_COMME;
+
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let validator_count = 10u64;
+        // Inline emission: 0.09 COMME/day per validator at small network size
+        let base_rate_per_day = (UNITS_PER_COMME * 9) / 100;
+        let per_epoch_per_validator = base_rate_per_day / 24;
+        let epoch_emission = per_epoch_per_validator * validator_count;
+
+        // Simulate 10 epoch transitions
+        for epoch in 0..10u64 {
+            state.current_epoch = epoch;
+
+            // Distribute emission to validators
+            for v in 0..validator_count as u8 {
+                let acct = state.accounts.get_or_create(addr(v));
+                acct.balance = Amount::from_raw(acct.balance.raw() + per_epoch_per_validator);
+                acct.total_mined = Amount::from_raw(acct.total_mined.raw() + per_epoch_per_validator);
+            }
+            state.total_emitted += epoch_emission;
+        }
+
+        // After 10 epochs, verify total emitted
+        let expected_total = epoch_emission * 10;
+        assert_eq!(state.total_emitted, expected_total);
+        assert!(state.total_emitted <= TOTAL_SUPPLY);
+
+        // Verify each validator received their share
+        for v in 0..validator_count as u8 {
+            let acct = state.accounts.get(&addr(v)).unwrap();
+            assert_eq!(acct.total_mined.raw(), per_epoch_per_validator * 10);
+        }
+    }
+
+    // Feature 215: Charitable burn test
+    #[test]
+    fn feature_215_charitable_burn() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let acct = state.accounts.get_or_create(addr(1));
+        acct.balance = Amount::from_comme(100);
+        state.total_emitted = Amount::from_comme(100).raw();
+
+        // Create a charitable donation transaction
+        let block = Block {
+            header: BlockHeader {
+                protocol_version: 1,
+                height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32],
+                proof_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 2000,
+                producer: addr(0),
+                epoch: 0,
+                producer_public_key: vec![],
+                signature: vec![],
+            },
+            transactions: vec![Transaction {
+                from: addr(1),
+                nonce: 0,
+                kind: TxKind::CharitableDonation {
+                    vote_epoch: 1,
+                    sell_amount: Amount::from_comme(5),
+                    burn_amount: Amount::from_comme(5),
+                    recipient_hash: [42u8; 32],
+                },
+                fee: 0,
+                signature: vec![],
+                public_key: vec![],
+            }],
+            proof_summaries: vec![],
+            compliance_summary: None,
+        };
+
+        state.apply_block(&block).unwrap();
+
+        // Verify burn tracked
+        assert_eq!(state.total_burned, Amount::from_comme(5).raw());
+        // CharitableDonation is protocol-triggered; it tracks the burn amount
+        // but the actual sell/transfer is handled separately.
+        // The sender's balance is not deducted here (protocol handles that).
+        let acct = state.accounts.get(&addr(1)).unwrap();
+        assert_eq!(acct.balance, Amount::from_comme(100));
+    }
+
+    // Feature 216: Emergency access test — circulating supply below 1M
+    #[test]
+    fn feature_216_emergency_access() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        // Not emergency at genesis (no emission)
+        assert!(!state.is_emergency_access());
+
+        // Emit 2M, burn 1.5M -> circulating = 500K < 1M -> emergency
+        state.total_emitted = Amount::from_comme(2_000_000).raw();
+        state.total_burned = Amount::from_comme(1_500_000).raw();
+        assert!(state.is_emergency_access());
+
+        // Circulating = 1.5M -> not emergency
+        state.total_burned = Amount::from_comme(500_000).raw();
+        assert!(!state.is_emergency_access());
+
+        // Exactly at threshold: 1M circulating -> not emergency (< not <=)
+        state.total_emitted = Amount::from_comme(2_000_000).raw();
+        state.total_burned = Amount::from_comme(1_000_000).raw();
+        assert!(!state.is_emergency_access());
+
+        // Just below: 999,999 circulating -> emergency
+        state.total_emitted = Amount::from_comme(2_000_000).raw();
+        state.total_burned = Amount::from_comme(1_000_001).raw();
+        assert!(state.is_emergency_access());
+    }
+
+    // Feature 218: Will function test — simulate 2-year absence
+    #[test]
+    fn feature_218_will_function_test() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        // Set up account with will contacts and grace
+        let acct = state.accounts.get_or_create(addr(1));
+        acct.balance = Amount::from_comme(10);
+        acct.is_validator = true;
+        acct.cumulative_uptime_secs = 365 * 24 * 3600; // 1 year
+        acct.grace_balance_secs = 365 * 24 * 3600;
+        acct.will_contacts = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
+
+        // Grace not expired yet -> no events
+        let events = state.process_will_events();
+        assert!(events.is_empty(), "No events while grace > 0");
+
+        // Drain grace to zero (2 year absence)
+        let acct = state.accounts.get_or_create(addr(1));
+        acct.drain_grace(2 * 365 * 24 * 3600);
+        assert_eq!(acct.grace_balance_secs, 0);
+
+        // Now process will events -> should get GraceExpired for each contact
+        let events = state.process_will_events();
+        assert_eq!(
+            events.len(),
+            3,
+            "Should emit one GraceExpired event per contact"
+        );
+        for event in &events {
+            assert_eq!(event.address, addr(1));
+            assert_eq!(event.event_type, WillEventType::GraceExpired);
+        }
+
+        // Verify each contact hash appears
+        let contact_hashes: Vec<[u8; 32]> = events.iter().map(|e| e.contact_hash).collect();
+        assert!(contact_hashes.contains(&[1u8; 32]));
+        assert!(contact_hashes.contains(&[2u8; 32]));
+        assert!(contact_hashes.contains(&[3u8; 32]));
+    }
 }

@@ -771,4 +771,71 @@ mod tests {
         assert_eq!(stats.compliant_count, 2);
         assert_eq!(stats.nerfed_count, 0);
     }
+
+    // Feature 199: Anti-scale simulation — 100 fake validators from same /24 subnet
+    #[test]
+    fn feature_199_anti_scale_100_validators_same_subnet() {
+        use commputer_core::compliance::{multi_node_multiplier, NerfRate};
+        use commputer_core::token::UNITS_PER_COMME;
+
+        let mut checker = ComplianceChecker::new();
+
+        // Register 100 validators on the same /24 subnet
+        for i in 0..100u8 {
+            let a = addr(i);
+            checker.register_node(a, format!("192.168.1.{}", i + 1));
+        }
+
+        // All should be nerfed (same /24 subnet)
+        for i in 0..100u8 {
+            let status = checker.check(&addr(i));
+            assert_ne!(
+                status,
+                ComplianceStatus::Compliant,
+                "Validator {} should be nerfed",
+                i
+            );
+        }
+
+        // Calculate total nerfed reward using multi_node_multiplier AND nerf rate.
+        // multi_node_multiplier gives: 100%, 25%, 6.25%, 1.5625%, 0%...
+        // But all 100 nodes are also nerfed (80%+ reward reduction).
+        let base_daily_reward = (UNITS_PER_COMME * 9) / 100; // 0.09 COMME/day
+        let nerf = NerfRate::INITIAL; // 80% nerf -> 20% reward
+        let nerf_mult = nerf.reward_multiplier();
+
+        let mut total_nerfed_reward: f64 = 0.0;
+        for n in 1..=100u32 {
+            let mult = multi_node_multiplier(n);
+            total_nerfed_reward += base_daily_reward as f64 * mult * nerf_mult;
+        }
+
+        // Single honest validator earns full reward
+        let single_honest_reward = base_daily_reward as f64;
+
+        // With nerf applied: total = (1.0 + 0.25 + 0.0625 + 0.015625) * 0.20 * base
+        // = 1.328125 * 0.20 * base = 0.265625 * base < 1.0 * base
+        assert!(
+            total_nerfed_reward < single_honest_reward,
+            "100 nerfed validators total ({:.0}) should earn less than single honest ({:.0})",
+            total_nerfed_reward,
+            single_honest_reward
+        );
+    }
+
+    // Feature 219: Compliance restoration test
+    #[test]
+    fn feature_219_compliance_restoration() {
+        let mut checker = ComplianceChecker::new();
+
+        // Register two validators on same subnet -> both nerfed
+        checker.register_node(addr(1), "192.168.1.10".into());
+        checker.register_node(addr(2), "192.168.1.11".into());
+        assert_eq!(checker.check(&addr(1)), ComplianceStatus::NerfedIncidental);
+        assert_eq!(checker.check(&addr(2)), ComplianceStatus::NerfedIncidental);
+
+        // Deregister the second -> first should be restored to compliant
+        checker.deregister_node(&addr(2));
+        assert_eq!(checker.check(&addr(1)), ComplianceStatus::Compliant);
+    }
 }

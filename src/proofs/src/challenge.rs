@@ -172,6 +172,40 @@ mod tests {
         assert_ne!(cpu.challenge_id, gpu.challenge_id);
     }
 
+    // Feature 205: Deterministic test mode — same seed produces same challenges
+    #[test]
+    fn feature_205_deterministic_challenges() {
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        // Create two deterministic RNGs with the same seed
+        let seed = 42u64;
+        let mut rng1 = StdRng::seed_from_u64(seed);
+        let mut rng2 = StdRng::seed_from_u64(seed);
+
+        // Generate epoch seeds deterministically
+        let mut seed_bytes1 = [0u8; 32];
+        let mut seed_bytes2 = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rng1, &mut seed_bytes1);
+        rand::RngCore::fill_bytes(&mut rng2, &mut seed_bytes2);
+        assert_eq!(seed_bytes1, seed_bytes2, "Same seed should produce same epoch seed");
+
+        // Generate challenges with same inputs
+        let addr = test_addr(1);
+        let c1 = ChallengeGenerator::generate(0, &seed_bytes1, addr, ResourceChannel::Processing, 100);
+        let c2 = ChallengeGenerator::generate(0, &seed_bytes2, addr, ResourceChannel::Processing, 100);
+
+        assert_eq!(c1.challenge_id, c2.challenge_id, "Same seed must produce same challenge ID");
+        assert_eq!(c1.payload, c2.payload, "Same seed must produce same payload");
+
+        // Different seed -> different challenges
+        let mut rng3 = StdRng::seed_from_u64(99);
+        let mut seed_bytes3 = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rng3, &mut seed_bytes3);
+        let c3 = ChallengeGenerator::generate(0, &seed_bytes3, addr, ResourceChannel::Processing, 100);
+        assert_ne!(c1.challenge_id, c3.challenge_id, "Different seed must produce different challenge");
+    }
+
     #[test]
     fn different_validators_different_ids() {
         let seed = [42u8; 32];

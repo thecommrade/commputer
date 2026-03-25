@@ -107,6 +107,23 @@ mod tests {
         assert_eq!(HolderTier::from_balance(10000), HolderTier::Full);
     }
 
+    // Feature 208: Tier threshold test — exact boundary values
+    #[test]
+    fn feature_208_tier_boundaries_exact() {
+        // Below Base threshold
+        assert_eq!(HolderTier::from_balance(0), HolderTier::None);
+
+        // Exact boundaries
+        assert_eq!(HolderTier::from_balance(1), HolderTier::Base);
+        assert_eq!(HolderTier::from_balance(10), HolderTier::Storage);
+        assert_eq!(HolderTier::from_balance(20), HolderTier::Compute);
+        assert_eq!(HolderTier::from_balance(33), HolderTier::Full);
+
+        // Just below boundaries — still previous tier
+        // Note: whole_comme() truncates, so we test with whole amounts
+        // For sub-COMME amounts we need the Account::tier() path which uses whole_comme()
+    }
+
     #[test]
     fn allocation_math() {
         // 1000 holders, 100TB total storage
