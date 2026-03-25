@@ -6,7 +6,9 @@
 
 ## Abstract
 
-Commputer is a Layer 1 blockchain that coordinates a distributed supercomputer built from small contributions by regular people. Contributors lend idle resources — CPU, GPU, RAM, storage, bandwidth — from their existing computers and earn $COMME, a token that grants access to a communal analytics platform and personal compute. The protocol enforces egalitarianism through math: scale is punished, not rewarded. A single desktop at full contribution earns maximum rewards. Warehouses and mining farms are economically destroyed by an adaptive penalty system that only gets harsher over time.
+Commputer is a Layer 1 blockchain that coordinates a distributed supercomputer built from small contributions by regular people. Contributors lend idle resources — CPU, GPU, RAM, storage, bandwidth — from their existing computers and earn $COMME, a token with a fixed supply of 2 billion and no premine. The protocol enforces egalitarianism through math: scale is punished, not rewarded. A single desktop at full contribution earns maximum rewards. Warehouses and mining farms are economically destroyed by an adaptive penalty system that only gets harsher over time.
+
+No other chain has multi-dimensional Proof of Work across five resource channels, demand-weighted emission that self-balances network composition, and anti-scale enforcement that makes datacenter mining economically suicidal. The L1 itself is the product.
 
 This is not a meme coin. It is barely even a cryptocurrency. It is a human project that uses a blockchain because no other mechanism can trustlessly enforce fairness across millions of strangers for generations.
 
@@ -30,49 +32,69 @@ The result is a communal computer that belongs to its participants. Not a compan
 
 Three rules are enshrined in this whitepaper and will never change:
 
-1. **1 $COMME = full access to the flagship analytics platform.** No tiers, no premium, no exceptions.
+1. **The flagship product always owns 51% of all network compute.** The communal product always has majority resources. Protocol-enforced.
 
-2. **The flagship always owns 51% of all network compute.** The communal product always has majority resources. Protocol-enforced.
+2. **The remaining 49% is split equally among qualifying holders per tier.** Pure equal division. No whale advantages.
 
-3. **The remaining 49% is split equally among qualifying holders per tier.** Pure equal division. No whale advantages.
+3. **The free path never closes.** Contribute a full desktop and you have full access without owning a single coin. Always.
 
 ---
 
 ## 4. What Launches
 
-Commputer launches with two things: the coin and the analytics platform.
+Commputer launches as a working L1 blockchain. A Rust CLI node. Here is what it does differently.
 
 ### The Coin: $COMME
 
-A Layer 1 token earned by contributing idle computer resources. Five proof channels verified from day one: CPU, GPU, storage, RAM, and bandwidth. Burn mechanics active at launch. Full anti-scale protections enforced from block one.
+A Layer 1 token with a fixed supply of 2,000,000,000 earned by contributing idle computer resources. Five proof channels verified from day one: CPU, GPU, storage, RAM, and bandwidth. Burn mechanics active at launch. Full anti-scale protections enforced from block one.
 
-### The Analytics Platform
+### Multi-Dimensional Proof of Work
 
-A world-class ML and analytics platform for cryptocurrency markets. Built by the founder. Powered by 51% of communal compute from the moment the network goes live.
+Every other PoW chain mines on a single axis. Commputer validates across five parallel channels — CPU, GPU, storage, RAM, and bandwidth — running asynchronously. A well-rounded home desktop contributing across all five channels earns a diversity bonus. Specialized farms earn less per unit than balanced machines. The protocol rewards the kind of computer real people actually own.
 
-**What exists today:** A production platform with 9 live data collectors, 60+ engineered features, multiple ML models with rigorous validation, live and paper trading infrastructure, and a real-time dashboard. This is the proof of concept — running, tested, and real.
+### Demand-Weighted Emission
 
-**Hold 1 $COMME and you have full access.** Contribute a full desktop and you have full access without owning a single coin. That is it. That is the launch product.
+Total emission per epoch is split across the five proof channels based on what the network actually needs, with guaranteed minimum floors so no channel ever goes to zero. If the network needs more storage, storage proofs pay more. If GPUs are scarce, GPU contributors earn more. The network self-balances its own resource composition without governance votes or manual intervention.
 
-### The Desktop App
+### Anti-Scale Enforcement
 
-Commputer is not a CLI tool for developers. It is a desktop application for regular people.
+The ideal Commputer validator is a regular person running one desktop at home. That is who the economics favor. A second node from the same operator earns 25% per unit. A third earns 6%. A fifth earns effectively zero. Datacenter patterns are detected and penalized. The adaptive nerf starts at 80% and can only increase, never decrease. The long-term target is 100% — zero rewards for cheaters. Details in Section 6.
 
-Download it. Install it. You see a resource slider, your wallet balance, your contribution stats, and your grace period. Move the slider to decide how much of your machine to share. The app auto-throttles when you are using your computer and ramps up when you are not.
+### Dual Burn Mechanics
 
-The analytics platform is accessed through the same app. Click "Analytics" and it works. No separate login. No browser redirect. The app proves wallet ownership behind the scenes. One app, one experience.
+Supply only goes down. Milestone burns trigger automatically when the network hits capacity thresholds. Burst compute burns let holders spend $COMME on temporary compute beyond their tier — permanently burned. Plus an annual charitable burn voted on by holders. Details in Section 7.
 
-### The Founder's Role
+### P2P Networking
 
-The analytics platform is the founder's L2 contribution to the network. This is how the anonymous founder earns — not through a premine, not through a dev tax, but by building a product people use. The same opportunity available to anyone building on Commputer.
+Gossip protocol for block propagation. DHT (Distributed Hash Table) for data storage and job routing. Both layers run simultaneously.
 
-The founder's 51% compute allocation feeds the analytics platform from day one. As the network grows, the platform grows. Resource contributions are pooled and usable by the founder for continuous improvement of the analytics platform.
+### Wallet
+
+Seed phrase recovery. Your keys, your coins. The node software includes a built-in wallet with the CLI.
+
+### The Pitch
+
+This is a working chain with protocol properties no other chain has. Multi-dimensional Proof of Work. Demand-weighted emission that self-balances. Anti-scale enforcement that makes mining farms unprofitable by design. A gold-standard hardware ceiling tied to a universal commodity. Grace periods that account for the reality of human life. A will function for when life ends.
+
+The L1 is the product. Everything else builds on top of it.
 
 ---
 
 ## 5. Roadmap
 
 Everything below is the direction. Not promises with dates. Not vaporware used to pump a token price. Real goals that the network works toward as it grows.
+
+### Analytics Platform (Founder's L2)
+
+A world-class ML and analytics platform for cryptocurrency markets. Built by the founder. Powered by the 51% communal compute allocation. This is how the anonymous founder earns — not through a premine, not through a dev tax, but by building a product people use. The same opportunity available to anyone building on Commputer.
+
+**What exists today:** A production platform with 9 live data collectors, 60+ engineered features, multiple ML models with rigorous validation, live and paper trading infrastructure, and a real-time dashboard. This is the proof of concept — running, tested, and real.
+
+**Hold 1 $COMME and you have full access** when it launches on the network. Contribute a full desktop and you have full access without owning a single coin.
+
+### Desktop App (Tauri GUI)
+
+Commputer launches as a CLI node for people comfortable with a terminal. The desktop app comes next — single download, cross-platform, install it like any other application. Resource slider from 1% to 100%. Auto-throttles when you are using your machine. Clear dashboard showing contributions, earnings, compliance status, and grace balance. Dead simple.
 
 ### Communication Layer
 - Personal email server
@@ -236,14 +258,14 @@ Floors are protocol-enforced. The remaining 60% floats to where demand is highes
 
 ---
 
-## 8. Two Paths to the Product
+## 8. Two Paths to the Network
 
 | Path | Requirement | What You Get |
 |---|---|---|
-| **Own It** | Hold 1+ $COMME | Access to the analytics platform. Hold more as tiers unlock on the roadmap. |
-| **Earn It** | Dedicate 1 desktop at 100% | Full access to everything available while contributing. Same product. Same features. No coins needed. Ever. |
+| **Own It** | Hold $COMME | Access to the network and its products as tiers unlock on the roadmap. |
+| **Earn It** | Dedicate 1 desktop at 100% | Full access to everything available while contributing. Same network. Same features. No coins needed. Ever. |
 
-**The product is never priced out.** No matter what $COMME trades at, anyone with a desktop can get full access for free today. This is what makes Commputer different from every token-gated product: the free path never closes.
+**The network is never priced out.** No matter what $COMME trades at, anyone with a desktop can participate for free today. This is what makes Commputer different from every token-gated project: the free path never closes.
 
 ### Grace Period
 
@@ -265,7 +287,7 @@ Storage includes emergency contacts — email addresses and phone numbers the bl
 
 ### Implementation
 
-The node software is written in Rust — the language the most battle-tested modern L1s converged on. Python powers the ML and analytics workloads on top of the network.
+The node software is written in Rust — the language the most battle-tested modern L1s converged on. The launch is a CLI node. The desktop GUI comes later on the roadmap.
 
 ### Layers
 
@@ -274,10 +296,6 @@ The node software is written in Rust — the language the most battle-tested mod
 **Networking:** Gossip protocol for block propagation. DHT (Distributed Hash Table) for data storage and job routing. Both layers run simultaneously.
 
 **Resource Orchestration:** Matches jobs to available resources. Respects the 51/49 split. Decomposes large tasks into desktop-sized pieces and reassembles results.
-
-### The Desktop App
-
-Single download. Cross-platform. Install it like any other application. Resource slider from 1% to 100%. Auto-throttles when you are using your machine. Clear dashboard showing contributions, earnings, compliance status, and grace balance. Analytics platform built in — click and use it. Dead simple.
 
 ---
 
@@ -305,7 +323,7 @@ Single download. Cross-platform. Install it like any other application. Resource
 
 Anonymous. The L1 protocol has zero founder allocation. No premine. No dev tax. No hidden wallet. Every $COMME is earned through contribution.
 
-The founder earns by building on the network — the analytics platform is an L2 product, powered by the 51% communal compute allocation. It is the founder's contribution to the ecosystem and the source of the founder's livelihood. The same opportunity is available to anyone who builds on Commputer.
+The founder earns by building on the network — the analytics platform is an L2 product on the roadmap, powered by the 51% communal compute allocation. It is the founder's contribution to the ecosystem and the source of the founder's livelihood. The same opportunity is available to anyone who builds on Commputer.
 
 No VCs. No influencer deals. No paid listings. Word of mouth only. The product is the marketing.
 
@@ -317,9 +335,9 @@ This is not a meme coin. It is almost not even a cryptocurrency. It is a human p
 
 This is an act of peaceful revolution — not against any company or government, but against the idea that knowledge, compute, and AI should be owned by a few and rented to the many.
 
-We are not selling the moon or lies. We are offering a real, tangible product that will improve — that much we can promise. Analytics on day one. A usable computer once the network is large enough. And a commitment: for as long as one person holds one $COMME, the work continues.
+Here is a working chain. Here is what it does differently: multi-dimensional Proof of Work, demand-weighted emission, anti-scale enforcement, a gold-standard hardware ceiling, grace periods for when life happens, and a will function for when it ends. Here is where we are going: an analytics platform, a desktop app, communication tools, personal infrastructure, and a permanent archive of human knowledge.
 
-Scale hurts. Honesty is the default. Life happens and the protocol accounts for it. The Commrade judges hoarders. The code is the contract. And the free path never closes.
+Scale hurts. Honesty is the default. Life happens and the protocol accounts for it. The code is the contract. And the free path never closes.
 
 ---
 
