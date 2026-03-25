@@ -496,6 +496,26 @@ impl ChainState {
             }
         }
 
+        // Feature 14: Reject dust transfers before taking mutable borrow on sender.
+        if let TxKind::Transfer { amount, .. } = &tx.kind {
+            if amount.raw() < commputer_core::transaction::DUST_LIMIT {
+                return Err(StateError::InvalidBlock(format!(
+                    "transfer amount {} below dust limit of {}",
+                    amount.raw(), commputer_core::transaction::DUST_LIMIT,
+                )));
+            }
+        }
+        // Feature 13: Account creation cost — check before mutable sender borrow.
+        if let TxKind::Transfer { to, .. } = &tx.kind {
+            let recipient_exists = self.accounts.get(to).is_some();
+            if !recipient_exists && tx.fee < commputer_core::transaction::ACCOUNT_CREATION_FEE {
+                return Err(StateError::InvalidBlock(format!(
+                    "transfer to new account requires fee >= {} (account creation cost), got {}",
+                    commputer_core::transaction::ACCOUNT_CREATION_FEE, tx.fee,
+                )));
+            }
+        }
+
         let current_epoch = self.current_epoch;
         let sender = self.accounts.get_or_create(tx.from);
         // Feature 183: Mark sender as active.
@@ -2101,5 +2121,65 @@ mod tests {
         assert!(contact_hashes.contains(&[1u8; 32]));
         assert!(contact_hashes.contains(&[2u8; 32]));
         assert!(contact_hashes.contains(&[3u8; 32]));
+    }
+
+    #[test]
+    fn feature_14_dust_limit_rejects_tiny_transfer() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let sender = state.accounts.get_or_create(addr(1));
+        sender.balance = Amount::from_comme(100);
+        // Pre-create recipient so account creation fee is not the issue.
+        let _recipient = state.accounts.get_or_create(addr(2));
+
+        let block = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                timestamp: 2000, producer: addr(0), epoch: 0,
+                producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
+            },
+            transactions: vec![Transaction {
+                from: addr(1), nonce: 0,
+                kind: TxKind::Transfer { to: addr(2), amount: Amount::from_raw(5_000) },
+                fee: 100_000, signature: vec![], public_key: vec![],
+                memo: None, timelock: None,
+            }],
+            proof_summaries: vec![], compliance_summary: None,
+        };
+        let result = state.apply_block(&block);
+        assert!(result.is_err(), "Dust transfer should be rejected");
+        assert!(result.unwrap_err().to_string().contains("dust limit"));
+    }
+
+    #[test]
+    fn feature_13_account_creation_cost() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let sender = state.accounts.get_or_create(addr(1));
+        sender.balance = Amount::from_comme(100);
+
+        let block = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                timestamp: 2000, producer: addr(0), epoch: 0,
+                producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
+            },
+            transactions: vec![Transaction {
+                from: addr(1), nonce: 0,
+                kind: TxKind::Transfer { to: addr(99), amount: Amount::from_comme(1) },
+                fee: 100_000, // below ACCOUNT_CREATION_FEE
+                signature: vec![], public_key: vec![], memo: None, timelock: None,
+            }],
+            proof_summaries: vec![], compliance_summary: None,
+        };
+        let result = state.apply_block(&block);
+        assert!(result.is_err(), "Transfer to new account with low fee should fail");
+        assert!(result.unwrap_err().to_string().contains("account creation cost"));
     }
 }
