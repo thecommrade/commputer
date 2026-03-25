@@ -1,0 +1,11 @@
+# Item 85: Log rotation for commputer node
+/var/log/commputer/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    maxsize 100M
+}

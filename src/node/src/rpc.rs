@@ -726,6 +726,84 @@ async fn faucet(
     })))
 }
 
+/// Item 95: Testnet leaderboard — top validators by total mined.
+async fn get_leaderboard(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let balances = state.balances.lock().await;
+    let mut validators: Vec<_> = balances.values()
+        .filter(|b| b.is_validator)
+        .map(|b| serde_json::json!({
+            "address": b.address,
+            "total_mined": b.total_mined,
+            "balance": b.balance,
+            "tier": b.tier,
+        }))
+        .collect();
+
+    // Sort by total_mined descending.
+    validators.sort_by(|a, b| {
+        let a_mined = a["total_mined"].as_u64().unwrap_or(0);
+        let b_mined = b["total_mined"].as_u64().unwrap_or(0);
+        b_mined.cmp(&a_mined)
+    });
+
+    // Top 50.
+    validators.truncate(50);
+
+    Json(serde_json::json!({
+        "leaderboard": validators,
+        "count": validators.len(),
+    }))
+}
+
+/// Item 96: Testnet statistics page — HTML page with network stats.
+async fn get_stats_page(
+    State(state): State<Arc<RpcState>>,
+) -> Html<String> {
+    let status = state.status.lock().await;
+    let metrics = state.metrics.lock().await;
+    let balances = state.balances.lock().await;
+
+    let validator_count = balances.values().filter(|b| b.is_validator).count();
+    let total_mined: u64 = balances.values().map(|b| b.total_mined).sum();
+    let units = commputer_core::token::UNITS_PER_COMME;
+
+    Html(format!(r#"<!DOCTYPE html>
+<html><head><title>Commputer Testnet Stats</title>
+<meta http-equiv="refresh" content="10">
+<style>
+body {{ font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }}
+h1 {{ color: #e94560; }}
+.stat {{ margin: 8px 0; }}
+.label {{ color: #8899aa; display: inline-block; width: 200px; }}
+</style></head><body>
+<h1>Commputer Testnet Statistics</h1>
+<div class="stat"><span class="label">Height:</span> {}</div>
+<div class="stat"><span class="label">Epoch:</span> {}</div>
+<div class="stat"><span class="label">Accounts:</span> {}</div>
+<div class="stat"><span class="label">Active Validators:</span> {}</div>
+<div class="stat"><span class="label">Total Emitted:</span> {} COMME</div>
+<div class="stat"><span class="label">Total Burned:</span> {} COMME</div>
+<div class="stat"><span class="label">Circulating:</span> {} COMME</div>
+<div class="stat"><span class="label">Total Mined (all):</span> {} COMME</div>
+<div class="stat"><span class="label">Peers Connected:</span> {}</div>
+<div class="stat"><span class="label">Pending Txs:</span> {}</div>
+<div class="stat"><span class="label">Banned Peers:</span> {}</div>
+<p style="color: #666; margin-top: 20px;">Auto-refreshes every 10 seconds.</p>
+</body></html>"#,
+        status.height, status.epoch, status.accounts,
+        validator_count,
+        status.emitted / units,
+        status.burned / units,
+        status.circulating / units,
+        total_mined / units,
+        metrics.peers_connected,
+        metrics.pending_txs,
+        metrics.peers_banned,
+    ))
+}
+
 // ── Feature 15: RPC API key authentication middleware ──
 
 /// Middleware that checks `X-API-Key` header against the configured key.
@@ -842,6 +920,8 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/fee-estimate", get(get_fee_estimate))
         .route("/rewards/{address}", get(get_pending_rewards))
         .route("/faucet", post(faucet))
+        .route("/leaderboard", get(get_leaderboard))
+        .route("/stats", get(get_stats_page))
         .route_layer(middleware::from_fn_with_state(rpc_state.clone(), auth_middleware))
         .route_layer(middleware::from_fn_with_state(rpc_state.clone(), rate_limit_middleware))
         .with_state(rpc_state)
