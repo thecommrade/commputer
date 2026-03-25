@@ -582,6 +582,14 @@ impl ChainState {
             }
 
             TxKind::ValidatorRegister { .. } => {
+                // Feature 4: Check minimum validator stake.
+                if sender.balance.raw() < commputer_core::transaction::MINIMUM_VALIDATOR_STAKE {
+                    return Err(StateError::InvalidBlock(format!(
+                        "insufficient balance for validator registration: need {} raw, have {}",
+                        commputer_core::transaction::MINIMUM_VALIDATOR_STAKE,
+                        sender.balance.raw(),
+                    )));
+                }
                 sender.is_validator = true;
                 sender.nonce += 1;
             }
@@ -2203,5 +2211,70 @@ mod tests {
         let result = state.apply_block(&block);
         assert!(result.is_err(), "Transfer to new account with low fee should fail");
         assert!(result.unwrap_err().to_string().contains("account creation cost"));
+    }
+
+    #[test]
+    fn validator_register_requires_minimum_stake() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        // Fund sender with less than MINIMUM_VALIDATOR_STAKE.
+        let sender_addr = addr(1);
+        let acct = state.accounts.get_or_create(sender_addr);
+        acct.balance = Amount::from_raw(commputer_core::transaction::MINIMUM_VALIDATOR_STAKE - 1);
+
+        let block = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                timestamp: 2000, producer: addr(0), epoch: 0,
+                producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
+                chain_id: String::new(),
+            },
+            transactions: vec![Transaction {
+                from: sender_addr,
+                nonce: 0,
+                kind: TxKind::ValidatorRegister {
+                    hardware_fingerprint_hash: [0u8; 32],
+                    contribution_percent: 100,
+                },
+                fee: 0,
+                signature: vec![], public_key: vec![], memo: None, timelock: None,
+            }],
+            proof_summaries: vec![],
+            compliance_summary: None,
+        };
+        let result = state.apply_block(&block);
+        assert!(result.is_err(), "Validator register with insufficient stake should fail");
+
+        // Now fund with enough and try again.
+        let acct = state.accounts.get_or_create(sender_addr);
+        acct.balance = Amount::from_raw(commputer_core::transaction::MINIMUM_VALIDATOR_STAKE);
+
+        let block2 = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                timestamp: 3000, producer: addr(0), epoch: 0,
+                producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
+                chain_id: String::new(),
+            },
+            transactions: vec![Transaction {
+                from: sender_addr,
+                nonce: 0,
+                kind: TxKind::ValidatorRegister {
+                    hardware_fingerprint_hash: [0u8; 32],
+                    contribution_percent: 100,
+                },
+                fee: 0,
+                signature: vec![], public_key: vec![], memo: None, timelock: None,
+            }],
+            proof_summaries: vec![],
+            compliance_summary: None,
+        };
+        state.apply_block(&block2).expect("Validator register with sufficient stake should succeed");
+        assert!(state.accounts.get(&sender_addr).unwrap().is_validator);
     }
 }

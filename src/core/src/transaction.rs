@@ -113,6 +113,9 @@ pub const ACCOUNT_CREATION_FEE: u64 = 1_000_000;
 /// Feature 14: Dust limit — transfers below this amount are rejected (0.0001 COMME).
 pub const DUST_LIMIT: u64 = 10_000;
 
+/// Minimum balance required to register as a validator (0.1 COMME = 10_000_000 raw units).
+pub const MINIMUM_VALIDATOR_STAKE: u64 = 10_000_000;
+
 /// A signed transaction on the Commputer network.
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Transaction {
