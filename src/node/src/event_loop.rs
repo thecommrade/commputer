@@ -48,6 +48,8 @@ pub struct EventLoop {
     pub seen_tx_hashes: HashSet<TxHash>,
     /// Per-peer message rate tracking: (peer_id -> (count, window_start)).
     pub peer_msg_rates: HashMap<libp2p::PeerId, (u32, std::time::Instant)>,
+    /// Peer reputation scores: higher is better. Starts at 100.
+    pub peer_scores: HashMap<libp2p::PeerId, i32>,
     /// Receiver for transactions submitted via the RPC server.
     pub rpc_rx: Option<mpsc::Receiver<Transaction>>,
     /// Shared RPC state (for updating the status snapshot).
@@ -78,6 +80,7 @@ impl EventLoop {
             banned_peers: HashSet::new(),
             seen_tx_hashes: HashSet::new(),
             peer_msg_rates: HashMap::new(),
+            peer_scores: HashMap::new(),
             rpc_rx: None,
             rpc_state: None,
         }
@@ -184,9 +187,19 @@ impl EventLoop {
         }
     }
 
+    /// Adjust a peer's reputation score. Negative values penalize, positive reward.
+    fn adjust_peer_score(&mut self, peer_id: libp2p::PeerId, delta: i32) {
+        let score = self.peer_scores.entry(peer_id).or_insert(100);
+        *score = (*score + delta).clamp(-100, 200);
+        if *score <= -50 {
+            self.ban_peer(peer_id, "reputation score dropped below threshold");
+        }
+    }
+
     /// Ban a peer and disconnect them.
     fn ban_peer(&mut self, peer_id: libp2p::PeerId, reason: &str) {
         if self.banned_peers.insert(peer_id) {
+            self.peer_scores.insert(peer_id, -100);
             warn!("Banning peer {} — {}", peer_id, reason);
             // Disconnect the peer.
             let _ = self.network.swarm.disconnect_peer_id(peer_id);
@@ -345,6 +358,8 @@ impl EventLoop {
                     }
                 }
                 info!("Connected to peer: {} at {}", peer_id, addr_str);
+                // Initialize peer reputation score.
+                self.peer_scores.entry(peer_id).or_insert(100);
             }
             SwarmEvent::Behaviour(CommpBehaviourEvent::Identify(
                 libp2p::identify::Event::Received { peer_id, info, .. }
@@ -367,6 +382,7 @@ impl EventLoop {
                 if let Some(validator_addr) = self.peer_validators.remove(&peer_id) {
                     self.compliance.deregister_node(&validator_addr);
                 }
+                self.peer_scores.remove(&peer_id);
                 info!("Disconnected from peer: {}", peer_id);
             }
             _ => {}
@@ -460,6 +476,8 @@ impl EventLoop {
             }
         }
 
+        // Block passed all checks — reward the peer.
+        self.adjust_peer_score(source, 1);
         true
     }
 
