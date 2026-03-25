@@ -29,7 +29,18 @@ pub struct Account {
     pub total_burned: Amount,
     /// Storage will contact hashes (if configured).
     pub will_contacts: Vec<[u8; 32]>,
+    /// Feature 183: Last epoch this account was active (sent or received a tx).
+    #[serde(default)]
+    pub last_active_epoch: u64,
+    /// Feature 184: Storage used by this account (in bytes).
+    #[serde(default)]
+    pub storage_used_bytes: u64,
+    /// Feature 185: Whether this account is currently in hot storage (in-memory).
+    #[serde(default = "default_true")]
+    pub is_hot: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Account {
     /// Create a new empty account.
@@ -45,6 +56,9 @@ impl Account {
             total_mined: Amount::ZERO,
             total_burned: Amount::ZERO,
             will_contacts: Vec::new(),
+            last_active_epoch: 0,
+            storage_used_bytes: 0,
+            is_hot: true,
         }
     }
 
@@ -81,10 +95,27 @@ impl Account {
             .min(self.cumulative_uptime_secs)
             .min(Self::MAX_GRACE_SECS);
     }
+
+    /// Feature 184: Storage tier allocation in bytes.
+    /// Base=1GB, Storage=10GB, Compute=20GB, Full=50GB, None=0.
+    pub fn storage_tier_allocation(&self) -> u64 {
+        match self.tier() {
+            HolderTier::None => 0,
+            HolderTier::Base => 1_000_000_000,         // 1 GB
+            HolderTier::Storage => 10_000_000_000,     // 10 GB
+            HolderTier::Compute => 20_000_000_000,     // 20 GB
+            HolderTier::Full => 50_000_000_000,        // 50 GB
+        }
+    }
+
+    /// Feature 184: Remaining storage quota (can be negative if over-limit).
+    pub fn storage_quota_remaining(&self) -> i64 {
+        self.storage_tier_allocation() as i64 - self.storage_used_bytes as i64
+    }
 }
 
 /// In-memory account store. Will be backed by RocksDB in production.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AccountStore {
     accounts: std::collections::HashMap<Address, Account>,
 }
@@ -124,6 +155,11 @@ impl AccountStore {
 
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty()
+    }
+
+    /// Remove an account from the store.
+    pub fn remove(&mut self, address: &Address) -> Option<Account> {
+        self.accounts.remove(address)
     }
 
     /// Iterate over all accounts.

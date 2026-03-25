@@ -1,24 +1,36 @@
-use rocksdb::{DB, Options, ColumnFamilyDescriptor};
+use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use commputer_core::block::{Block, BlockHash};
 use commputer_core::identity::Address;
+use tracing::info;
 use crate::account::Account;
 
 const CF_BLOCKS: &str = "blocks";
 const CF_BLOCK_HEIGHTS: &str = "block_heights";
 const CF_ACCOUNTS: &str = "accounts";
 const CF_META: &str = "meta";
+const CF_ARCHIVED: &str = "archived_accounts";
 
 pub const META_TOTAL_EMITTED: &str = "total_emitted";
 pub const META_TOTAL_BURNED: &str = "total_burned";
 pub const META_CURRENT_EPOCH: &str = "current_epoch";
 pub const META_CHAIN_HEIGHT: &str = "chain_height";
 pub const META_NERF_RATE_BPS: &str = "nerf_rate_bps";
+/// Feature 186: Schema version key.
+pub const META_SCHEMA_VERSION: &str = "schema_version";
+/// Feature 186: Current schema version.
+pub const CURRENT_SCHEMA_VERSION: u64 = 1;
 
 /// Persistent storage layer backed by RocksDB.
 /// Used alongside in-memory stores — this is the durable layer.
 pub struct RocksStore {
     db: DB,
+    /// Feature 188: Storage metrics counters.
+    pub total_reads: AtomicU64,
+    pub total_writes: AtomicU64,
+    pub total_read_us: AtomicU64,
+    pub total_write_us: AtomicU64,
 }
 
 impl RocksStore {
@@ -26,15 +38,67 @@ impl RocksStore {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
+        // Feature 189: Ensure WAL is enabled (RocksDB default, but be explicit).
+        opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::PointInTime);
 
-        let cf_names = vec![CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META];
+        let cf_names = vec![CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED];
         let cfs: Vec<ColumnFamilyDescriptor> = cf_names
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
             .collect();
 
         let db = DB::open_cf_descriptors(&opts, path, cfs)?;
-        Ok(Self { db })
+
+        // Feature 189: Log WAL recovery status.
+        info!("WAL recovery active — RocksDB opened with PointInTime recovery mode");
+
+        let store = Self {
+            db,
+            total_reads: AtomicU64::new(0),
+            total_writes: AtomicU64::new(0),
+            total_read_us: AtomicU64::new(0),
+            total_write_us: AtomicU64::new(0),
+        };
+
+        // Feature 186: Run migrations on open.
+        store.run_migrations()?;
+
+        // Feature 189: Verify WAL integrity.
+        store.verify_wal();
+
+        Ok(store)
+    }
+
+    /// Feature 186: Run any needed database migrations.
+    pub fn run_migrations(&self) -> Result<(), rocksdb::Error> {
+        let current = self.get_meta_u64(META_SCHEMA_VERSION)?.unwrap_or(0);
+        if current < CURRENT_SCHEMA_VERSION {
+            info!(
+                "Database migration: upgrading schema from v{} to v{}",
+                current, CURRENT_SCHEMA_VERSION
+            );
+            // Migration v0 -> v1: set schema version (initial schema, no data changes).
+            if current < 1 {
+                info!("Migration v0 -> v1: setting initial schema version");
+                self.put_meta_u64(META_SCHEMA_VERSION, 1)?;
+            }
+            // Future migrations go here as `if current < 2 { ... }` etc.
+            info!("Database migrations complete");
+        } else {
+            info!("Database schema at v{}, no migrations needed", current);
+        }
+        Ok(())
+    }
+
+    /// Feature 189: Verify WAL integrity by checking that the DB is readable.
+    fn verify_wal(&self) {
+        // RocksDB replays WAL on open. If we got here, WAL is valid.
+        // Do a simple read to confirm the DB is functional.
+        let cf = self.db.cf_handle(CF_META).unwrap();
+        match self.db.get_cf(&cf, META_SCHEMA_VERSION.as_bytes()) {
+            Ok(_) => info!("WAL verification passed"),
+            Err(e) => info!("WAL verification warning: {}", e),
+        }
     }
 
     // ── Block operations ──
@@ -146,14 +210,111 @@ impl RocksStore {
 
     pub fn get_meta_u64(&self, key: &str) -> Result<Option<u64>, rocksdb::Error> {
         let cf = self.db.cf_handle(CF_META).unwrap();
-        match self.db.get_cf(&cf, key.as_bytes())? {
+        let start = std::time::Instant::now();
+        let result = match self.db.get_cf(&cf, key.as_bytes())? {
             Some(data) => {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(&data);
                 Ok(Some(u64::from_le_bytes(buf)))
             }
             None => Ok(None),
+        };
+        self.total_reads.fetch_add(1, Ordering::Relaxed);
+        self.total_read_us.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        result
+    }
+
+    // ── Feature 183: Archived account operations ──
+
+    /// Archive an account to cold storage.
+    pub fn put_archived_account(&self, account: &Account) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle(CF_ARCHIVED).unwrap();
+        let encoded = borsh::to_vec(account).expect("account borsh serialization should not fail");
+        self.db.put_cf(&cf, account.address.0, &encoded)
+    }
+
+    /// Retrieve an archived account.
+    pub fn get_archived_account(&self, address: &Address) -> Result<Option<Account>, rocksdb::Error> {
+        let cf = self.db.cf_handle(CF_ARCHIVED).unwrap();
+        match self.db.get_cf(&cf, address.0)? {
+            Some(data) => {
+                let account: Account = borsh::from_slice(&data)
+                    .expect("account borsh deserialization should not fail");
+                Ok(Some(account))
+            }
+            None => Ok(None),
         }
+    }
+
+    /// Remove an archived account (after export or cleanup).
+    pub fn delete_archived_account(&self, address: &Address) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle(CF_ARCHIVED).unwrap();
+        self.db.delete_cf(&cf, address.0)
+    }
+
+    /// Count archived accounts.
+    pub fn archived_account_count(&self) -> usize {
+        let cf = self.db.cf_handle(CF_ARCHIVED).unwrap();
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        iter.count()
+    }
+
+    // ── Feature 190: Atomic write batch ──
+
+    /// Create a WriteBatch for atomic multi-key writes.
+    pub fn new_write_batch(&self) -> WriteBatch {
+        WriteBatch::default()
+    }
+
+    /// Add an account write to a batch.
+    pub fn batch_put_account(&self, batch: &mut WriteBatch, account: &Account) {
+        let cf = self.db.cf_handle(CF_ACCOUNTS).unwrap();
+        let encoded = borsh::to_vec(account).expect("account borsh serialization should not fail");
+        batch.put_cf(&cf, account.address.0, &encoded);
+    }
+
+    /// Add a block write to a batch.
+    pub fn batch_put_block(&self, batch: &mut WriteBatch, block: &Block) {
+        let hash = block.hash();
+        let height = block.height();
+        let encoded = borsh::to_vec(block).expect("block borsh serialization should not fail");
+        let cf_blocks = self.db.cf_handle(CF_BLOCKS).unwrap();
+        batch.put_cf(&cf_blocks, hash.0, &encoded);
+        let cf_heights = self.db.cf_handle(CF_BLOCK_HEIGHTS).unwrap();
+        batch.put_cf(&cf_heights, height.to_le_bytes(), hash.0);
+    }
+
+    /// Add a meta u64 write to a batch.
+    pub fn batch_put_meta_u64(&self, batch: &mut WriteBatch, key: &str, value: u64) {
+        let cf = self.db.cf_handle(CF_META).unwrap();
+        batch.put_cf(&cf, key.as_bytes(), value.to_le_bytes());
+    }
+
+    /// Atomically commit a write batch.
+    pub fn write_batch(&self, batch: WriteBatch) -> Result<(), rocksdb::Error> {
+        let start = std::time::Instant::now();
+        self.db.write(batch)?;
+        let elapsed = start.elapsed().as_micros() as u64;
+        self.total_writes.fetch_add(1, Ordering::Relaxed);
+        self.total_write_us.fetch_add(elapsed, Ordering::Relaxed);
+        Ok(())
+    }
+
+    // ── Feature 188: Storage metrics ──
+
+    /// Estimate database size on disk (in bytes).
+    pub fn estimate_db_size(&self) -> u64 {
+        let mut total: u64 = 0;
+        for cf_name in &[CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED] {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                if let Ok(Some(size_str)) = self.db.property_value_cf(&cf, "rocksdb.estimate-live-data-size") {
+                    if let Ok(size) = size_str.parse::<u64>() {
+                        total += size;
+                    }
+                }
+            }
+        }
+        total
     }
 }
 

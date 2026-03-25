@@ -73,6 +73,8 @@ pub struct RpcState {
     pub network_health: Mutex<NetworkHealthDashboard>,
     /// Feature 177: Per-peer connection quality metrics.
     pub peer_quality: Mutex<HashMap<String, serde_json::Value>>,
+    /// Feature 188: Storage metrics snapshot.
+    pub storage_metrics: Mutex<commputer_storage::StorageMetrics>,
 }
 
 /// Response for a submitted transaction.
@@ -318,6 +320,14 @@ async fn get_compliance(
     Json(stats)
 }
 
+/// GET /storage/metrics — Feature 188: storage metrics.
+async fn get_storage_metrics(
+    State(state): State<Arc<RpcState>>,
+) -> Json<commputer_storage::StorageMetrics> {
+    let metrics = state.storage_metrics.lock().await.clone();
+    Json(metrics)
+}
+
 /// GET /anti-scale — Feature 150: warehouse detection stats.
 async fn get_anti_scale(
     State(state): State<Arc<RpcState>>,
@@ -343,6 +353,7 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/anti-scale", get(get_anti_scale))
         .route("/network", get(get_network_health))
         .route("/network/quality", get(get_peer_quality))
+        .route("/storage/metrics", get(get_storage_metrics))
         .with_state(rpc_state)
 }
 
@@ -409,6 +420,7 @@ mod tests {
             anti_scale_metrics: Mutex::new(AntiScaleDashboard::default()),
             network_health: Mutex::new(NetworkHealthDashboard::default()),
             peer_quality: Mutex::new(HashMap::new()),
+            storage_metrics: Mutex::new(commputer_storage::StorageMetrics::default()),
         });
         (state, rx)
     }

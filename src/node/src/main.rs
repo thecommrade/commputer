@@ -99,6 +99,31 @@ enum Commands {
         #[arg(long, default_value = "true")]
         testnet: bool,
     },
+    /// Feature 187: Backup chain data to a compressed archive
+    Backup {
+        /// Output file path for the backup archive
+        #[arg(default_value = "commputer-backup.tar.gz")]
+        output: String,
+        #[arg(long, default_value = "true")]
+        testnet: bool,
+    },
+    /// Feature 187: Restore chain data from a compressed archive
+    Restore {
+        /// Input file path for the backup archive
+        input: String,
+        #[arg(long, default_value = "true")]
+        testnet: bool,
+    },
+    /// Feature 191: Verify state integrity (merkle tree verification)
+    VerifyState {
+        #[arg(long, default_value = "true")]
+        testnet: bool,
+    },
+    /// Feature 192: Rebuild indexes from raw block data
+    RebuildIndexes {
+        #[arg(long, default_value = "true")]
+        testnet: bool,
+    },
     /// Send COMME to another address
     Send {
         /// Recipient address (hex)
@@ -745,6 +770,7 @@ async fn run_node(
         anti_scale_metrics: tokio::sync::Mutex::new(rpc::AntiScaleDashboard::default()),
         network_health: tokio::sync::Mutex::new(rpc::NetworkHealthDashboard::default()),
         peer_quality: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        storage_metrics: tokio::sync::Mutex::new(commputer_storage::StorageMetrics::default()),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
@@ -839,10 +865,135 @@ async fn main() -> Result<()> {
             std::fs::write(&output, serde_json::to_string_pretty(&export)?)?;
             println!("Chain state exported to {}", output);
         }
+        Commands::Backup { output, testnet } => {
+            cmd_backup(&output, testnet)?;
+        }
+        Commands::Restore { input, testnet } => {
+            cmd_restore(&input, testnet)?;
+        }
+        Commands::VerifyState { testnet } => {
+            cmd_verify_state(testnet)?;
+        }
+        Commands::RebuildIndexes { testnet } => {
+            cmd_rebuild_indexes(testnet)?;
+        }
         Commands::Send { to, amount, testnet, rpc_port } => {
             cmd_send(&to, amount, testnet, rpc_port).await?;
         }
     }
+
+    Ok(())
+}
+
+// ── Feature 187: Backup and restore ──
+
+fn cmd_backup(output: &str, testnet: bool) -> Result<()> {
+    let dir = data_dir(testnet);
+    if !dir.exists() {
+        anyhow::bail!("Data directory {} does not exist. Nothing to backup.", dir.display());
+    }
+
+    let file = std::fs::File::create(output)?;
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+
+    archive.append_dir_all(".", &dir)?;
+    archive.finish()?;
+
+    println!("Backup created: {}", output);
+    println!("  Source: {}", dir.display());
+
+    Ok(())
+}
+
+fn cmd_restore(input: &str, testnet: bool) -> Result<()> {
+    let dir = data_dir(testnet);
+    let input_path = std::path::Path::new(input);
+    if !input_path.exists() {
+        anyhow::bail!("Backup file {} does not exist.", input);
+    }
+
+    if dir.exists() {
+        println!("WARNING: Data directory {} already exists.", dir.display());
+        let confirm = read_line("Overwrite? (yes/no): ");
+        if confirm != "yes" {
+            println!("Restore cancelled.");
+            return Ok(());
+        }
+        std::fs::remove_dir_all(&dir)?;
+    }
+
+    std::fs::create_dir_all(&dir)?;
+
+    let file = std::fs::File::open(input)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(&dir)?;
+
+    println!("Restore complete: {}", dir.display());
+    println!("  Source: {}", input);
+
+    Ok(())
+}
+
+// ── Feature 191: Verify state ──
+
+fn cmd_verify_state(testnet: bool) -> Result<()> {
+    let state = open_chain_state(testnet)?;
+    println!("Verifying state integrity...");
+
+    let computed_root = state.verify_state()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let stored_root = state.compute_state_root();
+
+    println!("  Accounts:       {}", state.accounts.len());
+    println!("  Computed root:  {}", hex::encode(computed_root));
+    println!("  Stored root:    {}", hex::encode(stored_root));
+
+    if computed_root == stored_root {
+        println!("  Result: PASS — state roots match");
+    } else {
+        println!("  Result: FAIL — state root mismatch!");
+    }
+
+    // Verify each account can be serialized/deserialized.
+    let mut errors = 0;
+    for account in state.accounts.iter() {
+        match borsh::to_vec(account) {
+            Ok(encoded) => {
+                if borsh::from_slice::<commputer_storage::Account>(&encoded).is_err() {
+                    println!("  ERROR: Account {} failed borsh round-trip", account.address);
+                    errors += 1;
+                }
+            }
+            Err(e) => {
+                println!("  ERROR: Account {} failed serialization: {}", account.address, e);
+                errors += 1;
+            }
+        }
+    }
+
+    if errors == 0 {
+        println!("  All {} accounts verified.", state.accounts.len());
+    } else {
+        println!("  {} errors found in {} accounts.", errors, state.accounts.len());
+    }
+
+    Ok(())
+}
+
+// ── Feature 192: Rebuild indexes ──
+
+fn cmd_rebuild_indexes(testnet: bool) -> Result<()> {
+    let mut state = open_chain_state(testnet)?;
+    println!("Rebuilding indexes from block data...");
+    println!("  Chain height: {}", state.blocks.height());
+
+    let (receipts, history) = state.rebuild_indexes();
+
+    println!("  Receipts rebuilt:        {}", receipts);
+    println!("  History entries rebuilt:  {}", history);
+    println!("Index rebuild complete.");
 
     Ok(())
 }

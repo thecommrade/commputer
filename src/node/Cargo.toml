@@ -23,8 +23,11 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 hex = "0.4"
+borsh = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
+flate2 = { workspace = true }
+tar = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
