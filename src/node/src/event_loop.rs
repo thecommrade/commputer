@@ -574,6 +574,7 @@ impl EventLoop {
                     .as_secs(),
                 producer: *self.wallet.address(),
                 epoch: self.state.current_epoch,
+                producer_public_key: vec![],
                 signature: vec![],
             },
             transactions: txs,
@@ -583,6 +584,9 @@ impl EventLoop {
         // Compute and set merkle roots.
         block.header.tx_root = block.compute_tx_root();
         block.header.proof_root = block.compute_proof_root();
+
+        // Sign the block header with our wallet key.
+        commputer_core::signing::sign_block(&mut block, &self.wallet);
 
         info!("Produced block candidate at height {}", next_height);
 

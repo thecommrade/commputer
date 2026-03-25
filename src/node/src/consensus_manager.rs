@@ -214,6 +214,7 @@ mod tests {
                 timestamp: 1000 + height,
                 producer,
                 epoch: 0,
+                producer_public_key: vec![],
                 signature: vec![],
             },
             transactions: vec![],

@@ -100,6 +100,7 @@ mod tests {
                 timestamp: 1000 + height,
                 producer: Address([0u8; 32]),
                 epoch: 0,
+                producer_public_key: vec![],
                 signature: vec![],
             },
             transactions: vec![],

@@ -151,6 +151,7 @@ fn create_genesis() -> Block {
             timestamp: 0, // Epoch zero.
             producer: Address([0u8; 32]), // No producer for genesis.
             epoch: 0,
+            producer_public_key: vec![],
             signature: vec![],
         },
         transactions: vec![],

@@ -404,6 +404,7 @@ mod tests {
                 timestamp: 1000,
                 producer: addr(0),
                 epoch: 0,
+                producer_public_key: vec![],
                 signature: vec![],
             },
             transactions: vec![],
@@ -448,6 +449,7 @@ mod tests {
                 timestamp: 2000,
                 producer: addr(0),
                 epoch: 0,
+                producer_public_key: vec![],
                 signature: vec![],
             },
             transactions: vec![Transaction {
@@ -487,6 +489,7 @@ mod tests {
                 timestamp: 2000,
                 producer: addr(0),
                 epoch: 0,
+                producer_public_key: vec![],
                 signature: vec![],
             },
             transactions: vec![Transaction {
@@ -529,6 +532,7 @@ mod tests {
                 timestamp: 2000,
                 producer: addr(0),
                 epoch: 0,
+                producer_public_key: vec![],
                 signature: vec![],
             },
             transactions: vec![Transaction {
@@ -571,6 +575,7 @@ mod tests {
                 timestamp: 2000,
                 producer: addr(0),
                 epoch: 0,
+                producer_public_key: vec![],
                 signature: vec![],
             },
             transactions: vec![Transaction {
@@ -644,6 +649,7 @@ mod tests {
                     timestamp: 2000,
                     producer: addr(0),
                     epoch: 0,
+                    producer_public_key: vec![],
                     signature: vec![],
                 },
                 transactions: vec![Transaction {
@@ -709,6 +715,7 @@ mod tests {
                 timestamp: 2000,
                 producer: addr(0),
                 epoch: 0,
+                producer_public_key: vec![],
                 signature: vec![],
             },
             transactions: vec![Transaction {
@@ -761,6 +768,7 @@ mod tests {
                 timestamp: 2000,
                 producer: addr(0),
                 epoch: 0,
+                producer_public_key: vec![],
                 signature: vec![],
             },
             transactions: vec![tx],

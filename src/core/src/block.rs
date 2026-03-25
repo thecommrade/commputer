@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use borsh::{BorshDeserialize, BorshSerialize};
 use sha2::{Sha256, Digest};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use crate::identity::Address;
 use crate::transaction::Transaction;
 use crate::proof::EpochProofSummary;
@@ -39,6 +40,8 @@ pub struct BlockHeader {
     pub producer: Address,
     /// Current epoch number.
     pub epoch: u64,
+    /// Producer's ed25519 public key (32 bytes). Required for signature verification.
+    pub producer_public_key: Vec<u8>,
     /// Signature of the producer over the header fields.
     pub signature: Vec<u8>,
 }
@@ -51,6 +54,47 @@ impl BlockHeader {
         let mut out = [0u8; 32];
         out.copy_from_slice(&hash);
         BlockHash(out)
+    }
+
+    /// Compute the bytes that the producer signs: all header fields except signature.
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        borsh::BorshSerialize::serialize(&self.height, &mut bytes).unwrap();
+        borsh::BorshSerialize::serialize(&self.parent_hash, &mut bytes).unwrap();
+        borsh::BorshSerialize::serialize(&self.tx_root, &mut bytes).unwrap();
+        borsh::BorshSerialize::serialize(&self.proof_root, &mut bytes).unwrap();
+        borsh::BorshSerialize::serialize(&self.state_root, &mut bytes).unwrap();
+        borsh::BorshSerialize::serialize(&self.timestamp, &mut bytes).unwrap();
+        borsh::BorshSerialize::serialize(&self.producer, &mut bytes).unwrap();
+        borsh::BorshSerialize::serialize(&self.epoch, &mut bytes).unwrap();
+        bytes
+    }
+
+    /// Verify the producer's signature on this header. Requires the producer's
+    /// public key. Returns false if the signature is missing/invalid or the key
+    /// doesn't match the producer address.
+    pub fn verify_signature(&self, public_key: &[u8]) -> bool {
+        if public_key.len() != 32 || self.signature.len() != 64 {
+            return false;
+        }
+        let pk_bytes: &[u8; 32] = match public_key.try_into() {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let vk = match VerifyingKey::from_bytes(pk_bytes) {
+            Ok(vk) => vk,
+            Err(_) => return false,
+        };
+        // Verify the public key matches the producer address.
+        if Address::from_public_key(&vk) != self.producer {
+            return false;
+        }
+        let sig_bytes: &[u8; 64] = match self.signature.as_slice().try_into() {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let sig = Signature::from_bytes(sig_bytes);
+        vk.verify(&self.signable_bytes(), &sig).is_ok()
     }
 }
 
@@ -97,6 +141,17 @@ impl Block {
                 })
                 .collect::<Vec<_>>()
         )
+    }
+
+    /// Verify the producer's signature using the embedded public key.
+    /// Returns true if the signature is valid and the key matches the producer address.
+    /// Returns true for unsigned blocks (genesis, legacy blocks) to maintain compatibility.
+    pub fn verify_producer_signature(&self) -> bool {
+        // Skip verification for unsigned blocks (genesis, old blocks).
+        if self.header.signature.is_empty() && self.header.producer_public_key.is_empty() {
+            return true;
+        }
+        self.header.verify_signature(&self.header.producer_public_key)
     }
 
     /// Verify that the header's tx_root and proof_root match the actual contents.

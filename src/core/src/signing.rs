@@ -1,3 +1,4 @@
+use crate::block::Block;
 use crate::wallet::Wallet;
 use crate::transaction::Transaction;
 use borsh::BorshSerialize;
@@ -16,6 +17,14 @@ pub fn sign_transaction(tx: &mut Transaction, wallet: &Wallet) {
     let sig = wallet.sign(&bytes);
     tx.signature = sig.to_bytes().to_vec();
     tx.public_key = wallet.public_key().to_bytes().to_vec();
+}
+
+/// Sign a block header with the producer's wallet key.
+pub fn sign_block(block: &mut Block, wallet: &Wallet) {
+    block.header.producer_public_key = wallet.public_key().to_bytes().to_vec();
+    let bytes = block.header.signable_bytes();
+    let sig = wallet.sign(&bytes);
+    block.header.signature = sig.to_bytes().to_vec();
 }
 
 pub fn verify_transaction(tx: &Transaction, public_key: &VerifyingKey) -> bool {
@@ -58,6 +67,89 @@ mod tests {
         sign_transaction(&mut tx, &sender);
         assert!(!tx.signature.is_empty());
         assert!(verify_transaction(&tx, sender.public_key()));
+    }
+
+    #[test]
+    fn sign_and_verify_block() {
+        use crate::block::{Block, BlockHeader, BlockHash};
+
+        let producer = Wallet::generate();
+        let mut block = Block {
+            header: BlockHeader {
+                height: 1,
+                parent_hash: BlockHash::GENESIS,
+                tx_root: [0u8; 32],
+                proof_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 1_700_000_000,
+                producer: *producer.address(),
+                epoch: 0,
+                producer_public_key: vec![],
+                signature: vec![],
+            },
+            transactions: vec![],
+            proof_summaries: vec![],
+        };
+
+        sign_block(&mut block, &producer);
+        assert_eq!(block.header.signature.len(), 64);
+        assert!(block.header.verify_signature(&producer.public_key().to_bytes()));
+    }
+
+    #[test]
+    fn tampered_block_fails_verification() {
+        use crate::block::{Block, BlockHeader, BlockHash};
+
+        let producer = Wallet::generate();
+        let mut block = Block {
+            header: BlockHeader {
+                height: 1,
+                parent_hash: BlockHash::GENESIS,
+                tx_root: [0u8; 32],
+                proof_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 1_700_000_000,
+                producer: *producer.address(),
+                epoch: 0,
+                producer_public_key: vec![],
+                signature: vec![],
+            },
+            transactions: vec![],
+            proof_summaries: vec![],
+        };
+
+        sign_block(&mut block, &producer);
+        // Tamper with the header.
+        block.header.timestamp = 999;
+        assert!(!block.header.verify_signature(&producer.public_key().to_bytes()));
+    }
+
+    #[test]
+    fn wrong_key_fails_block_verification() {
+        use crate::block::{Block, BlockHeader, BlockHash};
+
+        let producer = Wallet::generate();
+        let imposter = Wallet::generate();
+        let mut block = Block {
+            header: BlockHeader {
+                height: 1,
+                parent_hash: BlockHash::GENESIS,
+                tx_root: [0u8; 32],
+                proof_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 1_700_000_000,
+                producer: *producer.address(),
+                epoch: 0,
+                producer_public_key: vec![],
+                signature: vec![],
+            },
+            transactions: vec![],
+            proof_summaries: vec![],
+        };
+
+        // Sign with imposter's key — should fail because key doesn't match producer address.
+        sign_block(&mut block, &imposter);
+        assert!(!block.header.verify_signature(&imposter.public_key().to_bytes()));
     }
 
     #[test]
