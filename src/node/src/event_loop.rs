@@ -344,11 +344,12 @@ impl EventLoop {
             .unwrap_or(BlockHash::GENESIS);
 
         // Create a new block with pending transactions.
-        let block = Block {
+        let txs = std::mem::take(&mut self.pending_txs);
+        let mut block = Block {
             header: BlockHeader {
                 height: next_height,
                 parent_hash: parent,
-                tx_root: [0u8; 32],  // Simplified for now.
+                tx_root: [0u8; 32],
                 proof_root: [0u8; 32],
                 state_root: [0u8; 32],
                 timestamp: std::time::SystemTime::now()
@@ -359,9 +360,13 @@ impl EventLoop {
                 epoch: self.state.current_epoch,
                 signature: vec![],
             },
-            transactions: std::mem::take(&mut self.pending_txs),
+            transactions: txs,
             proof_summaries: vec![],
         };
+
+        // Compute and set merkle roots.
+        block.header.tx_root = block.compute_tx_root();
+        block.header.proof_root = block.compute_proof_root();
 
         info!("Produced block candidate at height {}", next_height);
 

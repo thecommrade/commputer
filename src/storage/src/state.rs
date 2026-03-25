@@ -183,14 +183,25 @@ impl ChainState {
             }
         }
 
-        // Verify all transaction signatures are present and structurally valid.
-        for tx in &block.transactions {
-            if tx.signature.is_empty() {
-                return Err(StateError::InvalidSignature("empty signature".into()));
+        // Verify parent hash matches (except genesis).
+        if block.height() > 0 {
+            if let Some(latest) = self.blocks.latest() {
+                if block.header.parent_hash != latest.hash() {
+                    return Err(StateError::InvalidBlock("parent hash mismatch".into()));
+                }
             }
-            if tx.signature.len() != 64 {
+        }
+
+        // Verify merkle roots match block contents.
+        if !block.verify_roots() {
+            return Err(StateError::InvalidBlock("merkle root mismatch".into()));
+        }
+
+        // Cryptographically verify all transaction signatures.
+        for tx in &block.transactions {
+            if !tx.verify() {
                 return Err(StateError::InvalidSignature(
-                    format!("invalid signature length: expected 64, got {}", tx.signature.len())
+                    format!("transaction from {:?} failed signature verification", tx.from)
                 ));
             }
         }
@@ -356,6 +367,8 @@ pub enum StateError {
     StorageError(String),
     #[error("invalid signature: {0}")]
     InvalidSignature(String),
+    #[error("invalid block: {0}")]
+    InvalidBlock(String),
 }
 
 #[cfg(test)]
@@ -730,7 +743,7 @@ mod tests {
         };
         sign_transaction(&mut tx, &wallet);
 
-        let block = Block {
+        let mut block = Block {
             header: BlockHeader {
                 height: 1,
                 parent_hash: state.blocks.latest().unwrap().hash(),
@@ -745,6 +758,9 @@ mod tests {
             transactions: vec![tx],
             proof_summaries: vec![],
         };
+        // Compute correct merkle roots before validation.
+        block.header.tx_root = block.compute_tx_root();
+        block.header.proof_root = block.compute_proof_root();
         assert!(state.apply_block_validated(&block).is_ok());
     }
 }
