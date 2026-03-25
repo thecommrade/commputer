@@ -37,7 +37,7 @@ futures = "0.3"
 libp2p = { version = "0.54", features = ["tokio", "gossipsub", "kad", "noise", "tcp", "yamux", "identify", "macros"] }
 
 # Storage
-rocksdb = "0.22"
+rocksdb = "0.24"
 
 # Logging
 tracing = "0.1"

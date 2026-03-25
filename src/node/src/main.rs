@@ -1,6 +1,7 @@
 mod consensus_manager;
 mod event_loop;
 
+use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 use tracing::{info, warn};
@@ -103,13 +104,29 @@ async fn main() -> Result<()> {
         info!("Running in TESTNET mode");
     }
 
-    // Initialize chain state.
-    let mut state = ChainState::new();
+    // Initialize persistent chain state.
+    let data_dir = if cli.testnet {
+        PathBuf::from("./commputer-testnet")
+    } else {
+        PathBuf::from("./commputer-data")
+    };
+    std::fs::create_dir_all(&data_dir)?;
+    info!("Data directory: {}", data_dir.display());
 
-    // Create and apply genesis block.
-    let genesis = create_genesis();
-    info!("Genesis block hash: {}", genesis.hash());
-    state.apply_block(&genesis)?;
+    let mut state = ChainState::open(&data_dir)?;
+
+    // Apply genesis block if this is a fresh chain.
+    if state.blocks.is_empty() {
+        let genesis = create_genesis();
+        info!("Genesis block hash: {}", genesis.hash());
+        state.apply_block(&genesis)?;
+    } else {
+        info!(
+            "Resumed chain at height {} with {} accounts",
+            state.blocks.height(),
+            state.accounts.len(),
+        );
+    }
 
     // Print emission schedule info.
     let schedule = EmissionSchedule::new();

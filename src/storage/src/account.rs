@@ -124,6 +124,11 @@ impl AccountStore {
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty()
     }
+
+    /// Iterate over all accounts.
+    pub fn iter(&self) -> impl Iterator<Item = &Account> {
+        self.accounts.values()
+    }
 }
 
 #[cfg(test)]
