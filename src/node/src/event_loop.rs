@@ -475,6 +475,26 @@ impl EventLoop {
         self.seen_tx_hashes.insert(hash);
         debug!("Accepted transaction into mempool: {:?}", hash);
         self.pending_txs.push(tx);
+        self.enforce_mempool_limit();
+    }
+
+    /// Maximum number of transactions in the mempool.
+    const MAX_MEMPOOL_SIZE: usize = 5000;
+
+    /// Enforce mempool size limit by evicting lowest-fee transactions.
+    fn enforce_mempool_limit(&mut self) {
+        while self.pending_txs.len() > Self::MAX_MEMPOOL_SIZE {
+            // Find the index of the lowest-fee transaction.
+            if let Some((min_idx, _)) = self.pending_txs.iter()
+                .enumerate()
+                .min_by_key(|(_, tx)| tx.fee)
+            {
+                let evicted = self.pending_txs.remove(min_idx);
+                debug!("Evicted low-fee tx from mempool: fee={}", evicted.fee);
+            } else {
+                break;
+            }
+        }
     }
 
     pub fn auto_register_validator(&mut self, contribution_percent: u8) {
