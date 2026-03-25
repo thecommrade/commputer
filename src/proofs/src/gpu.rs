@@ -13,6 +13,24 @@ pub struct GpuProver;
 
 const MATRIX_DIM: usize = 64;
 
+/// Detect if a GPU is likely available by checking common paths.
+/// Returns (detected: bool, description: String).
+pub fn detect_gpu() -> (bool, String) {
+    // Check for NVIDIA GPU
+    if std::path::Path::new("/dev/nvidia0").exists() {
+        return (true, "NVIDIA GPU detected".into());
+    }
+    // Check for AMD GPU
+    if std::path::Path::new("/dev/dri/renderD128").exists() {
+        return (true, "AMD/Intel GPU detected (DRI)".into());
+    }
+    // Check environment variable override
+    if std::env::var("COMMPUTER_GPU").is_ok() {
+        return (true, "GPU enabled via COMMPUTER_GPU env var".into());
+    }
+    (false, "No GPU detected — CPU fallback (reduced score)".into())
+}
+
 impl GpuProver {
     /// Solve a GPU proof challenge.
     pub fn solve(challenge: &ProofChallenge, validator: Address) -> ProofResponse {
