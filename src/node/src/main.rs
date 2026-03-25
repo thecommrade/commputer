@@ -53,6 +53,8 @@ enum Commands {
         #[command(subcommand)]
         action: WalletAction,
     },
+    /// Print node version and protocol info
+    Version,
     /// Show chain status
     Status {
         #[arg(long, default_value = "true")]
@@ -647,6 +649,7 @@ async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16) ->
         status: tokio::sync::Mutex::new(initial_status),
         peers: tokio::sync::Mutex::new(vec![]),
         balances: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        mempool: tokio::sync::Mutex::new(vec![]),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
@@ -680,6 +683,13 @@ async fn main() -> Result<()> {
             WalletAction::Show { testnet } => cmd_wallet_show(testnet)?,
             WalletAction::Export { testnet } => cmd_wallet_export(testnet)?,
         },
+        Commands::Version => {
+            println!("commputer {}", env!("CARGO_PKG_VERSION"));
+            println!("  Protocol:  /commputer/0.1.0");
+            println!("  Network:   testnet");
+            println!("  Supply:    2,000,000,000 COMME");
+            println!("  Consensus: Snowball (sample=3, quorum=2, threshold=5)");
+        }
         Commands::Status { testnet } => cmd_status(testnet)?,
         Commands::Peers { rpc_port } => cmd_peers(rpc_port).await?,
         Commands::Balance { address, rpc_port } => cmd_balance(&address, rpc_port).await?,

@@ -130,6 +130,19 @@ impl EventLoop {
                 *peers_guard = peers;
             }
 
+            // Update mempool snapshot.
+            if let Ok(mut mp_guard) = rpc.mempool.try_lock() {
+                *mp_guard = self.pending_txs.iter().map(|tx| {
+                    crate::rpc::MempoolTxInfo {
+                        tx_hash: hex::encode(tx.hash().0),
+                        from: hex::encode(tx.from.0),
+                        nonce: tx.nonce,
+                        fee: tx.fee,
+                        kind: format!("{:?}", tx.kind).chars().take(50).collect(),
+                    }
+                }).collect();
+            }
+
             // Update balance info for all accounts.
             if let Ok(mut bal_guard) = rpc.balances.try_lock() {
                 bal_guard.clear();

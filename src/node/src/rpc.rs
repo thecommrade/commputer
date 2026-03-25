@@ -57,6 +57,8 @@ pub struct RpcState {
     pub peers: Mutex<Vec<PeerInfo>>,
     /// Account balance lookup callback — stores (address_hex -> BalanceInfo).
     pub balances: Mutex<HashMap<String, BalanceInfo>>,
+    /// Pending mempool transactions.
+    pub mempool: Mutex<Vec<MempoolTxInfo>>,
 }
 
 /// Response for a submitted transaction.
@@ -150,6 +152,38 @@ async fn get_balance(
     }
 }
 
+/// Mempool transaction info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolTxInfo {
+    pub tx_hash: String,
+    pub from: String,
+    pub nonce: u64,
+    pub fee: u64,
+    pub kind: String,
+}
+
+/// GET /mempool — return pending transactions.
+async fn get_mempool(
+    State(state): State<Arc<RpcState>>,
+) -> Json<Vec<MempoolTxInfo>> {
+    let txs = state.mempool.lock().await.clone();
+    Json(txs)
+}
+
+/// GET /health — basic health check.
+async fn get_health(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let status = state.status.lock().await;
+    Json(serde_json::json!({
+        "healthy": true,
+        "height": status.height,
+        "epoch": status.epoch,
+        "peers": state.peers.lock().await.len(),
+        "pending_txs": status.pending_txs,
+    }))
+}
+
 /// Build the axum router (exposed for testing).
 pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
     Router::new()
@@ -157,6 +191,8 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/status", get(get_status))
         .route("/peers", get(get_peers))
         .route("/balance/{address}", get(get_balance))
+        .route("/mempool", get(get_mempool))
+        .route("/health", get(get_health))
         .with_state(rpc_state)
 }
 
@@ -212,6 +248,7 @@ mod tests {
             }),
             peers: Mutex::new(vec![]),
             balances: Mutex::new(HashMap::new()),
+            mempool: Mutex::new(vec![]),
         });
         (state, rx)
     }
