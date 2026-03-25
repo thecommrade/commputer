@@ -556,6 +556,7 @@ dependencies = [
  "commputer-storage",
  "commputer-validator",
  "futures",
+ "hex",
  "libp2p",
  "serde",
  "serde_json",
