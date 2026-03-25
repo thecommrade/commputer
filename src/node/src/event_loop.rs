@@ -3,7 +3,10 @@ use tokio::time;
 use tracing::{info, warn, debug};
 use futures::StreamExt;
 
+use std::collections::HashMap;
+
 use commputer_core::block::{Block, BlockHeader, BlockHash};
+use commputer_core::identity::Address;
 use commputer_core::transaction::Transaction;
 use commputer_core::token::UNITS_PER_COMME;
 use commputer_core::wallet::Wallet;
@@ -33,6 +36,10 @@ pub struct EventLoop {
     pub pending_txs: Vec<Transaction>,
     pub consensus: ConsensusManager,
     pub proof_manager: ProofManager,
+    /// Maps libp2p PeerIds to their observed IP addresses.
+    pub peer_ips: HashMap<libp2p::PeerId, String>,
+    /// Maps libp2p PeerIds to their Commputer validator addresses (learned from registration txs).
+    pub peer_validators: HashMap<libp2p::PeerId, Address>,
 }
 
 impl EventLoop {
@@ -54,6 +61,8 @@ impl EventLoop {
             pending_txs: Vec::new(),
             consensus: ConsensusManager::new(),
             proof_manager: ProofManager::new(our_address),
+            peer_ips: HashMap::new(),
+            peer_validators: HashMap::new(),
         }
     }
 
@@ -124,10 +133,24 @@ impl EventLoop {
                     address, self.network.local_peer_id
                 );
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                info!("Connected to peer: {}", peer_id);
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                // Extract the IP address from the multiaddr.
+                let addr_str = endpoint.get_remote_address().to_string();
+                if let Some(ip) = extract_ip_from_multiaddr(&addr_str) {
+                    self.peer_ips.insert(peer_id, ip.clone());
+                    // If we know this peer's validator address, register with compliance.
+                    if let Some(validator_addr) = self.peer_validators.get(&peer_id) {
+                        self.compliance.register_node(*validator_addr, ip);
+                    }
+                }
+                info!("Connected to peer: {} at {}", peer_id, addr_str);
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                // Clean up peer tracking.
+                self.peer_ips.remove(&peer_id);
+                if let Some(validator_addr) = self.peer_validators.remove(&peer_id) {
+                    self.compliance.deregister_node(&validator_addr);
+                }
                 info!("Disconnected from peer: {}", peer_id);
             }
             _ => {}
@@ -532,4 +555,16 @@ impl EventLoop {
             self.state.accounts.len(),
         );
     }
+}
+
+/// Extract an IPv4 or IPv6 address from a multiaddr string.
+/// Multiaddrs look like: /ip4/192.168.1.10/tcp/9000
+fn extract_ip_from_multiaddr(addr: &str) -> Option<String> {
+    let parts: Vec<&str> = addr.split('/').collect();
+    for (i, part) in parts.iter().enumerate() {
+        if (*part == "ip4" || *part == "ip6") && i + 1 < parts.len() {
+            return Some(parts[i + 1].to_string());
+        }
+    }
+    None
 }
