@@ -6,6 +6,7 @@ mod compute_session;
 mod consensus_manager;
 mod event_loop;
 mod job_cancel;
+mod job_rpc;
 mod job_spec;
 mod native_executor;
 mod proof_manager;
