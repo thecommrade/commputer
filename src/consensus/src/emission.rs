@@ -178,6 +178,19 @@ mod tests {
     }
 
     #[test]
+    fn nerfed_validator_earns_20_percent() {
+        use commputer_core::compliance::NerfRate;
+        let schedule = EmissionSchedule::new();
+        let full_rate = schedule.per_validator_daily_rate(1000);
+        let nerf = NerfRate::INITIAL; // 80% nerf
+        let nerfed_rate = (full_rate as f64 * nerf.reward_multiplier()).round() as u64;
+        // 80% nerf means 20% reward
+        assert!(nerfed_rate > 0);
+        assert!(nerfed_rate < full_rate);
+        assert_eq!(nerfed_rate, full_rate / 5);
+    }
+
+    #[test]
     fn demand_weighted_surplus() {
         let total = 1_000_000u64;
         let mut demand = HashMap::new();
