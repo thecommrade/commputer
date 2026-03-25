@@ -123,6 +123,21 @@ impl ChainState {
         Ok(())
     }
 
+    /// Retrieve a block by height. Checks in-memory first, falls back to RocksDB.
+    pub fn get_block_by_height(&self, height: u64) -> Option<Block> {
+        // Try in-memory first.
+        if let Some(block) = self.blocks.get_by_height(height) {
+            return Some(block.clone());
+        }
+        // Fall back to RocksDB for pruned blocks.
+        if let Some(ref rocks) = self.rocks {
+            if let Ok(Some(block)) = rocks.get_block_by_height(height) {
+                return Some(block);
+            }
+        }
+        None
+    }
+
     /// Remaining supply available for emission.
     pub fn remaining_supply(&self) -> u64 {
         TOTAL_SUPPLY.saturating_sub(self.total_emitted)
