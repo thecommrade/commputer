@@ -1,12 +1,12 @@
 # Commputer: A Communal Supercomputer
 
-**$COMME — First Draft Whitepaper**
+**$COMME — Whitepaper**
 
 ---
 
 ## Abstract
 
-Commputer is a Layer 1 blockchain that coordinates a distributed supercomputer built from small contributions by regular people. Contributors lend idle resources — CPU, GPU, RAM, storage, bandwidth — from their existing computers and earn $COMME, a token that grants access to a communal analytics platform, personal compute, and eventually AI. The protocol enforces egalitarianism through math: scale is punished, not rewarded. A single desktop at full contribution earns maximum rewards. Warehouses and mining farms are economically destroyed by an adaptive penalty system that only gets harsher over time.
+Commputer is a Layer 1 blockchain that coordinates a distributed supercomputer built from small contributions by regular people. Contributors lend idle resources — CPU, GPU, RAM, storage, bandwidth — from their existing computers and earn $COMME, a token that grants access to a communal analytics platform and personal compute. The protocol enforces egalitarianism through math: scale is punished, not rewarded. A single desktop at full contribution earns maximum rewards. Warehouses and mining farms are economically destroyed by an adaptive penalty system that only gets harsher over time.
 
 This is not a meme coin. It is barely even a cryptocurrency. It is a human project that uses a blockchain because no other mechanism can trustlessly enforce fairness across millions of strangers for generations.
 
@@ -22,15 +22,7 @@ Meanwhile, billions of computers sit mostly idle. The average desktop uses a fra
 
 Commputer builds a supercomputer from those idle resources. Anyone with a computer can contribute a portion of their machine — as little as 2% — and earn $COMME. The protocol verifies contributions across five dimensions (CPU, GPU, storage, RAM, bandwidth) and rewards them proportionally.
 
-The pooled compute provides what every person needs:
-
-1. **Communication and knowledge** — free for every holder. Email, text, voice, and video communication. The Humanities Archive. No gas fees. No ads. No data harvesting.
-
-2. **Personal infrastructure** — at higher thresholds, holders unlock communal storage, compute power, and AI access that grows as the network grows.
-
-3. **An ecosystem** — L2 developers build products on top of the network. The founder's crypto analytics platform is one such L2. Others will follow.
-
-Contributors who dedicate a full desktop get the same access as holders — no coins required. The product is never gated by price. It is gated by willingness to give back.
+The result is a communal computer that belongs to its participants. Not a company. Not a foundation. The network.
 
 ---
 
@@ -46,7 +38,83 @@ Three rules are enshrined in this whitepaper and will never change:
 
 ---
 
-## 4. Scale Hurts
+## 4. What Launches
+
+Commputer launches with two things: the coin and the analytics platform.
+
+### The Coin: $COMME
+
+A Layer 1 token earned by contributing idle computer resources. Five proof channels verified from day one: CPU, GPU, storage, RAM, and bandwidth. Burn mechanics active at launch. Full anti-scale protections enforced from block one.
+
+### The Analytics Platform
+
+A world-class ML and analytics platform for cryptocurrency markets. Built by the founder. Powered by 51% of communal compute from the moment the network goes live.
+
+**What exists today:** A production platform with 9 live data collectors, 60+ engineered features, multiple ML models with rigorous validation, live and paper trading infrastructure, and a real-time dashboard. This is the proof of concept — running, tested, and real.
+
+**Hold 1 $COMME and you have full access.** Contribute a full desktop and you have full access without owning a single coin. That is it. That is the launch product.
+
+### The Desktop App
+
+Commputer is not a CLI tool for developers. It is a desktop application for regular people.
+
+Download it. Install it. You see a resource slider, your wallet balance, your contribution stats, and your grace period. Move the slider to decide how much of your machine to share. The app auto-throttles when you are using your computer and ramps up when you are not.
+
+The analytics platform is accessed through the same app. Click "Analytics" and it works. No separate login. No browser redirect. The app proves wallet ownership behind the scenes. One app, one experience.
+
+### The Founder's Role
+
+The analytics platform is the founder's L2 contribution to the network. This is how the anonymous founder earns — not through a premine, not through a dev tax, but by building a product people use. The same opportunity available to anyone building on Commputer.
+
+The founder's 51% compute allocation feeds the analytics platform from day one. As the network grows, the platform grows. Resource contributions are pooled and usable by the founder for continuous improvement of the analytics platform.
+
+---
+
+## 5. Roadmap
+
+Everything below is the direction. Not promises with dates. Not vaporware used to pump a token price. Real goals that the network works toward as it grows.
+
+### Communication Layer
+- Personal email server
+- Text, voice, and video communication
+- No gas fees. No ads. No data harvesting.
+
+### Personal Infrastructure
+- Communal storage allocations
+- Personal compute power
+- AI and LLM access
+
+### The Humanities Archive
+A permanent, decentralized repository of human knowledge — academic papers, historical documents, scientific research, historically significant photographs, art, and literature. Hosted on Commputer's communal infrastructure from the flagship's 51% allocation.
+
+**Free to anyone on earth. No login. No token. No contribution required.**
+
+AI was trained on the sum of human academic labor and then sold back to us. Scientific knowledge sits behind paywalls. History belongs to whoever can afford access. The Humanities Archive is the answer: put it back. Permanently. On infrastructure that no one can acquire, censor, or shut down.
+
+The stated mission: become the default repository people choose — not because they care about crypto, but because it is the most reliable, permanent, uncensorable place to store the record of human knowledge. The most obvious choice.
+
+### $RAD
+Details to come when the time is right.
+
+### Ownership Tiers (Post-Launch)
+
+As the roadmap delivers new capabilities, holding more $COMME unlocks more of the communal computer:
+
+| Hold | Unlock |
+|---|---|
+| 1 $COMME | Full flagship analytics platform |
+| 5 $COMME | Personal email server |
+| 10 $COMME | Storage allocation |
+| 20 $COMME | Processing power |
+| 33 $COMME | Full personal computer + AI/LLM access |
+
+Each tier's resources come from the 49% communal pool, split equally among qualifying holders. The math is always visible: here is the pool, here is how many people share it, here is yours.
+
+In the beginning, your personal computer is a calculator. As the network grows, it becomes a Chromebook. Then a workstation. Then something nobody has today. The wine of technology. Patience will reward you.
+
+---
+
+## 6. Scale Hurts
 
 Every other blockchain rewards scale. Commputer punishes it.
 
@@ -90,7 +158,7 @@ Commputer does not create e-waste. There are no ASICs. No GPU farms. No warehous
 
 ---
 
-## 5. Tokenomics
+## 7. Tokenomics
 
 ### Supply
 
@@ -100,7 +168,7 @@ The maximum supply can only decrease through burns. It never increases.
 
 ### Emission — Hybrid Curve
 
-The protocol targets ~0.09 $COMME per day per maxed reference node at launch. As the network grows, the per-node rate adjusts downward on a published, deterministic curve:
+The protocol targets ~0.09 $COMME per day per maxed reference node at launch. As the network grows, the per-node rate decays on a published, deterministic inverse square root curve:
 
 | Network Size | Rate Per Node | Time to 33 $COMME |
 |---|---|---|
@@ -168,72 +236,28 @@ Floors are protocol-enforced. The remaining 60% floats to where demand is highes
 
 ---
 
-## 6. Two Paths to the Product
+## 8. Two Paths to the Product
 
 | Path | Requirement | What You Get |
 |---|---|---|
-| **Own It** | Hold 33 $COMME | Permanent access to everything. Turn off your computer, go on vacation — it is yours. |
-| **Earn It** | Dedicate 1 desktop at 100% | Full access to everything while contributing. Same product. Same features. No coins needed. Ever. |
-
-The "Earn It" path provides the exact same access as holding 33 $COMME. The only difference is permanence: holders own it unconditionally, contributors access it while contributing.
+| **Own It** | Hold 1+ $COMME | Access to the analytics platform. Hold more as tiers unlock on the roadmap. |
+| **Earn It** | Dedicate 1 desktop at 100% | Full access to everything available while contributing. Same product. Same features. No coins needed. Ever. |
 
 **The product is never priced out.** No matter what $COMME trades at, anyone with a desktop can get full access for free today. This is what makes Commputer different from every token-gated product: the free path never closes.
-
-### Ownership Tiers
-
-| Hold | Unlock |
-|---|---|
-| 1 $COMME | Full flagship analytics platform |
-| 5 $COMME | Personal email server |
-| 10 $COMME | Storage allocation |
-| 20 $COMME | Processing power |
-| 33 $COMME | Full personal computer + AI/LLM access |
-
-Each tier's resources come from the 49% communal pool, split equally among qualifying holders. The math is always visible: here is the pool, here is how many people share it, here is yours.
-
-In the beginning, your personal computer is a calculator. As the network grows, it becomes a Chromebook. Then a workstation. Then something nobody has today. The wine of technology. Patience will reward you.
 
 ### Grace Period
 
 Life happens. For contributors on the "Earn It" path, the protocol provides a grace period proportional to their contribution history:
 
-- 15 days contributing → 15 days grace
-- 1 year → 1 year
-- 10 years → 10 years (maximum)
+- 15 days contributing = 15 days grace
+- 1 year = 1 year
+- 10 years = 10 years (maximum)
 
-Grace drains day by day when offline, refills at 1:2 when back online (5 days online restores 10 days). Your dashboard shows the balance.
+Grace drains 1:1 when offline. It refills 2:1 when back online — 5 days online restores 10 days of grace. If you go offline for 10 days with 10 years banked, 5 days back online restores your full balance. Your dashboard shows the balance at all times.
 
 If grace runs out, access stops — but **personal data (photos, music, files) is held for 10 years regardless.** Someone's family photos are not leverage. Come back anytime, plug in, and pick up where you left off.
 
 Storage includes emergency contacts — email addresses and phone numbers the blockchain will reach out to if a grace period is triggered. In the event of death, the Will Function executes customizable instructions to ensure listed contacts can retrieve all personal data at no cost. Every attempt to reach those people will be made throughout the grace period. This is not a feature. This is infrastructure built for the reality of human life.
-
----
-
-## 7. The Flagship
-
-A world-class ML and analytics platform for cryptocurrency markets. Built by the core development team. Powered by 51% of communal compute.
-
-**What exists today:** A production platform with 9 live data collectors, 60+ engineered features, multiple ML models with rigorous validation, live and paper trading infrastructure, and a real-time dashboard. This is the proof of concept.
-
-**What launches with mainnet:** The L1 chain, validator software, and full flagship access for every holder and contributor.
-
-**What we are working toward:** The Humanities Archive. Agentic AI. Open LLM hosting. And someday, AGI — owned by the people.
-
-These are not promises with dates. They are the direction. For as long as one person holds one $COMME, the work continues.
-
----
-
-## 8. The Humanities Archive
-
-A permanent, decentralized repository of human knowledge — academic papers, historical documents, scientific research, historically significant photographs, art, and literature. Hosted on Commputer's communal infrastructure from the flagship's 51% allocation.
-
-**Free to anyone on earth. No login. No token. No contribution required.**
-
-AI was trained on the sum of human academic labor and then sold back to us. Scientific knowledge sits behind paywalls. History belongs to whoever can afford access. The Humanities Archive is the answer: put it back. Permanently. On infrastructure that no one can acquire, censor, or shut down.
-
-The mission: become the default repository people choose — not because they care about crypto, but because it is the most reliable, permanent, uncensorable place to store the record of human knowledge.
-
-The archive launches when the network can guarantee data integrity and redundancy at scale. It starts small and grows with the network.
 
 ---
 
@@ -251,9 +275,9 @@ The node software is written in Rust — the language the most battle-tested mod
 
 **Resource Orchestration:** Matches jobs to available resources. Respects the 51/49 split. Decomposes large tasks into desktop-sized pieces and reassembles results.
 
-### Validator Software
+### The Desktop App
 
-Single download. Cross-platform. Resource slider from 1% to 100%. Auto-throttles when you are using your machine. Clear dashboard showing contributions, earnings, compliance status, and grace balance. Dead simple.
+Single download. Cross-platform. Install it like any other application. Resource slider from 1% to 100%. Auto-throttles when you are using your machine. Clear dashboard showing contributions, earnings, compliance status, and grace balance. Analytics platform built in — click and use it. Dead simple.
 
 ---
 
@@ -272,6 +296,7 @@ Single download. Cross-platform. Resource slider from 1% to 100%. Auto-throttles
 
 - Your tier and unlocked features
 - Exact resource allocation: total pool, number sharing it, your precise share
+- Grace period balance
 - No hiding. No vague numbers. The math is the product.
 
 ---
@@ -280,7 +305,7 @@ Single download. Cross-platform. Resource slider from 1% to 100%. Auto-throttles
 
 Anonymous. The L1 protocol has zero founder allocation. No premine. No dev tax. No hidden wallet. Every $COMME is earned through contribution.
 
-The founder earns from L2s, dApps, and services built on top of Commputer — the same opportunity available to anyone building on the network. At the protocol level, the founder is just another holder and contributor, bound by the same rules.
+The founder earns by building on the network — the analytics platform is an L2 product, powered by the 51% communal compute allocation. It is the founder's contribution to the ecosystem and the source of the founder's livelihood. The same opportunity is available to anyone who builds on Commputer.
 
 No VCs. No influencer deals. No paid listings. Word of mouth only. The product is the marketing.
 
@@ -292,7 +317,7 @@ This is not a meme coin. It is almost not even a cryptocurrency. It is a human p
 
 This is an act of peaceful revolution — not against any company or government, but against the idea that knowledge, compute, and AI should be owned by a few and rented to the many.
 
-We are not selling the moon or lies. We are offering a real, tangible product that will improve — that much we can promise. A usable computer once the network is large enough. Analytics on day one. And a commitment: for as long as one person holds one $COMME, the work continues.
+We are not selling the moon or lies. We are offering a real, tangible product that will improve — that much we can promise. Analytics on day one. A usable computer once the network is large enough. And a commitment: for as long as one person holds one $COMME, the work continues.
 
 Scale hurts. Honesty is the default. Life happens and the protocol accounts for it. The Commrade judges hoarders. The code is the contract. And the free path never closes.
 

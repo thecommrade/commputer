@@ -1,127 +1,114 @@
 # Commputer — Twitter Snippets
 
-Ready to copy-paste. Mix of philosophy, mechanics, and vision.
+Ready to copy-paste. Mix of hooks, explainers, philosophy, and mission.
 
 ---
 
-## Snippet 1 — The Hook
+## 1 — Hook: The Pitch
 
-Give 2% of your computer. Get a product that grows every day. No purchase necessary.
+$COMME isn't something you buy. It's something you earn by giving us a little of your computer.
 
-That's Commputer. A communal supercomputer where scale hurts and regular people win.
+Download the app. Slide how much you want to give. That's it. You're part of a supercomputer now.
 
-Whitepaper dropping soon. $COMME
-
-#Commputer #DePIN #Web3 #Crypto #L1 #DecentralizedCompute
+No VCs. No influencer deals. Anonymous founder. Word of mouth only. The product is the marketing.
 
 ---
 
-## Snippet 2 — Anti-Scale
+## 2 — Hook: Anti-Scale
 
-Every blockchain rewards whales. We punish them.
+Every blockchain rewards whoever spends the most. We do the opposite.
 
-One desktop = max rewards. Two nodes? 75% penalty. A warehouse? The math bankrupts you.
+One desktop at 100% is the ceiling. Run a warehouse and the math destroys you. Scale hurts, not helps.
 
-Commputer is built for regular people. Your laptop is enough. $COMME
-
-#Commputer #ScaleHurts #Crypto #L1 #DePIN #AntiWhale
+Commputer was built for regular people. Your laptop is enough. $COMME
 
 ---
 
-## Snippet 3 — The Product
+## 3 — Hook: What It Isn't
 
-1 $COMME = full access to a world-class crypto analytics platform. No tiers. No premium.
+This isn't a meme coin. It almost isn't even cryptocurrency.
 
-33 $COMME = a personal computer that grows forever.
+It's a communal supercomputer that uses a blockchain because no other tool can enforce fairness across millions of strangers for generations.
 
-Or just plug in a desktop. Same access. No coins needed. Ever.
-
-#Commputer #COMME #DePIN #CryptoAnalytics #ML
+2 billion fixed supply. Dual burn mechanism. The number only goes down. $COMME
 
 ---
 
-## Snippet 4 — The Humanities Archive
+## 4 — Explainer: How It Works
 
-AI was trained on humanity's academic work. Then paywalled and sold back to us as a subscription.
+Here's the deal with Commputer:
 
-We're putting it back. Free. Permanent. On infrastructure no one can buy, censor, or shut down.
+You download a desktop app. You slide a bar to choose how much of your idle computer to share. You earn $COMME.
 
-The Humanities Archive. Coming to Commputer. $COMME
+Hold 1 = access to a crypto analytics platform.
+Hold 33 = a full personal computer that grows as the network grows, plus AI access on the roadmap.
 
-#Commputer #OpenAccess #OpenScience #FreeKnowledge #Web3
+Or just contribute a full desktop and get all of it for free. No coins needed. Ever.
 
 ---
 
-## Snippet 5 — The Revolution
+## 5 — Explainer: The Wine
 
-This is not a meme coin. It's barely even crypto.
+Your share of Commputer starts small. That's the truth.
 
-It's a human project that uses a blockchain because no other tool can enforce fairness at scale for generations.
+But as more people join, the network gets stronger. Your slice of it gets more powerful. Not because you paid more, but because more people showed up.
 
-Communal compute. Communal AI. Owned by the people.
+The wine of technology. Your product gets better with age.
 
 $COMME
 
-#Commputer #PeacefulRevolution #DecentralizedAI #Web3
+---
+
+## 6 — Explainer: The Burns
+
+$COMME has a fixed supply of 2 billion. It goes down three ways:
+
+Milestone burns — the network hits capacity targets, coins get destroyed automatically.
+Usage burns — spend $COMME on burst compute, it's gone forever.
+Annual charitable burns — holders vote to fund a cause. The protocol donates and burns a matching amount.
+
+Feed the hungry. Cure disease. Improve the environment. That's what the burns fund. Never war. Never politics. Never profit.
 
 ---
 
-## Snippet 6 — The Wine
+## 7 — Philosophy: The Promise
 
-In the beginning, your share of the network is a calculator.
+So long as one person holds 1 $COMME, I will be working toward the full vision.
 
-Year 2: a Chromebook.
-Year 5: a workstation.
-Year 10: something nobody has today.
+That's not a tagline. That's the commitment. Analytics on day one. A communal computer that grows. The Humanities Archive. Eventually, AI owned by the people who built it.
 
-Commputer. The wine of technology. Patience will reward you. $COMME
-
-#Commputer #COMME #DePIN #LongTermValue #Crypto
+No timeline promises. Just direction, and the work.
 
 ---
 
-## Snippet 7 — Life Happens
+## 8 — Philosophy: Who Built This
 
-Lost your job? Internet down? War?
+No VC money. No premine. No dev tax. No founder allocation at the protocol level. Zero.
 
-Commputer holds your data for up to 10 years. Come back when you can. Plug in. Pick up where you left off.
+An anonymous person built this because they believe compute, knowledge, and AI shouldn't be owned by a few companies and rented back to everyone else.
 
-The protocol doesn't punish you for being human. $COMME
-
-#Commputer #HumanFirst #Web3 #Crypto #DePIN
+Word of mouth only. If you're here, someone told you. That's the whole marketing strategy. $COMME
 
 ---
 
-## Snippet 8 — The Charity
+## 9 — Philosophy: Life Happens
 
-Every year, $COMME holders vote to donate. Healthcare. Housing. Education. Mental health. Animal shelters. The environment. The elderly. The disabled.
+Lost your job? Internet down? Just need a break?
 
-The donation is matched by a burn. Charity gets money. Supply shrinks. Everyone wins.
+Commputer holds your personal data for up to 10 years. Your grace period matches your contribution history. Come back when you can. Plug in. Pick up where you left off.
 
-What it will NEVER fund: war, politics, or profit.
+The protocol doesn't punish you for being human.
 
-#Commputer #CryptoForGood #Charity #COMME #Web3
-
----
-
-## Snippet 9 — The Will
-
-If the worst happens, Commputer has your back.
-
-Your data has a will. Emergency contacts. Auto-notifications. Free downloads for your family. No fees. No deadlines. No profiting from your loss.
-
-This is infrastructure for life. $COMME
-
-#Commputer #HumanFirst #Web3 #DigitalLegacy
+$COMME #Commputer #DePIN
 
 ---
 
-## Snippet 10 — The Gold Standard
+## 10 — Mission: The Big Picture
 
-Commputer's mining cap isn't based on specs. It's pegged to 10 grams of gold.
+We are building a distributed supercomputer from regular people's idle desktops.
 
-Whatever desktop that buys you — anywhere in the world, in any currency — that's max rewards. Can't spend your way past it. Can't whale your way around it.
+Not a token play. Not a whitepaper fantasy. There's a working analytics platform behind this right now, with live data collectors, ML models, and real infrastructure.
 
-Fair by design. $COMME
+The chain launches when it's ready. The product already exists.
 
-#Commputer #GoldStandard #FairMining #DePIN #L1
+$COMME #Commputer #L1 #DePIN #DecentralizedCompute
