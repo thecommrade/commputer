@@ -834,6 +834,18 @@ impl EventLoop {
             for tx in &block.transactions {
                 self.seen_tx_hashes.insert(tx.hash());
             }
+
+            // Log block time delta from previous block.
+            if let Some(prev) = self.state.blocks.latest() {
+                let delta = block.header.timestamp.saturating_sub(prev.header.timestamp);
+                if delta > 0 {
+                    debug!("Block time: {}s (target: 2s)", delta);
+                    if delta > 10 {
+                        warn!("Block time drift: {}s between blocks {} and {}", delta, height - 1, height);
+                    }
+                }
+            }
+
             match self.state.apply_block_validated(&block) {
                 Ok(()) => {
                     info!("Finalized and applied block {} at height {}", hash, height);
