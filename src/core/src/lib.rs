@@ -12,6 +12,7 @@ pub mod signing;
 pub mod testutil;
 pub mod merkle;
 pub mod genesis;
+pub mod compute;
 #[cfg(test)]
 mod fuzz_tests;
 
