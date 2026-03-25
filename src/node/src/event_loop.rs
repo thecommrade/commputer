@@ -217,7 +217,12 @@ impl EventLoop {
         let mut consensus_interval = time::interval(Duration::from_millis(500));
         let mut proof_interval = time::interval(Duration::from_secs(300));
 
-        info!("Event loop started. Listening for peers...");
+        info!("Event loop started at height {}. Listening for peers...", self.state.blocks.height());
+
+        // Initial sync: request any missing blocks we might have missed.
+        // This runs once at startup after peers connect.
+        let mut sync_requested = false;
+        let mut sync_timer = time::interval(Duration::from_secs(5));
 
         // Set up graceful shutdown signal handler.
         let mut sigterm = tokio::signal::unix::signal(
@@ -256,6 +261,18 @@ impl EventLoop {
                 }
                 _ = proof_interval.tick() => {
                     self.handle_proof_tick();
+                }
+                _ = sync_timer.tick() => {
+                    // If we have peers but haven't synced yet, request the next block.
+                    if !sync_requested && !self.peer_ips.is_empty() {
+                        let our_height = self.state.blocks.height();
+                        // Request the next few blocks we might be missing.
+                        for h in (our_height + 1)..=(our_height + 10) {
+                            self.request_block(h);
+                        }
+                        sync_requested = true;
+                        info!("Initial sync: requested blocks {} to {}", our_height + 1, our_height + 10);
+                    }
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Received SIGINT — shutting down gracefully");
