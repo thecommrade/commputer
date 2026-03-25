@@ -91,6 +91,7 @@ mod tests {
             },
             transactions: vec![],
             proof_summaries: vec![],
+            compliance_summary: None,
         };
 
         sign_block(&mut block, &producer);
@@ -118,6 +119,7 @@ mod tests {
             },
             transactions: vec![],
             proof_summaries: vec![],
+            compliance_summary: None,
         };
 
         sign_block(&mut block, &producer);
@@ -147,6 +149,7 @@ mod tests {
             },
             transactions: vec![],
             proof_summaries: vec![],
+            compliance_summary: None,
         };
 
         // Sign with imposter's key — should fail because key doesn't match producer address.

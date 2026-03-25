@@ -290,6 +290,7 @@ mod tests {
             },
             transactions: vec![],
             proof_summaries: vec![],
+            compliance_summary: None,
         }
     }
 

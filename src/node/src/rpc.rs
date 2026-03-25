@@ -65,6 +65,10 @@ pub struct RpcState {
     pub receipts: Mutex<HashMap<String, serde_json::Value>>,
     /// Node metrics snapshot.
     pub metrics: Mutex<NodeMetrics>,
+    /// Feature 142: Compliance dashboard stats.
+    pub compliance_stats: Mutex<ComplianceDashboard>,
+    /// Feature 150: Anti-scale metrics.
+    pub anti_scale_metrics: Mutex<AntiScaleDashboard>,
 }
 
 /// Response for a submitted transaction.
@@ -258,6 +262,41 @@ async fn get_health(
     }))
 }
 
+/// Feature 142: Compliance dashboard response.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ComplianceDashboard {
+    pub total_validators: u64,
+    pub compliant_count: u64,
+    pub nerfed_count: u64,
+    pub current_nerf_percentage: u32,
+    pub suspicious_count: u64,
+}
+
+/// Feature 150: Anti-scale metrics response.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AntiScaleDashboard {
+    pub total_warehouse_detections: u64,
+    pub total_nerfed_rewards: u64,
+    pub nerf_percentage_history: Vec<(u64, u32)>,
+    pub largest_detected_clusters: Vec<(usize, String)>,
+}
+
+/// GET /compliance — Feature 142: network-wide compliance stats.
+async fn get_compliance(
+    State(state): State<Arc<RpcState>>,
+) -> Json<ComplianceDashboard> {
+    let stats = state.compliance_stats.lock().await.clone();
+    Json(stats)
+}
+
+/// GET /anti-scale — Feature 150: warehouse detection stats.
+async fn get_anti_scale(
+    State(state): State<Arc<RpcState>>,
+) -> Json<AntiScaleDashboard> {
+    let metrics = state.anti_scale_metrics.lock().await.clone();
+    Json(metrics)
+}
+
 /// Build the axum router (exposed for testing).
 pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
     Router::new()
@@ -271,6 +310,8 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/metrics", get(get_metrics))
         .route("/proofs/status", get(get_proof_status))
         .route("/health", get(get_health))
+        .route("/compliance", get(get_compliance))
+        .route("/anti-scale", get(get_anti_scale))
         .with_state(rpc_state)
 }
 
@@ -333,6 +374,8 @@ mod tests {
                 uptime_secs: 0, height: 0, epoch: 0, peers_connected: 0,
                 peers_banned: 0, blocks_produced: 0, pending_txs: 0, seen_tx_count: 0,
             }),
+            compliance_stats: Mutex::new(ComplianceDashboard::default()),
+            anti_scale_metrics: Mutex::new(AntiScaleDashboard::default()),
         });
         (state, rx)
     }

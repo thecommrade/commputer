@@ -42,6 +42,18 @@ impl NerfRate {
     pub fn reward_multiplier(&self) -> f64 {
         1.0 - (self.rate_bps as f64 / 10000.0)
     }
+
+    /// Feature 140: Compute adaptive nerf rate based on network-wide nerfed ratio.
+    /// Formula: 8000 + (nerfed_ratio * 2000) bps, capped at 10000.
+    /// As more validators are nerfed, the nerf penalty slides toward 100%.
+    pub fn compute_adaptive(nerfed_count: u64, total_validators: u64) -> u32 {
+        if total_validators == 0 {
+            return 8000;
+        }
+        let nerfed_ratio = nerfed_count as f64 / total_validators as f64;
+        let rate = 8000.0 + (nerfed_ratio * 2000.0);
+        (rate.round() as u32).min(10000)
+    }
 }
 
 /// Flags that can trigger a compliance review.
@@ -59,6 +71,16 @@ pub enum ComplianceFlag {
     DatacenterPattern,
     /// Challenge-response timing inconsistent with reported hardware.
     TimingAnomaly { expected_ms: u64, actual_ms: u64 },
+    /// Feature 138: Same /16 subnet detected.
+    SameSubnet16 { peer_address: Address },
+    /// Feature 138: Same ASN detected.
+    SameAsn { asn: String, peer_address: Address },
+    /// Feature 148: Validator running on known datacenter IP range.
+    DatacenterIp { provider: String },
+    /// Feature 149: Multiple validators behind same IP (VPN/proxy suspected).
+    VpnProxy { ip: String, validator_count: usize },
+    /// Feature 138: Geographic proximity (same /16 or ASN).
+    GeographicProximity { peer_address: Address },
 }
 
 /// Verdict from a compliance review.
@@ -73,4 +95,41 @@ pub struct ComplianceVerdict {
     pub explanation: String,
     /// What the validator should do to restore compliance.
     pub resolution_steps: Vec<String>,
+}
+
+/// Feature 146: Compliance summary included in blocks by block producers.
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct ComplianceSummary {
+    /// Number of currently nerfed validators.
+    pub nerfed_count: u64,
+    /// Current total nerf percentage in basis points.
+    pub total_nerf_percentage: u32,
+    /// Number of active suspicion flags across all validators.
+    pub suspicion_flags: u64,
+}
+
+/// Feature 139: Exponential decay multiplier for multi-node operators.
+/// First node: 100%, second: 25%, third: 6.25%, fourth: 1.5625%, fifth+: 0%.
+pub fn multi_node_multiplier(node_count: u32) -> f64 {
+    match node_count {
+        0 => 0.0,
+        1 => 1.0,
+        2 => 0.25,
+        3 => 0.0625,
+        4 => 0.015625,
+        _ => 0.0, // 5+ nodes get zero rewards
+    }
+}
+
+/// Feature 150: Anti-scale metrics for the /anti-scale RPC endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AntiScaleMetrics {
+    /// Total number of warehouse-pattern detections.
+    pub total_warehouse_detections: u64,
+    /// Total rewards nerfed (in raw units).
+    pub total_nerfed_rewards: u64,
+    /// History of nerf percentage changes: (epoch, bps).
+    pub nerf_percentage_history: Vec<(u64, u32)>,
+    /// Largest detected clusters: (cluster_size, sample_address_hex).
+    pub largest_detected_clusters: Vec<(usize, String)>,
 }

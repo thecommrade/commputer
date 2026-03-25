@@ -8,3 +8,5 @@ description.workspace = true
 
 [dependencies]
 commputer-core = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }

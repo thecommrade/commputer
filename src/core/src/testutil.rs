@@ -38,6 +38,7 @@ pub fn test_block_with_parent(height: u64, parent: BlockHash) -> Block {
         },
         transactions: vec![],
         proof_summaries: vec![],
+        compliance_summary: None,
     }
 }
 
@@ -59,6 +60,7 @@ pub fn test_block_with_producer(height: u64, producer: Address) -> Block {
         },
         transactions: vec![],
         proof_summaries: vec![],
+        compliance_summary: None,
     }
 }
 
@@ -96,5 +98,6 @@ pub fn genesis_block() -> Block {
         },
         transactions: vec![],
         proof_summaries: vec![],
+        compliance_summary: None,
     }
 }

@@ -5,6 +5,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use crate::identity::Address;
 use crate::transaction::Transaction;
 use crate::proof::EpochProofSummary;
+use crate::compliance::ComplianceSummary;
 
 fn default_protocol_version() -> u32 { CURRENT_PROTOCOL_VERSION }
 
@@ -119,6 +120,9 @@ pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Transaction>,
     pub proof_summaries: Vec<EpochProofSummary>,
+    /// Feature 146: Compliance summary included by block producers.
+    #[serde(default)]
+    pub compliance_summary: Option<ComplianceSummary>,
 }
 
 impl Block {

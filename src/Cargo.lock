@@ -711,6 +711,8 @@ name = "commputer-validator"
 version = "0.1.0"
 dependencies = [
  "commputer-core",
+ "serde",
+ "tracing",
 ]
 
 [[package]]

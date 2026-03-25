@@ -79,6 +79,12 @@ pub enum TxKind {
         /// Custom execution options hash.
         options_hash: [u8; 32],
     },
+
+    /// Feature 144: Compliance appeal — nerfed validator submits proof of compliance.
+    ComplianceAppeal {
+        /// Hash of the compliance proof data.
+        proof_hash: [u8; 32],
+    },
 }
 
 /// Minimum transaction fee in raw units (0.0001 COMME = 100_000 raw units).

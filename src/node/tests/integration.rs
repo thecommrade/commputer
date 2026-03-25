@@ -25,6 +25,7 @@ fn test_block() -> Block {
         },
         transactions: vec![],
         proof_summaries: vec![],
+        compliance_summary: None,
     }
 }
 
@@ -167,6 +168,7 @@ async fn fork_competing_blocks_propagate() {
         },
         transactions: vec![],
         proof_summaries: vec![],
+        compliance_summary: None,
     };
 
     let block_b = Block {
@@ -184,6 +186,7 @@ async fn fork_competing_blocks_propagate() {
         },
         transactions: vec![],
         proof_summaries: vec![],
+        compliance_summary: None,
     };
 
     let hash_a = block_a.hash();

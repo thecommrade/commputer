@@ -2,7 +2,7 @@ use std::path::Path;
 use commputer_core::block::Block;
 use commputer_core::token::TOTAL_SUPPLY;
 use commputer_core::transaction::{TxKind, Transaction};
-use commputer_core::compliance::NerfRate;
+use commputer_core::compliance::{ComplianceStatus, NerfRate};
 use tracing::{info, warn};
 use crate::account::AccountStore;
 use crate::blockstore::BlockStore;
@@ -416,6 +416,21 @@ impl ChainState {
             TxKind::CharitableVote { .. } => {
                 sender.nonce += 1;
             }
+
+            TxKind::ComplianceAppeal { .. } => {
+                // Feature 144: If the validator is nerfed and submits a compliance appeal,
+                // restore to Compliant status. The proof_hash is recorded for audit.
+                if sender.is_validator
+                    && sender.compliance != ComplianceStatus::Compliant
+                {
+                    info!(
+                        "Feature 144: Compliance appeal accepted for {}, restoring to Compliant",
+                        tx.from
+                    );
+                    sender.compliance = ComplianceStatus::Compliant;
+                }
+                sender.nonce += 1;
+            }
         }
 
         Ok(())
@@ -635,6 +650,7 @@ mod tests {
             },
             transactions: vec![],
             proof_summaries: vec![],
+            compliance_summary: None,
         }
     }
 
@@ -690,6 +706,7 @@ mod tests {
                 public_key: vec![],
             }],
             proof_summaries: vec![],
+            compliance_summary: None,
         };
         state.apply_block(&block).unwrap();
 
@@ -732,6 +749,7 @@ mod tests {
                 public_key: vec![],
             }],
             proof_summaries: vec![],
+            compliance_summary: None,
         };
         state.apply_block(&block).unwrap();
 
@@ -776,6 +794,7 @@ mod tests {
                 public_key: vec![],
             }],
             proof_summaries: vec![],
+            compliance_summary: None,
         };
         state.apply_block(&block).unwrap();
 
@@ -820,6 +839,7 @@ mod tests {
                 public_key: vec![],
             }],
             proof_summaries: vec![],
+            compliance_summary: None,
         };
         assert!(state.apply_block(&block).is_err());
     }
@@ -894,6 +914,7 @@ mod tests {
                     public_key: vec![],
                 }],
                 proof_summaries: vec![],
+            compliance_summary: None,
             };
             state.apply_block(&block).unwrap();
             // Flush accounts (apply_block persists blocks and meta, but
@@ -961,6 +982,7 @@ mod tests {
                 public_key: vec![],
             }],
             proof_summaries: vec![],
+            compliance_summary: None,
         };
         assert!(state.apply_block_validated(&block).is_err());
     }
@@ -1006,6 +1028,7 @@ mod tests {
             },
             transactions: vec![tx],
             proof_summaries: vec![],
+            compliance_summary: None,
         };
         // Compute correct merkle roots before validation.
         block.header.tx_root = block.compute_tx_root();

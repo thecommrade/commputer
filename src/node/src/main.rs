@@ -174,6 +174,7 @@ fn create_genesis() -> Block {
         },
         transactions: vec![],
         proof_summaries: vec![],
+        compliance_summary: None,
     }
 }
 
@@ -698,6 +699,8 @@ async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16, co
             pending_txs: 0,
             seen_tx_count: 0,
         }),
+        compliance_stats: tokio::sync::Mutex::new(rpc::ComplianceDashboard::default()),
+        anti_scale_metrics: tokio::sync::Mutex::new(rpc::AntiScaleDashboard::default()),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).

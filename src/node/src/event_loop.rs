@@ -1052,6 +1052,7 @@ impl EventLoop {
             },
             transactions: txs,
             proof_summaries: vec![],
+            compliance_summary: None,
         };
 
         // Compute and set merkle roots and state root.
