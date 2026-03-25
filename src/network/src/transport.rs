@@ -39,7 +39,40 @@ pub struct CommpBehaviour {
 impl CommpNetwork {
     /// Create a new CommpNetwork listening on the given port via TCP and QUIC.
     pub fn new(listen_port: u16) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut swarm = SwarmBuilder::with_new_identity()
+        Self::new_with_keypair_path(listen_port, None)
+    }
+
+    /// Item 3: Create a CommpNetwork with a persistent keypair.
+    /// If `keypair_path` is provided, loads the keypair from disk or generates
+    /// and saves a new one. This ensures the peer ID survives restarts.
+    pub fn new_with_keypair_path(listen_port: u16, keypair_path: Option<&std::path::Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let identity = if let Some(path) = keypair_path {
+            if path.exists() {
+                let bytes = std::fs::read(path)?;
+                let keypair = libp2p::identity::Keypair::from_protobuf_encoding(&bytes)?;
+                info!("Loaded persistent peer identity from {}", path.display());
+                keypair
+            } else {
+                let keypair = libp2p::identity::Keypair::generate_ed25519();
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let bytes = keypair.to_protobuf_encoding()?;
+                std::fs::write(path, &bytes)?;
+                // Set restrictive permissions on the key file (Unix only).
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                }
+                info!("Generated and saved new peer identity to {}", path.display());
+                keypair
+            }
+        } else {
+            libp2p::identity::Keypair::generate_ed25519()
+        };
+
+        let mut swarm = SwarmBuilder::with_existing_identity(identity)
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),

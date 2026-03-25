@@ -240,13 +240,36 @@ fn data_dir(testnet: bool) -> PathBuf {
     }
 }
 
+/// Item 4: Wallet directory is separate from chain data — lives in ~/.commputer/wallet/.
+fn wallet_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".commputer")
+        .join("wallet")
+}
+
 fn wallet_path(testnet: bool) -> PathBuf {
-    data_dir(testnet).join("wallet.json")
+    let dir = wallet_dir();
+    if testnet {
+        dir.join("wallet-testnet.json")
+    } else {
+        dir.join("wallet.json")
+    }
 }
 
 /// Feature 245: Get the path for a named wallet.
 fn wallet_path_named(testnet: bool, name: &str) -> PathBuf {
-    data_dir(testnet).join("wallets").join(format!("{}.json", name))
+    let dir = wallet_dir();
+    let suffix = if testnet { "-testnet" } else { "" };
+    dir.join("wallets").join(format!("{}{}.json", name, suffix))
+}
+
+/// Item 3: Path for the persistent libp2p peer identity keypair.
+fn peer_key_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".commputer")
+        .join("peer_key.bin")
 }
 
 fn read_password(prompt: &str) -> String {
@@ -819,8 +842,9 @@ async fn run_node(
     info!("  GPU:     {}", hardware.gpu_model.as_deref().unwrap_or("none"));
     info!("  OS:      {}", hardware.os_family);
 
-    // Set up network.
-    let mut network = CommpNetwork::new(port)
+    // Set up network with persistent peer identity (Item 3).
+    let peer_key = peer_key_path();
+    let mut network = CommpNetwork::new_with_keypair_path(port, Some(&peer_key))
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     info!("P2P peer ID: {}", network.local_peer_id);
 
