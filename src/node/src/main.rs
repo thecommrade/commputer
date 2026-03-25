@@ -1,6 +1,7 @@
 mod consensus_manager;
 mod event_loop;
 mod proof_manager;
+mod rpc;
 
 use std::path::PathBuf;
 use anyhow::Result;
@@ -43,6 +44,9 @@ enum Commands {
         log_level: String,
         #[arg(long, default_value = "9000")]
         port: u16,
+        /// Port for the JSON RPC server (transaction submission, status queries)
+        #[arg(long, default_value = "9944")]
+        rpc_port: u16,
     },
     /// Wallet management
     Wallet {
@@ -62,6 +66,9 @@ enum Commands {
         amount: u64,
         #[arg(long, default_value = "true")]
         testnet: bool,
+        /// RPC port of the running node (for broadcast)
+        #[arg(long, default_value = "9944")]
+        rpc_port: u16,
     },
 }
 
@@ -334,7 +341,7 @@ fn cmd_status(testnet: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_send(to: &str, amount: u64, testnet: bool) -> Result<()> {
+async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result<()> {
     let path = wallet_path(testnet);
     if !path.exists() {
         anyhow::bail!("No wallet found. Run `commputer wallet create` first.");
@@ -405,13 +412,37 @@ fn cmd_send(to: &str, amount: u64, testnet: bool) -> Result<()> {
     println!("  Amount: {} COMME", amount);
     println!("  Nonce:  {}", nonce);
     println!("  TxHash: {}", hex::encode(tx_hash.0));
+
+    // Attempt to broadcast via RPC to the running node.
+    let url = format!("http://127.0.0.1:{}/tx", rpc_port);
     println!();
-    println!("Transaction created. Start the node to broadcast.");
+    println!("Broadcasting to node at {}...", url);
+
+    let client = reqwest::Client::new();
+    match client.post(&url).json(&tx).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                println!("Transaction accepted by node.");
+                println!("  Response: {}", body);
+            } else {
+                println!("Node rejected transaction (HTTP {}).", status);
+                println!("  Response: {}", body);
+            }
+        }
+        Err(e) => {
+            println!("Could not reach node at {} — is it running?", url);
+            println!("  Error: {}", e);
+            println!();
+            println!("Transaction saved locally. Start the node to broadcast.");
+        }
+    }
 
     Ok(())
 }
 
-async fn run_node(testnet: bool, log_level: String, port: u16) -> Result<()> {
+async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16) -> Result<()> {
     // Initialize logging.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -498,9 +529,33 @@ async fn run_node(testnet: bool, log_level: String, port: u16) -> Result<()> {
         info!("Connected to {} seed nodes", seeds_connected);
     }
 
-    // Create and run event loop.
+    // Set up RPC server channel.
+    let (tx_sender, tx_receiver) = tokio::sync::mpsc::channel(256);
+    let initial_status = rpc::ChainStatus {
+        height: state.blocks.height(),
+        total_supply: commputer_core::token::TOTAL_SUPPLY,
+        emitted: state.total_emitted,
+        burned: state.total_burned,
+        circulating: state.circulating_supply(),
+        remaining: state.remaining_supply(),
+        accounts: state.accounts.len(),
+        epoch: state.current_epoch,
+        pending_txs: 0,
+    };
+
+    let rpc_state = std::sync::Arc::new(rpc::RpcState {
+        tx_sender,
+        status: tokio::sync::Mutex::new(initial_status),
+    });
+
+    // Create event loop and attach RPC channel (shares status with RPC server).
     let mut event_loop = EventLoop::new(state, wallet, network);
+    event_loop.attach_rpc(tx_receiver, rpc_state.clone());
     event_loop.auto_register_validator(100);
+
+    // Spawn RPC server in the background.
+    tokio::spawn(rpc::start_rpc_server(rpc_port, rpc_state));
+
     event_loop.run().await;
 
     Ok(())
@@ -515,8 +570,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { testnet, log_level, port } => {
-            run_node(testnet, log_level, port).await?;
+        Commands::Run { testnet, log_level, port, rpc_port } => {
+            run_node(testnet, log_level, port, rpc_port).await?;
         }
         Commands::Wallet { action } => match action {
             WalletAction::Create { testnet } => cmd_wallet_create(testnet)?,
@@ -525,7 +580,9 @@ async fn main() -> Result<()> {
             WalletAction::Export { testnet } => cmd_wallet_export(testnet)?,
         },
         Commands::Status { testnet } => cmd_status(testnet)?,
-        Commands::Send { to, amount, testnet } => cmd_send(&to, amount, testnet)?,
+        Commands::Send { to, amount, testnet, rpc_port } => {
+            cmd_send(&to, amount, testnet, rpc_port).await?;
+        }
     }
 
     Ok(())

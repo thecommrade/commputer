@@ -23,3 +23,5 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 hex = "0.4"
+axum = { workspace = true }
+reqwest = { workspace = true }

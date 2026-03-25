@@ -1,4 +1,6 @@
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{info, warn, debug};
 use futures::StreamExt;
@@ -40,6 +42,10 @@ pub struct EventLoop {
     pub peer_ips: HashMap<libp2p::PeerId, String>,
     /// Maps libp2p PeerIds to their Commputer validator addresses (learned from registration txs).
     pub peer_validators: HashMap<libp2p::PeerId, Address>,
+    /// Receiver for transactions submitted via the RPC server.
+    pub rpc_rx: Option<mpsc::Receiver<Transaction>>,
+    /// Shared RPC state (for updating the status snapshot).
+    pub rpc_state: Option<Arc<crate::rpc::RpcState>>,
 }
 
 impl EventLoop {
@@ -63,6 +69,40 @@ impl EventLoop {
             proof_manager: ProofManager::new(our_address),
             peer_ips: HashMap::new(),
             peer_validators: HashMap::new(),
+            rpc_rx: None,
+            rpc_state: None,
+        }
+    }
+
+    /// Attach the RPC channel and shared state for the RPC server.
+    pub fn attach_rpc(
+        &mut self,
+        rx: mpsc::Receiver<Transaction>,
+        state: Arc<crate::rpc::RpcState>,
+    ) {
+        self.rpc_rx = Some(rx);
+        self.rpc_state = Some(state);
+        self.update_rpc_status();
+    }
+
+    /// Push a fresh status snapshot to the RPC shared state.
+    fn update_rpc_status(&self) {
+        if let Some(ref rpc) = self.rpc_state {
+            let snapshot = crate::rpc::ChainStatus {
+                height: self.state.blocks.height(),
+                total_supply: commputer_core::token::TOTAL_SUPPLY,
+                emitted: self.state.total_emitted,
+                burned: self.state.total_burned,
+                circulating: self.state.circulating_supply(),
+                remaining: self.state.remaining_supply(),
+                accounts: self.state.accounts.len(),
+                epoch: self.state.current_epoch,
+                pending_txs: self.pending_txs.len(),
+            };
+            // Use try_lock to avoid blocking the event loop.
+            if let Ok(mut guard) = rpc.status.try_lock() {
+                *guard = snapshot;
+            }
         }
     }
 
@@ -75,15 +115,31 @@ impl EventLoop {
         info!("Event loop started. Listening for peers...");
 
         loop {
+            // Take the RPC receiver out to satisfy the borrow checker in select!
+            let rpc_recv = async {
+                if let Some(ref mut rx) = self.rpc_rx {
+                    rx.recv().await
+                } else {
+                    // No RPC channel — park forever.
+                    std::future::pending::<Option<Transaction>>().await
+                }
+            };
+
             tokio::select! {
                 event = self.network.swarm.select_next_some() => {
                     self.handle_swarm_event(event);
                 }
+                Some(tx) = rpc_recv => {
+                    info!("Received transaction from RPC: {}", hex::encode(tx.hash().0));
+                    self.handle_rpc_transaction(tx);
+                }
                 _ = epoch_interval.tick() => {
                     self.handle_epoch_tick();
+                    self.update_rpc_status();
                 }
                 _ = block_interval.tick() => {
                     self.handle_block_tick();
+                    self.update_rpc_status();
                 }
                 _ = consensus_interval.tick() => {
                     self.handle_consensus_tick();
@@ -207,6 +263,28 @@ impl EventLoop {
         // Attempt finalization (handles single-candidate fast-path).
         self.consensus.try_finalize_round(height);
         self.try_apply_finalized(height);
+    }
+
+    /// Handle a transaction submitted via the RPC server: validate, add to mempool, broadcast.
+    fn handle_rpc_transaction(&mut self, tx: Transaction) {
+        if !tx.verify() {
+            warn!("RPC transaction failed verification — dropping");
+            return;
+        }
+
+        let tx_hash = tx.hash();
+
+        // Broadcast on the transactions gossipsub topic.
+        if let Ok(data) = serde_json::to_vec(&tx) {
+            let topic = topics::tx_topic();
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, data) {
+                warn!("Failed to broadcast RPC transaction: {}", e);
+            }
+        }
+
+        info!("Broadcast transaction {} from RPC", hex::encode(tx_hash.0));
+        self.pending_txs.push(tx);
+        self.update_rpc_status();
     }
 
     fn handle_new_transaction(&mut self, tx: Transaction) {
