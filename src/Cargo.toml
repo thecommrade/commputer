@@ -31,6 +31,7 @@ rand = "0.8"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 
 # Networking
 libp2p = { version = "0.54", features = ["tokio", "gossipsub", "kad", "noise", "tcp", "yamux", "identify", "macros"] }

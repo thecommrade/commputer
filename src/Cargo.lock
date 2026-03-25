@@ -504,6 +504,10 @@ dependencies = [
  "commputer-network",
  "commputer-proofs",
  "commputer-storage",
+ "commputer-validator",
+ "futures",
+ "libp2p",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -586,6 +590,9 @@ dependencies = [
 [[package]]
 name = "commputer-validator"
 version = "0.1.0"
+dependencies = [
+ "commputer-core",
+]
 
 [[package]]
 name = "concurrent-queue"

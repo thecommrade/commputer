@@ -1,3 +1,5 @@
+mod event_loop;
+
 use anyhow::Result;
 use clap::Parser;
 use tracing::{info, warn};
@@ -5,8 +7,12 @@ use tracing::{info, warn};
 use commputer_core::block::{Block, BlockHeader, BlockHash};
 use commputer_core::identity::Address;
 use commputer_core::token::{TOTAL_SUPPLY, UNITS_PER_COMME};
+use commputer_core::wallet::Wallet;
 use commputer_storage::state::ChainState;
 use commputer_consensus::emission::EmissionSchedule;
+use commputer_network::transport::CommpNetwork;
+
+use crate::event_loop::EventLoop;
 
 #[derive(Parser, Debug)]
 #[command(name = "commputer")]
@@ -20,6 +26,10 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// P2P listen port.
+    #[arg(long, default_value = "9000")]
+    port: u16,
 }
 
 fn create_genesis() -> Block {
@@ -111,16 +121,24 @@ async fn main() -> Result<()> {
 
     print_chain_status(&state);
 
-    info!("Node initialized. Waiting for peers...");
-    info!("(Full P2P networking not yet implemented. This is the foundation.)");
+    // Load or create wallet.
+    let wallet = Wallet::generate(); // For testnet, generate fresh each time.
+    info!("Wallet address: {}", wallet.address());
 
-    // In production, this is where the main event loop runs:
-    // 1. Accept peer connections
-    // 2. Participate in Snowball consensus
-    // 3. Issue and verify proof challenges
-    // 4. Produce blocks when selected as anchor
-    // 5. Process transactions
-    // 6. Track epochs and distribute emission
+    // Set up network.
+    let mut network = CommpNetwork::new(cli.port)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    info!("P2P peer ID: {}", network.local_peer_id);
+
+    // Connect to seed nodes.
+    let seeds_connected = network.connect_to_seeds();
+    if seeds_connected > 0 {
+        info!("Connected to {} seed nodes", seeds_connected);
+    }
+
+    // Create and run event loop.
+    let mut event_loop = EventLoop::new(state, wallet, network);
+    event_loop.run().await;
 
     Ok(())
 }
