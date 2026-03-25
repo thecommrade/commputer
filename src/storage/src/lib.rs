@@ -4,6 +4,7 @@ pub mod rocks;
 pub mod receipt;
 pub mod state;
 pub mod traits;
+pub mod job_pool;
 
 pub use account::{Account, AccountStore};
 pub use blockstore::BlockStore;

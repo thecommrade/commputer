@@ -1,5 +1,8 @@
+mod capacity;
+mod compute_handler;
 mod consensus_manager;
 mod event_loop;
+mod job_spec;
 mod proof_manager;
 mod rpc;
 mod validation;
