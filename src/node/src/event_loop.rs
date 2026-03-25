@@ -865,6 +865,31 @@ impl EventLoop {
                     _ => {}
                 }
             }
+            // Relay client events — log relay connections
+            SwarmEvent::Behaviour(CommpBehaviourEvent::RelayClient(event)) => {
+                debug!("Relay client event: {:?}", event);
+            }
+            // DCUtR hole-punching events
+            SwarmEvent::Behaviour(CommpBehaviourEvent::Dcutr(event)) => {
+                info!("DCUtR hole-punch event: {:?}", event);
+            }
+            // UPnP port mapping events
+            SwarmEvent::Behaviour(CommpBehaviourEvent::Upnp(event)) => {
+                match event {
+                    libp2p::upnp::Event::NewExternalAddr(addr) => {
+                        info!("UPnP: mapped external address {}", addr);
+                    }
+                    libp2p::upnp::Event::GatewayNotFound => {
+                        debug!("UPnP: no gateway found (normal behind VPN)");
+                    }
+                    libp2p::upnp::Event::NonRoutableGateway => {
+                        debug!("UPnP: gateway is not routable");
+                    }
+                    libp2p::upnp::Event::ExpiredExternalAddr(addr) => {
+                        debug!("UPnP: external address expired: {}", addr);
+                    }
+                }
+            }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 // Clean up peer tracking.
                 self.peer_ips.remove(&peer_id);
