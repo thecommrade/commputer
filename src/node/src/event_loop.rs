@@ -159,7 +159,7 @@ impl EventLoop {
             peer_subnets: HashMap::new(),
             peer_rtts: HashMap::new(),
             ping_timestamps: HashMap::new(),
-            partition_detected: false,
+            partition_detected: true, // Start paused — unpause when peers connect
             verified_peer_validators: HashMap::new(),
             peer_quality: HashMap::new(),
             custom_seeds: Vec::new(),
