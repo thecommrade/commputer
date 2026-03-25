@@ -1,3 +1,5 @@
+mod capacity;
+mod compute_handler;
 mod consensus_manager;
 mod event_loop;
 mod proof_manager;
