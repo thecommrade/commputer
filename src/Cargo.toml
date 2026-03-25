@@ -8,6 +8,7 @@ members = [
     "node",
     "validator",
     "storage",
+    "sim",
 ]
 
 [workspace.package]
@@ -52,6 +53,9 @@ clap = { version = "4", features = ["derive"] }
 # HTTP / RPC
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# CSV
+csv = "1"
 
 # Error handling
 thiserror = "2"

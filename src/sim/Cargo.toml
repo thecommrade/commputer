@@ -1,0 +1,20 @@
+[package]
+name = "commputer-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Economic simulation tool for the Commputer network"
+
+[[bin]]
+name = "commputer-sim"
+path = "src/main.rs"
+
+[dependencies]
+commputer-core = { workspace = true }
+commputer-consensus = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+csv = "1"
