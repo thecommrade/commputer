@@ -46,6 +46,8 @@ pub struct EventLoop {
     pub banned_peers: HashSet<libp2p::PeerId>,
     /// Transaction hashes already seen (in finalized blocks or mempool) for dedup.
     pub seen_tx_hashes: HashSet<TxHash>,
+    /// Per-peer message rate tracking: (peer_id -> (count, window_start)).
+    pub peer_msg_rates: HashMap<libp2p::PeerId, (u32, std::time::Instant)>,
     /// Receiver for transactions submitted via the RPC server.
     pub rpc_rx: Option<mpsc::Receiver<Transaction>>,
     /// Shared RPC state (for updating the status snapshot).
@@ -75,6 +77,7 @@ impl EventLoop {
             peer_validators: HashMap::new(),
             banned_peers: HashSet::new(),
             seen_tx_hashes: HashSet::new(),
+            peer_msg_rates: HashMap::new(),
             rpc_rx: None,
             rpc_state: None,
         }
@@ -280,6 +283,22 @@ impl EventLoop {
                 if self.banned_peers.contains(&propagation_source) {
                     debug!("Ignoring message from banned peer {}", propagation_source);
                     return;
+                }
+
+                // Rate limiting: max 50 messages per peer per second.
+                const MAX_MSGS_PER_SEC: u32 = 50;
+                let now = std::time::Instant::now();
+                let entry = self.peer_msg_rates.entry(propagation_source)
+                    .or_insert((0, now));
+                if now.duration_since(entry.1).as_secs() >= 1 {
+                    // Reset window.
+                    *entry = (1, now);
+                } else {
+                    entry.0 += 1;
+                    if entry.0 > MAX_MSGS_PER_SEC {
+                        self.ban_peer(propagation_source, "exceeded message rate limit");
+                        return;
+                    }
                 }
 
                 let topic = message.topic.as_str();
