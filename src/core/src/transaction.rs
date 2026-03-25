@@ -81,13 +81,18 @@ pub enum TxKind {
     },
 }
 
+/// Minimum transaction fee in raw units (0.0001 COMME = 100_000 raw units).
+pub const MINIMUM_FEE: u64 = 100_000;
+
 /// A signed transaction on the Commputer network.
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Transaction {
     pub from: Address,
     pub nonce: u64,
     pub kind: TxKind,
-    /// Signature over (from || nonce || kind).
+    /// Transaction fee in raw units. Burned on inclusion (not paid to validators).
+    pub fee: u64,
+    /// Signature over (from || nonce || kind || fee).
     pub signature: Vec<u8>,
     /// Sender's ed25519 public key (32 bytes). Required for signature verification.
     pub public_key: Vec<u8>,
@@ -136,11 +141,12 @@ impl Transaction {
             Err(_) => return false,
         };
         let sig = Signature::from_bytes(sig_bytes);
-        // Sign over (from || nonce || kind)
+        // Sign over (from || nonce || kind || fee)
         let mut bytes = Vec::new();
         borsh::BorshSerialize::serialize(&self.from, &mut bytes).unwrap();
         borsh::BorshSerialize::serialize(&self.nonce, &mut bytes).unwrap();
         borsh::BorshSerialize::serialize(&self.kind, &mut bytes).unwrap();
+        borsh::BorshSerialize::serialize(&self.fee, &mut bytes).unwrap();
         vk.verify(&bytes, &sig).is_ok()
     }
 

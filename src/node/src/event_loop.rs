@@ -405,6 +405,10 @@ impl EventLoop {
         if self.seen_tx_hashes.contains(&hash) {
             return Err("duplicate transaction");
         }
+        // Minimum fee check.
+        if tx.fee < commputer_core::transaction::MINIMUM_FEE {
+            return Err("fee below minimum");
+        }
         // Nonce validation: must match expected next nonce for sender.
         // Account for pending txs already in mempool from the same sender.
         let on_chain_nonce = self.state.accounts

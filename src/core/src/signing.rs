@@ -9,6 +9,7 @@ fn tx_signable_bytes(tx: &Transaction) -> Vec<u8> {
     tx.from.serialize(&mut bytes).unwrap();
     tx.nonce.serialize(&mut bytes).unwrap();
     tx.kind.serialize(&mut bytes).unwrap();
+    tx.fee.serialize(&mut bytes).unwrap();
     bytes
 }
 
@@ -60,6 +61,7 @@ mod tests {
                 to: recipient,
                 amount: Amount::from_comme(10),
             },
+            fee: 0,
             signature: vec![],
             public_key: vec![],
         };
@@ -164,6 +166,7 @@ mod tests {
                 to: recipient,
                 amount: Amount::from_comme(10),
             },
+            fee: 0,
             signature: vec![],
             public_key: vec![],
         };

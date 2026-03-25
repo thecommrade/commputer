@@ -247,6 +247,17 @@ impl ChainState {
             });
         }
 
+        // Deduct and burn fee.
+        if tx.fee > 0 {
+            let fee_amount = commputer_core::token::Amount::from_raw(tx.fee);
+            if sender.balance.raw() < tx.fee {
+                return Err(StateError::InsufficientBalance);
+            }
+            sender.balance = sender.balance.checked_sub(fee_amount)
+                .ok_or(StateError::InsufficientBalance)?;
+            self.total_burned += tx.fee;
+        }
+
         match &tx.kind {
             TxKind::Transfer { to, amount } => {
                 let sender_balance = sender.balance;
@@ -459,6 +470,7 @@ mod tests {
                     to: addr(2),
                     amount: Amount::from_comme(33),
                 },
+                fee: 0,
                 signature: vec![],
                 public_key: vec![],
             }],
@@ -500,6 +512,7 @@ mod tests {
                     burn_amount: Amount::from_comme(5),
                     job_hash: [0u8; 32],
                 },
+                fee: 0,
                 signature: vec![],
                 public_key: vec![],
             }],
@@ -543,6 +556,7 @@ mod tests {
                     burn_amount: Amount::from_comme(3),
                     job_hash: [0u8; 32],
                 },
+                fee: 0,
                 signature: vec![],
                 public_key: vec![],
             }],
@@ -586,6 +600,7 @@ mod tests {
                     burn_amount: Amount::from_comme(5), // More than balance
                     job_hash: [0u8; 32],
                 },
+                fee: 0,
                 signature: vec![],
                 public_key: vec![],
             }],
@@ -659,6 +674,7 @@ mod tests {
                         to: addr(2),
                         amount: Amount::from_comme(33),
                     },
+                    fee: 0,
                     signature: vec![],
                     public_key: vec![],
                 }],
@@ -725,6 +741,7 @@ mod tests {
                     to: addr(2),
                     amount: Amount::from_comme(10),
                 },
+                fee: 0,
                 signature: vec![], // Empty — should be rejected
                 public_key: vec![],
             }],
@@ -753,6 +770,7 @@ mod tests {
                 to: addr(2),
                 amount: Amount::from_comme(10),
             },
+            fee: 0,
             signature: vec![],
             public_key: vec![],
         };

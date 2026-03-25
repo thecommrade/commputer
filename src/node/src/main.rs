@@ -413,6 +413,7 @@ async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result
             to: to_addr,
             amount: send_amount,
         },
+        fee: commputer_core::transaction::MINIMUM_FEE,
         signature: vec![],
         public_key: vec![],
     };

@@ -226,6 +226,7 @@ mod tests {
                 to,
                 amount: Amount::from_comme(10),
             },
+            fee: 0,
             signature: vec![],
             public_key: vec![],
         };
@@ -274,6 +275,7 @@ mod tests {
                 to: Address([3u8; 32]),
                 amount: Amount::from_comme(5),
             },
+            fee: 0,
             signature: vec![],
             public_key: vec![],
         };
@@ -309,6 +311,7 @@ mod tests {
                 to: Address([4u8; 32]),
                 amount: Amount::from_comme(1),
             },
+            fee: 0,
             signature: vec![0u8; 64],
             public_key: wallet.public_key().to_bytes().to_vec(),
         };
