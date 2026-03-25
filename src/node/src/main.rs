@@ -508,17 +508,26 @@ async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result
     let wallet = Keystore::load(&path, &password)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let state = open_chain_state(testnet)?;
     let from_addr = *wallet.address();
+    let from_hex = hex::encode(from_addr.0);
 
-    // Look up sender nonce.
-    let nonce = state
-        .accounts
-        .get(&from_addr)
-        .map(|a| a.nonce)
-        .unwrap_or(0);
+    // Fetch nonce from running node via RPC (falls back to local state).
+    let client = reqwest::Client::new();
+    let nonce_url = format!("http://127.0.0.1:{}/nonce/{}", rpc_port, from_hex);
+    let nonce = match client.get(&nonce_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            body["nonce"].as_u64().unwrap_or(0)
+        }
+        _ => {
+            // Fall back to local chain state.
+            let state = open_chain_state(testnet)?;
+            state.accounts.get(&from_addr).map(|a| a.nonce).unwrap_or(0)
+        }
+    };
 
-    // Verify balance.
+    // Verify balance from local state.
+    let state = open_chain_state(testnet)?;
     let balance = state
         .accounts
         .get(&from_addr)
