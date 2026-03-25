@@ -17,3 +17,6 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 hex = "0.4"
 bip39 = "2"
+aes-gcm = "0.10"
+argon2 = "0.5"
+serde_json = { workspace = true }
