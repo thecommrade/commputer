@@ -14,11 +14,6 @@ pub mod testutil;
 pub mod merkle;
 pub mod qr;
 pub mod genesis;
-pub mod tier_progress;
-pub mod l2;
-pub mod milestones;
-pub mod charitable;
-pub mod carbon;
 #[cfg(test)]
 mod fuzz_tests;
 

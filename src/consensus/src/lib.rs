@@ -5,8 +5,6 @@ pub mod emission;
 pub mod anchor;
 pub mod burst_pricing;
 pub mod health;
-pub mod burst_pricing;
-pub mod health;
 
 pub use snowball::SnowballVoter;
 pub use dag::{Dag, DagVertex};

@@ -423,6 +423,16 @@ impl ChainState {
             }
         }
 
+        // Verify chain_id (allow empty for backwards compat).
+        if !block.header.chain_id.is_empty()
+            && block.header.chain_id != commputer_core::genesis::TESTNET_CHAIN_ID
+            && block.header.chain_id != commputer_core::genesis::MAINNET_CHAIN_ID
+        {
+            return Err(StateError::InvalidBlock(format!(
+                "invalid chain_id: {}", block.header.chain_id
+            )));
+        }
+
         // Verify merkle roots match block contents.
         if !block.verify_roots() {
             return Err(StateError::InvalidBlock("merkle root mismatch".into()));
@@ -1395,6 +1405,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![],
             proof_summaries: vec![],
@@ -1442,6 +1453,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -1491,6 +1503,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -1539,6 +1552,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -1587,6 +1601,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -1740,6 +1755,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -1801,6 +1817,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![tx],
             proof_summaries: vec![],
@@ -2021,6 +2038,7 @@ mod tests {
                 producer_public_key: vec![],
                 signature: vec![],
                 checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1),
@@ -2140,6 +2158,7 @@ mod tests {
                 tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
                 timestamp: 2000, producer: addr(0), epoch: 0,
                 producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1), nonce: 0,
@@ -2169,6 +2188,7 @@ mod tests {
                 tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
                 timestamp: 2000, producer: addr(0), epoch: 0,
                 producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
+                chain_id: String::new(),
             },
             transactions: vec![Transaction {
                 from: addr(1), nonce: 0,

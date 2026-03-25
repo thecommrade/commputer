@@ -353,7 +353,7 @@ mod tests {
                 epoch: 0,
                 producer_public_key: vec![],
                 signature: vec![],
-                checkpoint_hash: None,
+                checkpoint_hash: None, chain_id: String::new(),
             },
             transactions: vec![],
             proof_summaries: vec![],
