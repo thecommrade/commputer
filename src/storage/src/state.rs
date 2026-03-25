@@ -279,13 +279,23 @@ impl ChainState {
                 if sender_balance.raw() < amount.raw() {
                     return Err(StateError::InsufficientBalance);
                 }
+                let old_tier = sender.tier();
                 sender.balance = sender_balance.checked_sub(*amount)
                     .ok_or(StateError::InsufficientBalance)?;
                 sender.nonce += 1;
+                let new_tier = sender.tier();
+                if old_tier != new_tier {
+                    info!("Tier change: {} went from {:?} to {:?}", tx.from, old_tier, new_tier);
+                }
 
                 let recipient = self.accounts.get_or_create(*to);
+                let old_recv_tier = recipient.tier();
                 recipient.balance = recipient.balance.checked_add(*amount)
                     .ok_or(StateError::Overflow)?;
+                let new_recv_tier = recipient.tier();
+                if old_recv_tier != new_recv_tier {
+                    info!("Tier change: {} went from {:?} to {:?}", to, old_recv_tier, new_recv_tier);
+                }
             }
 
             TxKind::ValidatorRegister { .. } => {
