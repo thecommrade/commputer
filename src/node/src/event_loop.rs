@@ -1,11 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{info, warn, debug};
 use futures::StreamExt;
-
-use std::collections::HashMap;
 
 use commputer_core::block::{Block, BlockHeader, BlockHash};
 use commputer_core::identity::Address;
@@ -42,6 +41,8 @@ pub struct EventLoop {
     pub peer_ips: HashMap<libp2p::PeerId, String>,
     /// Maps libp2p PeerIds to their Commputer validator addresses (learned from registration txs).
     pub peer_validators: HashMap<libp2p::PeerId, Address>,
+    /// Peers banned for sending invalid data (bad blocks, bad signatures).
+    pub banned_peers: HashSet<libp2p::PeerId>,
     /// Receiver for transactions submitted via the RPC server.
     pub rpc_rx: Option<mpsc::Receiver<Transaction>>,
     /// Shared RPC state (for updating the status snapshot).
@@ -69,6 +70,7 @@ impl EventLoop {
             proof_manager: ProofManager::new(our_address),
             peer_ips: HashMap::new(),
             peer_validators: HashMap::new(),
+            banned_peers: HashSet::new(),
             rpc_rx: None,
             rpc_state: None,
         }
@@ -102,6 +104,20 @@ impl EventLoop {
             // Use try_lock to avoid blocking the event loop.
             if let Ok(mut guard) = rpc.status.try_lock() {
                 *guard = snapshot;
+            }
+        }
+    }
+
+    /// Ban a peer and disconnect them.
+    fn ban_peer(&mut self, peer_id: libp2p::PeerId, reason: &str) {
+        if self.banned_peers.insert(peer_id) {
+            warn!("Banning peer {} — {}", peer_id, reason);
+            // Disconnect the peer.
+            let _ = self.network.swarm.disconnect_peer_id(peer_id);
+            // Clean up tracking.
+            self.peer_ips.remove(&peer_id);
+            if let Some(validator_addr) = self.peer_validators.remove(&peer_id) {
+                self.compliance.deregister_node(&validator_addr);
             }
         }
     }
@@ -162,12 +178,18 @@ impl EventLoop {
             SwarmEvent::Behaviour(CommpBehaviourEvent::Gossipsub(
                 gossipsub::Event::Message { propagation_source, message, .. }
             )) => {
+                // Drop messages from banned peers.
+                if self.banned_peers.contains(&propagation_source) {
+                    debug!("Ignoring message from banned peer {}", propagation_source);
+                    return;
+                }
+
                 let topic = message.topic.as_str();
                 debug!("Gossipsub message on topic: {} from {}", topic, propagation_source);
 
                 if topic == topics::TOPIC_BLOCKS {
                     if let Ok(block) = serde_json::from_slice::<Block>(&message.data) {
-                        self.handle_received_block(block);
+                        self.handle_received_block(block, propagation_source);
                     }
                 } else if topic == topics::TOPIC_TRANSACTIONS {
                     if let Ok(tx) = serde_json::from_slice::<Transaction>(&message.data) {
@@ -175,7 +197,7 @@ impl EventLoop {
                     }
                 } else if topic == topics::TOPIC_CONSENSUS {
                     if let Ok(msg) = serde_json::from_slice::<ConsensusMessage>(&message.data) {
-                        self.handle_consensus_message(msg);
+                        self.handle_consensus_message(msg, propagation_source);
                     }
                 } else if topic == topics::TOPIC_PROOFS {
                     if let Ok(msg) = serde_json::from_slice::<ProofMessage>(&message.data) {
@@ -190,6 +212,12 @@ impl EventLoop {
                 );
             }
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                // Reject connections from banned peers.
+                if self.banned_peers.contains(&peer_id) {
+                    info!("Rejecting connection from banned peer {}", peer_id);
+                    let _ = self.network.swarm.disconnect_peer_id(peer_id);
+                    return;
+                }
                 // Extract the IP address from the multiaddr.
                 let addr_str = endpoint.get_remote_address().to_string();
                 if let Some(ip) = extract_ip_from_multiaddr(&addr_str) {
@@ -214,7 +242,7 @@ impl EventLoop {
     }
 
     /// Handle a consensus protocol message from a peer.
-    fn handle_consensus_message(&mut self, msg: ConsensusMessage) {
+    fn handle_consensus_message(&mut self, msg: ConsensusMessage, source: libp2p::PeerId) {
         match msg {
             ConsensusMessage::BlockCandidate { block } => {
                 let hash = block.hash();
@@ -222,6 +250,11 @@ impl EventLoop {
 
                 if self.state.blocks.contains(&hash) {
                     return; // Already finalized this block.
+                }
+
+                // Validate block before accepting as candidate.
+                if !self.validate_block_from_peer(&block, source) {
+                    return;
                 }
 
                 debug!("Received block candidate {} at height {}", hash, height);
@@ -247,14 +280,45 @@ impl EventLoop {
         }
     }
 
+    /// Validate a block received from a peer. Returns false and bans the peer
+    /// if the block has bad merkle roots or invalid transaction signatures.
+    fn validate_block_from_peer(&mut self, block: &Block, source: libp2p::PeerId) -> bool {
+        // Check merkle roots.
+        if !block.verify_roots() {
+            self.ban_peer(source, "sent block with invalid merkle roots");
+            return false;
+        }
+
+        // Verify all transaction signatures in the block.
+        for tx in &block.transactions {
+            if !tx.verify() {
+                self.ban_peer(
+                    source,
+                    &format!(
+                        "sent block containing transaction with invalid signature at height {}",
+                        block.height()
+                    ),
+                );
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// A block received on the blocks topic (legacy path). Enter it as a candidate
     /// instead of applying directly.
-    fn handle_received_block(&mut self, block: Block) {
+    fn handle_received_block(&mut self, block: Block, source: libp2p::PeerId) {
         let hash = block.hash();
         let height = block.height();
 
         if self.state.blocks.contains(&hash) {
             return; // Already have this block.
+        }
+
+        // Validate before accepting.
+        if !self.validate_block_from_peer(&block, source) {
+            return;
         }
 
         debug!("Received block {} at height {} — entering as candidate", hash, height);
