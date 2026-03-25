@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use commputer_core::transaction::TxHash;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -43,6 +44,8 @@ pub struct EventLoop {
     pub peer_validators: HashMap<libp2p::PeerId, Address>,
     /// Peers banned for sending invalid data (bad blocks, bad signatures).
     pub banned_peers: HashSet<libp2p::PeerId>,
+    /// Transaction hashes already seen (in finalized blocks or mempool) for dedup.
+    pub seen_tx_hashes: HashSet<TxHash>,
     /// Receiver for transactions submitted via the RPC server.
     pub rpc_rx: Option<mpsc::Receiver<Transaction>>,
     /// Shared RPC state (for updating the status snapshot).
@@ -71,6 +74,7 @@ impl EventLoop {
             peer_ips: HashMap::new(),
             peer_validators: HashMap::new(),
             banned_peers: HashSet::new(),
+            seen_tx_hashes: HashSet::new(),
             rpc_rx: None,
             rpc_state: None,
         }
@@ -367,12 +371,13 @@ impl EventLoop {
 
     /// Handle a transaction submitted via the RPC server: validate, add to mempool, broadcast.
     fn handle_rpc_transaction(&mut self, tx: Transaction) {
-        if !tx.verify() {
-            warn!("RPC transaction failed verification — dropping");
+        if let Err(reason) = self.validate_tx_for_mempool(&tx) {
+            warn!("RPC transaction rejected: {}", reason);
             return;
         }
 
         let tx_hash = tx.hash();
+        self.seen_tx_hashes.insert(tx_hash);
 
         // Broadcast on the transactions gossipsub topic.
         if let Ok(data) = serde_json::to_vec(&tx) {
@@ -387,16 +392,38 @@ impl EventLoop {
         self.update_rpc_status();
     }
 
-    fn handle_new_transaction(&mut self, tx: Transaction, source: libp2p::PeerId) {
-        // Reject null sender
+    /// Validate a transaction for mempool admission: signature, nonce, dedup.
+    fn validate_tx_for_mempool(&self, tx: &Transaction) -> Result<(), &'static str> {
         if tx.from.0 == [0u8; 32] {
-            debug!("Rejected transaction: null sender");
-            return;
+            return Err("null sender");
         }
-
-        // Full cryptographic signature verification
         if !tx.verify() {
-            debug!("Rejected transaction: signature verification failed");
+            return Err("signature verification failed");
+        }
+        // Reject duplicates (already in mempool or finalized).
+        let hash = tx.hash();
+        if self.seen_tx_hashes.contains(&hash) {
+            return Err("duplicate transaction");
+        }
+        // Nonce validation: must match expected next nonce for sender.
+        // Account for pending txs already in mempool from the same sender.
+        let on_chain_nonce = self.state.accounts
+            .get(&tx.from)
+            .map(|a| a.nonce)
+            .unwrap_or(0);
+        let pending_from_sender = self.pending_txs.iter()
+            .filter(|ptx| ptx.from == tx.from)
+            .count() as u64;
+        let expected_nonce = on_chain_nonce + pending_from_sender;
+        if tx.nonce != expected_nonce {
+            return Err("invalid nonce");
+        }
+        Ok(())
+    }
+
+    fn handle_new_transaction(&mut self, tx: Transaction, source: libp2p::PeerId) {
+        if let Err(reason) = self.validate_tx_for_mempool(&tx) {
+            debug!("Rejected transaction from {}: {}", source, reason);
             return;
         }
 
@@ -416,6 +443,7 @@ impl EventLoop {
         }
 
         let hash = tx.hash();
+        self.seen_tx_hashes.insert(hash);
         debug!("Accepted transaction into mempool: {:?}", hash);
         self.pending_txs.push(tx);
     }
@@ -658,6 +686,10 @@ impl EventLoop {
 
         if let Some(block) = self.consensus.take_finalized(height) {
             let hash = block.hash();
+            // Record all tx hashes from this block as seen (double-spend prevention).
+            for tx in &block.transactions {
+                self.seen_tx_hashes.insert(tx.hash());
+            }
             match self.state.apply_block_validated(&block) {
                 Ok(()) => {
                     info!("Finalized and applied block {} at height {}", hash, height);
