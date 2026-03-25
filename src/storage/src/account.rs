@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use borsh::{BorshDeserialize, BorshSerialize};
+use sha2::{Sha256, Digest};
 use commputer_core::identity::Address;
 use commputer_core::token::Amount;
 use commputer_core::tier::HolderTier;
@@ -129,6 +130,55 @@ impl AccountStore {
     pub fn iter(&self) -> impl Iterator<Item = &Account> {
         self.accounts.values()
     }
+
+    /// Compute the merkle root of all account states.
+    /// Accounts are sorted by address for deterministic ordering,
+    /// then hashed into a binary merkle tree.
+    pub fn compute_state_root(&self) -> [u8; 32] {
+        if self.accounts.is_empty() {
+            return [0u8; 32];
+        }
+
+        // Sort accounts by address for deterministic ordering.
+        let mut sorted: Vec<&Account> = self.accounts.values().collect();
+        sorted.sort_by_key(|a| a.address.0);
+
+        // Hash each account into a leaf.
+        let leaves: Vec<[u8; 32]> = sorted.iter().map(|acct| {
+            let encoded = borsh::to_vec(acct).expect("account serialization");
+            let hash = Sha256::digest(&encoded);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&hash);
+            out
+        }).collect();
+
+        merkle_root(&leaves)
+    }
+}
+
+/// Simple binary merkle root computation.
+fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
+    if leaves.is_empty() {
+        return [0u8; 32];
+    }
+    if leaves.len() == 1 {
+        return leaves[0];
+    }
+    let mut next = Vec::with_capacity((leaves.len() + 1) / 2);
+    for pair in leaves.chunks(2) {
+        let mut hasher = Sha256::new();
+        hasher.update(pair[0]);
+        if pair.len() == 2 {
+            hasher.update(pair[1]);
+        } else {
+            hasher.update(pair[0]);
+        }
+        let hash = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hash);
+        next.push(out);
+    }
+    merkle_root(&next)
 }
 
 #[cfg(test)]
@@ -214,6 +264,42 @@ mod tests {
         acct.grace_balance_secs = 100;
         acct.drain_grace(200); // More than balance
         assert_eq!(acct.grace_balance_secs, 0);
+    }
+
+    #[test]
+    fn state_root_deterministic() {
+        let mut store = AccountStore::new();
+        let mut a1 = Account::new(test_address(1));
+        a1.balance = Amount::from_comme(100);
+        store.put(a1);
+        let mut a2 = Account::new(test_address(2));
+        a2.balance = Amount::from_comme(50);
+        store.put(a2);
+
+        let root1 = store.compute_state_root();
+        let root2 = store.compute_state_root();
+        assert_eq!(root1, root2, "state root must be deterministic");
+        assert_ne!(root1, [0u8; 32], "state root must not be zero with accounts");
+    }
+
+    #[test]
+    fn state_root_changes_on_balance_update() {
+        let mut store = AccountStore::new();
+        let mut a1 = Account::new(test_address(1));
+        a1.balance = Amount::from_comme(100);
+        store.put(a1.clone());
+        let root_before = store.compute_state_root();
+
+        a1.balance = Amount::from_comme(200);
+        store.put(a1);
+        let root_after = store.compute_state_root();
+        assert_ne!(root_before, root_after, "state root must change when balance changes");
+    }
+
+    #[test]
+    fn state_root_empty_is_zero() {
+        let store = AccountStore::new();
+        assert_eq!(store.compute_state_root(), [0u8; 32]);
     }
 
     #[test]

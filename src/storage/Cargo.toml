@@ -12,6 +12,7 @@ serde = { workspace = true }
 borsh = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
 rocksdb = { workspace = true }
 
 [dev-dependencies]

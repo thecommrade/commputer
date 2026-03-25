@@ -862,9 +862,10 @@ impl EventLoop {
             proof_summaries: vec![],
         };
 
-        // Compute and set merkle roots.
+        // Compute and set merkle roots and state root.
         block.header.tx_root = block.compute_tx_root();
         block.header.proof_root = block.compute_proof_root();
+        block.header.state_root = self.state.compute_state_root();
 
         // Sign the block header with our wallet key.
         commputer_core::signing::sign_block(&mut block, &self.wallet);

@@ -138,6 +138,11 @@ impl ChainState {
         None
     }
 
+    /// Compute the state root from the current account store.
+    pub fn compute_state_root(&self) -> [u8; 32] {
+        self.accounts.compute_state_root()
+    }
+
     /// Remaining supply available for emission.
     pub fn remaining_supply(&self) -> u64 {
         TOTAL_SUPPLY.saturating_sub(self.total_emitted)
