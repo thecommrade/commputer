@@ -38,6 +38,7 @@ impl BandwidthProver {
     }
 
     /// Verify a bandwidth proof by recomputing the hash.
+    /// Also checks timing — excessively slow responses indicate poor bandwidth.
     pub fn verify(challenge: &ProofChallenge, response: &ProofResponse) -> bool {
         let size_kb = u32::from_le_bytes(
             challenge.payload[..4].try_into().unwrap()
@@ -45,7 +46,29 @@ impl BandwidthProver {
         let seed = &challenge.payload[4..];
 
         let expected = Self::bandwidth_hash(seed, size_kb as usize);
-        expected[..] == response.result[..]
+        if expected[..] != response.result[..] {
+            return false;
+        }
+
+        // Timing check: processing 1MB of data shouldn't take > 5 seconds.
+        let max_ms = (size_kb as u64 / 1024 + 1) * 5000;
+        if response.compute_time_ms > max_ms {
+            return false; // Too slow — possible throttling
+        }
+
+        true
+    }
+
+    /// Estimate bandwidth score (0-100) from compute time.
+    /// Lower time = higher score.
+    pub fn score_from_timing(size_kb: u32, compute_time_ms: u64) -> u32 {
+        if compute_time_ms == 0 {
+            return 100;
+        }
+        // Expected: ~1ms per MB for fast hardware.
+        let expected_ms = (size_kb as u64 / 1024).max(1);
+        let ratio = expected_ms as f64 / compute_time_ms as f64;
+        (ratio * 100.0).clamp(0.0, 100.0) as u32
     }
 
     /// Core computation: generate `size_kb` kilobytes of data from seed, hash it.
