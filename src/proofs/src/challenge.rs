@@ -16,11 +16,27 @@ impl ChallengeGenerator {
         channel: ResourceChannel,
         deadline_block: u64,
     ) -> ProofChallenge {
-        // Deterministic challenge ID from seed + target + channel.
-        let challenge_id = Self::derive_challenge_id(epoch_seed, &target, &channel);
+        Self::generate_with_difficulty(epoch, epoch_seed, target, channel, deadline_block, 1.0)
+    }
 
-        // Channel-specific payload.
-        let payload = Self::generate_payload(&challenge_id, &channel);
+    /// Feature 114: Generate a challenge with a difficulty scaling parameter.
+    /// Feature 120: Uses SHA-256(block_hash || epoch || validator_address) as seed.
+    pub fn generate_with_difficulty(
+        epoch: u64,
+        epoch_seed: &[u8; 32],
+        target: Address,
+        channel: ResourceChannel,
+        deadline_block: u64,
+        difficulty: f64,
+    ) -> ProofChallenge {
+        // Feature 120: Deterministic randomness from block_hash + epoch + validator_address.
+        let deterministic_seed = Self::derive_deterministic_seed(epoch_seed, epoch, &target);
+
+        // Deterministic challenge ID from deterministic seed + channel.
+        let challenge_id = Self::derive_challenge_id(&deterministic_seed, &target, &channel);
+
+        // Channel-specific payload, scaled by difficulty.
+        let payload = Self::generate_payload_with_difficulty(&challenge_id, &channel, difficulty);
 
         ProofChallenge {
             channel,
@@ -30,6 +46,18 @@ impl ChallengeGenerator {
             payload,
             deadline_block,
         }
+    }
+
+    /// Feature 120: Derive deterministic seed from SHA-256(block_hash || epoch || validator_address).
+    fn derive_deterministic_seed(block_hash: &[u8; 32], epoch: u64, target: &Address) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(block_hash);
+        hasher.update(epoch.to_le_bytes());
+        hasher.update(target.0);
+        let result = hasher.finalize();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&result);
+        seed
     }
 
     /// Derive a deterministic challenge ID.
@@ -48,50 +76,57 @@ impl ChallengeGenerator {
         id
     }
 
-    /// Generate channel-specific challenge payload.
-    fn generate_payload(challenge_id: &[u8; 32], channel: &ResourceChannel) -> Vec<u8> {
+    /// Generate channel-specific challenge payload with difficulty scaling.
+    fn generate_payload_with_difficulty(
+        challenge_id: &[u8; 32],
+        channel: &ResourceChannel,
+        difficulty: f64,
+    ) -> Vec<u8> {
         match channel {
             ResourceChannel::Processing => {
-                // CPU challenge: iterative hashing puzzle.
-                // The validator must perform N rounds of SHA-256 on the challenge ID.
-                // N is encoded in the first 4 bytes of payload.
-                let iterations: u32 = 10_000;
+                let base_iterations: u32 = 10_000;
+                let iterations = (base_iterations as f64 * difficulty).round() as u32;
                 let mut payload = iterations.to_le_bytes().to_vec();
                 payload.extend_from_slice(challenge_id);
                 payload
             }
             ResourceChannel::Gpu => {
-                // GPU challenge: matrix multiplication seed.
-                // Full implementation will use ML micro-benchmarks.
                 let mut payload = vec![0x02]; // GPU challenge type marker
                 payload.extend_from_slice(challenge_id);
                 payload
             }
             ResourceChannel::Storage => {
-                // Storage challenge: request specific data chunks.
-                // The challenge ID determines which chunks to retrieve.
+                // Feature 118: Storage challenge with offset and length.
                 let mut payload = vec![0x03]; // Storage challenge type marker
-                // In production: chunk indices derived from challenge_id.
+                // Derive offset and length from challenge_id.
+                let offset = u32::from_le_bytes(challenge_id[0..4].try_into().unwrap()) % (1_048_576 - 4096);
+                let length = ((u32::from_le_bytes(challenge_id[4..8].try_into().unwrap()) % 4096) + 64)
+                    .min(4096);
+                payload.extend_from_slice(&offset.to_le_bytes());
+                payload.extend_from_slice(&length.to_le_bytes());
                 payload.extend_from_slice(challenge_id);
                 payload
             }
             ResourceChannel::Ram => {
-                // RAM challenge: memory-hard computation.
-                // Must allocate and use a large buffer to solve in time.
-                let required_mb: u32 = 256; // 256MB working set
+                let base_mb: u32 = 256;
+                let required_mb = (base_mb as f64 * difficulty).round() as u32;
                 let mut payload = required_mb.to_le_bytes().to_vec();
                 payload.extend_from_slice(challenge_id);
                 payload
             }
             ResourceChannel::Bandwidth => {
-                // Bandwidth challenge: timed data transfer.
-                // Payload specifies the data size to transfer.
-                let data_size_kb: u32 = 1024; // 1MB transfer
+                let base_kb: u32 = 1024;
+                let data_size_kb = (base_kb as f64 * difficulty).round() as u32;
                 let mut payload = data_size_kb.to_le_bytes().to_vec();
                 payload.extend_from_slice(challenge_id);
                 payload
             }
         }
+    }
+
+    /// Legacy payload generation (no difficulty scaling).
+    fn generate_payload(challenge_id: &[u8; 32], channel: &ResourceChannel) -> Vec<u8> {
+        Self::generate_payload_with_difficulty(challenge_id, channel, 1.0)
     }
 
     fn channel_tag(channel: &ResourceChannel) -> &'static [u8] {

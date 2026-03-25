@@ -47,6 +47,9 @@ enum Commands {
         /// Port for the JSON RPC server (transaction submission, status queries)
         #[arg(long, default_value = "9944")]
         rpc_port: u16,
+        /// Percentage of hardware resources to contribute (1-100)
+        #[arg(long, default_value = "100")]
+        contribution_percent: u8,
     },
     /// Wallet management
     Wallet {
@@ -556,7 +559,7 @@ async fn cmd_balance(address: &str, rpc_port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16) -> Result<()> {
+async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16, contribution_percent: u8) -> Result<()> {
     // Initialize logging.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -643,6 +646,15 @@ async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16) ->
     };
     info!("Wallet address: {}", wallet.address());
 
+    // Detect hardware fingerprint.
+    let hardware = commputer_core::identity::HardwareFingerprint::detect();
+    info!("Hardware detected:");
+    info!("  CPU:     {} ({} cores)", hardware.cpu_model, hardware.cpu_cores);
+    info!("  RAM:     {} MB", hardware.ram_total_mb);
+    info!("  Storage: {} MB", hardware.storage_total_mb);
+    info!("  GPU:     {}", hardware.gpu_model.as_deref().unwrap_or("none"));
+    info!("  OS:      {}", hardware.os_family);
+
     // Set up network.
     let mut network = CommpNetwork::new(port)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -689,9 +701,9 @@ async fn run_node(testnet: bool, log_level: String, port: u16, rpc_port: u16) ->
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
-    let mut event_loop = EventLoop::new(state, wallet, network);
+    let mut event_loop = EventLoop::new(state, wallet, network, hardware);
     event_loop.attach_rpc(tx_receiver, rpc_state.clone());
-    event_loop.auto_register_validator(100);
+    event_loop.auto_register_validator(contribution_percent);
 
     // Spawn RPC server in the background.
     tokio::spawn(rpc::start_rpc_server(rpc_port, rpc_state));
@@ -710,8 +722,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { testnet, log_level, port, rpc_port } => {
-            run_node(testnet, log_level, port, rpc_port).await?;
+        Commands::Run { testnet, log_level, port, rpc_port, contribution_percent } => {
+            run_node(testnet, log_level, port, rpc_port, contribution_percent).await?;
         }
         Commands::Wallet { action } => match action {
             WalletAction::Create { testnet } => cmd_wallet_create(testnet)?,

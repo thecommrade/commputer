@@ -8,7 +8,7 @@ use tracing::{info, warn, debug};
 use futures::StreamExt;
 
 use commputer_core::block::{Block, BlockHeader, BlockHash};
-use commputer_core::identity::Address;
+use commputer_core::identity::{Address, HardwareFingerprint};
 use commputer_core::transaction::Transaction;
 use commputer_core::token::UNITS_PER_COMME;
 use commputer_core::wallet::Wallet;
@@ -38,6 +38,8 @@ pub struct EventLoop {
     pub pending_txs: Vec<Transaction>,
     pub consensus: ConsensusManager,
     pub proof_manager: ProofManager,
+    /// Detected hardware fingerprint for this node.
+    pub hardware: HardwareFingerprint,
     /// Maps libp2p PeerIds to their observed IP addresses.
     pub peer_ips: HashMap<libp2p::PeerId, String>,
     /// Maps libp2p PeerIds to their Commputer validator addresses (learned from registration txs).
@@ -61,6 +63,7 @@ impl EventLoop {
         state: ChainState,
         wallet: Wallet,
         network: CommpNetwork,
+        hardware: HardwareFingerprint,
     ) -> Self {
         let epoch_state = EpochState::new(0, 0);
         let our_address = *wallet.address();
@@ -75,6 +78,7 @@ impl EventLoop {
             pending_txs: Vec::new(),
             consensus: ConsensusManager::new(),
             proof_manager: ProofManager::new(our_address),
+            hardware,
             peer_ips: HashMap::new(),
             peer_validators: HashMap::new(),
             banned_peers: HashSet::new(),
@@ -711,8 +715,10 @@ impl EventLoop {
         let remaining = self.state.remaining_supply();
         let actual_emission = epoch_emission.min(remaining);
 
-        // Finalize proof results and update epoch summaries
-        let proof_summaries = self.proof_manager.finalize_epoch();
+        // Feature 114: Finalize proof results with difficulty weighting.
+        let proof_summaries = self.proof_manager.finalize_epoch_with_difficulty(
+            &self.epoch_state.difficulty_multiplier,
+        );
         for (_addr, summary) in &proof_summaries {
             self.epoch_state.record_summary(summary.clone());
         }
@@ -812,8 +818,12 @@ impl EventLoop {
             diversity_bonus: 50,
         };
 
+        // Feature 114: Compute next epoch's difficulty multipliers.
+        let next_difficulty = self.epoch_state.compute_next_difficulty();
+
         self.state.current_epoch = epoch + 1;
         self.epoch_state = EpochState::new(epoch + 1, 0);
+        self.epoch_state.difficulty_multiplier = next_difficulty;
         self.epoch_state.record_summary(self_summary);
     }
 
@@ -1062,7 +1072,33 @@ impl EventLoop {
             }
             ProofMessage::Response(response) => {
                 debug!("Received proof response from {:?}", response.validator);
-                self.proof_manager.record_response(response);
+                // Feature 113: Cross-node proof verification — verify before accepting.
+                if let Some(challenge) = self.proof_manager.get_pending_challenge(&response.challenge_id) {
+                    let verdict = commputer_proofs::ProofVerifier::verify(&challenge, &response);
+                    match verdict {
+                        commputer_core::proof::ProofVerdict::Valid |
+                        commputer_core::proof::ProofVerdict::Suspicious => {
+                            self.proof_manager.record_response(response);
+                        }
+                        _ => {
+                            warn!("Rejected invalid proof response from {:?}", response.validator);
+                            // Broadcast rejection so other nodes know.
+                            let rejection = ProofMessage::Rejection {
+                                challenge_id: response.challenge_id,
+                                validator: response.validator,
+                                reason: format!("{:?}", verdict),
+                            };
+                            self.publish_proof_message(&rejection);
+                        }
+                    }
+                } else {
+                    // Unknown challenge — still record for aggregation.
+                    self.proof_manager.record_response(response);
+                }
+            }
+            ProofMessage::Rejection { challenge_id: _, validator, reason } => {
+                debug!("Received proof rejection for {:?}: {}", validator, reason);
+                // Could track rejection counts per validator for reputation.
             }
         }
     }

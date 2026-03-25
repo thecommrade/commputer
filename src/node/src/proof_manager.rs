@@ -13,6 +13,23 @@ use std::collections::HashMap;
 pub enum ProofMessage {
     Challenge(ProofChallenge),
     Response(ProofResponse),
+    /// Feature 113: Rejection broadcast when a proof is invalid.
+    Rejection {
+        challenge_id: [u8; 32],
+        validator: Address,
+        reason: String,
+    },
+}
+
+/// Feature 115: Per-validator per-channel proof statistics.
+#[derive(Debug, Clone, Default)]
+pub struct ProofChannelStats {
+    pub challenges_issued: u64,
+    pub challenges_passed: u64,
+    pub challenges_failed: u64,
+    pub avg_response_time_ms: u64,
+    /// Accumulated response times for averaging.
+    total_response_time_ms: u64,
 }
 
 /// Default storage data size: 1 MB assigned to each validator.
@@ -26,6 +43,10 @@ pub struct ProofManager {
     pub current_height: u64,
     /// Our assigned storage data (generated deterministically from address).
     storage_data: Vec<u8>,
+    /// Feature 112: Contribution percent caps resource usage (1-100).
+    pub contribution_percent: u8,
+    /// Feature 115: Per-validator per-channel statistics.
+    pub channel_stats: HashMap<(Address, ResourceChannel), ProofChannelStats>,
 }
 
 impl ProofManager {
@@ -38,10 +59,19 @@ impl ProofManager {
             our_address,
             current_height: 0,
             storage_data,
+            contribution_percent: 100,
+            channel_stats: HashMap::new(),
         }
     }
 
+    /// Feature 113: Get a pending challenge by ID (for cross-node verification).
+    pub fn get_pending_challenge(&self, challenge_id: &[u8; 32]) -> Option<ProofChallenge> {
+        self.pending_challenges.get(challenge_id).cloned()
+    }
+
     /// Generate one challenge per ResourceChannel for the given target validator.
+    /// `difficulty_multipliers` optionally scales difficulty per channel (Feature 114).
+    /// `block_hash` is used for deterministic randomness (Feature 120).
     pub fn generate_challenges(
         &mut self,
         epoch: u64,
@@ -49,12 +79,30 @@ impl ProofManager {
         target: Address,
         deadline_block: u64,
     ) -> Vec<ProofChallenge> {
+        self.generate_challenges_with_difficulty(epoch, epoch_seed, target, deadline_block, &HashMap::new())
+    }
+
+    /// Generate challenges with per-channel difficulty multipliers.
+    pub fn generate_challenges_with_difficulty(
+        &mut self,
+        epoch: u64,
+        epoch_seed: &[u8; 32],
+        target: Address,
+        deadline_block: u64,
+        difficulty_multipliers: &HashMap<ResourceChannel, f64>,
+    ) -> Vec<ProofChallenge> {
         let mut challenges = Vec::new();
         for channel in ResourceChannel::ALL {
-            let challenge = ChallengeGenerator::generate(
-                epoch, epoch_seed, target, channel, deadline_block,
+            let difficulty = difficulty_multipliers.get(&channel).copied().unwrap_or(1.0);
+            // Feature 112: Scale difficulty by contribution_percent.
+            let scaled_difficulty = difficulty * (self.contribution_percent as f64 / 100.0);
+            let challenge = ChallengeGenerator::generate_with_difficulty(
+                epoch, epoch_seed, target, channel, deadline_block, scaled_difficulty,
             );
             self.pending_challenges.insert(challenge.challenge_id, challenge.clone());
+            // Feature 115: Track challenge issuance.
+            let stats = self.channel_stats.entry((target, channel)).or_default();
+            stats.challenges_issued += 1;
             challenges.push(challenge);
         }
         challenges
@@ -88,7 +136,16 @@ impl ProofManager {
 
     /// Verify all collected responses against pending challenges and produce
     /// per-validator EpochProofSummary results. Clears state for next epoch.
+    /// Feature 116: Weights scores by difficulty_multiplier and penalizes slow responses.
     pub fn finalize_epoch(&mut self) -> Vec<(Address, EpochProofSummary)> {
+        self.finalize_epoch_with_difficulty(&HashMap::new())
+    }
+
+    /// Finalize with per-channel difficulty multipliers for weighted scoring.
+    pub fn finalize_epoch_with_difficulty(
+        &mut self,
+        difficulty_multipliers: &HashMap<ResourceChannel, f64>,
+    ) -> Vec<(Address, EpochProofSummary)> {
         // Group responses by validator.
         let mut by_validator: HashMap<Address, Vec<&ProofResponse>> = HashMap::new();
         for resp in &self.responses {
@@ -131,14 +188,41 @@ impl ProofManager {
                     } else {
                         ProofVerifier::verify(challenge, resp)
                     };
-                    let score = match verdict {
-                        ProofVerdict::Valid => 100,
+
+                    let base_score = match verdict {
+                        ProofVerdict::Valid => 100u32,
                         ProofVerdict::Suspicious => 50,
                         ProofVerdict::Invalid | ProofVerdict::TimedOut => 0,
                     };
 
+                    // Feature 116: Weight by difficulty multiplier.
+                    let difficulty = difficulty_multipliers
+                        .get(&challenge.channel)
+                        .copied()
+                        .unwrap_or(1.0);
+                    let mut score = (base_score as f64 * difficulty).round() as u32;
+
+                    // Feature 116: Penalize slow responses (> 5s gets a 20% penalty per extra second).
+                    if base_score > 0 && resp.compute_time_ms > 5000 {
+                        let extra_secs = (resp.compute_time_ms - 5000) / 1000;
+                        let penalty = (extra_secs as f64 * 0.2).min(0.9); // Max 90% penalty
+                        score = (score as f64 * (1.0 - penalty)).round() as u32;
+                    }
+
+                    // Feature 115: Update channel stats.
+                    let stats = self.channel_stats
+                        .entry((validator, challenge.channel))
+                        .or_default();
                     if score > 0 {
+                        stats.challenges_passed += 1;
                         channels_contributed += 1;
+                    } else {
+                        stats.challenges_failed += 1;
+                    }
+                    stats.total_response_time_ms += resp.compute_time_ms;
+                    let total_responses = stats.challenges_passed + stats.challenges_failed;
+                    if total_responses > 0 {
+                        stats.avg_response_time_ms = stats.total_response_time_ms / total_responses;
                     }
 
                     match challenge.channel {

@@ -31,12 +31,21 @@ pub fn detect_gpu() -> (bool, String) {
     (false, "No GPU detected — CPU fallback (reduced score)".into())
 }
 
+/// Check if a GPU is available on this system.
+pub fn gpu_available() -> bool {
+    detect_gpu().0
+}
+
 impl GpuProver {
     /// Solve a GPU proof challenge.
+    /// Feature 117: If no GPU detected, uses CPU fallback path.
+    /// The result is the same (deterministic), but a metadata byte is prepended
+    /// to indicate fallback was used, which the verifier uses to cap scores.
     pub fn solve(challenge: &ProofChallenge, validator: Address) -> ProofResponse {
         assert_eq!(challenge.channel, ResourceChannel::Gpu);
 
         let start = Instant::now();
+        let (has_gpu, _desc) = detect_gpu();
 
         // Payload layout: [0x02 type marker, then 32-byte seed]
         let seed = &challenge.payload[1..];
@@ -45,20 +54,36 @@ impl GpuProver {
 
         let elapsed = start.elapsed();
 
+        // Feature 117: Mark whether GPU or CPU fallback was used.
+        // We prepend a byte: 0x01 = GPU, 0x00 = CPU fallback.
+        let mut full_result = vec![if has_gpu { 0x01 } else { 0x00 }];
+        full_result.extend_from_slice(&result);
+
         ProofResponse {
             challenge_id: challenge.challenge_id,
             validator,
-            result: result.to_vec(),
+            result: full_result,
             compute_time_ms: elapsed.as_millis() as u64,
             signature: vec![],
         }
     }
 
     /// Verify a GPU proof by recomputing the matrix multiply + hash.
+    /// Feature 117: Handles both old (32-byte) and new (33-byte with GPU flag) formats.
     pub fn verify(challenge: &ProofChallenge, response: &ProofResponse) -> bool {
         let seed = &challenge.payload[1..];
         let expected = Self::matrix_hash(seed);
-        expected[..] == response.result[..]
+        if response.result.len() == 33 {
+            // New format: first byte is GPU flag, remaining 32 are the hash.
+            expected[..] == response.result[1..]
+        } else {
+            expected[..] == response.result[..]
+        }
+    }
+
+    /// Feature 117: Check if a response used CPU fallback (score capped at 50).
+    pub fn used_cpu_fallback(response: &ProofResponse) -> bool {
+        response.result.len() == 33 && response.result[0] == 0x00
     }
 
     /// Core computation: generate two 64x64 matrices from seed, multiply,
@@ -155,7 +180,9 @@ mod tests {
     fn wrong_gpu_result_fails() {
         let challenge = make_gpu_challenge();
         let mut response = GpuProver::solve(&challenge, test_addr());
-        response.result[0] ^= 0xFF;
+        // Corrupt the hash part (after the GPU flag byte).
+        let last = response.result.len() - 1;
+        response.result[last] ^= 0xFF;
         assert!(!GpuProver::verify(&challenge, &response));
     }
 
@@ -168,9 +195,16 @@ mod tests {
     }
 
     #[test]
-    fn gpu_result_is_32_bytes() {
+    fn gpu_result_is_33_bytes() {
         let challenge = make_gpu_challenge();
         let response = GpuProver::solve(&challenge, test_addr());
-        assert_eq!(response.result.len(), 32);
+        // 1 byte GPU flag + 32 bytes hash
+        assert_eq!(response.result.len(), 33);
+    }
+
+    #[test]
+    fn gpu_available_function_works() {
+        // Just ensure it doesn't panic.
+        let _ = gpu_available();
     }
 }

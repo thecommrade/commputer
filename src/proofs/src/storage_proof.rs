@@ -17,17 +17,25 @@ const CHUNK_SIZE: usize = 64;
 
 impl StorageProver {
     /// Solve a storage proof challenge.
-    /// `data` is the validator's stored data blob.
+    /// `data` is the validator's stored data blob (1MB assigned chunk).
+    /// Feature 118: Supports both legacy (seed-only) and new (offset+length) payload formats.
     pub fn solve(challenge: &ProofChallenge, data: &[u8], validator: Address) -> ProofResponse {
         assert_eq!(challenge.channel, ResourceChannel::Storage);
 
         let start = Instant::now();
 
-        // Payload layout: [0x03 type marker, then 32-byte seed]
-        let seed = &challenge.payload[1..];
-
-        let offsets = Self::derive_offsets(seed, data.len());
-        let result = Self::hash_chunks(data, &offsets);
+        let result = if challenge.payload.len() >= 9 + 32 {
+            // Feature 118: New format — [0x03, 4-byte offset, 4-byte length, 32-byte seed]
+            let offset = u32::from_le_bytes(challenge.payload[1..5].try_into().unwrap()) as usize;
+            let length = u32::from_le_bytes(challenge.payload[5..9].try_into().unwrap()) as usize;
+            let seed = &challenge.payload[9..];
+            Self::hash_range(data, offset, length, seed)
+        } else {
+            // Legacy format — [0x03, 32-byte seed]
+            let seed = &challenge.payload[1..];
+            let offsets = Self::derive_offsets(seed, data.len());
+            Self::hash_chunks(data, &offsets)
+        };
 
         let elapsed = start.elapsed();
 
@@ -41,11 +49,32 @@ impl StorageProver {
     }
 
     /// Verify a storage proof by recomputing against the real data.
+    /// Feature 118: Supports both legacy and new payload formats.
     pub fn verify(challenge: &ProofChallenge, response: &ProofResponse, data: &[u8]) -> bool {
-        let seed = &challenge.payload[1..];
-        let offsets = Self::derive_offsets(seed, data.len());
-        let expected = Self::hash_chunks(data, &offsets);
+        let expected = if challenge.payload.len() >= 9 + 32 {
+            let offset = u32::from_le_bytes(challenge.payload[1..5].try_into().unwrap()) as usize;
+            let length = u32::from_le_bytes(challenge.payload[5..9].try_into().unwrap()) as usize;
+            let seed = &challenge.payload[9..];
+            Self::hash_range(data, offset, length, seed)
+        } else {
+            let seed = &challenge.payload[1..];
+            let offsets = Self::derive_offsets(seed, data.len());
+            Self::hash_chunks(data, &offsets)
+        };
         expected[..] == response.result[..]
+    }
+
+    /// Feature 118: Hash a specific byte range from data, mixed with seed.
+    fn hash_range(data: &[u8], offset: usize, length: usize, seed: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(seed);
+        let start = offset.min(data.len());
+        let end = (offset + length).min(data.len());
+        hasher.update(&data[start..end]);
+        let result = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&result);
+        out
     }
 
     /// Generate deterministic test data of the given size, seeded by `seed`.

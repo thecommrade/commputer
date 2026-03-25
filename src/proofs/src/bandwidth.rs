@@ -100,6 +100,64 @@ impl BandwidthProver {
     }
 }
 
+/// Feature 119: Bandwidth challenge that pairs two validators for cross-verification.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BandwidthChallenge {
+    /// First validator in the pair.
+    pub validator_a: Address,
+    /// Second validator in the pair.
+    pub validator_b: Address,
+    /// Data size in KB for the transfer test.
+    pub data_size_kb: u32,
+    /// Epoch this challenge belongs to.
+    pub epoch: u64,
+    /// Unique challenge identifier.
+    pub challenge_id: [u8; 32],
+}
+
+/// Feature 119: Report from one side of a bandwidth challenge pair.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BandwidthReport {
+    pub challenge_id: [u8; 32],
+    pub reporter: Address,
+    pub peer: Address,
+    pub round_trip_ms: u64,
+    pub data_size_kb: u32,
+    pub data_hash: [u8; 32],
+}
+
+impl BandwidthChallenge {
+    /// Create a new bandwidth challenge pairing two validators.
+    pub fn new(validator_a: Address, validator_b: Address, data_size_kb: u32, epoch: u64, seed: &[u8; 32]) -> Self {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(seed);
+        hasher.update(validator_a.0);
+        hasher.update(validator_b.0);
+        hasher.update(epoch.to_le_bytes());
+        let id = hasher.finalize();
+        let mut challenge_id = [0u8; 32];
+        challenge_id.copy_from_slice(&id);
+        Self { validator_a, validator_b, data_size_kb, epoch, challenge_id }
+    }
+
+    /// Feature 119: Cross-verify two reports from a bandwidth challenge pair.
+    /// Both sides should report similar round-trip times (within 50% of each other).
+    pub fn cross_verify(report_a: &BandwidthReport, report_b: &BandwidthReport) -> bool {
+        if report_a.challenge_id != report_b.challenge_id {
+            return false;
+        }
+        if report_a.data_hash != report_b.data_hash {
+            return false;
+        }
+        // Check RTT similarity: within 50%.
+        let max_rtt = report_a.round_trip_ms.max(report_b.round_trip_ms);
+        let min_rtt = report_a.round_trip_ms.min(report_b.round_trip_ms);
+        if max_rtt == 0 { return true; }
+        (min_rtt as f64 / max_rtt as f64) >= 0.5
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +210,56 @@ mod tests {
         let mut response = BandwidthProver::solve(&challenge, test_addr());
         response.result[0] ^= 0xFF;
         assert!(!BandwidthProver::verify(&challenge, &response));
+    }
+
+    #[test]
+    fn bandwidth_challenge_pairing() {
+        let addr_a = test_addr();
+        let mut b = [0u8; 32];
+        b[0] = 2;
+        let addr_b = Address(b);
+        let seed = [42u8; 32];
+        let bc = BandwidthChallenge::new(addr_a, addr_b, 100, 0, &seed);
+        assert_eq!(bc.validator_a, addr_a);
+        assert_eq!(bc.validator_b, addr_b);
+    }
+
+    #[test]
+    fn bandwidth_cross_verify_similar_rtt() {
+        let hash = [1u8; 32];
+        let id = [2u8; 32];
+        let addr_a = test_addr();
+        let mut b = [0u8; 32];
+        b[0] = 2;
+        let addr_b = Address(b);
+
+        let report_a = BandwidthReport {
+            challenge_id: id, reporter: addr_a, peer: addr_b,
+            round_trip_ms: 100, data_size_kb: 100, data_hash: hash,
+        };
+        let report_b = BandwidthReport {
+            challenge_id: id, reporter: addr_b, peer: addr_a,
+            round_trip_ms: 120, data_size_kb: 100, data_hash: hash,
+        };
+        assert!(BandwidthChallenge::cross_verify(&report_a, &report_b));
+    }
+
+    #[test]
+    fn bandwidth_cross_verify_rejects_mismatched_hash() {
+        let id = [2u8; 32];
+        let addr_a = test_addr();
+        let mut b = [0u8; 32];
+        b[0] = 2;
+        let addr_b = Address(b);
+
+        let report_a = BandwidthReport {
+            challenge_id: id, reporter: addr_a, peer: addr_b,
+            round_trip_ms: 100, data_size_kb: 100, data_hash: [1u8; 32],
+        };
+        let report_b = BandwidthReport {
+            challenge_id: id, reporter: addr_b, peer: addr_a,
+            round_trip_ms: 100, data_size_kb: 100, data_hash: [2u8; 32],
+        };
+        assert!(!BandwidthChallenge::cross_verify(&report_a, &report_b));
     }
 }
