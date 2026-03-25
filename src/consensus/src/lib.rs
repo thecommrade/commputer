@@ -4,6 +4,9 @@ pub mod epoch;
 pub mod emission;
 pub mod anchor;
 pub mod job_assignment;
+pub mod job_verification;
+pub mod dispute;
+pub mod job_pricing;
 pub mod burst_pricing;
 pub mod health;
 
