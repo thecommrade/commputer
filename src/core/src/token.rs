@@ -9,6 +9,23 @@ pub const UNITS_PER_COMME: u64 = 100_000_000;
 /// Total fixed supply: 2 billion $COMME in raw units.
 pub const TOTAL_SUPPLY: u64 = 2_000_000_000 * UNITS_PER_COMME;
 
+/// 51% of network compute is reserved for communal products (storage, communication, AI,
+/// Humanities Archive). Also serves as emergency safeguard for user data protection.
+/// This constant is enforced in the compute job routing system.
+pub const FLAGSHIP_COMPUTE_SHARE: u64 = 51;
+
+/// 49% of network compute is available for holder burst compute jobs.
+/// Split equally among qualifying holders per tier. No whale advantages.
+pub const HOLDER_COMPUTE_SHARE: u64 = 49;
+
+/// 10% of TOTAL network resources are held in reserve at all times.
+/// This is NOT part of the 51/49 split — it's subtracted before the split.
+/// Purpose: absorb sudden capacity changes (validators joining/leaving)
+/// without disrupting active products or user compute sessions.
+/// The 51/49 split applies to the remaining 90% of available resources.
+/// This constant never changes.
+pub const NETWORK_RESERVE_PERCENT: u64 = 10;
+
 /// Token amount in smallest units. All arithmetic is done in these units
 /// to avoid floating point. 1 $COMME = 10^8 units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,

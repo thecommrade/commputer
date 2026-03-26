@@ -155,23 +155,39 @@ impl ConsensusManager {
     /// Add a candidate block. Creates the voter for this height if needed.
     /// If there is only one candidate, it is immediately finalized.
     /// Feature 125: Detects equivocation (same validator, same height, different hash).
+    /// `from_network` should be true for blocks received from remote peers;
+    /// local retries (same producer, rejected block) should pass false to
+    /// avoid false-positive equivocation detection.
     pub fn add_candidate(&mut self, block: Block) {
+        self.add_candidate_inner(block, true);
+    }
+
+    /// Add a locally produced candidate without triggering equivocation detection.
+    pub fn add_local_candidate(&mut self, block: Block) {
+        self.add_candidate_inner(block, false);
+    }
+
+    fn add_candidate_inner(&mut self, block: Block, from_network: bool) {
         let height = block.height();
         let hash = block.hash();
         let producer = block.header.producer;
 
-        // Feature 125: Check for equivocation.
+        // Feature 125: Check for equivocation — only flag blocks received from the
+        // network. Local retries at the same height are normal (e.g. after a rejected
+        // block) and should not trigger slashing.
         let key = (producer, height);
-        if let Some(existing_hash) = self.validator_blocks.get(&key) {
-            if *existing_hash != hash {
-                warn!(
-                    "EQUIVOCATION DETECTED: validator {} signed two different blocks at height {} ({} and {})",
-                    producer, height, existing_hash, hash
-                );
-                self.slashed_validators.insert(producer);
+        if from_network {
+            if let Some(existing_hash) = self.validator_blocks.get(&key) {
+                if *existing_hash != hash {
+                    warn!(
+                        "EQUIVOCATION DETECTED: validator {} signed two different blocks at height {} ({} and {})",
+                        producer, height, existing_hash, hash
+                    );
+                    self.slashed_validators.insert(producer);
+                }
+            } else {
+                self.validator_blocks.insert(key, hash);
             }
-        } else {
-            self.validator_blocks.insert(key, hash);
         }
 
         // Feature 129: Track height start time.

@@ -22,7 +22,7 @@ Meanwhile, billions of computers sit mostly idle. The average desktop uses a fra
 
 ## 2. The Solution
 
-Commputer builds a supercomputer from those idle resources. Anyone with a computer can contribute a portion of their machine — as little as 2% — and earn $COMME. The protocol verifies contributions across five dimensions (CPU, GPU, storage, RAM, bandwidth) and rewards them proportionally.
+Commputer builds a supercomputer from those idle resources. Anyone with a computer can contribute a portion of their machine — as little as 1% — and earn $COMME. The protocol verifies contributions across five dimensions (CPU, GPU, storage, RAM, bandwidth) and rewards them proportionally.
 
 The result is a communal computer that belongs to its participants. Not a company. Not a foundation. The network.
 
@@ -37,6 +37,8 @@ Three rules are enshrined in this whitepaper and will never change:
 2. **The remaining 49% is split equally among qualifying holders per tier.** Pure equal division. No whale advantages.
 
 3. **The free path never closes.** Contribute a full desktop and you have full access without owning a single coin. Always.
+
+4. **10% of all network resources are held in permanent reserve.** This is not part of the 51/49 split — it is subtracted before the split. The reserve absorbs sudden capacity changes when validators join or leave, preventing disruption to active products and user sessions. The 51/49 split applies to the remaining 90%. This constant never changes. In an emergency (sudden large-scale validator loss), the 51% product allocation is additionally redeployed to protect user data and maintain network stability. Once capacity recovers, the 51% rebuilds and resumes serving products.
 
 ---
 
@@ -84,9 +86,9 @@ The L1 is the product. Everything else builds on top of it.
 
 Everything below is the direction. Not promises with dates. Not vaporware used to pump a token price. Real goals that the network works toward as it grows.
 
-### Founder's L2
+### The Founder
 
-The anonymous founder earns by building products on the network — not through a premine, not through a dev tax, but by creating something people use. The same opportunity is available to anyone who builds on Commputer. L2s and dApps built on the network have access to pooled compute through the job submission protocol, and the founder's L2 is no different from any other.
+The anonymous founder has no special treatment. No premine. No dev tax. No hidden wallet. No privileged access. The founder earns exactly the same way as everyone else: by running a node with the same limitations as any other single desktop, and by building on the chain like anyone else can. Zero advantage.
 
 ### Desktop App (Tauri GUI)
 
@@ -360,7 +362,7 @@ The pooled resources are not theoretical. They are usable. Here is how:
 
 Anonymous. The L1 protocol has zero founder allocation. No premine. No dev tax. No hidden wallet. Every $COMME is earned through contribution.
 
-The founder earns by building L2 products on the network. Not from the protocol. Not from a hidden allocation. By creating something people want to use, like anyone else who builds on Commputer.
+The founder runs a node with the same limitations as any other single desktop. The founder earns by contributing resources and by building on the chain — the same opportunities available to every participant. Zero special treatment. Zero advantage. Verify it yourself in the code.
 
 No VCs. No influencer deals. No paid listings. Word of mouth only. The product is the marketing.
 

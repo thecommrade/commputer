@@ -96,7 +96,7 @@ pub fn genesis_block() -> Block {
             tx_root: [0u8; 32],
             proof_root: [0u8; 32],
             state_root: [0u8; 32],
-            timestamp: 0,
+            timestamp: 1647907200, // 2022-03-22 00:00:00 UTC
             producer: Address([0u8; 32]),
             epoch: 0,
             producer_public_key: vec![],

@@ -560,10 +560,24 @@ fn cmd_wallet_show(testnet: bool) -> Result<()> {
     println!("  Full:      {}", hex::encode(addr.0));
 
     if let Some(account) = state.accounts.get(addr) {
-        println!("  Balance:   {}", account.balance);
-        println!("  Tier:      {:?}", account.tier());
-        println!("  Nonce:     {}", account.nonce);
-        println!("  Validator: {}", if account.is_validator { "yes" } else { "no" });
+        // Item 59: Human-readable amounts like "1.5 COMME"
+        let whole = account.balance.raw() / UNITS_PER_COMME;
+        let frac = account.balance.raw() % UNITS_PER_COMME;
+        let mined_whole = account.total_mined.raw() / UNITS_PER_COMME;
+        let mined_frac = account.total_mined.raw() % UNITS_PER_COMME;
+        if frac > 0 {
+            println!("  Balance:     {}.{:08} COMME", whole, frac);
+        } else {
+            println!("  Balance:     {} COMME", whole);
+        }
+        println!("  Tier:        {:?}", account.tier());
+        println!("  Nonce:       {}", account.nonce);
+        println!("  Validator:   {}", if account.is_validator { "yes" } else { "no" });
+        if mined_frac > 0 {
+            println!("  Total Mined: {}.{:08} COMME", mined_whole, mined_frac);
+        } else {
+            println!("  Total Mined: {} COMME", mined_whole);
+        }
     } else {
         println!("  Balance:   0 COMME");
         println!("  Tier:      None");
@@ -987,16 +1001,17 @@ async fn run_node(
 
         wallet
     };
-    info!("Wallet address: {}", wallet.address());
+    // Item 66: Clean, professional startup banner with key info.
+    info!("Wallet:       {}", hex::encode(wallet.address().0));
+    info!("Chain ID:     {}", config::DEFAULT_TESTNET_CHAIN_ID);
+    info!("Seeds:        {:?}", if seeds.is_empty() { config::DEFAULT_TESTNET_SEEDS.iter().map(|s| s.to_string()).collect::<Vec<_>>() } else { seeds.clone() });
+    info!("Contribution: {}%", contribution_percent);
+    info!("Data dir:     {}", dir.display());
+    info!("Wallet file:  {}", wallet_file.display());
 
     // Detect hardware fingerprint.
     let hardware = commputer_core::identity::HardwareFingerprint::detect();
-    info!("Hardware detected:");
-    info!("  CPU:     {} ({} cores)", hardware.cpu_model, hardware.cpu_cores);
-    info!("  RAM:     {} MB", hardware.ram_total_mb);
-    info!("  Storage: {} MB", hardware.storage_total_mb);
-    info!("  GPU:     {}", hardware.gpu_model.as_deref().unwrap_or("none"));
-    info!("  OS:      {}", hardware.os_family);
+    info!("Hardware: {} ({} cores), {} MB RAM", hardware.cpu_model, hardware.cpu_cores, hardware.ram_total_mb);
 
     // Set up network with persistent peer identity (Item 3).
     let peer_key = peer_key_path();
