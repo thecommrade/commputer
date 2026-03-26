@@ -198,20 +198,20 @@
                 </div>
                 <div class="step">
                     <span class="step-num">02</span>
-                    <h3>Create Wallet</h3>
-                    <p>Generate your wallet. Write down the seed phrase. This is your identity.</p>
+                    <h3>Start Mining</h3>
+                    <p>Run the node. A wallet is created automatically on first run. Write down your seed phrase.</p>
                     <div class="code-block">
-                        <code>commputer wallet create</code>
-                        <button class="copy-btn" onclick="copyText('commputer wallet create')">copy</button>
+                        <code>commputer run --testnet</code>
+                        <button class="copy-btn" onclick="copyText('commputer run --testnet')">copy</button>
                     </div>
                 </div>
                 <div class="step">
                     <span class="step-num">03</span>
-                    <h3>Start Contributing</h3>
-                    <p>Run the node. Choose how much of your computer to contribute. Start earning.</p>
+                    <h3>Wait for Rewards</h3>
+                    <p>Your node connects, syncs, registers as a validator, and starts solving proof challenges. First reward comes at the next epoch boundary.</p>
                     <div class="code-block">
-                        <code>commputer run --contribution 50</code>
-                        <button class="copy-btn" onclick="copyText('commputer run --contribution 50')">copy</button>
+                        <code>commputer status --testnet</code>
+                        <button class="copy-btn" onclick="copyText('commputer status --testnet')">copy</button>
                     </div>
                 </div>
                 <div class="step">
@@ -324,5 +324,10 @@
         }
     })();
     </script>
+    <footer style="text-align:center; padding: 2rem; color: var(--text-dim, #666); font-size: 0.85rem; border-top: 1px solid var(--border, #333);">
+        <span id="footer-height">Chain height: —</span> &middot;
+        <a href="https://github.com/thecommrade/commputer" style="color: var(--accent, #e94560);">GitHub</a> &middot;
+        Commputer &copy; 2026
+    </footer>
 </body>
 </html>
