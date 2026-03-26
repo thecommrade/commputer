@@ -100,10 +100,23 @@ pub struct EpochProofSummary {
 }
 
 impl EpochProofSummary {
-    /// Composite Resource Score using sub-linear R^0.7 formula per channel.
-    /// This penalizes over-investment in a single channel (anti-warehouse).
+    /// Count how many proof channels this validator contributed to (score > 0).
+    pub fn active_channel_count(&self) -> usize {
+        let channels = [
+            self.processing_score,
+            self.gpu_score,
+            self.storage_score,
+            self.ram_score,
+            self.bandwidth_score,
+        ];
+        channels.iter().filter(|&&s| s > 0).count()
+    }
+
+    /// Composite Resource Score using sub-linear R^0.7 formula per channel,
+    /// with DIVERSITY_MULTIPLIER applied based on active channel count.
     /// Each channel score is raised to the power 0.7, then summed.
-    /// Diversity bonus adds up to 25% for contributing across all 5 channels.
+    /// The diversity multiplier from token.rs rewards well-rounded nodes
+    /// (up to 5% bonus for all 5 channels).
     pub fn composite_score(&self) -> u64 {
         let channels = [
             self.processing_score as f64,
@@ -119,10 +132,12 @@ impl EpochProofSummary {
             .map(|&r| if r > 0.0 { r.powf(0.7) } else { 0.0 })
             .sum();
 
-        // Diversity bonus: up to 25% boost. diversity_bonus ranges 0-50.
-        let bonus = base * (self.diversity_bonus as f64 / 200.0);
+        // Apply DIVERSITY_MULTIPLIER based on active channel count.
+        // Values are percentages: [100, 100, 101, 102, 103, 105].
+        let channel_count = self.active_channel_count().min(5);
+        let multiplier = crate::token::DIVERSITY_MULTIPLIER[channel_count];
 
-        // Scale to integer. Multiply by 100 for precision.
-        ((base + bonus) * 100.0).round() as u64
+        // Scale to integer. Multiply by 100 for precision, then apply multiplier.
+        (base * 100.0 * multiplier as f64 / 100.0).round() as u64
     }
 }
