@@ -5,6 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Commputer — A Communal Supercomputer</title>
     <meta name="description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources. $COMME. Scale hurts. Patience rewards.">
+    <meta property="og:title" content="Commputer — A Communal Supercomputer">
+    <meta property="og:description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources. $COMME. Scale hurts. Patience rewards.">
+    <meta property="og:image" content="https://commputer.xyz/og-image.png">
+    <meta property="og:url" content="https://commputer.xyz/">
+    <meta property="og:type" content="website">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Commputer — A Communal Supercomputer">
+    <meta name="twitter:description" content="A Layer 1 blockchain built from regular people's idle desktop resources. $COMME.">
+    <meta name="twitter:image" content="https://commputer.xyz/og-image.png">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
@@ -13,7 +23,10 @@
     <nav id="nav">
         <div class="nav-inner">
             <a href="#" class="nav-logo">COMMPUTER</a>
-            <div class="nav-links">
+            <button class="hamburger" id="hamburger" aria-label="Toggle menu">
+                <span></span><span></span><span></span>
+            </button>
+            <div class="nav-links" id="nav-links">
                 <a href="#dashboard">Dashboard</a>
                 <a href="#whitepaper">Whitepaper</a>
                 <a href="#download">Download</a>
@@ -139,10 +152,10 @@
                 <details class="other-platforms">
                     <summary>All platforms</summary>
                     <table class="download-table">
-                        <tr><td>Linux x86_64</td><td><a href="#">commputer-linux-x86_64</a></td><td class="hash">sha256: —</td></tr>
-                        <tr><td>Linux aarch64</td><td><a href="#">commputer-linux-aarch64</a></td><td class="hash">sha256: —</td></tr>
-                        <tr><td>macOS x86_64</td><td><a href="#">commputer-macos-x86_64</a></td><td class="hash">sha256: —</td></tr>
-                        <tr><td>macOS aarch64</td><td><a href="#">commputer-macos-aarch64</a></td><td class="hash">sha256: —</td></tr>
+                        <tr><td>Linux x86_64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-linux-x86_64">commputer-linux-x86_64</a></td><td class="hash">sha256: —</td></tr>
+                        <tr><td>Linux aarch64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-linux-aarch64">commputer-linux-aarch64</a></td><td class="hash">sha256: —</td></tr>
+                        <tr><td>macOS x86_64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-macos-x86_64">commputer-macos-x86_64</a></td><td class="hash">sha256: —</td></tr>
+                        <tr><td>macOS aarch64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-macos-aarch64">commputer-macos-aarch64</a></td><td class="hash">sha256: —</td></tr>
                     </table>
                 </details>
             </div>
@@ -252,5 +265,55 @@
     </main>
 
     <script src="app.js"></script>
+    <script>
+    // Item 6: Typing animation on first visit
+    (function() {
+        if (sessionStorage.getItem('commputer-typed')) return;
+        const h1 = document.querySelector('#hero .hero-text h1');
+        if (!h1) return;
+        const text = h1.textContent;
+        h1.textContent = '';
+        h1.style.borderRight = '2px solid var(--accent)';
+        let i = 0;
+        function type() {
+            if (i < text.length) {
+                h1.textContent += text[i++];
+                setTimeout(type, 80 + Math.random() * 40);
+            } else {
+                h1.style.borderRight = 'none';
+                sessionStorage.setItem('commputer-typed', '1');
+            }
+        }
+        type();
+    })();
+
+    // Item 15: Keyboard navigation — / to focus search, Escape to close
+    document.addEventListener('keydown', function(e) {
+        if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+            e.preventDefault();
+            var input = document.getElementById('explorer-input');
+            if (input) { input.focus(); input.scrollIntoView({behavior:'smooth',block:'center'}); }
+        }
+        if (e.key === 'Escape') {
+            document.activeElement.blur();
+            var navLinks = document.getElementById('nav-links');
+            if (navLinks) navLinks.classList.remove('open');
+            var hamburger = document.getElementById('hamburger');
+            if (hamburger) hamburger.classList.remove('active');
+        }
+    });
+
+    // Item 5: Hamburger menu toggle
+    (function() {
+        var hamburger = document.getElementById('hamburger');
+        var navLinks = document.getElementById('nav-links');
+        if (hamburger && navLinks) {
+            hamburger.addEventListener('click', function() {
+                navLinks.classList.toggle('open');
+                hamburger.classList.toggle('active');
+            });
+        }
+    })();
+    </script>
 </body>
 </html>

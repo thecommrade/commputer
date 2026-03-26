@@ -93,8 +93,17 @@ async function fetchFallback() {
     }
 }
 
+// Show fetching state
+function setFetching() {
+    const dot = document.querySelector('.status-dot');
+    const text = document.getElementById('status-text');
+    if (dot) dot.className = 'status-dot fetching';
+    if (text) text.textContent = 'Fetching...';
+}
+
 // Main refresh loop
 async function refresh() {
+    setFetching();
     const live = await fetchLive();
     if (!live) {
         const cached = await fetchFallback();
@@ -113,12 +122,15 @@ function detectOS() {
     const el = document.getElementById('detected-os');
     const btn = document.getElementById('download-btn');
 
+    const base = 'https://github.com/thecommrade/commputer/releases/latest/download/';
     if (ua.includes('mac')) {
         el.textContent = 'macOS';
         btn.textContent = 'Download for macOS';
+        btn.href = base + (ua.includes('arm') || ua.includes('aarch64') ? 'commputer-macos-aarch64' : 'commputer-macos-x86_64');
     } else if (ua.includes('linux')) {
         el.textContent = 'Linux';
         btn.textContent = 'Download for Linux';
+        btn.href = base + 'commputer-linux-x86_64';
     } else if (ua.includes('win')) {
         el.textContent = 'Windows';
         btn.textContent = 'Download for Windows (coming soon)';

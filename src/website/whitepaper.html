@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Commputer Whitepaper — $COMME</title>
+    <meta name="description" content="The complete Commputer protocol specification, tokenomics, and vision. A Layer 1 blockchain building a communal supercomputer.">
+    <meta property="og:title" content="Commputer Whitepaper — $COMME">
+    <meta property="og:description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources.">
+    <meta property="og:image" content="https://commputer.xyz/og-image.png">
+    <meta property="og:type" content="article">
+    <meta name="twitter:card" content="summary_large_image">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .wp-layout {
+            display: flex;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding-top: 60px;
+        }
+        .wp-toc {
+            position: sticky;
+            top: 60px;
+            width: 260px;
+            min-width: 260px;
+            height: calc(100vh - 60px);
+            overflow-y: auto;
+            padding: 24px 16px;
+            border-right: 1px solid var(--border);
+        }
+        .wp-toc h3 {
+            font-size: 11px;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            margin-bottom: 16px;
+        }
+        .wp-toc a {
+            display: block;
+            color: var(--text-dim);
+            font-size: 12px;
+            padding: 4px 0;
+            line-height: 1.5;
+        }
+        .wp-toc a:hover, .wp-toc a.active {
+            color: var(--accent);
+            text-decoration: none;
+        }
+        .wp-toc a.toc-sub {
+            padding-left: 16px;
+            font-size: 11px;
+        }
+        .wp-content {
+            flex: 1;
+            min-width: 0;
+            padding: 40px 48px 80px;
+        }
+        .wp-content h1 {
+            font-size: 32px;
+            color: var(--accent);
+            letter-spacing: 4px;
+            margin-bottom: 8px;
+        }
+        .wp-content .wp-subtitle {
+            font-size: 14px;
+            color: var(--text-dim);
+            margin-bottom: 48px;
+        }
+        .wp-content h2 {
+            font-size: 20px;
+            color: var(--text-bright);
+            text-transform: none;
+            letter-spacing: 0;
+            margin: 48px 0 16px;
+            padding-top: 24px;
+            border-top: 1px solid var(--border);
+        }
+        .wp-content h3 {
+            font-size: 15px;
+            color: var(--accent);
+            margin: 24px 0 8px;
+        }
+        .wp-content p {
+            margin-bottom: 16px;
+            line-height: 1.8;
+        }
+        .wp-content ul, .wp-content ol {
+            margin-bottom: 16px;
+            padding-left: 24px;
+        }
+        .wp-content li {
+            margin-bottom: 8px;
+            line-height: 1.7;
+        }
+        .wp-content strong {
+            color: var(--text-bright);
+        }
+        .wp-content hr {
+            border: none;
+            border-top: 1px solid var(--border);
+            margin: 32px 0;
+        }
+        .wp-content table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0 24px;
+        }
+        .wp-content th {
+            text-align: left;
+            padding: 8px 12px;
+            font-size: 11px;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            border-bottom: 1px solid var(--border);
+        }
+        .wp-content td {
+            padding: 8px 12px;
+            font-size: 13px;
+            border-bottom: 1px solid var(--border);
+        }
+        .wp-content blockquote {
+            border-left: 2px solid var(--accent);
+            padding-left: 16px;
+            margin: 16px 0;
+            color: var(--text-dim);
+            font-style: italic;
+        }
+        .wp-content .closing {
+            text-align: center;
+            font-style: italic;
+            color: var(--text-dim);
+            margin-top: 48px;
+        }
+        @media (max-width: 768px) {
+            .wp-toc { display: none; }
+            .wp-content { padding: 24px 16px 48px; }
+            .wp-content h1 { font-size: 24px; }
+        }
+    </style>
+</head>
+<body>
+    <nav id="nav">
+        <div class="nav-inner">
+            <a href="index.html" class="nav-logo">COMMPUTER</a>
+            <button class="hamburger" id="hamburger" aria-label="Toggle menu">
+                <span></span><span></span><span></span>
+            </button>
+            <div class="nav-links" id="nav-links">
+                <a href="index.html#dashboard">Dashboard</a>
+                <a href="whitepaper.html">Whitepaper</a>
+                <a href="index.html#download">Download</a>
+                <a href="index.html#explorer">Explorer</a>
+                <a href="index.html#start">Get Started</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="wp-layout">
+        <aside class="wp-toc" id="toc">
+            <h3>Contents</h3>
+            <a href="#abstract">Abstract</a>
+            <a href="#problem" class="toc-sub">1. The Problem</a>
+            <a href="#solution" class="toc-sub">2. The Solution</a>
+            <a href="#principles">3. Core Principles</a>
+            <a href="#launches">4. What Launches</a>
+            <a href="#roadmap">5. Roadmap</a>
+            <a href="#scale">6. Scale Hurts</a>
+            <a href="#tokenomics">7. Tokenomics</a>
+            <a href="#paths">8. Two Paths</a>
+            <a href="#architecture">9. Architecture</a>
+            <a href="#transparency">10. Transparency</a>
+            <a href="#founder">11. Founder</a>
+            <a href="#what-this-is">12. What This Is</a>
+        </aside>
+
+        <main class="wp-content">
+            <h1>COMMPUTER</h1>
+            <p class="wp-subtitle">A Communal Supercomputer &mdash; $COMME Whitepaper</p>
+
+            <h2 id="abstract">Abstract</h2>
+            <p>Commputer is a Layer 1 blockchain that coordinates a distributed supercomputer built from small contributions by regular people. Contributors lend idle resources &mdash; CPU, GPU, RAM, storage, bandwidth &mdash; from their existing computers and earn $COMME, a token with a fixed supply of 2 billion and no premine. The protocol enforces egalitarianism through math: scale is punished, not rewarded. A single desktop at full contribution earns maximum rewards. Warehouses and mining farms are economically destroyed by an adaptive penalty system that only gets harsher over time.</p>
+            <p>No other chain has multi-dimensional Proof of Work across five resource channels, demand-weighted emission that self-balances network composition, and anti-scale enforcement that makes datacenter mining economically suicidal. The L1 itself is the product.</p>
+            <p>This is not a meme coin. It is barely even a cryptocurrency. It is a human project that uses a blockchain because no other mechanism can trustlessly enforce fairness across millions of strangers for generations.</p>
+
+            <hr>
+
+            <h2 id="problem">1. The Problem</h2>
+            <p>Technology extracts from people. Cloud computing is rented, never owned. AI models were trained on the sum of human academic labor and then paywalled as subscriptions. Scientific papers funded by public money sit behind corporate gates. The compute required to participate in the modern economy is concentrated in the hands of a few companies, and access is sold back to the public at a premium.</p>
+            <p>Meanwhile, billions of computers sit mostly idle. The average desktop uses a fraction of its capacity. That unused compute, storage, and memory is wasted &mdash; not because people would not share it, but because no system exists to coordinate the sharing fairly.</p>
+
+            <h2 id="solution">2. The Solution</h2>
+            <p>Commputer builds a supercomputer from those idle resources. Anyone with a computer can contribute a portion of their machine &mdash; as little as 2% &mdash; and earn $COMME. The protocol verifies contributions across five dimensions (CPU, GPU, storage, RAM, bandwidth) and rewards them proportionally.</p>
+            <p>The result is a communal computer that belongs to its participants. Not a company. Not a foundation. The network.</p>
+
+            <hr>
+
+            <h2 id="principles">3. Core Principles</h2>
+            <p>Three rules are enshrined in this whitepaper and will never change:</p>
+            <ol>
+                <li><strong>51% of all network compute is reserved for building products that serve the users.</strong> Shared storage, communication, AI, the Humanities Archive &mdash; whatever the network grows to support. This allocation also serves as an emergency safeguard: if the network suffers a sudden loss of resources, the 51% is deployed to protect user data &mdash; emails, photos, files &mdash; from being lost. Once capacity recovers, the 51% rebuilds to full and resumes creating. Protocol-enforced.</li>
+                <li><strong>The remaining 49% is split equally among qualifying holders per tier.</strong> Pure equal division. No whale advantages.</li>
+                <li><strong>The free path never closes.</strong> Contribute a full desktop and you have full access without owning a single coin. Always.</li>
+            </ol>
+
+            <hr>
+
+            <h2 id="launches">4. What Launches</h2>
+            <p>Commputer launches as a working L1 blockchain. A Rust CLI node. Here is what it does differently.</p>
+
+            <h3>The Coin: $COMME</h3>
+            <p>A Layer 1 token with a fixed supply of 2,000,000,000 earned by contributing idle computer resources. Five proof channels verified from day one: CPU, GPU, storage, RAM, and bandwidth. Burn mechanics active at launch. Full anti-scale protections enforced from block one.</p>
+
+            <h3>Multi-Dimensional Proof of Work</h3>
+            <p>Every other PoW chain mines on a single axis. Commputer validates across five parallel channels &mdash; CPU, GPU, storage, RAM, and bandwidth &mdash; running asynchronously. A well-rounded home desktop contributing across all five channels earns a diversity bonus. Specialized farms earn less per unit than balanced machines. The protocol rewards the kind of computer real people actually own.</p>
+
+            <h3>Demand-Weighted Emission</h3>
+            <p>Total emission per epoch is split across the five proof channels based on what the network actually needs, with guaranteed minimum floors so no channel ever goes to zero. If the network needs more storage, storage proofs pay more. If GPUs are scarce, GPU contributors earn more. The network self-balances its own resource composition without governance votes or manual intervention.</p>
+
+            <h3>Anti-Scale Enforcement</h3>
+            <p>The ideal Commputer validator is a regular person running one desktop at home. That is who the economics favor. A second node from the same operator earns 25% per unit. A third earns 6%. A fifth earns effectively zero. Datacenter patterns are detected and penalized. The adaptive nerf starts at 80% and can only increase, never decrease. The long-term target is 100% &mdash; zero rewards for cheaters. Details in Section 6.</p>
+
+            <h3>Dual Burn Mechanics</h3>
+            <p>Supply only goes down. Milestone burns trigger automatically when the network hits capacity thresholds. Burst compute burns let holders spend $COMME on temporary compute beyond their tier &mdash; permanently burned. Plus an annual charitable burn voted on by holders. Details in Section 7.</p>
+
+            <h3>P2P Networking</h3>
+            <p>Gossip protocol for block propagation. DHT (Distributed Hash Table) for data storage and job routing. Both layers run simultaneously.</p>
+
+            <h3>Wallet</h3>
+            <p>Seed phrase recovery. Your keys, your coins. The node software includes a built-in wallet with the CLI.</p>
+
+            <h3>The Pitch</h3>
+            <p>This is a working chain with protocol properties no other chain has. Multi-dimensional Proof of Work. Demand-weighted emission that self-balances. Anti-scale enforcement that makes mining farms unprofitable by design. A gold-standard hardware ceiling tied to a universal commodity. Grace periods that account for the reality of human life. A will function for when life ends.</p>
+            <p>The L1 is the product. Everything else builds on top of it.</p>
+
+            <hr>
+
+            <h2 id="roadmap">5. Roadmap</h2>
+            <p>Everything below is the direction. Not promises with dates. Not vaporware used to pump a token price. Real goals that the network works toward as it grows.</p>
+
+            <h3>Founder's L2</h3>
+            <p>The anonymous founder earns by building products on the network &mdash; not through a premine, not through a dev tax, but by creating something people use. The same opportunity is available to anyone who builds on Commputer.</p>
+
+            <h3>Desktop App (Tauri GUI)</h3>
+            <p>Commputer launches as a CLI node for people comfortable with a terminal. The desktop app comes next &mdash; single download, cross-platform, install it like any other application. Resource slider from 1% to 100%. Auto-throttles when you are using your machine.</p>
+
+            <h3>Communication Layer</h3>
+            <ul>
+                <li>Personal email server</li>
+                <li>Text, voice, and video communication</li>
+                <li>No gas fees. No ads. No data harvesting.</li>
+            </ul>
+
+            <h3>Personal Infrastructure</h3>
+            <ul>
+                <li>Communal storage allocations</li>
+                <li>Personal compute power</li>
+                <li>AI and LLM access</li>
+            </ul>
+
+            <h3>The Humanities Archive</h3>
+            <p>A permanent, decentralized repository of human knowledge &mdash; academic papers, historical documents, scientific research, historically significant photographs, art, and literature. Hosted on Commputer's communal infrastructure from the flagship's 51% allocation.</p>
+            <p><strong>Free to anyone on earth. No login. No token. No contribution required.</strong></p>
+            <p>AI was trained on the sum of human academic labor and then sold back to us. Scientific knowledge sits behind paywalls. History belongs to whoever can afford access. The Humanities Archive is the answer: put it back. Permanently. On infrastructure that no one can acquire, censor, or shut down.</p>
+
+            <h3>Communal AI</h3>
+            <p>The long-term goal of the 51% compute allocation &mdash; beyond storage, communication, and the Humanities Archive &mdash; is to train and run AI that belongs to the people who power it.</p>
+            <p>Not a company's AI. Not a government's AI. An AI trained on data the community votes to include, governed by the holders who contribute the resources that make it possible, and available to anyone the network can support.</p>
+            <p><strong>The kill switch:</strong> If the community decides the AI is harmful, they turn off their resource contributions and it stops. No board meeting. No corporate decision. The validators withdraw their compute and the AI goes offline.</p>
+
+            <h3>$RAD</h3>
+            <p>Details to come when the time is right.</p>
+
+            <h3>Ownership Tiers (Post-Launch)</h3>
+            <table>
+                <thead><tr><th>Hold</th><th>Unlock</th></tr></thead>
+                <tbody>
+                    <tr><td>1 $COMME</td><td>Full flagship analytics platform</td></tr>
+                    <tr><td>5 $COMME</td><td>Personal email server</td></tr>
+                    <tr><td>10 $COMME</td><td>Storage allocation</td></tr>
+                    <tr><td>20 $COMME</td><td>Processing power</td></tr>
+                    <tr><td>33 $COMME</td><td>Full personal computer + AI/LLM access</td></tr>
+                </tbody>
+            </table>
+            <p>In the beginning, your personal computer is a calculator. As the network grows, it becomes a Chromebook. Then a workstation. Then something nobody has today. The wine of technology. Patience will reward you.</p>
+
+            <hr>
+
+            <h2 id="scale">6. Scale Hurts</h2>
+            <p>Every other blockchain rewards scale. Commputer punishes it.</p>
+            <p>The ideal Commputer validator is a regular person running one desktop at home. That is who the economics favor.</p>
+
+            <h3>The Gold Standard</h3>
+            <p>The reference node is not defined by fixed hardware specs. It is pegged to what <strong>0.3225 troy ounces (0.3539 oz / 10.03 grams) of gold</strong> would buy you in desktop hardware in 2026, measured at the median exchange rate across all available world currencies.</p>
+            <p>This means:</p>
+            <ul>
+                <li>The hardware ceiling evolves as technology advances.</li>
+                <li>No one can spend their way into an advantage.</li>
+                <li>As currencies fluctuate, the median measurement ensures no single economy's inflation or deflation distorts the standard.</li>
+                <li>The protocol publishes the current gold-standard hardware profile transparently.</li>
+            </ul>
+
+            <h3>Anti-Scale Mechanisms</h3>
+            <ul>
+                <li><strong>Exponential decay:</strong> A second node from the same operator earns 25% per unit. A third earns 6%. A fifth earns effectively zero.</li>
+                <li><strong>Diversity bonus:</strong> Nodes contributing across all five proof channels earn a multiplier.</li>
+                <li><strong>Hardware fingerprinting and behavioral analysis:</strong> The protocol detects datacenter patterns and flags them.</li>
+                <li><strong>Resource spike detection:</strong> Sudden jumps in claimed resources trigger verification cooldowns.</li>
+                <li><strong>Network-wide concentration limit:</strong> No single identity may represent more than 0.1% of total resources.</li>
+            </ul>
+
+            <h3>Compliance, Not Punishment</h3>
+            <p>If you are flagged &mdash; perhaps you added a second machine or upgraded your hardware &mdash; the protocol tells you exactly what happened and how to fix it. Fix it, and full rewards restore immediately. No probation. No scarlet letter.</p>
+
+            <h3>The Adaptive Nerf</h3>
+            <p>The nerf percentage starts at 80% and <strong>can only increase, never decrease.</strong> As the network grows and gaming becomes more tempting, the penalty automatically gets harsher. The long-term target is 100% &mdash; zero rewards for cheaters.</p>
+            <p>This is not governance. It is math. Code, not votes.</p>
+
+            <h3>Environmental Design</h3>
+            <p>Commputer does not create e-waste. There are no ASICs. No GPU farms. No warehouses burning electricity. The network is powered by machines that already exist, contributing resources they are not currently using. The marginal environmental cost of Commputer is near zero.</p>
+
+            <hr>
+
+            <h2 id="tokenomics">7. Tokenomics</h2>
+
+            <h3>Supply</h3>
+            <p><strong>2,000,000,000 $COMME. Fixed. Final.</strong></p>
+            <p>The maximum supply can only decrease through burns. It never increases.</p>
+
+            <h3>Emission &mdash; Hybrid Curve</h3>
+            <p>The protocol targets ~0.09 $COMME per day per maxed reference node at launch. As the network grows, the per-node rate decays on a published, deterministic inverse square root curve:</p>
+            <table>
+                <thead><tr><th>Network Size</th><th>Rate Per Node</th><th>Time to 33 $COMME</th></tr></thead>
+                <tbody>
+                    <tr><td>1,000&ndash;10,000 validators</td><td>~0.09/day</td><td>~1 year</td></tr>
+                    <tr><td>10,000&ndash;100,000 validators</td><td>~0.065/day</td><td>~1.5 years</td></tr>
+                    <tr><td>100,000&ndash;1,000,000 validators</td><td>~0.03/day</td><td>~3 years</td></tr>
+                    <tr><td>1,000,000&ndash;10,000,000 validators</td><td>~0.01/day (floor)</td><td>~9 years</td></tr>
+                </tbody>
+            </table>
+            <p>The floor rate of 0.01 $COMME per day never changes. Mining always produces something.</p>
+
+            <h3>Emergency Provisions</h3>
+            <p><strong>Sub-1M Supply Rule:</strong> Should total supply ever burn below 1,000,000 $COMME, any contribution &mdash; no matter how small &mdash; grants full access to the L1 and every product built on it.</p>
+            <p><strong>Inactive Wallets:</strong> Wallets that have been completely inactive for 120 years are considered nonexistent.</p>
+            <p><strong>Quantum Resistance:</strong> Should computation ever advance to the point where wallets can be breached, the full product becomes free for anyone who contributes at half the level described by the gold standard.</p>
+
+            <h3>Demand-Weighted Allocation</h3>
+            <table>
+                <thead><tr><th>Channel</th><th>Floor</th><th>Range</th></tr></thead>
+                <tbody>
+                    <tr><td>Processing</td><td>10%</td><td>10&ndash;35%</td></tr>
+                    <tr><td>GPU</td><td>10%</td><td>10&ndash;35%</td></tr>
+                    <tr><td>Storage</td><td>10%</td><td>10&ndash;35%</td></tr>
+                    <tr><td>RAM</td><td>5%</td><td>5&ndash;25%</td></tr>
+                    <tr><td>Bandwidth</td><td>5%</td><td>5&ndash;25%</td></tr>
+                </tbody>
+            </table>
+
+            <h3>Three Burn Mechanisms</h3>
+            <p><strong>1. Milestone Burns</strong> &mdash; Capacity milestones trigger automatic on-chain burns. Predictable, transparent, verifiable.</p>
+            <p><strong>2. Usage Burns</strong> &mdash; Holders can spend $COMME on burst compute beyond their tier allocation. This is permanently burned.</p>
+            <p><strong>Storage protections:</strong> Burst storage comes with a 2-year grace period to retrieve data.</p>
+            <p><strong>The Will Function:</strong> In the event of a holder's death, the protocol provides customizable execution options for their stored data. Every attempt will be made to contact listed persons throughout the grace period. For those listed contacts, no payment is required to download personal data.</p>
+            <p><strong>3. Annual Charitable Burn</strong> &mdash; Once per year, holders vote on a charitable cause. The protocol sells $COMME to fund the charity and burns a matching amount.</p>
+
+            <p><strong>What it may fund</strong> (restricted to these categories, enshrined in this whitepaper):</p>
+            <ul>
+                <li>Feed the hungry</li>
+                <li>Cure disease</li>
+                <li>Improve the environment</li>
+                <li>Provide healthcare</li>
+                <li>House the houseless</li>
+                <li>Expand mental health availability</li>
+                <li>Rehabilitate the drug addicted and incarcerated</li>
+                <li>Improve access to education for any person of any age</li>
+                <li>Care for the elderly</li>
+                <li>Fund animal shelters</li>
+                <li>Provide assistance and accessibility for the physically or mentally disabled</li>
+                <li>Fund civil servants: fire, EMS, and social workers</li>
+            </ul>
+
+            <p><strong>What it may never fund:</strong></p>
+            <ul>
+                <li>War, in any form, for any reason</li>
+                <li>Politics, parties, campaigns, or lobbying</li>
+                <li>Governments</li>
+                <li>Any venture that intends to make a profit</li>
+            </ul>
+
+            <hr>
+
+            <h2 id="paths">8. Two Paths to the Network</h2>
+            <table>
+                <thead><tr><th>Path</th><th>Requirement</th><th>What You Get</th></tr></thead>
+                <tbody>
+                    <tr><td><strong>Own It</strong></td><td>Hold $COMME</td><td>Access to the network and its products as tiers unlock.</td></tr>
+                    <tr><td><strong>Earn It</strong></td><td>Dedicate 1 desktop at 100%</td><td>Full access to everything. No coins needed. Ever.</td></tr>
+                </tbody>
+            </table>
+            <p><strong>The network is never priced out.</strong> No matter what $COMME trades at, anyone with a desktop can participate for free today.</p>
+
+            <h3>Grace Period</h3>
+            <p>Life happens. For contributors on the "Earn It" path, the protocol provides a grace period proportional to their contribution history:</p>
+            <ul>
+                <li>15 days contributing = 15 days grace</li>
+                <li>1 year = 1 year</li>
+                <li>10 years = 10 years (maximum)</li>
+            </ul>
+            <p>Grace drains 1:1 when offline. It refills 2:1 when back online &mdash; 5 days online restores 10 days of grace.</p>
+            <p>If grace runs out, access stops &mdash; but <strong>personal data is held for 10 years regardless.</strong> Someone's family photos are not leverage.</p>
+
+            <hr>
+
+            <h2 id="architecture">9. Network Architecture</h2>
+
+            <h3>Implementation</h3>
+            <p>The node software is written in Rust &mdash; the language the most battle-tested modern L1s converged on. The launch is a CLI node. The desktop GUI comes later on the roadmap.</p>
+
+            <h3>Layers</h3>
+            <p><strong>Consensus:</strong> Custom consensus built around multi-dimensional Proof of Work. Five parallel proof channels running asynchronously.</p>
+            <p><strong>Networking:</strong> Gossip protocol for block propagation. DHT for data storage and job routing.</p>
+            <p><strong>Resource Orchestration:</strong> Matches jobs to available resources. Respects the 51/49 split. Decomposes large tasks into desktop-sized pieces and reassembles results.</p>
+
+            <h3>Compute Jobs</h3>
+            <p><strong>Submitting a job:</strong> A holder spends $COMME to submit a compute job. The spent $COMME is permanently burned. The job specification describes resource requirements, maximum duration, and the work to be done.</p>
+            <p><strong>Routing:</strong> The network matches the job to validators with the right resource profile. The protocol respects the 51/49 split.</p>
+            <p><strong>Execution:</strong> Jobs run in sandboxed environments on the validator's machine. The validator cannot see the job contents. The job cannot access the validator's system.</p>
+            <p><strong>Verification:</strong> Random validators independently re-execute a portion of the work. If results don't match, the job is disputed. The majority result wins.</p>
+            <p><strong>Pricing:</strong> Dynamic, based on network load. Near full capacity, the price becomes prohibitive &mdash; the protocol's way of saying "the network needs more validators, not more jobs."</p>
+
+            <hr>
+
+            <h2 id="transparency">10. Transparency</h2>
+
+            <h3>Public Dashboard (no login, day one)</h3>
+            <ul>
+                <li>Total network resources &mdash; live</li>
+                <li>Validators online</li>
+                <li>Emission rates per channel</li>
+                <li>Remaining supply with burns tracked in real time</li>
+                <li>Non-compliance statistics and current nerf percentage</li>
+                <li>Charitable donation history</li>
+            </ul>
+
+            <h3>Holder Dashboard</h3>
+            <ul>
+                <li>Your tier and unlocked features</li>
+                <li>Exact resource allocation: total pool, number sharing it, your precise share</li>
+                <li>Grace period balance</li>
+                <li>No hiding. No vague numbers. The math is the product.</li>
+            </ul>
+
+            <hr>
+
+            <h2 id="founder">11. Founder</h2>
+            <p>Anonymous. The L1 protocol has zero founder allocation. No premine. No dev tax. No hidden wallet. Every $COMME is earned through contribution.</p>
+            <p>The founder earns by building L2 products on the network. Not from the protocol. Not from a hidden allocation. By creating something people want to use, like anyone else who builds on Commputer.</p>
+            <p>No VCs. No influencer deals. No paid listings. Word of mouth only. The product is the marketing.</p>
+
+            <hr>
+
+            <h2 id="what-this-is">12. What This Is</h2>
+            <p>This is not a meme coin. It is almost not even a cryptocurrency. It is a human project that uses a blockchain because no other technology can trustlessly enforce egalitarian distribution at scale for generations.</p>
+            <p>This is an act of peaceful revolution &mdash; not against any company or government, but against the idea that knowledge, compute, and AI should be owned by a few and rented to the many.</p>
+            <p>Here is a working chain. Here is what it does differently: multi-dimensional Proof of Work, demand-weighted emission, anti-scale enforcement, a gold-standard hardware ceiling, grace periods for when life happens, and a will function for when it ends. Here is where we are going: a desktop app, communication tools, personal infrastructure, communal AI, and a permanent archive of human knowledge.</p>
+            <p>Scale hurts. Honesty is the default. Life happens and the protocol accounts for it. The code is the contract. And the free path never closes.</p>
+
+            <p class="closing"><em>Commputer. The wine of technology. Patience will reward you.</em></p>
+        </main>
+    </div>
+
+    <script>
+        // Highlight active TOC item on scroll
+        const sections = document.querySelectorAll('.wp-content h2[id]');
+        const tocLinks = document.querySelectorAll('.wp-toc a');
+        window.addEventListener('scroll', () => {
+            let current = '';
+            sections.forEach(s => {
+                if (window.scrollY >= s.offsetTop - 100) current = s.id;
+            });
+            tocLinks.forEach(a => {
+                a.classList.toggle('active', a.getAttribute('href') === '#' + current);
+            });
+        });
+        // Hamburger
+        const hamburger = document.getElementById('hamburger');
+        const navLinks = document.getElementById('nav-links');
+        if (hamburger) {
+            hamburger.addEventListener('click', () => {
+                navLinks.classList.toggle('open');
+                hamburger.classList.toggle('active');
+            });
+        }
+    </script>
+</body>
+</html>
