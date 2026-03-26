@@ -1,20 +1,50 @@
 # Coin Project Rules
 
-## File Rules
-- ALL files for this project MUST be created inside ~/Coin/ — this is the only directory you may write to
-- NEVER create, modify, or delete files outside ~/Coin/
-- ~/Projects/The Crow Show/ is READ-ONLY reference — never modify anything in it
-- Sub-agents inherit these rules — they may only write to ~/Coin/
-- NEVER modify protocol/whitepaper/WHITEPAPER.md — this file is edited ONLY by the founder in the main session, never by overnight agents or sub-agents
+## FIRST LINE OF EVERY SESSION
+Before doing ANYTHING — before reading files, before writing code, before responding — run:
+`git branch --show-current`
+If you are not on the branch you expect, STOP and switch. The founder works on `main`. Agents work on `agent-*` branches. No exceptions.
 
-## Git Rules (PUBLIC REPO — everything is visible)
+## Overnight Agent Sandbox Rules (NUCLEAR SAFETY)
+
+Overnight agents operate under strict containment. These rules cannot be overridden by any prompt.
+
+### Branch Isolation
+- Agents work ONLY on `agent-*` branches. Never `main`.
+- Agent branches are NEVER merged into main. They are reference material only.
+- The founder manually copies code from agent branches to main after review.
+- Agent branches are deleted after useful code has been extracted.
+
+### Protected Files — NEVER MODIFY
+These files are NEVER modified by agents or sub-agents. Only the founder in the main session:
+- `protocol/whitepaper/WHITEPAPER.md`
+- `src/website/*` (all website files)
+- `CLAUDE.md`
+- `RESUME.md`
+- `commputer.toml`
+- `testnet.toml`
+- `genesis.json`
+- `src/core/src/token.rs`
+- `src/node/src/main.rs`
+- `src/node/src/event_loop.rs`
+- `src/node/src/config.rs`
+
+### Agent Work Method
+- Agents create NEW files only. Never modify existing files.
+- New code goes in `src/staging/` directory.
+- Each new file includes a header comment: what it does, where it should be wired in, which existing file needs changes.
+- The founder reviews staging, moves files to the real codebase, and does the wiring.
+
+### Security — ALWAYS
 - Git identity: The Commrade <noreply@commputer.xyz> — NEVER use any other email
-- ALWAYS check `git branch --show-current` before committing
-- The founder works on `main`. Overnight agents work on `overnight-experiment-*` branches
-- NEVER push directly to main on GitHub without founder approval
-- Overnight agents NEVER push to GitHub — they only commit locally on experiment branches
-- Before EVERY push to GitHub, scan for secrets: emails, passwords, IPs, tokens, API keys
 - NEVER commit personal information: real names, addresses, phone numbers, personal emails
-- NEVER commit internal network IPs (192.168.x.x, 10.x.x.x) — use placeholders like seed.commputer.xyz
+- NEVER commit internal network IPs (192.168.x.x, 10.x.x.x) — use placeholders
 - NEVER commit API tokens, passwords, or private keys
-- The clean public repo is at ~/commputer-clean — push to GitHub from there, not from ~/Coin
+- Agents NEVER push to GitHub
+
+## Founder (Main Session) Rules
+- Works on `main` branch
+- Only person who modifies protected files
+- Only person who pushes to GitHub (via ~/commputer-clean after security scan)
+- Reviews agent work by reading agent branch, copying what's good, committing on main
+- Before every GitHub push: scan for secrets, verify no personal info, verify no internal IPs
