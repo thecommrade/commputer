@@ -1590,6 +1590,15 @@ impl EventLoop {
         };
         commputer_core::signing::sign_transaction(&mut tx, &self.wallet);
 
+        // Broadcast ValidatorRegister tx to the network so peers learn our identity.
+        if let Ok(data) = serde_json::to_vec(&tx) {
+            let compressed = commputer_network::compress(&data);
+            let topic = topics::tx_topic();
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed) {
+                debug!("Failed to broadcast ValidatorRegister tx (will retry on peer connect): {}", e);
+            }
+        }
+
         // Add to our own mempool so it gets included in the next block we produce.
         self.pending_txs.push(tx);
 
