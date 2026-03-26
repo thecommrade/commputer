@@ -94,6 +94,12 @@ pub struct RpcState {
     pub rate_limits: Mutex<HashMap<String, (u32, Instant)>>,
     /// Item 55: Configurable CORS allowed origins (comma-separated or "*").
     pub cors_origins: String,
+    /// Item 116: Network traffic statistics.
+    pub traffic_stats: Mutex<serde_json::Value>,
+    /// Item 150: Per-validator proof history for charting.
+    pub proof_history: Mutex<HashMap<String, Vec<serde_json::Value>>>,
+    /// Item 160: Proof leaderboard data per channel.
+    pub proof_leaderboard: Mutex<HashMap<String, Vec<serde_json::Value>>>,
 }
 
 /// Response for a submitted transaction.
@@ -319,6 +325,40 @@ async fn get_proof_status(
         "channels": ["Processing", "Gpu", "Storage", "Ram", "Bandwidth"],
         "challenge_interval_blocks": 300,
         "note": "Detailed per-channel scores available via /balance/{address}"
+    }))
+}
+
+/// Item 150: GET /proofs/history/{address} — return per-validator proof history for charting.
+async fn get_proof_history(
+    State(state): State<Arc<RpcState>>,
+    Path(address): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(msg) = validate_address(&address) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+    }
+
+    let history = state.proof_history.lock().await;
+    if let Some(entries) = history.get(&address) {
+        (StatusCode::OK, Json(serde_json::json!({
+            "address": address,
+            "history": entries,
+        })))
+    } else {
+        (StatusCode::OK, Json(serde_json::json!({
+            "address": address,
+            "history": [],
+        })))
+    }
+}
+
+/// Item 160: GET /proofs/leaderboard — return top validators per proof channel.
+async fn get_proof_leaderboard(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let leaderboard = state.proof_leaderboard.lock().await;
+    Json(serde_json::json!({
+        "channels": ["Processing", "Gpu", "Storage", "Ram", "Bandwidth"],
+        "leaderboard": *leaderboard,
     }))
 }
 
@@ -611,6 +651,14 @@ async fn get_nonce(
 }
 
 /// GET /fee-estimate — recommend a transaction fee based on mempool fullness.
+/// Item 116: GET /traffic -- return network traffic statistics.
+async fn get_traffic(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let stats = state.traffic_stats.lock().await.clone();
+    Json(stats)
+}
+
 async fn get_fee_estimate(
     State(state): State<Arc<RpcState>>,
 ) -> Json<serde_json::Value> {
@@ -926,6 +974,8 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/metrics", get(get_metrics))
         .route("/metrics/prometheus", get(get_prometheus_metrics))
         .route("/proofs/status", get(get_proof_status))
+        .route("/proofs/history/{address}", get(get_proof_history))
+        .route("/proofs/leaderboard", get(get_proof_leaderboard))
         .route("/health", get(get_health))
         .route("/compliance", get(get_compliance))
         .route("/anti-scale", get(get_anti_scale))
@@ -934,6 +984,7 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/storage/metrics", get(get_storage_metrics))
         .route("/ws", get(ws_handler))
         .route("/fee-estimate", get(get_fee_estimate))
+        .route("/traffic", get(get_traffic))
         .route("/rewards/{address}", get(get_pending_rewards))
         .route("/faucet", post(faucet))
         .route("/leaderboard", get(get_leaderboard))
@@ -1019,6 +1070,9 @@ mod tests {
             rate_limits: Mutex::new(HashMap::new()),
             validator_performance: Mutex::new(HashMap::new()),
             cors_origins: "*".to_string(),
+            traffic_stats: Mutex::new(serde_json::json!({})),
+            proof_history: Mutex::new(HashMap::new()),
+            proof_leaderboard: Mutex::new(HashMap::new()),
         });
         (state, rx)
     }

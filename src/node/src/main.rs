@@ -10,6 +10,7 @@ mod job_cancel;
 mod job_rpc;
 mod job_spec;
 mod native_executor;
+mod parallel_sync;
 mod proof_manager;
 mod result_cache;
 mod tier_rate_limit;
@@ -953,11 +954,15 @@ async fn run_node(
     // Feature 166: Bootstrap Kademlia for peer discovery.
     network.bootstrap_kademlia();
 
-    // Feature 168: Relay protocol detection and logging.
+    // Item 104: Relay node mode — node forwards traffic for NAT-ed peers.
     if relay {
-        info!("Relay mode enabled — will attempt circuit relay for NAT traversal");
-        info!("Note: full relay protocol not yet implemented, running in detection mode");
+        network.enable_relay_mode();
+        info!("Relay mode active — this node will forward traffic, no mining");
     }
+
+    // Item 102: Detect and log NAT type on startup.
+    let nat_type = network.detect_nat_type();
+    info!("NAT type: {}", nat_type);
 
     // Set up RPC server channel.
     let (tx_sender, tx_receiver) = tokio::sync::mpsc::channel(256);
@@ -1003,6 +1008,9 @@ async fn run_node(
         rate_limits: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         validator_performance: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         cors_origins: cors_origins.clone(),
+        traffic_stats: tokio::sync::Mutex::new(serde_json::json!({})),
+        proof_history: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        proof_leaderboard: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).

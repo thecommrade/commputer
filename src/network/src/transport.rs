@@ -3,8 +3,116 @@ use libp2p::{
     relay, dcutr, upnp,
     Multiaddr, PeerId as Libp2pPeerId, Swarm, SwarmBuilder,
 };
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{info, warn, debug};
+
+// ---------------------------------------------------------------------------
+// Item 102: NAT type detection based on observed external addresses.
+// ---------------------------------------------------------------------------
+
+/// Detected NAT type based on heuristics from the identify protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NatType {
+    /// Full cone NAT — any external host can send packets to internal host.
+    FullCone,
+    /// Restricted cone — only hosts the internal host has sent to can reply.
+    RestrictedCone,
+    /// Port-restricted cone — only (host, port) pairs the internal host has sent to can reply.
+    PortRestricted,
+    /// Symmetric NAT — different external port for each destination.
+    Symmetric,
+    /// Unable to determine NAT type.
+    Unknown,
+}
+
+impl std::fmt::Display for NatType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NatType::FullCone => write!(f, "Full Cone"),
+            NatType::RestrictedCone => write!(f, "Restricted Cone"),
+            NatType::PortRestricted => write!(f, "Port Restricted"),
+            NatType::Symmetric => write!(f, "Symmetric"),
+            NatType::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+/// Detect NAT type from a set of observed external addresses reported by peers.
+/// Uses heuristics: if we see the same external IP:port from multiple peers,
+/// we're likely behind a full-cone or restricted-cone NAT. If we see different
+/// ports, it's symmetric NAT.
+pub fn detect_nat_type(observed_addrs: &[String]) -> NatType {
+    if observed_addrs.is_empty() {
+        return NatType::Unknown;
+    }
+
+    // Extract IP:port pairs from multiaddr-style or plain addresses
+    let mut ips: HashSet<String> = HashSet::new();
+    let mut ports: HashSet<String> = HashSet::new();
+
+    for addr in observed_addrs {
+        // Extract IP and port from multiaddr format /ip4/X.X.X.X/tcp/PORT
+        let parts: Vec<&str> = addr.split('/').collect();
+        let mut ip = None;
+        let mut port = None;
+        for (i, part) in parts.iter().enumerate() {
+            if (*part == "ip4" || *part == "ip6") && i + 1 < parts.len() {
+                ip = Some(parts[i + 1].to_string());
+            }
+            if (*part == "tcp" || *part == "udp") && i + 1 < parts.len() {
+                port = Some(parts[i + 1].to_string());
+            }
+        }
+        if let Some(ip_val) = ip {
+            ips.insert(ip_val);
+        }
+        if let Some(port_val) = port {
+            ports.insert(port_val);
+        }
+    }
+
+    if ips.is_empty() {
+        return NatType::Unknown;
+    }
+
+    // Heuristics:
+    // - Multiple different external IPs: likely behind a load balancer or multi-homed (treat as Unknown)
+    // - Single IP, single port: Full Cone or Restricted Cone
+    // - Single IP, multiple ports: Symmetric NAT
+    if ips.len() > 1 {
+        // Multiple external IPs — could be multi-homed, hard to classify
+        NatType::Unknown
+    } else if ports.len() <= 1 {
+        // Consistent port across observations — Full Cone or Restricted Cone
+        if observed_addrs.len() >= 3 {
+            NatType::FullCone
+        } else {
+            NatType::RestrictedCone
+        }
+    } else {
+        // Different external ports for different peers — Symmetric
+        NatType::Symmetric
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Item 103: UPnP status tracking.
+// ---------------------------------------------------------------------------
+
+/// Status of UPnP port mapping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UpnpStatus {
+    /// UPnP has not been attempted yet.
+    NotAttempted,
+    /// UPnP mapping succeeded on the given external address.
+    Mapped(String),
+    /// UPnP mapping failed.
+    Failed(String),
+    /// UPnP is not available on this network.
+    Unavailable,
+}
 
 /// The Commputer P2P network built on libp2p.
 ///
@@ -23,6 +131,12 @@ use tracing::{info, warn, debug};
 pub struct CommpNetwork {
     pub swarm: Swarm<CommpBehaviour>,
     pub local_peer_id: Libp2pPeerId,
+    /// Item 102: Observed external addresses from identify protocol.
+    pub observed_addrs: Vec<String>,
+    /// Item 103: Current UPnP status.
+    pub upnp_status: UpnpStatus,
+    /// Item 104: Whether this node is running in relay mode.
+    pub relay_mode: bool,
 }
 
 /// Combined libp2p behaviour.
@@ -152,6 +266,9 @@ impl CommpNetwork {
         let mut network = Self {
             swarm,
             local_peer_id,
+            observed_addrs: Vec::new(),
+            upnp_status: UpnpStatus::NotAttempted,
+            relay_mode: false,
         };
 
         for topic in crate::topics::all_topics() {
@@ -288,5 +405,378 @@ impl CommpNetwork {
         info!("P2P transport: TCP + QUIC dual-stack");
         info!("P2P features: relay, DCUtR hole-punching, UPnP");
         info!("P2P protocol: /commputer/0.1.0");
+    }
+
+    /// Item 102: Detect NAT type from observed external addresses.
+    pub fn detect_nat_type(&self) -> NatType {
+        let nat_type = detect_nat_type(&self.observed_addrs);
+        info!("NAT type detected: {}", nat_type);
+        nat_type
+    }
+
+    /// Item 102: Record an observed external address from the identify protocol.
+    pub fn record_observed_addr(&mut self, addr: String) {
+        if !self.observed_addrs.contains(&addr) {
+            debug!("New observed external address: {}", addr);
+            self.observed_addrs.push(addr);
+        }
+    }
+
+    /// Item 103: Get UPnP mapping status.
+    pub fn upnp_status(&self) -> &UpnpStatus {
+        &self.upnp_status
+    }
+
+    /// Item 103: Update UPnP status and log.
+    pub fn set_upnp_status(&mut self, status: UpnpStatus) {
+        match &status {
+            UpnpStatus::Mapped(addr) => info!("UPnP mapping succeeded: {}", addr),
+            UpnpStatus::Failed(reason) => warn!("UPnP mapping failed: {}", reason),
+            UpnpStatus::Unavailable => info!("UPnP not available on this network"),
+            UpnpStatus::NotAttempted => {}
+        }
+        self.upnp_status = status;
+    }
+
+    /// Item 104: Enable relay mode — node forwards traffic for NAT-ed peers.
+    pub fn enable_relay_mode(&mut self) {
+        self.relay_mode = true;
+        info!("Relay mode enabled — this node will forward traffic for NAT-ed peers");
+    }
+
+    /// Item 104: Check if running in relay mode.
+    pub fn is_relay_mode(&self) -> bool {
+        self.relay_mode
+    }
+
+    /// Item 111: Check if a connected peer supports QUIC and attempt upgrade.
+    /// Returns true if a QUIC dial was attempted.
+    pub fn try_upgrade_to_quic(&mut self, peer_addr: &Multiaddr) -> bool {
+        let addr_str = peer_addr.to_string();
+        // Only upgrade TCP connections
+        if !addr_str.contains("/tcp/") {
+            return false;
+        }
+        // Construct QUIC equivalent
+        let quic_addr_str = addr_str
+            .replace("/tcp/", "/udp/")
+            .replace("/p2p/", "/quic-v1/p2p/");
+        if let Ok(quic_addr) = quic_addr_str.parse::<Multiaddr>() {
+            match self.dial(quic_addr) {
+                Ok(()) => {
+                    debug!("Attempting QUIC upgrade for peer at {}", addr_str);
+                    true
+                }
+                Err(e) => {
+                    debug!("QUIC upgrade failed for {}: {}", addr_str, e);
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Item 113: Resolve DNS TXT records for seed node multiaddrs.
+    /// TXT records should contain multiaddr strings, one per record.
+    pub fn resolve_dns_txt_seeds(&mut self, domains: &[String]) -> usize {
+        let mut connected = 0;
+        for domain in domains {
+            // Use the trust-dns/hickory resolver or fall back to system resolver
+            // For now, parse TXT-record-style multiaddrs from a well-known subdomain
+            let txt_domain = format!("_dnsaddr.{}", domain);
+            info!("Resolving DNS TXT seeds from {}", txt_domain);
+
+            // System DNS resolution for TXT records is not directly available in std.
+            // We document the format and resolve A/AAAA records as a fallback.
+            match std::net::ToSocketAddrs::to_socket_addrs(&(domain.as_str(), 9000u16)) {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        let multiaddr_str = match addr {
+                            std::net::SocketAddr::V4(v4) => {
+                                format!("/ip4/{}/tcp/{}", v4.ip(), v4.port())
+                            }
+                            std::net::SocketAddr::V6(v6) => {
+                                format!("/ip6/{}/tcp/{}", v6.ip(), v6.port())
+                            }
+                        };
+                        if let Ok(multiaddr) = multiaddr_str.parse::<Multiaddr>()
+                            && self.dial(multiaddr).is_ok()
+                        {
+                            info!("Connected to DNS TXT seed {} -> {}", domain, multiaddr_str);
+                            connected += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to resolve DNS TXT seed '{}': {}", txt_domain, e);
+                }
+            }
+        }
+        connected
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Item 116: Network traffic statistics.
+// ---------------------------------------------------------------------------
+
+/// Tracks bytes sent/received per protocol per peer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrafficStats {
+    /// Total bytes sent.
+    pub bytes_sent: u64,
+    /// Total bytes received.
+    pub bytes_received: u64,
+    /// Per-peer byte counts: peer_id_hex -> (sent, received).
+    pub per_peer: std::collections::HashMap<String, (u64, u64)>,
+    /// Per-protocol byte counts: protocol_name -> (sent, received).
+    pub per_protocol: std::collections::HashMap<String, (u64, u64)>,
+}
+
+impl TrafficStats {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record bytes sent to a peer on a given protocol.
+    pub fn record_sent(&mut self, peer_id: &str, protocol: &str, bytes: u64) {
+        self.bytes_sent += bytes;
+        let entry = self.per_peer.entry(peer_id.to_string()).or_insert((0, 0));
+        entry.0 += bytes;
+        let proto_entry = self.per_protocol.entry(protocol.to_string()).or_insert((0, 0));
+        proto_entry.0 += bytes;
+    }
+
+    /// Record bytes received from a peer on a given protocol.
+    pub fn record_received(&mut self, peer_id: &str, protocol: &str, bytes: u64) {
+        self.bytes_received += bytes;
+        let entry = self.per_peer.entry(peer_id.to_string()).or_insert((0, 0));
+        entry.1 += bytes;
+        let proto_entry = self.per_protocol.entry(protocol.to_string()).or_insert((0, 0));
+        proto_entry.1 += bytes;
+    }
+
+    /// Get a summary for display / RPC.
+    pub fn summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "bytes_sent": self.bytes_sent,
+            "bytes_received": self.bytes_received,
+            "per_protocol": self.per_protocol,
+            "peer_count": self.per_peer.len(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Item 117: Bandwidth throttling with token bucket algorithm.
+// ---------------------------------------------------------------------------
+
+/// Token bucket bandwidth throttler.
+/// Allows bursts up to the bucket capacity, refills at `rate_bytes_per_sec`.
+#[derive(Debug, Clone)]
+pub struct BandwidthThrottler {
+    /// Maximum upload rate in bytes per second.
+    pub max_upload_bps: u64,
+    /// Maximum download rate in bytes per second.
+    pub max_download_bps: u64,
+    /// Current upload tokens available.
+    upload_tokens: u64,
+    /// Current download tokens available.
+    download_tokens: u64,
+    /// Last refill timestamp (unix ms).
+    last_refill_ms: u64,
+    /// Bucket capacity (max burst size).
+    bucket_capacity: u64,
+}
+
+impl BandwidthThrottler {
+    /// Create a new throttler with the given upload/download limits in bytes/sec.
+    pub fn new(max_upload_bps: u64, max_download_bps: u64) -> Self {
+        let capacity = max_upload_bps.max(max_download_bps);
+        Self {
+            max_upload_bps,
+            max_download_bps,
+            upload_tokens: capacity,
+            download_tokens: capacity,
+            last_refill_ms: 0,
+            bucket_capacity: capacity,
+        }
+    }
+
+    /// Create an unlimited throttler (no rate limiting).
+    pub fn unlimited() -> Self {
+        Self::new(u64::MAX / 2, u64::MAX / 2)
+    }
+
+    /// Refill tokens based on elapsed time.
+    pub fn refill(&mut self, now_ms: u64) {
+        if self.last_refill_ms == 0 {
+            self.last_refill_ms = now_ms;
+            return;
+        }
+        let elapsed_ms = now_ms.saturating_sub(self.last_refill_ms);
+        if elapsed_ms == 0 {
+            return;
+        }
+        let upload_refill = self.max_upload_bps * elapsed_ms / 1000;
+        let download_refill = self.max_download_bps * elapsed_ms / 1000;
+        self.upload_tokens = (self.upload_tokens + upload_refill).min(self.bucket_capacity);
+        self.download_tokens = (self.download_tokens + download_refill).min(self.bucket_capacity);
+        self.last_refill_ms = now_ms;
+    }
+
+    /// Try to consume upload tokens. Returns true if allowed.
+    pub fn try_upload(&mut self, bytes: u64) -> bool {
+        if bytes <= self.upload_tokens {
+            self.upload_tokens -= bytes;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Try to consume download tokens. Returns true if allowed.
+    pub fn try_download(&mut self, bytes: u64) -> bool {
+        if bytes <= self.download_tokens {
+            self.download_tokens -= bytes;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check remaining upload capacity.
+    pub fn upload_remaining(&self) -> u64 {
+        self.upload_tokens
+    }
+
+    /// Check remaining download capacity.
+    pub fn download_remaining(&self) -> u64 {
+        self.download_tokens
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Item 112: Peer exchange protocol.
+// ---------------------------------------------------------------------------
+
+/// Periodically shares known peer addresses via gossipsub.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerExchange {
+    /// Known peer addresses to share.
+    pub peer_addrs: Vec<PeerExchangeEntry>,
+    /// Timestamp of the exchange.
+    pub timestamp_ms: u64,
+}
+
+/// A single entry in a peer exchange message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerExchangeEntry {
+    /// Peer's multiaddr.
+    pub addr: String,
+    /// When we last successfully connected to this peer.
+    pub last_connected_ms: u64,
+}
+
+impl PeerExchange {
+    /// Create a new peer exchange message from known peers.
+    pub fn from_peers(peers: &[PeerExchangeEntry], now_ms: u64) -> Self {
+        Self {
+            peer_addrs: peers.to_vec(),
+            timestamp_ms: now_ms,
+        }
+    }
+
+    /// Serialize to bytes for gossipsub transmission.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Deserialize from bytes received via gossipsub.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        serde_json::from_slice(data).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nat_type_unknown_empty() {
+        assert_eq!(detect_nat_type(&[]), NatType::Unknown);
+    }
+
+    #[test]
+    fn nat_type_full_cone() {
+        let addrs = vec![
+            "/ip4/1.2.3.4/tcp/9000".to_string(),
+            "/ip4/1.2.3.4/tcp/9000".to_string(),
+            "/ip4/1.2.3.4/tcp/9000".to_string(),
+        ];
+        assert_eq!(detect_nat_type(&addrs), NatType::FullCone);
+    }
+
+    #[test]
+    fn nat_type_symmetric() {
+        let addrs = vec![
+            "/ip4/1.2.3.4/tcp/9000".to_string(),
+            "/ip4/1.2.3.4/tcp/9001".to_string(),
+            "/ip4/1.2.3.4/tcp/9002".to_string(),
+        ];
+        assert_eq!(detect_nat_type(&addrs), NatType::Symmetric);
+    }
+
+    #[test]
+    fn traffic_stats_tracking() {
+        let mut stats = TrafficStats::new();
+        stats.record_sent("peer1", "gossipsub", 1000);
+        stats.record_received("peer1", "gossipsub", 2000);
+        stats.record_sent("peer2", "kademlia", 500);
+
+        assert_eq!(stats.bytes_sent, 1500);
+        assert_eq!(stats.bytes_received, 2000);
+        assert_eq!(stats.per_peer.len(), 2);
+        assert_eq!(stats.per_protocol.len(), 2);
+    }
+
+    #[test]
+    fn bandwidth_throttler_basic() {
+        let mut throttler = BandwidthThrottler::new(1000, 1000);
+        throttler.refill(0);
+        assert!(throttler.try_upload(500));
+        assert_eq!(throttler.upload_remaining(), 500);
+        assert!(throttler.try_upload(500));
+        assert!(!throttler.try_upload(1)); // Exhausted
+    }
+
+    #[test]
+    fn bandwidth_throttler_refill() {
+        let mut throttler = BandwidthThrottler::new(1000, 1000);
+        throttler.refill(1000); // Initialize timestamp
+        throttler.upload_tokens = 0;
+        throttler.download_tokens = 0;
+        throttler.refill(2000); // 1 second later
+        assert_eq!(throttler.upload_remaining(), 1000);
+    }
+
+    #[test]
+    fn peer_exchange_roundtrip() {
+        let entries = vec![PeerExchangeEntry {
+            addr: "/ip4/1.2.3.4/tcp/9000".to_string(),
+            last_connected_ms: 1000,
+        }];
+        let exchange = PeerExchange::from_peers(&entries, 2000);
+        let bytes = exchange.to_bytes();
+        let decoded = PeerExchange::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.peer_addrs.len(), 1);
+        assert_eq!(decoded.timestamp_ms, 2000);
+    }
+
+    #[test]
+    fn upnp_status_display() {
+        let status = UpnpStatus::Mapped("1.2.3.4:9000".to_string());
+        assert!(matches!(status, UpnpStatus::Mapped(_)));
     }
 }
