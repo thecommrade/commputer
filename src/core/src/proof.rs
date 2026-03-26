@@ -114,7 +114,12 @@ impl EpochProofSummary {
 
     /// Composite Resource Score using sub-linear R^0.7 formula per channel,
     /// with DIVERSITY_MULTIPLIER applied based on active channel count.
+<<<<<<< HEAD
     /// Each channel score is raised to the power 0.7, then summed.
+=======
+    /// Each channel score is capped at the gold-standard reference,
+    /// then raised to the power 0.7 and summed.
+>>>>>>> af652b2 (fix: restore personal info removal and IP placeholders after merge revert)
     /// The diversity multiplier from token.rs rewards well-rounded nodes
     /// (up to 5% bonus for all 5 channels).
     pub fn composite_score(&self) -> u64 {

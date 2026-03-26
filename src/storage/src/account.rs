@@ -9,6 +9,7 @@ use commputer_core::compliance::ComplianceStatus;
 /// Will execution status for the storage will function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Default)]
 pub enum WillStatus {
+<<<<<<< HEAD
     /// No will registered.
     #[default]
     None,
@@ -17,6 +18,12 @@ pub enum WillStatus {
     /// Grace period expired, notification events emitted.
     Pending,
     /// Will executed (contacts notified, data available for download).
+=======
+    #[default]
+    None,
+    Registered,
+    Pending,
+>>>>>>> af652b2 (fix: restore personal info removal and IP placeholders after merge revert)
     Executed,
 }
 
@@ -70,7 +77,11 @@ pub struct Account {
     /// Burst storage purchase timestamp (unix seconds). Starts 2-year grace period.
     #[serde(default)]
     pub burst_storage_purchased_at: Option<u64>,
+<<<<<<< HEAD
     /// Will execution status: None, Pending, Executed.
+=======
+    /// Will execution status.
+>>>>>>> af652b2 (fix: restore personal info removal and IP placeholders after merge revert)
     #[serde(default)]
     pub will_status: WillStatus,
 }
@@ -157,7 +168,11 @@ impl Account {
     /// Check if this wallet should be marked inactive (120+ years since last activity).
     pub fn check_inactive(&mut self, current_timestamp: u64) {
         if self.last_active_timestamp == 0 {
+<<<<<<< HEAD
             return; // Never active — skip (genesis accounts).
+=======
+            return;
+>>>>>>> af652b2 (fix: restore personal info removal and IP placeholders after merge revert)
         }
         if current_timestamp.saturating_sub(self.last_active_timestamp) > INACTIVE_WALLET_THRESHOLD_SECS {
             self.is_inactive = true;
@@ -169,7 +184,11 @@ impl Account {
         if let Some(purchased_at) = self.burst_storage_purchased_at {
             current_timestamp.saturating_sub(purchased_at) > BURST_STORAGE_GRACE_SECS
         } else {
+<<<<<<< HEAD
             false // No burst storage purchased.
+=======
+            false
+>>>>>>> af652b2 (fix: restore personal info removal and IP placeholders after merge revert)
         }
     }
 
