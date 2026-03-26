@@ -1127,6 +1127,11 @@ impl EventLoop {
             ConsensusMessage::LightClientResponse { .. } => {
                 // Handle light client response (future use).
             }
+            ConsensusMessage::CheckpointCommitment { height, state_root, validator } => {
+                // Feature 133: Record checkpoint vote from a validator.
+                debug!("Checkpoint commitment from {} at height {}", validator, height);
+                self.consensus.record_checkpoint_vote(height, validator, state_root);
+            }
         }
     }
 

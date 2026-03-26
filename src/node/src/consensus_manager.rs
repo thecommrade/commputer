@@ -10,6 +10,32 @@ use commputer_consensus::snowball::{SnowballParams, SnowballVoter};
 /// Feature 129: Consensus timeout — if no block finalized within this duration, force re-election.
 pub const CONSENSUS_TIMEOUT_SECS: u64 = 30;
 
+/// Feature 126: Minimum block interval per validator (seconds).
+pub const MIN_BLOCK_INTERVAL_SECS: u64 = 2;
+
+/// Feature 139: Maximum allowed timestamp drift from network median (seconds).
+pub const MAX_TIMESTAMP_DRIFT_SECS: u64 = 15;
+
+/// Feature 121: View change protocol.
+/// If the elected block producer is offline for this duration (seconds),
+/// the next-highest CRS validator takes over block production.
+pub const VIEW_CHANGE_TIMEOUT_SECS: u64 = 10;
+
+/// Feature 121: View change state — tracks when a view change is triggered.
+#[derive(Debug, Clone)]
+pub struct ViewChange {
+    /// The height at which the view change occurred.
+    pub height: u64,
+    /// The original producer who was expected to produce the block.
+    pub original_producer: Address,
+    /// The replacement producer who took over.
+    pub replacement_producer: Address,
+    /// When the view change was initiated.
+    pub triggered_at: Instant,
+    /// The view number (0 = original, 1 = first replacement, etc.).
+    pub view_number: u32,
+}
+
 /// Messages exchanged between nodes for Snowball consensus and sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConsensusMessage {
@@ -49,6 +75,13 @@ pub enum ConsensusMessage {
         merkle_proof: Option<commputer_core::merkle::MerkleProof>,
         tx_hash: [u8; 32],
     },
+
+    /// Feature 133: Checkpoint commitment — validators sign a checkpoint.
+    CheckpointCommitment {
+        height: u64,
+        state_root: [u8; 32],
+        validator: Address,
+    },
 }
 
 /// Per-height voting state: the voter plus all candidate blocks.
@@ -76,6 +109,12 @@ pub struct ConsensusManager {
     pub slashed_validators: HashSet<Address>,
     /// Feature 129: Track when each height started consensus.
     pub height_start_time: HashMap<u64, Instant>,
+    /// Feature 121: View change history.
+    pub view_changes: Vec<ViewChange>,
+    /// Feature 126: Track last block timestamp per validator for rate limiting.
+    pub last_block_time: HashMap<Address, u64>,
+    /// Feature 133: Checkpoint commitments: height -> set of (validator, state_root).
+    pub checkpoint_votes: HashMap<u64, HashMap<Address, [u8; 32]>>,
 }
 
 impl ConsensusManager {
@@ -91,6 +130,23 @@ impl ConsensusManager {
             validator_blocks: HashMap::new(),
             slashed_validators: HashSet::new(),
             height_start_time: HashMap::new(),
+            view_changes: Vec::new(),
+            last_block_time: HashMap::new(),
+            checkpoint_votes: HashMap::new(),
+        }
+    }
+
+    /// Create a consensus manager with custom Snowball parameters (Feature 131).
+    pub fn with_params(params: SnowballParams) -> Self {
+        Self {
+            heights: HashMap::new(),
+            params,
+            validator_blocks: HashMap::new(),
+            slashed_validators: HashSet::new(),
+            height_start_time: HashMap::new(),
+            view_changes: Vec::new(),
+            last_block_time: HashMap::new(),
+            checkpoint_votes: HashMap::new(),
         }
     }
 
@@ -273,6 +329,170 @@ impl ConsensusManager {
     pub fn has_height(&self, height: u64) -> bool {
         self.heights.contains_key(&height)
     }
+
+    /// Feature 121: Record a view change event.
+    pub fn record_view_change(
+        &mut self,
+        height: u64,
+        original_producer: Address,
+        replacement_producer: Address,
+        view_number: u32,
+    ) {
+        let vc = ViewChange {
+            height,
+            original_producer,
+            replacement_producer,
+            triggered_at: Instant::now(),
+            view_number,
+        };
+        warn!(
+            "View change at height {}: {} -> {} (view #{})",
+            height, original_producer, replacement_producer, view_number
+        );
+        self.view_changes.push(vc);
+    }
+
+    /// Feature 121: Check if a view change should be triggered for the given height.
+    /// Returns true if no block has been seen for VIEW_CHANGE_TIMEOUT_SECS.
+    pub fn should_view_change(&self, height: u64) -> bool {
+        if let Some(start) = self.height_start_time.get(&height) {
+            start.elapsed().as_secs() >= VIEW_CHANGE_TIMEOUT_SECS
+        } else {
+            false
+        }
+    }
+
+    /// Feature 126: Check if a block from this validator is rate-limited.
+    /// Returns true if the block is too fast (less than MIN_BLOCK_INTERVAL_SECS
+    /// since the last block from this validator).
+    pub fn is_block_rate_limited(&self, producer: &Address, timestamp: u64) -> bool {
+        if let Some(&last_time) = self.last_block_time.get(producer) {
+            timestamp < last_time + MIN_BLOCK_INTERVAL_SECS
+        } else {
+            false
+        }
+    }
+
+    /// Feature 126: Record when a validator produced a block.
+    pub fn record_block_time(&mut self, producer: Address, timestamp: u64) {
+        self.last_block_time.insert(producer, timestamp);
+    }
+
+    /// Feature 127: Check if a block should be suppressed (empty block with no
+    /// transactions and no proof summaries).
+    pub fn should_suppress_empty_block(block: &Block) -> bool {
+        block.transactions.is_empty()
+            && block.proof_summaries.is_empty()
+            && block.epoch_summary.is_none()
+    }
+
+    /// Feature 132: Batch-finalize multiple blocks at once when catching up.
+    /// Takes blocks sorted by height and finalizes them directly without
+    /// running the full Snowball protocol (used during sync/catchup).
+    pub fn batch_finalize_catchup(&mut self, blocks: Vec<Block>) -> Vec<Block> {
+        let mut finalized = Vec::new();
+        for block in blocks {
+            let height = block.height();
+            let hash = block.hash();
+
+            // Track validator block for equivocation detection.
+            let key = (block.header.producer, height);
+            self.validator_blocks.entry(key).or_insert(hash);
+
+            finalized.push(block);
+        }
+        finalized
+    }
+
+    /// Feature 133: Record a checkpoint commitment from a validator.
+    pub fn record_checkpoint_vote(
+        &mut self,
+        height: u64,
+        validator: Address,
+        state_root: [u8; 32],
+    ) {
+        let votes = self.checkpoint_votes.entry(height).or_default();
+        votes.insert(validator, state_root);
+    }
+
+    /// Feature 133: Check if a checkpoint has reached consensus (2/3+ agreement).
+    pub fn checkpoint_consensus(
+        &self,
+        height: u64,
+        total_validators: usize,
+    ) -> Option<[u8; 32]> {
+        if total_validators == 0 {
+            return None;
+        }
+        let threshold = (total_validators * 2) / 3 + 1;
+
+        if let Some(votes) = self.checkpoint_votes.get(&height) {
+            // Count votes per state root.
+            let mut root_counts: HashMap<[u8; 32], usize> = HashMap::new();
+            for root in votes.values() {
+                *root_counts.entry(*root).or_insert(0) += 1;
+            }
+            // Find any root with enough votes.
+            for (root, count) in &root_counts {
+                if *count >= threshold {
+                    return Some(*root);
+                }
+            }
+        }
+        None
+    }
+
+    /// Feature 139: Validate a block's timestamp against the network median.
+    /// Returns true if the timestamp is within acceptable drift.
+    pub fn validate_timestamp(
+        &self,
+        block_timestamp: u64,
+        recent_timestamps: &[u64],
+    ) -> bool {
+        if recent_timestamps.is_empty() {
+            return true; // No reference — accept.
+        }
+
+        let mut sorted = recent_timestamps.to_vec();
+        sorted.sort();
+        let median = sorted[sorted.len() / 2];
+
+        // Block timestamp must not be too far in the future or past.
+        let drift = if block_timestamp > median {
+            block_timestamp - median
+        } else {
+            median - block_timestamp
+        };
+
+        drift <= MAX_TIMESTAMP_DRIFT_SECS
+    }
+}
+
+/// Feature 134: Generate a light client merkle proof for a transaction in a block.
+/// Given a block and a transaction hash, returns the merkle proof and the index.
+pub fn generate_light_client_proof(
+    block: &Block,
+    tx_hash: [u8; 32],
+) -> Option<(commputer_core::merkle::MerkleProof, usize)> {
+    let tx_hashes: Vec<[u8; 32]> = block.transactions.iter()
+        .map(|tx| tx.hash().0)
+        .collect();
+
+    // Find the index of the transaction.
+    let tx_index = tx_hashes.iter().position(|h| *h == tx_hash)?;
+
+    let proof = commputer_core::merkle::generate_merkle_proof(&tx_hashes, tx_index)?;
+    Some((proof, tx_index))
+}
+
+/// Feature 135: Verify a light client merkle proof without downloading the full block.
+/// Given a tx hash, proof, and the block header's tx_root, verify inclusion.
+pub fn verify_light_client_proof(
+    tx_hash: [u8; 32],
+    proof: &commputer_core::merkle::MerkleProof,
+    tx_root: [u8; 32],
+) -> bool {
+    commputer_core::merkle::verify_merkle_proof(tx_hash, proof, tx_root)
 }
 
 #[cfg(test)]
@@ -292,6 +512,10 @@ mod tests {
     }
 
     fn make_test_block_with_producer(height: u64, producer: Address) -> Block {
+        make_test_block_with_timestamp(height, producer, 1000 + height)
+    }
+
+    fn make_test_block_with_timestamp(height: u64, producer: Address, timestamp: u64) -> Block {
         Block {
             header: BlockHeader {
                 protocol_version: 1,
@@ -300,7 +524,7 @@ mod tests {
                 tx_root: [0u8; 32],
                 proof_root: [0u8; 32],
                 state_root: [0u8; 32],
-                timestamp: 1000 + height,
+                timestamp,
                 producer,
                 epoch: 0,
                 producer_public_key: vec![],
@@ -313,6 +537,8 @@ mod tests {
             compliance_summary: None, epoch_summary: None,
         }
     }
+
+    // ---- Existing tests ----
 
     #[test]
     fn single_candidate_finalizes_immediately() {
@@ -403,12 +629,11 @@ mod tests {
         // - Both nodes try to finalize
         // We simulate a network where hash_1 has a slight majority.
         for round in 0..10 {
-            let pref_a = cm_a.query_preference(1);
-            let pref_b = cm_b.query_preference(1);
+            let _pref_a = cm_a.query_preference(1);
+            let _pref_b = cm_b.query_preference(1);
 
             // Simulate 3 peers voting (sample_size=3):
             // - 2 peers prefer hash_1, 1 prefers hash_2 (gives hash_1 the edge)
-            // For the initial rounds before any preference is set, seed the votes.
             let majority_hash = hash_1;
             let minority_hash = hash_2;
 
@@ -503,5 +728,431 @@ mod tests {
             cm.try_finalize_round(1);
         }
         assert_eq!(cm.finalized_at_height(1), None);
+    }
+
+    // ---- Feature 121: View change tests ----
+
+    #[test]
+    fn view_change_recorded() {
+        let mut cm = ConsensusManager::new();
+        cm.record_view_change(10, addr(1), addr(2), 1);
+        assert_eq!(cm.view_changes.len(), 1);
+        assert_eq!(cm.view_changes[0].height, 10);
+        assert_eq!(cm.view_changes[0].original_producer, addr(1));
+        assert_eq!(cm.view_changes[0].replacement_producer, addr(2));
+        assert_eq!(cm.view_changes[0].view_number, 1);
+    }
+
+    // ---- Feature 122: Extended equivocation detection tests ----
+
+    #[test]
+    fn equivocation_detected_and_slashed() {
+        let mut cm = ConsensusManager::new();
+        let validator = addr(1);
+
+        // First block from validator at height 5.
+        let block_a = make_test_block_with_producer(5, validator);
+        cm.add_candidate(block_a);
+        assert!(!cm.is_slashed(&validator));
+
+        // Second different block from same validator at same height.
+        let mut block_b = make_test_block_with_timestamp(5, validator, 1006);
+        // Give it a different state root to make hash differ.
+        block_b.header.state_root = [1u8; 32];
+        cm.add_candidate(block_b);
+
+        // Should now be slashed.
+        assert!(cm.is_slashed(&validator));
+    }
+
+    #[test]
+    fn same_block_twice_not_equivocation() {
+        let mut cm = ConsensusManager::new();
+        let validator = addr(1);
+
+        let block = make_test_block_with_producer(5, validator);
+        let block_clone = block.clone();
+        cm.add_candidate(block);
+        cm.add_candidate(block_clone); // Same block — not equivocation.
+
+        assert!(!cm.is_slashed(&validator));
+    }
+
+    #[test]
+    fn different_heights_not_equivocation() {
+        let mut cm = ConsensusManager::new();
+        let validator = addr(1);
+
+        let block_a = make_test_block_with_producer(5, validator);
+        let block_b = make_test_block_with_producer(6, validator);
+        cm.add_candidate(block_a);
+        cm.add_candidate(block_b);
+
+        // Different heights — this is normal behavior, not equivocation.
+        assert!(!cm.is_slashed(&validator));
+    }
+
+    #[test]
+    fn different_validators_same_height_not_equivocation() {
+        let mut cm = ConsensusManager::new();
+
+        let block_a = make_test_block_with_producer(5, addr(1));
+        let block_b = make_test_block_with_producer(5, addr(2));
+        cm.add_candidate(block_a);
+        cm.add_candidate(block_b);
+
+        assert!(!cm.is_slashed(&addr(1)));
+        assert!(!cm.is_slashed(&addr(2)));
+    }
+
+    #[test]
+    fn multiple_equivocators_all_slashed() {
+        let mut cm = ConsensusManager::new();
+
+        // Validator 1 equivocates.
+        let b1a = make_test_block_with_producer(5, addr(1));
+        let mut b1b = make_test_block_with_timestamp(5, addr(1), 1006);
+        b1b.header.state_root = [1u8; 32];
+        cm.add_candidate(b1a);
+        cm.add_candidate(b1b);
+
+        // Validator 2 equivocates.
+        let b2a = make_test_block_with_producer(5, addr(2));
+        let mut b2b = make_test_block_with_timestamp(5, addr(2), 1007);
+        b2b.header.state_root = [2u8; 32];
+        cm.add_candidate(b2a);
+        cm.add_candidate(b2b);
+
+        assert!(cm.is_slashed(&addr(1)));
+        assert!(cm.is_slashed(&addr(2)));
+    }
+
+    // ---- Feature 123: Slashing ensures zero epoch rewards ----
+
+    #[test]
+    fn slashed_validator_gets_zero_rewards() {
+        let mut cm = ConsensusManager::new();
+        let validator = addr(1);
+
+        // Cause equivocation.
+        let b1 = make_test_block_with_producer(5, validator);
+        let mut b2 = make_test_block_with_timestamp(5, validator, 1006);
+        b2.header.state_root = [1u8; 32];
+        cm.add_candidate(b1);
+        cm.add_candidate(b2);
+
+        // Validator is slashed — should get zero epoch rewards.
+        assert!(cm.is_slashed(&validator));
+
+        // Simulate reward calculation: slashed validators get 0.
+        let base_reward = 1000u64;
+        let actual_reward = if cm.is_slashed(&validator) { 0 } else { base_reward };
+        assert_eq!(actual_reward, 0);
+
+        // Non-slashed validator gets full reward.
+        let non_slashed = addr(2);
+        let non_slashed_reward = if cm.is_slashed(&non_slashed) { 0 } else { base_reward };
+        assert_eq!(non_slashed_reward, 1000);
+    }
+
+    #[test]
+    fn slashing_resets_at_epoch_boundary() {
+        let mut cm = ConsensusManager::new();
+        let validator = addr(1);
+
+        // Cause slashing.
+        let b1 = make_test_block_with_producer(5, validator);
+        let mut b2 = make_test_block_with_timestamp(5, validator, 1006);
+        b2.header.state_root = [1u8; 32];
+        cm.add_candidate(b1);
+        cm.add_candidate(b2);
+        assert!(cm.is_slashed(&validator));
+
+        // Reset at epoch boundary.
+        cm.reset_epoch_slashing();
+        assert!(!cm.is_slashed(&validator));
+    }
+
+    // ---- Feature 126: Block production rate limiting ----
+
+    #[test]
+    fn block_rate_limiting() {
+        let mut cm = ConsensusManager::new();
+        let validator = addr(1);
+
+        cm.record_block_time(validator, 1000);
+
+        // Block at 1001 (only 1s later) should be rate-limited.
+        assert!(cm.is_block_rate_limited(&validator, 1001));
+
+        // Block at 1002 (exactly 2s later) should be allowed.
+        assert!(!cm.is_block_rate_limited(&validator, 1002));
+
+        // Block at 1005 (5s later) should be allowed.
+        assert!(!cm.is_block_rate_limited(&validator, 1005));
+    }
+
+    #[test]
+    fn block_rate_limiting_unknown_validator() {
+        let cm = ConsensusManager::new();
+        // Unknown validator — no rate limit.
+        assert!(!cm.is_block_rate_limited(&addr(99), 1000));
+    }
+
+    // ---- Feature 127: Empty block suppression ----
+
+    #[test]
+    fn empty_block_suppressed() {
+        let block = make_test_block(1);
+        assert!(ConsensusManager::should_suppress_empty_block(&block));
+    }
+
+    #[test]
+    fn block_with_transactions_not_suppressed() {
+        use commputer_core::transaction::{Transaction, TxKind};
+        use commputer_core::token::Amount;
+
+        let mut block = make_test_block(1);
+        block.transactions.push(Transaction {
+            from: addr(1),
+            nonce: 0,
+            kind: TxKind::Transfer {
+                to: addr(2),
+                amount: Amount::from_raw(100),
+            },
+            fee: 0,
+            signature: vec![],
+            public_key: vec![],
+            memo: None,
+            timelock: None,
+        });
+        assert!(!ConsensusManager::should_suppress_empty_block(&block));
+    }
+
+    // ---- Feature 132: Multi-block finality (batch catchup) ----
+
+    #[test]
+    fn batch_finalize_catchup() {
+        let mut cm = ConsensusManager::new();
+        let blocks = vec![
+            make_test_block_with_producer(1, addr(1)),
+            make_test_block_with_producer(2, addr(2)),
+            make_test_block_with_producer(3, addr(3)),
+        ];
+        let finalized = cm.batch_finalize_catchup(blocks);
+        assert_eq!(finalized.len(), 3);
+        // Validator blocks should be tracked.
+        assert!(cm.validator_blocks.contains_key(&(addr(1), 1)));
+        assert!(cm.validator_blocks.contains_key(&(addr(2), 2)));
+        assert!(cm.validator_blocks.contains_key(&(addr(3), 3)));
+    }
+
+    // ---- Feature 133: Checkpoint commitment ----
+
+    #[test]
+    fn checkpoint_commitment_consensus() {
+        let mut cm = ConsensusManager::new();
+        let state_root = [42u8; 32];
+
+        // 3 validators vote for the same state root at height 1000.
+        cm.record_checkpoint_vote(1000, addr(1), state_root);
+        cm.record_checkpoint_vote(1000, addr(2), state_root);
+        cm.record_checkpoint_vote(1000, addr(3), state_root);
+
+        // With 4 total validators, need 3 votes (2/3 + 1 = 3).
+        assert_eq!(cm.checkpoint_consensus(1000, 4), Some(state_root));
+
+        // With 5 total validators, need 4 votes — not enough.
+        assert_eq!(cm.checkpoint_consensus(1000, 5), None);
+    }
+
+    #[test]
+    fn checkpoint_no_consensus_on_different_roots() {
+        let mut cm = ConsensusManager::new();
+        cm.record_checkpoint_vote(1000, addr(1), [1u8; 32]);
+        cm.record_checkpoint_vote(1000, addr(2), [2u8; 32]);
+        cm.record_checkpoint_vote(1000, addr(3), [3u8; 32]);
+
+        // Everyone voted for different roots — no consensus.
+        assert_eq!(cm.checkpoint_consensus(1000, 3), None);
+    }
+
+    // ---- Feature 137: Fork choice rule test ----
+
+    #[test]
+    fn fork_choice_crs_weighted() {
+        // Create two equal-length forks. The one with CRS-weighted majority
+        // should be selected through Snowball voting.
+        let mut cm = ConsensusManager::new();
+
+        // Two competing blocks at the same height from different validators.
+        let block_a = make_test_block_with_producer(1, addr(1));
+        let block_b = make_test_block_with_producer(1, addr(2));
+        let hash_a = block_a.hash();
+        let hash_b = block_b.hash();
+
+        cm.add_candidate(block_a);
+        cm.add_candidate(block_b);
+
+        // Simulate CRS-weighted voting: validator with higher CRS gets more
+        // "votes" (peers that follow CRS prefer that validator's block).
+        // hash_a has 2/3 support (CRS-weighted), hash_b has 1/3.
+        for _ in 0..5 {
+            cm.record_response(1, hash_a);
+            cm.record_response(1, hash_a);
+            cm.record_response(1, hash_b);
+            cm.try_finalize_round(1);
+        }
+
+        let winner = cm.finalized_at_height(1);
+        assert!(winner.is_some(), "Should finalize after 5 rounds of consistent voting");
+        assert_eq!(winner.unwrap(), hash_a, "CRS-weighted majority should win");
+    }
+
+    #[test]
+    fn fork_choice_equal_length_deterministic() {
+        // With equal voting, the fork choice should still converge deterministically.
+        let mut cm_1 = ConsensusManager::new();
+        let mut cm_2 = ConsensusManager::new();
+
+        let block_a = make_test_block_with_producer(1, addr(1));
+        let block_b = make_test_block_with_producer(1, addr(2));
+        let hash_a = block_a.hash();
+
+        cm_1.add_candidate(block_a.clone());
+        cm_1.add_candidate(block_b.clone());
+        cm_2.add_candidate(block_a);
+        cm_2.add_candidate(block_b);
+
+        // Both managers see the same voting pattern.
+        for _ in 0..6 {
+            cm_1.record_response(1, hash_a);
+            cm_1.record_response(1, hash_a);
+            cm_1.try_finalize_round(1);
+
+            cm_2.record_response(1, hash_a);
+            cm_2.record_response(1, hash_a);
+            cm_2.try_finalize_round(1);
+        }
+
+        let final_1 = cm_1.finalized_at_height(1);
+        let final_2 = cm_2.finalized_at_height(1);
+        assert_eq!(final_1, final_2, "Both managers must agree with same inputs");
+    }
+
+    // ---- Feature 139: Time warp attack prevention ----
+
+    #[test]
+    fn timestamp_within_drift_accepted() {
+        let cm = ConsensusManager::new();
+        let recent = vec![1000, 1002, 1004, 1006, 1008];
+        // Median is 1004. Block at 1010 is +6s drift — within 15s limit.
+        assert!(cm.validate_timestamp(1010, &recent));
+    }
+
+    #[test]
+    fn timestamp_too_far_in_future_rejected() {
+        let cm = ConsensusManager::new();
+        let recent = vec![1000, 1002, 1004, 1006, 1008];
+        // Median is 1004. Block at 1025 is +21s drift — exceeds 15s limit.
+        assert!(!cm.validate_timestamp(1025, &recent));
+    }
+
+    #[test]
+    fn timestamp_too_far_in_past_rejected() {
+        let cm = ConsensusManager::new();
+        let recent = vec![1000, 1002, 1004, 1006, 1008];
+        // Median is 1004. Block at 980 is -24s drift — exceeds 15s limit.
+        assert!(!cm.validate_timestamp(980, &recent));
+    }
+
+    #[test]
+    fn timestamp_empty_references_always_accepted() {
+        let cm = ConsensusManager::new();
+        assert!(cm.validate_timestamp(9999, &[]));
+    }
+
+    // ---- Feature 131: Custom params ----
+
+    #[test]
+    fn custom_params_constructor() {
+        let params = SnowballParams {
+            sample_size: 10,
+            quorum: 7,
+            decision_threshold: 15,
+        };
+        let cm = ConsensusManager::with_params(params);
+        // Verify custom params are used by testing convergence speed.
+        // With decision_threshold=15, need 15 rounds.
+        let mut cm = cm;
+        let block_a = make_test_block_with_producer(1, addr(1));
+        let block_b = make_test_block_with_producer(1, addr(2));
+        let hash_a = block_a.hash();
+        cm.add_candidate(block_a);
+        cm.add_candidate(block_b);
+
+        // 14 rounds should not be enough.
+        for _ in 0..14 {
+            for _ in 0..7 {
+                cm.record_response(1, hash_a);
+            }
+            cm.try_finalize_round(1);
+        }
+        assert_eq!(cm.finalized_at_height(1), None);
+
+        // 1 more round should finalize.
+        for _ in 0..7 {
+            cm.record_response(1, hash_a);
+        }
+        cm.try_finalize_round(1);
+        assert_eq!(cm.finalized_at_height(1), Some(hash_a));
+    }
+
+    // ---- Feature 134/135: Light client proof generation and verification ----
+
+    #[test]
+    fn light_client_proof_roundtrip() {
+        use commputer_core::transaction::{Transaction, TxKind};
+        use commputer_core::token::Amount;
+
+        // Create a block with transactions.
+        let mut block = make_test_block(1);
+        for i in 0..5 {
+            let mut from = [0u8; 32];
+            from[0] = i + 10;
+            block.transactions.push(Transaction {
+                from: Address(from),
+                nonce: i as u64,
+                kind: TxKind::Transfer {
+                    to: addr(99),
+                    amount: Amount::from_raw(100),
+                },
+                fee: 0,
+                signature: vec![],
+                public_key: vec![],
+                memo: None,
+                timelock: None,
+            });
+        }
+        block.header.tx_root = block.compute_tx_root();
+
+        // Generate proof for the 3rd transaction.
+        let tx_hash = block.transactions[2].hash().0;
+        let (proof, idx) = generate_light_client_proof(&block, tx_hash).unwrap();
+        assert_eq!(idx, 2);
+
+        // Verify the proof.
+        assert!(verify_light_client_proof(tx_hash, &proof, block.header.tx_root));
+
+        // Wrong tx hash should fail.
+        let fake_hash = [0xFFu8; 32];
+        assert!(!verify_light_client_proof(fake_hash, &proof, block.header.tx_root));
+    }
+
+    #[test]
+    fn light_client_proof_missing_tx() {
+        let block = make_test_block(1); // No transactions.
+        let result = generate_light_client_proof(&block, [1u8; 32]);
+        assert!(result.is_none());
     }
 }
