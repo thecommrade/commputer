@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Transaction confirmation waiting module.
 //!
 //! Polls a node's RPC endpoint to wait for a transaction to reach

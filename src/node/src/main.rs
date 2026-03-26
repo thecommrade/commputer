@@ -4,6 +4,7 @@ mod compute_dashboard;
 mod compute_cli;
 mod compute_handler;
 mod compute_session;
+mod config;
 mod consensus_manager;
 mod event_loop;
 mod job_cancel;
@@ -61,8 +62,12 @@ struct Cli {
 enum Commands {
     /// Run the Commputer node
     Run {
+        /// Run in testnet mode (default: true, use --mainnet for mainnet)
         #[arg(long, default_value = "true")]
         testnet: bool,
+        /// Run in mainnet mode (overrides --testnet)
+        #[arg(long, default_value = "false")]
+        mainnet: bool,
         #[arg(long, default_value = "info")]
         log_level: String,
         #[arg(long, default_value = "9000")]
@@ -70,6 +75,9 @@ enum Commands {
         /// Port for the JSON RPC server (transaction submission, status queries)
         #[arg(long, default_value = "9944")]
         rpc_port: u16,
+        /// Bind address for the RPC server (0.0.0.0 for remote access)
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_bind: String,
         /// Feature 24: RPC API key for authentication
         #[arg(long)]
         rpc_key: Option<String>,
@@ -101,6 +109,17 @@ enum Commands {
         #[arg(long, default_value = "*")]
         cors_origins: String,
     },
+    /// Alias for 'run --testnet' — start mining immediately
+    Mine {
+        #[arg(long, default_value = "9000")]
+        port: u16,
+        #[arg(long, default_value = "9944")]
+        rpc_port: u16,
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Check for updates and install the latest version
+    Update,
     /// Wallet management
     Wallet {
         #[command(subcommand)]
@@ -281,20 +300,14 @@ enum AddressAction {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Item 8: Data directory — ~/.commputer/testnet/ or ~/.commputer/mainnet/.
 fn data_dir(testnet: bool) -> PathBuf {
-    if testnet {
-        PathBuf::from("./commputer-testnet")
-    } else {
-        PathBuf::from("./commputer-data")
-    }
+    config::data_dir(testnet)
 }
 
-/// Item 4: Wallet directory is separate from chain data — lives in ~/.commputer/wallet/.
+/// Item 9: Wallet directory — ~/.commputer/wallet/ (survives data wipes).
 fn wallet_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".commputer")
-        .join("wallet")
+    config::wallet_dir()
 }
 
 fn wallet_path(testnet: bool) -> PathBuf {
@@ -316,10 +329,7 @@ fn wallet_path_named(testnet: bool, name: &str) -> PathBuf {
 
 /// Item 3: Path for the persistent libp2p peer identity keypair.
 fn peer_key_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".commputer")
-        .join("peer_key.bin")
+    config::peer_key_path()
 }
 
 fn read_password(prompt: &str) -> String {
@@ -404,8 +414,8 @@ fn print_banner() {
     println!("  ║      $COMME · 2B supply · burn-heavy         ║");
     println!("  ║      Scale hurts. Patience rewards.          ║");
     println!("  ╚═══════════════════════════════════════════════╝");
-    // Item 49: Show version and git commit hash in startup banner.
-    println!("  Version: {} (git: {})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
+    println!("  Version: {} (git: {}) built {}", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"), env!("BUILD_DATE"));
+    println!("  Chain:   {}", config::DEFAULT_TESTNET_CHAIN_ID);
     println!();
 }
 
@@ -550,10 +560,24 @@ fn cmd_wallet_show(testnet: bool) -> Result<()> {
     println!("  Full:      {}", hex::encode(addr.0));
 
     if let Some(account) = state.accounts.get(addr) {
-        println!("  Balance:   {}", account.balance);
-        println!("  Tier:      {:?}", account.tier());
-        println!("  Nonce:     {}", account.nonce);
-        println!("  Validator: {}", if account.is_validator { "yes" } else { "no" });
+        // Item 59: Human-readable amounts like "1.5 COMME"
+        let whole = account.balance.raw() / UNITS_PER_COMME;
+        let frac = account.balance.raw() % UNITS_PER_COMME;
+        let mined_whole = account.total_mined.raw() / UNITS_PER_COMME;
+        let mined_frac = account.total_mined.raw() % UNITS_PER_COMME;
+        if frac > 0 {
+            println!("  Balance:     {}.{:08} COMME", whole, frac);
+        } else {
+            println!("  Balance:     {} COMME", whole);
+        }
+        println!("  Tier:        {:?}", account.tier());
+        println!("  Nonce:       {}", account.nonce);
+        println!("  Validator:   {}", if account.is_validator { "yes" } else { "no" });
+        if mined_frac > 0 {
+            println!("  Total Mined: {}.{:08} COMME", mined_whole, mined_frac);
+        } else {
+            println!("  Total Mined: {} COMME", mined_whole);
+        }
     } else {
         println!("  Balance:   0 COMME");
         println!("  Tier:      None");
@@ -816,6 +840,7 @@ async fn run_node(
     log_level: String,
     port: u16,
     rpc_port: u16,
+    rpc_bind: String,
     contribution_percent: u8,
     relay: bool,
     seeds: Vec<String>,
@@ -837,6 +862,12 @@ async fn run_node(
             .with_env_filter(env_filter)
             .init();
     }
+
+    // Item 8: Auto-create ~/.commputer/ directory structure on first run.
+    config::ensure_dirs(testnet);
+
+    // Item 6: Load config from ~/.commputer/config.toml (CLI flags override).
+    let _node_config = config::NodeConfig::load();
 
     print_banner();
 
@@ -905,6 +936,7 @@ async fn run_node(
     }
 
     // Load or create wallet. Feature 244: support --password flag for non-interactive decrypt.
+    // Item 10: First-run experience — auto-create wallet, display seed phrase, wait for confirm.
     let wallet_file = wallet_path(testnet);
     let wallet = if wallet_file.exists() {
         let pw = if let Some(ref pw) = password {
@@ -915,19 +947,71 @@ async fn run_node(
         Keystore::load(&wallet_file, &pw)
             .map_err(|e| anyhow::anyhow!("{}", e))?
     } else {
-        info!("No wallet found — generating ephemeral wallet for this session.");
-        Wallet::generate()
+        // First run — create wallet automatically
+        println!();
+        println!("  ┌─────────────────────────────────────────────┐");
+        println!("  │         FIRST RUN — WALLET CREATION          │");
+        println!("  └─────────────────────────────────────────────┘");
+        println!();
+
+        let wallet = Wallet::generate();
+        let phrase = wallet.seed_phrase();
+
+        println!("  Your new wallet address:");
+        println!("    {}", hex::encode(wallet.address().0));
+        println!();
+        println!("  Your seed phrase (WRITE THIS DOWN):");
+        println!();
+        for (i, word) in phrase.split_whitespace().enumerate() {
+            println!("    {:>2}. {}", i + 1, word);
+        }
+        println!();
+        println!("  ⚠  This is the ONLY way to recover your wallet.");
+        println!("  ⚠  Store it securely. Never share it with anyone.");
+        println!();
+
+        // Set a password and save
+        let pw = if let Some(ref pw) = password {
+            pw.clone()
+        } else {
+            let pw = read_password("Set a wallet password: ");
+            if pw.is_empty() {
+                anyhow::bail!("Password cannot be empty.");
+            }
+            let confirm = read_password("Confirm password: ");
+            if pw != confirm {
+                anyhow::bail!("Passwords do not match.");
+            }
+            pw
+        };
+
+        if let Some(parent) = wallet_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Keystore::save(&wallet, &wallet_file, &pw)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        println!("  Wallet saved to: {}", wallet_file.display());
+        println!();
+
+        // Wait for user confirmation before starting
+        if password.is_none() {
+            read_line("Press ENTER to start the node...");
+        }
+
+        wallet
     };
-    info!("Wallet address: {}", wallet.address());
+    // Item 66: Clean, professional startup banner with key info.
+    info!("Wallet:       {}", hex::encode(wallet.address().0));
+    info!("Chain ID:     {}", config::DEFAULT_TESTNET_CHAIN_ID);
+    info!("Seeds:        {:?}", if seeds.is_empty() { config::DEFAULT_TESTNET_SEEDS.iter().map(|s| s.to_string()).collect::<Vec<_>>() } else { seeds.clone() });
+    info!("Contribution: {}%", contribution_percent);
+    info!("Data dir:     {}", dir.display());
+    info!("Wallet file:  {}", wallet_file.display());
 
     // Detect hardware fingerprint.
     let hardware = commputer_core::identity::HardwareFingerprint::detect();
-    info!("Hardware detected:");
-    info!("  CPU:     {} ({} cores)", hardware.cpu_model, hardware.cpu_cores);
-    info!("  RAM:     {} MB", hardware.ram_total_mb);
-    info!("  Storage: {} MB", hardware.storage_total_mb);
-    info!("  GPU:     {}", hardware.gpu_model.as_deref().unwrap_or("none"));
-    info!("  OS:      {}", hardware.os_family);
+    info!("Hardware: {} ({} cores), {} MB RAM", hardware.cpu_model, hardware.cpu_cores, hardware.ram_total_mb);
 
     // Set up network with persistent peer identity (Item 3).
     let peer_key = peer_key_path();
@@ -1013,6 +1097,7 @@ async fn run_node(
         rate_limits: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         validator_performance: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         cors_origins: cors_origins.clone(),
+        start_time: std::time::Instant::now(),
         traffic_stats: tokio::sync::Mutex::new(serde_json::json!({})),
         proof_history: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         proof_leaderboard: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1030,9 +1115,50 @@ async fn run_node(
     event_loop.custom_seeds = seeds;
 
     // Spawn RPC server in the background.
-    tokio::spawn(rpc::start_rpc_server(rpc_port, rpc_state));
+    // Item 26: RPC binds to rpc_bind address (0.0.0.0 for remote access).
+    tokio::spawn(rpc::start_rpc_server(rpc_port, rpc_bind, rpc_state));
 
     event_loop.run().await;
+
+    Ok(())
+}
+
+/// Item 19: Update command — check for new version and replace binary.
+async fn cmd_update() -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("Current version: {}", current);
+    println!("Checking for updates...");
+
+    let client = reqwest::Client::new();
+    let url = "https://api.github.com/repos/thecommrade/commputer/releases/latest";
+    let resp = client.get(url)
+        .header("User-Agent", "commputer-updater")
+        .send().await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r.json().await?;
+            let latest = body["tag_name"].as_str().unwrap_or("unknown");
+            let latest_clean = latest.trim_start_matches('v');
+
+            if latest_clean == current {
+                println!("You are already running the latest version.");
+            } else {
+                println!("New version available: {} (you have {})", latest, current);
+                println!();
+                println!("To update, run:");
+                println!("  curl -sSf https://commputer.xyz/install.sh | sh");
+            }
+        }
+        Ok(r) => {
+            println!("Could not check for updates (HTTP {})", r.status());
+            println!("Check https://github.com/thecommrade/commputer/releases manually.");
+        }
+        Err(e) => {
+            println!("Could not reach update server: {}", e);
+            println!("Check https://github.com/thecommrade/commputer/releases manually.");
+        }
+    }
 
     Ok(())
 }
@@ -1068,8 +1194,16 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds, password, wallet: _, dashboard: _, rpc_key: _, json_log, cors_origins } => {
-            run_node(testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds, password, json_log, cors_origins).await?;
+        Commands::Run { testnet, mainnet, log_level, port, rpc_port, rpc_bind, contribution_percent, relay, seeds, dns_seeds, password, wallet: _, dashboard: _, rpc_key: _, json_log, cors_origins } => {
+            // --mainnet overrides --testnet
+            let is_testnet = if mainnet { false } else { testnet };
+            run_node(is_testnet, log_level, port, rpc_port, rpc_bind, contribution_percent, relay, seeds, dns_seeds, password, json_log, cors_origins).await?;
+        }
+        Commands::Mine { port, rpc_port, password } => {
+            run_node(true, "info".to_string(), port, rpc_port, "127.0.0.1".to_string(), 100, false, vec![], vec![], password, false, "*".to_string()).await?;
+        }
+        Commands::Update => {
+            cmd_update().await?;
         }
         Commands::Wallet { action } => match action {
             WalletAction::Create { testnet } => cmd_wallet_create(testnet)?,
@@ -1078,9 +1212,10 @@ async fn main() -> Result<()> {
             WalletAction::Export { testnet } => cmd_wallet_export(testnet)?,
         },
         Commands::Version => {
-            println!("commputer {}", env!("CARGO_PKG_VERSION"));
+            println!("commputer {} (git: {})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
+            println!("  Built:     {}", env!("BUILD_DATE"));
             println!("  Protocol:  /commputer/0.1.0");
-            println!("  Network:   testnet");
+            println!("  Chain ID:  {}", config::DEFAULT_TESTNET_CHAIN_ID);
             println!("  Supply:    2,000,000,000 COMME");
             println!("  Consensus: Snowball (sample=3, quorum=2, threshold=5)");
         }

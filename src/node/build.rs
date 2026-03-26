@@ -1,4 +1,4 @@
-/// Item 49: Capture git commit hash at compile time.
+/// Capture git commit hash and build date at compile time.
 fn main() {
     // Get the current git commit hash.
     let output = std::process::Command::new("git")
@@ -13,6 +13,10 @@ fn main() {
     };
 
     println!("cargo:rustc-env=GIT_HASH={}", git_hash);
+
+    // Item 18: Build date for --version output.
+    let now = chrono::Utc::now();
+    println!("cargo:rustc-env=BUILD_DATE={}", now.format("%Y-%m-%d"));
 
     // Re-run if the git HEAD changes.
     println!("cargo:rerun-if-changed=../.git/HEAD");

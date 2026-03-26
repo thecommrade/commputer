@@ -19,6 +19,11 @@
 
 html {
     scroll-behavior: smooth;
+    overflow-x: hidden;
+}
+
+body {
+    overflow-x: hidden;
 }
 
 body {
@@ -602,6 +607,25 @@ footer {
     .explorer-search {
         flex-direction: column;
     }
+
+    .code-block {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .code-block code {
+        white-space: pre-wrap;
+        word-break: break-all;
+        font-size: 11px;
+    }
+
+    .steps .step {
+        padding-left: 16px;
+    }
+
+    section {
+        padding: 48px 16px;
+    }
 }
 
 @media (max-width: 480px) {
@@ -612,4 +636,60 @@ footer {
     .hero-text h1 {
         font-size: 28px;
     }
+}
+
+/* Item 48: Loading skeleton animation */
+.loading {
+    background: linear-gradient(90deg, var(--bg-card) 25%, var(--bg-hover) 50%, var(--bg-card) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    color: transparent !important;
+    border-radius: 4px;
+    min-width: 60px;
+    display: inline-block;
+}
+
+@keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+/* Block explorer table */
+.block-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+}
+
+.block-table th {
+    text-align: left;
+    padding: 8px 12px;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    font-weight: 500;
+}
+
+.block-table td {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+}
+
+.block-table tr:hover td {
+    background: var(--bg-hover);
+}
+
+.block-table a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.block-table a:hover {
+    text-decoration: underline;
+}
+
+.mono {
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    color: var(--text-dim);
 }

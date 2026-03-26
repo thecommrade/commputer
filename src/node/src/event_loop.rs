@@ -60,6 +60,7 @@ impl Default for PeerQuality {
     }
 }
 
+#[allow(dead_code)]
 /// Main event loop for a Commputer node. Coordinates network, consensus, proofs, and chain state.
 pub struct EventLoop {
     pub state: ChainState,
@@ -439,8 +440,8 @@ impl EventLoop {
         let mut ping_interval = time::interval(Duration::from_secs(30));
         // Feature 172: Partition check every 10s.
         let mut partition_check_interval = time::interval(Duration::from_secs(10));
-        // Feature 178: Seed reconnection every 5 minutes.
-        let mut seed_reconnect_interval = time::interval(Duration::from_secs(300));
+        // Feature 178: Seed reconnection every 30 seconds when disconnected.
+        let mut seed_reconnect_interval = time::interval(Duration::from_secs(30));
         // Feature 11: Automatic peer rotation every 5 minutes.
         let mut peer_rotation_interval = time::interval(Duration::from_secs(300));
         // Item 22: Job timeout enforcement every 30s.
@@ -458,6 +459,9 @@ impl EventLoop {
         // This runs once at startup after peers connect.
         let mut sync_requested = false;
         let mut sync_timer = time::interval(Duration::from_secs(5));
+
+        // Item 73: Periodic status line every 60 seconds.
+        let mut status_line_interval = time::interval(Duration::from_secs(60));
 
         // Set up graceful shutdown signal handler.
         let mut sigterm = match tokio::signal::unix::signal(
@@ -541,6 +545,19 @@ impl EventLoop {
                             hex::encode(&executor.0[..8]),
                         );
                     }
+                }
+                _ = status_line_interval.tick() => {
+                    // Item 73: Periodic one-line status summary.
+                    let height = self.state.blocks.height();
+                    let peers = self.peer_ips.len();
+                    let epoch = self.state.current_epoch;
+                    let balance = self.state.accounts.get(self.wallet.address())
+                        .map(|a| a.balance.raw() / UNITS_PER_COMME)
+                        .unwrap_or(0);
+                    info!(
+                        "Height: {} | Peers: {} | Balance: {} COMME | Epoch: {}",
+                        height, peers, balance, epoch
+                    );
                 }
                 _ = async {
                     if let Some(ref mut sig) = sighup {
@@ -638,13 +655,20 @@ impl EventLoop {
                     Err(e) => warn!("Failed to serialize mempool: {}", e),
                 }
             }
+
+        // Item 69: Clean shutdown message.
+        println!();
+        println!("  Shutting down... state saved. Goodbye.");
+        println!();
     }
 
     /// Feature 20: Maximum signature cache size.
+    #[allow(dead_code)]
     const SIG_CACHE_MAX: usize = 10_000;
 
     /// Feature 20: Verify a transaction signature with caching.
     /// Returns true if the signature is valid (or was previously verified).
+    #[allow(dead_code)]
     pub fn verify_tx_cached(&mut self, tx: &Transaction) -> bool {
         let tx_hash = tx.hash();
         // Check cache first.
@@ -863,6 +887,22 @@ impl EventLoop {
                     info!("First peer connection established — node is now eligible to produce blocks");
                     self.has_ever_connected = true;
                     self.partition_detected = false;
+
+                    // Broadcast any pending ValidatorRegister transactions so the
+                    // seed node learns our identity immediately.
+                    for tx in &self.pending_txs {
+                        if matches!(tx.kind, commputer_core::transaction::TxKind::ValidatorRegister { .. }) {
+                            if let Ok(data) = serde_json::to_vec(tx) {
+                                let compressed = commputer_network::compress(&data);
+                                let topic = topics::tx_topic();
+                                if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed) {
+                                    debug!("Failed to broadcast ValidatorRegister tx on connect: {}", e);
+                                } else {
+                                    info!("Broadcast ValidatorRegister tx to network");
+                                }
+                            }
+                        }
+                    }
                 }
                 // Reject connections from banned peers.
                 if self.banned_peers.contains(&peer_id) {
@@ -1372,8 +1412,10 @@ impl EventLoop {
             && self.state.blocks.height() < timelock {
                 return Err("transaction timelocked");
             }
-        // Minimum fee check.
-        if tx.fee < commputer_core::transaction::MINIMUM_FEE {
+        // Minimum fee check (validator registration is fee-exempt).
+        if tx.fee < commputer_core::transaction::MINIMUM_FEE
+            && !matches!(tx.kind, commputer_core::transaction::TxKind::ValidatorRegister { .. })
+        {
             return Err("fee below minimum");
         }
         // Nonce validation: must match expected next nonce for sender.
@@ -1521,9 +1563,49 @@ impl EventLoop {
         };
         self.epoch_state.record_summary(summary);
 
+        // Create and sign a ValidatorRegister transaction with our wallet address.
+        // This is broadcast to the network so peers can verify our identity.
+        let nonce = self.state.accounts.get(self.wallet.address())
+            .map(|a| a.nonce)
+            .unwrap_or(0);
+        let mut tx = Transaction {
+            from: *self.wallet.address(),
+            nonce,
+            kind: commputer_core::transaction::TxKind::ValidatorRegister {
+                hardware_fingerprint_hash: {
+                    use sha2::{Sha256, Digest};
+                    let hw_bytes = borsh::to_vec(&self.hardware).unwrap_or_default();
+                    let hash = Sha256::digest(&hw_bytes);
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&hash);
+                    out
+                },
+                contribution_percent,
+            },
+            fee: 0, // Registration is fee-exempt
+            signature: vec![],
+            public_key: vec![],
+            memo: None,
+            timelock: None,
+        };
+        commputer_core::signing::sign_transaction(&mut tx, &self.wallet);
+
+        // Broadcast ValidatorRegister tx to the network so peers learn our identity.
+        if let Ok(data) = serde_json::to_vec(&tx) {
+            let compressed = commputer_network::compress(&data);
+            let topic = topics::tx_topic();
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed) {
+                debug!("Failed to broadcast ValidatorRegister tx (will retry on peer connect): {}", e);
+            }
+        }
+
+        // Add to our own mempool so it gets included in the next block we produce.
+        self.pending_txs.push(tx);
+
         info!(
-            "Registered as validator at {}% contribution",
+            "Registered as validator at {}% contribution (address: {})",
             contribution_percent,
+            self.wallet.address(),
         );
     }
 
@@ -1951,7 +2033,8 @@ impl EventLoop {
         }
 
         // Enter our own block as a candidate and start the vote.
-        self.consensus.add_candidate(block);
+        // Use add_local_candidate to avoid false equivocation detection on retries.
+        self.consensus.add_local_candidate(block);
 
         // Attempt finalization (handles single-candidate fast-path).
         self.consensus.try_finalize_round(next_height);
@@ -2282,23 +2365,28 @@ impl EventLoop {
         }
     }
 
-    /// Feature 178: Reconnect to any disconnected seed nodes.
+    /// Feature 178: Reconnect to seed nodes when we have no peers.
     fn reconnect_seeds(&mut self) {
         if self.custom_seeds.is_empty() {
             return;
         }
+        // Only attempt reconnection when we have zero peers.
+        let peer_count = self.network.swarm.connected_peers().count();
+        if peer_count > 0 {
+            return;
+        }
+        info!("No peers connected — attempting seed reconnection");
         let seeds = self.custom_seeds.clone();
         let mut reconnected = 0;
         for addr_str in &seeds {
             if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
-                // Only reconnect if we don't already have this peer.
                 if let Ok(()) = self.network.dial(addr) {
                     reconnected += 1;
                 }
             }
         }
         if reconnected > 0 {
-            debug!("Reconnected to {} seed nodes", reconnected);
+            info!("Dialed {} seed nodes for reconnection", reconnected);
         }
     }
 
@@ -2386,6 +2474,7 @@ fn is_private_ip(ip: &str) -> bool {
 // ── Mainnet readiness: Additional features ──
 
 /// Feature 15: Validator performance history.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ValidatorPerformance {
     pub blocks_produced: u64,
@@ -2395,10 +2484,12 @@ pub struct ValidatorPerformance {
 }
 
 /// Feature 9: Validator registration cooldown height.
+#[allow(dead_code)]
 pub const VALIDATOR_COOLDOWN_BLOCKS: u64 = 10;
 
 /// Feature 16: Network bootstrap — on first start, request state snapshot.
 /// Falls back to block-by-block sync (already implemented via sync protocol).
+#[allow(dead_code)]
 pub fn bootstrap_note() {
     tracing::info!("Feature 16: Network bootstrap optimization — requesting state snapshot from peers");
     tracing::info!("Falling back to block-by-block sync if snapshot unavailable");
@@ -2406,6 +2497,7 @@ pub fn bootstrap_note() {
 
 /// Feature 20: Config hot reload placeholder — log level can be changed via SIGHUP.
 /// Full implementation requires tracing_subscriber::reload which needs the reload layer.
+#[allow(dead_code)]
 pub fn config_reload_note() {
     tracing::info!("Feature 20: Config hot reload — send SIGHUP to reload log level");
 }

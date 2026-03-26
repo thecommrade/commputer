@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Item 109: Parallel block download during initial sync.
 //!
 //! Requests blocks from multiple peers simultaneously to speed up

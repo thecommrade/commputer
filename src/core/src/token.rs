@@ -9,6 +9,44 @@ pub const UNITS_PER_COMME: u64 = 100_000_000;
 /// Total fixed supply: 2 billion $COMME in raw units.
 pub const TOTAL_SUPPLY: u64 = 2_000_000_000 * UNITS_PER_COMME;
 
+/// 51% of network compute is reserved for communal products (storage, communication, AI,
+/// Humanities Archive). Also serves as emergency safeguard for user data protection.
+/// This constant is enforced in the compute job routing system.
+pub const FLAGSHIP_COMPUTE_SHARE: u64 = 51;
+
+/// 49% of network compute is available for holder burst compute jobs.
+/// Split equally among qualifying holders per tier. No whale advantages.
+pub const HOLDER_COMPUTE_SHARE: u64 = 49;
+
+/// Dynamic network reserve — NOT part of the 51/49 split, subtracted before.
+/// Formula: reserve_pct = RESERVE_MIN + (RESERVE_RANGE × churn_rate)
+/// where churn_rate = (validators_joined + validators_left) / total_validators in last epoch.
+/// Purpose: absorb sudden capacity changes without disrupting active products.
+/// More volatile = more reserve. Stable = less reserve.
+pub const RESERVE_MIN_PERCENT: u64 = 5;
+pub const RESERVE_MAX_PERCENT: u64 = 15;
+pub const RESERVE_RANGE_PERCENT: u64 = 10; // RESERVE_MAX - RESERVE_MIN
+
+/// Calculate dynamic reserve percentage based on validator churn rate (0.0 to 1.0).
+pub fn dynamic_reserve_percent(churn_rate: f64) -> u64 {
+    let churn_clamped = churn_rate.min(1.0).max(0.0);
+    let reserve = RESERVE_MIN_PERCENT as f64 + (RESERVE_RANGE_PERCENT as f64 * churn_clamped);
+    (reserve.round() as u64).min(RESERVE_MAX_PERCENT)
+}
+
+/// Diversity bonus multipliers based on number of active proof channels.
+/// A well-rounded desktop contributing across all 5 channels earns a small bonus.
+/// The bonus is intentionally modest — 5% max — so that missing a channel
+/// (e.g., no GPU) doesn't feel like punishment.
+pub const DIVERSITY_MULTIPLIER: [u64; 6] = [
+    100, // 0 channels: 1.00x (shouldn't happen)
+    100, // 1 channel:  1.00x
+    101, // 2 channels: 1.01x
+    102, // 3 channels: 1.02x
+    103, // 4 channels: 1.03x
+    105, // 5 channels: 1.05x
+]; // Values are percentages: divide by 100 to get multiplier
+
 /// Token amount in smallest units. All arithmetic is done in these units
 /// to avoid floating point. 1 $COMME = 10^8 units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,

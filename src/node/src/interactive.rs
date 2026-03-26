@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Interactive transaction builder module.
 //!
 //! Provides a step-by-step CLI workflow for constructing, signing,

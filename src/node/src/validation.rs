@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use commputer_core::transaction::Transaction;
 use rayon::prelude::*;
 

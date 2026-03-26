@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Wallet balance watching module.
 //!
 //! Polls a node's RPC endpoint to monitor balance changes for a given address.

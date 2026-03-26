@@ -1,0 +1,33 @@
+# Commputer Node Configuration
+# Place this file at ~/.commputer/config.toml to override defaults.
+
+# Network mode: "testnet" or "mainnet"
+network = "testnet"
+
+# Chain ID for this network
+chain_id = "commputer-testnet-1"
+
+# Seed nodes to connect to on startup
+# These are the default testnet seed nodes
+seeds = ["198.51.100.254:9000"]
+
+# P2P listening port
+port = 9000
+
+# RPC server port
+rpc_port = 9944
+
+# RPC bind address (127.0.0.1 for local only, 0.0.0.0 for remote access)
+rpc_bind = "127.0.0.1"
+
+# Epoch duration in seconds (60 for testnet, 3600 for mainnet)
+epoch_duration = 60
+
+# Percentage of hardware resources to contribute (1-100)
+contribution_percent = 100
+
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+
+# CORS allowed origins for RPC (comma-separated, or "*" for all)
+cors_origins = "*"

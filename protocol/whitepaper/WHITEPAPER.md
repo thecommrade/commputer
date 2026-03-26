@@ -22,7 +22,7 @@ Meanwhile, billions of computers sit mostly idle. The average desktop uses a fra
 
 ## 2. The Solution
 
-Commputer builds a supercomputer from those idle resources. Anyone with a computer can contribute a portion of their machine — as little as 2% — and earn $COMME. The protocol verifies contributions across five dimensions (CPU, GPU, storage, RAM, bandwidth) and rewards them proportionally.
+Commputer builds a supercomputer from those idle resources. Anyone with a computer can contribute a portion of their machine — as little as 1% — and earn $COMME. The protocol verifies contributions across five dimensions (CPU, GPU, storage, RAM, bandwidth) and rewards them proportionally.
 
 The result is a communal computer that belongs to its participants. Not a company. Not a foundation. The network.
 
@@ -37,6 +37,8 @@ Three rules are enshrined in this whitepaper and will never change:
 2. **The remaining 49% is split equally among qualifying holders per tier.** Pure equal division. No whale advantages.
 
 3. **The free path never closes.** Contribute a full desktop and you have full access without owning a single coin. Always.
+
+4. **A dynamic reserve of network resources is held back at all times.** This is not part of the 51/49 split — it is subtracted before the split. The reserve absorbs sudden capacity changes when validators join or leave, preventing disruption to active products and user sessions. The formula: `Reserve % = 5% + (10% × churn_rate)` where churn_rate is the fraction of validators that joined or left in the last epoch. Minimum 5%, maximum 15%. Steady state (~1% churn): ~5% reserve. Rapid growth (50% churn): ~10%. Chaos (100% churn): 15% cap. The network automatically holds more when things are volatile and releases capacity when stable. The 51/49 split applies to whatever remains after the reserve. In an emergency (sudden large-scale validator loss), the 51% product allocation is additionally redeployed to protect user data and maintain network stability. Once capacity recovers, the 51% rebuilds and resumes serving products.
 
 ---
 
@@ -162,15 +164,27 @@ The ideal Commputer validator is a regular person running one desktop at home. T
 
 ### The Gold Standard
 
-The reference node is not defined by fixed hardware specs. It is pegged to what **0.3225 troy ounces (0.3539 oz / 10.03 grams) of gold** would buy you in desktop hardware in 2026, measured at the median exchange rate across all available world currencies.
+The reference node is anchored to what **0.3225 troy ounces (0.3539 oz / 10.03 grams) of gold** would buy you in desktop hardware, measured at the median exchange rate across all available world currencies. Gold is universal, stable across centuries, and independent of any single currency or economy.
+
+**How it works in the protocol:**
+
+The blockchain does not know gold prices or hardware costs. Instead, it uses **benchmark scores.** On first run, every node runs a calibration benchmark across all 5 proof channels — CPU, GPU, storage, RAM, bandwidth. This produces a raw performance score per channel.
+
+The protocol defines a **reference score** per channel — what the gold-standard desktop would achieve on that benchmark. This reference score is the reward ceiling:
+
+- Score at or above the reference: you earn maximum rewards.
+- Score below the reference: you earn proportionally less.
+- Score above the reference: you still earn maximum, not more. The ceiling is the ceiling.
+
+**The yearly update cycle:**
+
+Once per year, the reference scores are updated based on what 10 grams of gold currently buys in desktop hardware. Initially the founder publishes this; later, holders vote on it. The update is transparent: here is the gold price, here is what it buys, here is the benchmark that hardware produces, here are the new reference scores.
 
 This means:
-- The hardware ceiling evolves as technology advances. What 10 grams of gold buys today is different from what it buys in 2035.
-- No one can spend their way into an advantage. The ceiling is tied to a universal, currency-neutral commodity, not to any specific hardware specification.
-- As currencies fluctuate, the median measurement ensures no single economy's inflation or deflation distorts the standard.
-- The protocol publishes the current gold-standard hardware profile transparently. How it is calculated, how it evolves, and what the current ceiling is — all visible, all auditable.
-
-A desktop matching the current gold-standard profile and contributing 100% earns maximum rewards. Anything beyond that earns exponentially less.
+- The ceiling evolves as technology advances. What 10 grams of gold buys in 2026 is different from 2035.
+- No one can spend their way past the ceiling. A $50,000 server earns the same as a $300 desktop that matches the reference.
+- As currencies fluctuate, the gold anchor ensures the standard is currency-neutral.
+- No oracle or price feed is needed. The protocol only knows benchmark scores. The gold-to-hardware conversion happens in the yearly governance decision, not on-chain.
 
 ### Anti-Scale Mechanisms
 
@@ -230,6 +244,8 @@ With 2B supply and the hybrid curve, mining stretches across 65+ years at mass a
 **Inactive Wallets:** Wallets that have been completely inactive for 120 years are considered nonexistent. Their coins are effectively removed from circulating supply.
 
 **Quantum Resistance:** Should computation ever advance to the point where wallets can be breached, the full product becomes free for anyone who contributes at half the level described by the gold standard. The protocol adapts to protect users, not extract from them.
+
+**Post-Mining Era:** Once all coins have been mined and the total supply is fully distributed, the network becomes free to use for everyone who participates — even the smallest contribution. At that point, the coin's value comes entirely from utility and burns, not scarcity of new emission. Contributors keep the network alive because the products it provides are worth contributing to, not because of mining rewards.
 
 ### Demand-Weighted Allocation
 
