@@ -47,6 +47,30 @@ pub const DIVERSITY_MULTIPLIER: [u64; 6] = [
     105, // 5 channels: 1.05x
 ]; // Values are percentages: divide by 100 to get multiplier
 
+/// Reference (gold-standard) benchmark scores per channel.
+/// These represent a median desktop in 2026: the ceiling for reward scoring.
+/// Scoring above these values earns the same reward, not more.
+/// Values are on a 0-100 scale matching EpochProofSummary scores.
+pub const REFERENCE_SCORES: [u32; 5] = [
+    100, // Processing (CPU): reference desktop at 100%
+    100, // GPU: reference desktop at 100%
+    100, // Storage: reference desktop at 100%
+    100, // RAM: reference desktop at 100%
+    100, // Bandwidth: reference desktop at 100%
+];
+
+/// Cost of one reference-node-equivalent for one year of burst compute, in raw COMME units.
+/// Pegged to 0.3225 troy oz / 10.03g of gold at 2026 median currency.
+/// At ~33 COMME/year reference yield, burst compute costs 33 COMME per ref-node-year.
+pub const BURST_COMPUTE_ANNUAL_COST: u64 = 33 * UNITS_PER_COMME;
+
+/// Cap a channel score at the reference (gold-standard) level.
+/// Nodes that benchmark above reference earn the same, not more.
+pub fn cap_at_reference(channel_idx: usize, score: u32) -> u32 {
+    let reference = REFERENCE_SCORES.get(channel_idx).copied().unwrap_or(100);
+    score.min(reference)
+}
+
 /// Token amount in smallest units. All arithmetic is done in these units
 /// to avoid floating point. 1 $COMME = 10^8 units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,

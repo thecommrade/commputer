@@ -61,6 +61,75 @@ pub enum AccessPath {
     EmergencyAccess,
 }
 
+impl AccessPath {
+    /// Resolve effective access given current network state.
+    /// `circulating_supply` is emitted minus burned (in whole COMME).
+    /// `total_emitted` is raw units emitted so far.
+    /// `is_contributing` means the user is actively contributing resources.
+    /// Enforces sub-1M emergency access and post-mining free-for-all.
+    pub fn resolve(
+        balance_whole_comme: u64,
+        contribution_percent: u8,
+        circulating_supply_whole: u64,
+        total_emitted: u64,
+        is_contributing: bool,
+    ) -> Self {
+        // Post-mining era: all coins mined → free for all.
+        if total_emitted >= crate::token::TOTAL_SUPPLY && is_contributing {
+            return AccessPath::EmergencyAccess; // Full access for any contributor
+        }
+
+        // Sub-1M emergency access: any contribution = full access.
+        if circulating_supply_whole < HolderTier::EMERGENCY_SUPPLY_THRESHOLD && is_contributing {
+            return AccessPath::EmergencyAccess;
+        }
+
+        // Normal tier resolution.
+        if contribution_percent >= 100 {
+            return AccessPath::Contributor;
+        }
+        if contribution_percent > 0 {
+            return AccessPath::PartialContributor { contribution_percent };
+        }
+
+        AccessPath::Holder {
+            tier: HolderTier::from_balance(balance_whole_comme),
+        }
+    }
+
+    /// Whether this access path grants full (tier=Full equivalent) access.
+    pub fn has_full_access(&self) -> bool {
+        matches!(
+            self,
+            AccessPath::Contributor
+                | AccessPath::EmergencyAccess
+                | AccessPath::Holder {
+                    tier: HolderTier::Full
+                }
+        )
+    }
+
+    /// Minimum tier this access path grants. Used for tier-checking enforcement.
+    pub fn effective_tier(&self) -> HolderTier {
+        match self {
+            AccessPath::Holder { tier } => *tier,
+            AccessPath::Contributor | AccessPath::EmergencyAccess => HolderTier::Full,
+            AccessPath::PartialContributor {
+                contribution_percent,
+            } => {
+                // Proportional: 50%+ gets Compute, 25%+ gets Storage, any gets Base.
+                if *contribution_percent >= 50 {
+                    HolderTier::Compute
+                } else if *contribution_percent >= 25 {
+                    HolderTier::Storage
+                } else {
+                    HolderTier::Base
+                }
+            }
+        }
+    }
+}
+
 /// Resource allocation for a specific tier.
 /// The 51/49 split: 51% to flagship, 49% divided equally among tier holders.
 #[derive(Debug, Clone)]

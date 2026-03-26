@@ -1775,6 +1775,63 @@ impl EventLoop {
             account.refill_grace(3600);
         }
 
+        // 120-year inactive wallet cleanup: mark wallets inactive if last active > 120 years ago.
+        {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let addrs: Vec<Address> = self.state.accounts.iter()
+                .filter(|a| !a.is_inactive && a.last_active_timestamp > 0)
+                .map(|a| a.address)
+                .collect();
+            let mut marked = 0u64;
+            for addr in addrs {
+                if let Some(acct) = self.state.accounts.get_mut(&addr) {
+                    acct.check_inactive(now_secs);
+                    if acct.is_inactive {
+                        marked += 1;
+                    }
+                }
+            }
+            if marked > 0 {
+                info!("Marked {} wallets as inactive (120+ years)", marked);
+            }
+        }
+
+        // Will function processing: check grace period expiry and emit notifications.
+        {
+            use commputer_storage::account::WillStatus;
+            let _now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let addrs: Vec<Address> = self.state.accounts.iter()
+                .filter(|a| !a.will_contacts.is_empty() && a.will_status == WillStatus::Registered)
+                .map(|a| a.address)
+                .collect();
+            for addr in addrs {
+                if let Some(acct) = self.state.accounts.get_mut(&addr) {
+                    // Check if grace period has fully expired.
+                    if acct.grace_balance_secs == 0 && acct.cumulative_uptime_secs > 0 {
+                        acct.will_status = WillStatus::Pending;
+                        info!("Will triggered for {}: grace period expired, notifying contacts", addr);
+                    }
+                }
+            }
+        }
+
+        // Update capacity RPC data.
+        if let Some(ref rpc_state) = self.rpc_state {
+            let total_cap = validator_count; // Each validator = 1 unit of capacity.
+            let churn = 0.0; // TODO: compute real churn from validators joined/left.
+            let breakdown = commputer_storage::job_pool::JobPool::new()
+                .capacity_breakdown(total_cap, churn);
+            if let Ok(mut cap) = rpc_state.capacity.try_lock() {
+                *cap = breakdown;
+            }
+        }
+
         // Re-register ourselves for the next epoch
         let self_summary = commputer_core::proof::EpochProofSummary {
             validator: *self.wallet.address(),

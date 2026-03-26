@@ -102,6 +102,8 @@ pub struct RpcState {
     pub proof_history: Mutex<HashMap<String, Vec<serde_json::Value>>>,
     /// Item 160: Proof leaderboard data per channel.
     pub proof_leaderboard: Mutex<HashMap<String, Vec<serde_json::Value>>>,
+    /// Capacity breakdown: (total, reserve_pct, flagship_slots, user_slots).
+    pub capacity: Mutex<(u64, u64, u64, u64)>,
 }
 
 /// Response for a submitted transaction.
@@ -1104,6 +1106,21 @@ async fn get_supply(
     }))
 }
 
+/// GET /capacity — network compute capacity breakdown (51/49 split + dynamic reserve).
+async fn get_capacity(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let (total, reserve_pct, flagship, user) = *state.capacity.lock().await;
+    Json(serde_json::json!({
+        "total_capacity": total,
+        "reserve_percent": reserve_pct,
+        "flagship_capacity": flagship,
+        "flagship_share_percent": commputer_core::token::FLAGSHIP_COMPUTE_SHARE,
+        "user_capacity": user,
+        "user_share_percent": commputer_core::token::HOLDER_COMPUTE_SHARE,
+    }))
+}
+
 /// GET /health — enhanced health check with uptime and sync status.
 async fn get_health_enhanced(
     State(state): State<Arc<RpcState>>,
@@ -1148,6 +1165,7 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/blocks", get(get_recent_blocks))
         .route("/account/{address}", get(get_account))
         .route("/supply", get(get_supply))
+        .route("/capacity", get(get_capacity))
         .route("/compliance", get(get_compliance))
         .route("/anti-scale", get(get_anti_scale))
         .route("/network", get(get_network_health))
@@ -1245,6 +1263,7 @@ mod tests {
             traffic_stats: Mutex::new(serde_json::json!({})),
             proof_history: Mutex::new(HashMap::new()),
             proof_leaderboard: Mutex::new(HashMap::new()),
+            capacity: Mutex::new((0, 0, 0, 0)),
         });
         (state, rx)
     }

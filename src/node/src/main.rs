@@ -1101,6 +1101,7 @@ async fn run_node(
         traffic_stats: tokio::sync::Mutex::new(serde_json::json!({})),
         proof_history: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         proof_leaderboard: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        capacity: tokio::sync::Mutex::new((0, 0, 0, 0)),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).

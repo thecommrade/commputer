@@ -6,6 +6,26 @@ use commputer_core::token::Amount;
 use commputer_core::tier::HolderTier;
 use commputer_core::compliance::ComplianceStatus;
 
+/// Will execution status for the storage will function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Default)]
+pub enum WillStatus {
+    /// No will registered.
+    #[default]
+    None,
+    /// Will registered, not yet triggered.
+    Registered,
+    /// Grace period expired, notification events emitted.
+    Pending,
+    /// Will executed (contacts notified, data available for download).
+    Executed,
+}
+
+/// 120 years in seconds — wallets inactive this long are excluded from circulating supply.
+pub const INACTIVE_WALLET_THRESHOLD_SECS: u64 = 120 * 365 * 24 * 3600;
+
+/// 2 years in seconds — burst storage grace period for data retrieval.
+pub const BURST_STORAGE_GRACE_SECS: u64 = 2 * 365 * 24 * 3600;
+
 /// An account on the Commputer network.
 /// Every address that has interacted with the chain has an account.
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -41,6 +61,18 @@ pub struct Account {
     /// Feature 5: Block height at which this validator was registered.
     #[serde(default)]
     pub validator_registered_height: Option<u64>,
+    /// Last active timestamp (unix seconds) for 120-year inactive wallet cleanup.
+    #[serde(default)]
+    pub last_active_timestamp: u64,
+    /// Whether this wallet has been marked as inactive (120+ years no activity).
+    #[serde(default)]
+    pub is_inactive: bool,
+    /// Burst storage purchase timestamp (unix seconds). Starts 2-year grace period.
+    #[serde(default)]
+    pub burst_storage_purchased_at: Option<u64>,
+    /// Will execution status: None, Pending, Executed.
+    #[serde(default)]
+    pub will_status: WillStatus,
 }
 
 fn default_true() -> bool { true }
@@ -63,6 +95,10 @@ impl Account {
             storage_used_bytes: 0,
             is_hot: true,
             validator_registered_height: None,
+            last_active_timestamp: 0,
+            is_inactive: false,
+            burst_storage_purchased_at: None,
+            will_status: WillStatus::None,
         }
     }
 
@@ -116,6 +152,34 @@ impl Account {
     /// Feature 184: Remaining storage quota (can be negative if over-limit).
     pub fn storage_quota_remaining(&self) -> i64 {
         self.storage_tier_allocation() as i64 - self.storage_used_bytes as i64
+    }
+
+    /// Check if this wallet should be marked inactive (120+ years since last activity).
+    pub fn check_inactive(&mut self, current_timestamp: u64) {
+        if self.last_active_timestamp == 0 {
+            return; // Never active — skip (genesis accounts).
+        }
+        if current_timestamp.saturating_sub(self.last_active_timestamp) > INACTIVE_WALLET_THRESHOLD_SECS {
+            self.is_inactive = true;
+        }
+    }
+
+    /// Whether burst storage grace period has expired.
+    pub fn burst_storage_grace_expired(&self, current_timestamp: u64) -> bool {
+        if let Some(purchased_at) = self.burst_storage_purchased_at {
+            current_timestamp.saturating_sub(purchased_at) > BURST_STORAGE_GRACE_SECS
+        } else {
+            false // No burst storage purchased.
+        }
+    }
+
+    /// Whether this account has burst storage within the 2-year grace period.
+    pub fn has_burst_storage_grace(&self, current_timestamp: u64) -> bool {
+        if let Some(purchased_at) = self.burst_storage_purchased_at {
+            current_timestamp.saturating_sub(purchased_at) <= BURST_STORAGE_GRACE_SECS
+        } else {
+            false
+        }
     }
 }
 

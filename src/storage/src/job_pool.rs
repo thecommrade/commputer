@@ -337,6 +337,60 @@ impl JobPool {
     pub fn all_jobs(&self) -> Vec<&PoolJob> {
         self.jobs.values().collect()
     }
+
+    /// Route jobs respecting the 51/49 split and dynamic reserve.
+    /// Returns (flagship_jobs, user_jobs) that can be assigned given capacity constraints.
+    /// `total_capacity` is the total available compute slots.
+    /// `churn_rate` is validator churn for dynamic reserve calculation.
+    pub fn route_jobs_with_capacity(
+        &self,
+        total_capacity: u64,
+        churn_rate: f64,
+    ) -> (Vec<&PoolJob>, Vec<&PoolJob>) {
+        use commputer_core::token::{
+            dynamic_reserve_percent, FLAGSHIP_COMPUTE_SHARE, HOLDER_COMPUTE_SHARE,
+        };
+
+        // Subtract dynamic reserve from total capacity.
+        let reserve_pct = dynamic_reserve_percent(churn_rate);
+        let usable_capacity = total_capacity.saturating_sub(total_capacity * reserve_pct / 100);
+
+        // 51/49 split of usable capacity.
+        let flagship_capacity = usable_capacity * FLAGSHIP_COMPUTE_SHARE / 100;
+        let user_capacity = usable_capacity * HOLDER_COMPUTE_SHARE / 100;
+
+        let flagship_jobs: Vec<&PoolJob> = self
+            .pending_flagship_jobs()
+            .into_iter()
+            .take(flagship_capacity as usize)
+            .collect();
+
+        let user_jobs: Vec<&PoolJob> = self
+            .pending_other_jobs()
+            .into_iter()
+            .take(user_capacity as usize)
+            .collect();
+
+        (flagship_jobs, user_jobs)
+    }
+
+    /// Get current capacity breakdown for RPC reporting.
+    /// Returns (total, reserve_pct, flagship_slots, user_slots).
+    pub fn capacity_breakdown(
+        &self,
+        total_capacity: u64,
+        churn_rate: f64,
+    ) -> (u64, u64, u64, u64) {
+        use commputer_core::token::{
+            dynamic_reserve_percent, FLAGSHIP_COMPUTE_SHARE, HOLDER_COMPUTE_SHARE,
+        };
+
+        let reserve_pct = dynamic_reserve_percent(churn_rate);
+        let usable = total_capacity.saturating_sub(total_capacity * reserve_pct / 100);
+        let flagship = usable * FLAGSHIP_COMPUTE_SHARE / 100;
+        let user = usable * HOLDER_COMPUTE_SHARE / 100;
+        (total_capacity, reserve_pct, flagship, user)
+    }
 }
 
 /// Serializable snapshot of the job pool for persistence.

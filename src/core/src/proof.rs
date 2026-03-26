@@ -118,13 +118,20 @@ impl EpochProofSummary {
     /// The diversity multiplier from token.rs rewards well-rounded nodes
     /// (up to 5% bonus for all 5 channels).
     pub fn composite_score(&self) -> u64 {
-        let channels = [
-            self.processing_score as f64,
-            self.gpu_score as f64,
-            self.storage_score as f64,
-            self.ram_score as f64,
-            self.bandwidth_score as f64,
+        let raw_channels = [
+            self.processing_score,
+            self.gpu_score,
+            self.storage_score,
+            self.ram_score,
+            self.bandwidth_score,
         ];
+
+        // Cap each channel at the gold-standard reference score.
+        let channels: Vec<f64> = raw_channels
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| crate::token::cap_at_reference(i, s) as f64)
+            .collect();
 
         // Sub-linear: R^0.7 per channel. A score of 100 -> 100^0.7 ≈ 25.1
         // This means doubling resources gives less than double the score.
