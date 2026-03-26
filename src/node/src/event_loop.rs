@@ -60,6 +60,7 @@ impl Default for PeerQuality {
     }
 }
 
+#[allow(dead_code)]
 /// Main event loop for a Commputer node. Coordinates network, consensus, proofs, and chain state.
 pub struct EventLoop {
     pub state: ChainState,
@@ -641,10 +642,12 @@ impl EventLoop {
     }
 
     /// Feature 20: Maximum signature cache size.
+    #[allow(dead_code)]
     const SIG_CACHE_MAX: usize = 10_000;
 
     /// Feature 20: Verify a transaction signature with caching.
     /// Returns true if the signature is valid (or was previously verified).
+    #[allow(dead_code)]
     pub fn verify_tx_cached(&mut self, tx: &Transaction) -> bool {
         let tx_hash = tx.hash();
         // Check cache first.
@@ -2386,6 +2389,7 @@ fn is_private_ip(ip: &str) -> bool {
 // ── Mainnet readiness: Additional features ──
 
 /// Feature 15: Validator performance history.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ValidatorPerformance {
     pub blocks_produced: u64,
@@ -2395,10 +2399,12 @@ pub struct ValidatorPerformance {
 }
 
 /// Feature 9: Validator registration cooldown height.
+#[allow(dead_code)]
 pub const VALIDATOR_COOLDOWN_BLOCKS: u64 = 10;
 
 /// Feature 16: Network bootstrap — on first start, request state snapshot.
 /// Falls back to block-by-block sync (already implemented via sync protocol).
+#[allow(dead_code)]
 pub fn bootstrap_note() {
     tracing::info!("Feature 16: Network bootstrap optimization — requesting state snapshot from peers");
     tracing::info!("Falling back to block-by-block sync if snapshot unavailable");
@@ -2406,6 +2412,7 @@ pub fn bootstrap_note() {
 
 /// Feature 20: Config hot reload placeholder — log level can be changed via SIGHUP.
 /// Full implementation requires tracing_subscriber::reload which needs the reload layer.
+#[allow(dead_code)]
 pub fn config_reload_note() {
     tracing::info!("Feature 20: Config hot reload — send SIGHUP to reload log level");
 }

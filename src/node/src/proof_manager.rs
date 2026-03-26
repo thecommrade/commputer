@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use commputer_core::proof::{
     ProofChallenge, ProofResponse, ResourceChannel, EpochProofSummary, ProofVerdict,
 };

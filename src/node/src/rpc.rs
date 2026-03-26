@@ -11,7 +11,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{info, warn};
@@ -994,27 +994,27 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .with_state(rpc_state)
 }
 
-/// Start the RPC server on the given port.
+/// Start the RPC server on the given port and bind address.
 pub async fn start_rpc_server(
     rpc_port: u16,
+    rpc_bind: String,
     rpc_state: Arc<RpcState>,
 ) {
     let security_state = rpc_state.clone();
     let app = build_router(rpc_state)
-        // Item 58: Security headers on all RPC responses.
-        // Item 55: Configurable CORS via RpcState.cors_origins.
         .layer(axum::middleware::from_fn_with_state(security_state, security_headers));
 
-    // Item 57: Already bound to 127.0.0.1 (localhost only) for CORS safety.
-    let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", rpc_port)).await {
+    // Item 26: Bind to configured address (0.0.0.0 for remote, 127.0.0.1 for local).
+    let bind_addr = format!("{}:{}", rpc_bind, rpc_port);
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
         Err(e) => {
-            warn!("Failed to bind RPC server on port {}: {}", rpc_port, e);
+            warn!("Failed to bind RPC server on {}: {}", bind_addr, e);
             return;
         }
     };
 
-    info!("RPC server listening on http://127.0.0.1:{}", rpc_port);
+    info!("RPC server listening on http://{}", bind_addr);
 
     if let Err(e) = axum::serve(listener, app).await {
         warn!("RPC server error: {}", e);

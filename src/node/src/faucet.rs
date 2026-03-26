@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::sync::Mutex;
 use commputer_core::token::{Amount, UNITS_PER_COMME};

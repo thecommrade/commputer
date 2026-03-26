@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Network info CLI module.
 //!
 //! Fetches and displays network information from a running node,

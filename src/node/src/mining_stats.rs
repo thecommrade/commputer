@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Mining statistics CLI module.
 //!
 //! Fetches and displays mining-related metrics from a running node.

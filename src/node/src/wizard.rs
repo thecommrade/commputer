@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! First-run wizard (#42)
 use std::io::{self, BufRead, Write};
 

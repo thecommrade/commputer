@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::HashMap;
 use commputer_core::genesis::GenesisConfig;
 use commputer_core::wallet::Wallet;

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,7 @@ pub const MAX_TIMESTAMP_DRIFT_SECS: u64 = 15;
 pub const VIEW_CHANGE_TIMEOUT_SECS: u64 = 10;
 
 /// Feature 121: View change state — tracks when a view change is triggered.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ViewChange {
     /// The height at which the view change occurred.

@@ -33,6 +33,10 @@ rayon = "1"
 rand.workspace = true
 chrono = { workspace = true }
 dirs = "5"
+toml = "0.8"
+
+[build-dependencies]
+chrono = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
