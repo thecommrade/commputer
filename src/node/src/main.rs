@@ -307,6 +307,7 @@ fn wallet_path(testnet: bool) -> PathBuf {
 }
 
 /// Feature 245: Get the path for a named wallet.
+#[allow(dead_code)]
 fn wallet_path_named(testnet: bool, name: &str) -> PathBuf {
     let dir = wallet_dir();
     let suffix = if testnet { "-testnet" } else { "" };
@@ -322,6 +323,10 @@ fn peer_key_path() -> PathBuf {
 }
 
 fn read_password(prompt: &str) -> String {
+    // Check environment variable first (for systemd/headless operation)
+    if let Ok(pw) = std::env::var("COMMPUTER_WALLET_PASSWORD") {
+        return pw;
+    }
     eprint!("{}", prompt);
     let mut password = String::new();
     if let Err(e) = std::io::stdin().read_line(&mut password) {
@@ -1711,6 +1716,7 @@ struct GenesisConfig {
 }
 
 /// Feature 1: Load genesis config from genesis.json.
+#[allow(dead_code)]
 fn load_genesis_config() -> Option<GenesisConfig> {
     for path_str in &["genesis.json", "../genesis.json"] {
         if let Ok(contents) = std::fs::read_to_string(path_str) {
