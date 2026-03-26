@@ -1,0 +1,27 @@
+# Commputer Seed Node Configuration
+# Place at ~/.commputer/config.toml on the seed node machine.
+
+network = "testnet"
+chain_id = "commputer-testnet-1"
+
+# Seed nodes don't need to connect to other seeds (they ARE the seed)
+seeds = []
+
+# Standard seed node ports
+port = 9000
+rpc_port = 9944
+
+# Bind RPC to all interfaces so remote nodes can query
+rpc_bind = "0.0.0.0"
+
+# Fast epochs for testnet
+epoch_duration = 60
+
+# Full contribution
+contribution_percent = 100
+
+# Info-level logging (structured for journald)
+log_level = "info"
+
+# Allow CORS from the website
+cors_origins = "https://commputer.xyz,https://api.commputer.xyz,*"

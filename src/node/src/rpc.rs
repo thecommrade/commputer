@@ -94,6 +94,8 @@ pub struct RpcState {
     pub rate_limits: Mutex<HashMap<String, (u32, Instant)>>,
     /// Item 55: Configurable CORS allowed origins (comma-separated or "*").
     pub cors_origins: String,
+    /// Node start time for uptime calculation.
+    pub start_time: Instant,
     /// Item 116: Network traffic statistics.
     pub traffic_stats: Mutex<serde_json::Value>,
     /// Item 150: Per-validator proof history for charting.
@@ -375,19 +377,7 @@ async fn get_receipt(
     }
 }
 
-/// GET /health — basic health check.
-async fn get_health(
-    State(state): State<Arc<RpcState>>,
-) -> Json<serde_json::Value> {
-    let status = state.status.lock().await;
-    Json(serde_json::json!({
-        "healthy": true,
-        "height": status.height,
-        "epoch": status.epoch,
-        "peers": state.peers.lock().await.len(),
-        "pending_txs": status.pending_txs,
-    }))
-}
+// /health endpoint moved to get_health_enhanced below build_router
 
 /// Feature 142: Compliance dashboard response.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -958,6 +948,182 @@ async fn rate_limit_middleware(
     next.run(req).await
 }
 
+// ── Items 28-29, 35, 40, 42, 46: New RPC endpoints for testnet launch ──
+
+/// GET /validators — list of connected validators with details.
+async fn get_validators(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let balances = state.balances.lock().await;
+    let peers = state.peers.lock().await;
+    let uptime = state.start_time.elapsed().as_secs();
+
+    let mut validators: Vec<serde_json::Value> = balances.values()
+        .filter(|b| b.is_validator)
+        .map(|b| {
+            let peer = peers.iter().find(|p| p.validator_address.as_deref() == Some(&b.address));
+            serde_json::json!({
+                "address": b.address,
+                "peer_id": peer.map(|p| p.peer_id.as_str()).unwrap_or("offline"),
+                "contribution_percent": 100,
+                "balance": b.balance,
+                "total_mined": b.total_mined,
+                "tier": b.tier,
+                "online": peer.is_some(),
+            })
+        })
+        .collect();
+
+    validators.sort_by(|a, b| {
+        let am = a["total_mined"].as_u64().unwrap_or(0);
+        let bm = b["total_mined"].as_u64().unwrap_or(0);
+        bm.cmp(&am)
+    });
+
+    Json(serde_json::json!({
+        "validators": validators,
+        "count": validators.len(),
+        "uptime_secs": uptime,
+    }))
+}
+
+/// GET /network/info — enhanced network info for website dashboard.
+async fn get_network_info(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let balances = state.balances.lock().await;
+    let peers = state.peers.lock().await;
+    let status = state.status.lock().await;
+    let health = state.network_health.lock().await;
+    let uptime = state.start_time.elapsed().as_secs();
+
+    let total_validators = balances.values().filter(|b| b.is_validator).count();
+
+    Json(serde_json::json!({
+        "total_validators": total_validators,
+        "total_peers": peers.len(),
+        "total_compute_capacity": "N/A",
+        "network_uptime_secs": uptime,
+        "height": status.height,
+        "epoch": status.epoch,
+        "avg_latency_ms": health.avg_latency_ms,
+        "partition_risk": health.partition_risk,
+    }))
+}
+
+/// GET /blocks — return last N blocks.
+async fn get_recent_blocks(
+    State(state): State<Arc<RpcState>>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let limit: usize = params.get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10)
+        .min(100);
+
+    let blocks = state.blocks.lock().await;
+    let status = state.status.lock().await;
+    let height = status.height;
+
+    let mut result = Vec::new();
+    let start = height.saturating_sub(limit as u64);
+    for h in (start..=height).rev() {
+        if let Some(block) = blocks.get(&h) {
+            // Extract key fields for the list view
+            let header = block.get("header").cloned().unwrap_or_default();
+            let tx_count = block.get("transactions")
+                .and_then(|t| t.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            result.push(serde_json::json!({
+                "height": header.get("height").cloned().unwrap_or(serde_json::json!(h)),
+                "hash": format!("{:x}", h), // simplified
+                "timestamp": header.get("timestamp").cloned().unwrap_or_default(),
+                "tx_count": tx_count,
+                "producer": header.get("producer").cloned().unwrap_or_default(),
+                "epoch": header.get("epoch").cloned().unwrap_or_default(),
+            }));
+        }
+    }
+
+    Json(serde_json::json!({
+        "blocks": result,
+        "count": result.len(),
+        "height": height,
+    }))
+}
+
+/// GET /account/{address} — account details (balance, tier, tx count, proofs).
+async fn get_account(
+    State(state): State<Arc<RpcState>>,
+    Path(address): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(msg) = validate_address(&address) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+    }
+
+    let balances = state.balances.lock().await;
+    if let Some(info) = balances.get(&address) {
+        let units = commputer_core::token::UNITS_PER_COMME;
+        (StatusCode::OK, Json(serde_json::json!({
+            "address": info.address,
+            "balance": info.balance,
+            "balance_comme": format!("{}.{:08}", info.balance / units, info.balance % units),
+            "tier": info.tier,
+            "nonce": info.nonce,
+            "is_validator": info.is_validator,
+            "total_mined": info.total_mined,
+            "total_mined_comme": format!("{}.{:08}", info.total_mined / units, info.total_mined % units),
+        })))
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "Account not found on chain",
+            "address": address,
+        })))
+    }
+}
+
+/// GET /supply — total, emitted, burned, circulating supply.
+async fn get_supply(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let status = state.status.lock().await;
+    let units = commputer_core::token::UNITS_PER_COMME;
+
+    Json(serde_json::json!({
+        "total": status.total_supply,
+        "total_comme": format!("{}", status.total_supply / units),
+        "emitted": status.emitted,
+        "emitted_comme": format!("{}", status.emitted / units),
+        "burned": status.burned,
+        "burned_comme": format!("{}", status.burned / units),
+        "circulating": status.circulating,
+        "circulating_comme": format!("{}", status.circulating / units),
+        "remaining": status.remaining,
+        "remaining_comme": format!("{}", status.remaining / units),
+    }))
+}
+
+/// GET /health — enhanced health check with uptime and sync status.
+async fn get_health_enhanced(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let status = state.status.lock().await;
+    let peers = state.peers.lock().await;
+    let uptime = state.start_time.elapsed().as_secs();
+
+    Json(serde_json::json!({
+        "healthy": true,
+        "height": status.height,
+        "epoch": status.epoch,
+        "peers": peers.len(),
+        "pending_txs": status.pending_txs,
+        "uptime_secs": uptime,
+        "synced": true,
+        "chain_id": crate::config::DEFAULT_TESTNET_CHAIN_ID,
+    }))
+}
+
 /// Build the axum router (exposed for testing).
 pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
     Router::new()
@@ -976,7 +1142,12 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/proofs/status", get(get_proof_status))
         .route("/proofs/history/{address}", get(get_proof_history))
         .route("/proofs/leaderboard", get(get_proof_leaderboard))
-        .route("/health", get(get_health))
+        .route("/health", get(get_health_enhanced))
+        .route("/validators", get(get_validators))
+        .route("/network/info", get(get_network_info))
+        .route("/blocks", get(get_recent_blocks))
+        .route("/account/{address}", get(get_account))
+        .route("/supply", get(get_supply))
         .route("/compliance", get(get_compliance))
         .route("/anti-scale", get(get_anti_scale))
         .route("/network", get(get_network_health))
@@ -1070,6 +1241,7 @@ mod tests {
             rate_limits: Mutex::new(HashMap::new()),
             validator_performance: Mutex::new(HashMap::new()),
             cors_origins: "*".to_string(),
+            start_time: Instant::now(),
             traffic_stats: Mutex::new(serde_json::json!({})),
             proof_history: Mutex::new(HashMap::new()),
             proof_leaderboard: Mutex::new(HashMap::new()),

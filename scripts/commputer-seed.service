@@ -1,0 +1,33 @@
+[Unit]
+Description=Commputer Seed Node
+Documentation=https://github.com/thecommrade/commputer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=commputer
+Group=commputer
+ExecStart=/home/commputer/.local/bin/commputer run --testnet --port 9000 --rpc-port 9944 --rpc-bind 0.0.0.0 --password ${COMMPUTER_WALLET_PASSWORD}
+Restart=always
+RestartSec=5
+Environment=COMMPUTER_WALLET_PASSWORD=
+EnvironmentFile=-/etc/commputer/seed.env
+
+# Logging to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=commputer-seed
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/commputer/.commputer
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
