@@ -9,6 +9,12 @@ pub const UNITS_PER_COMME: u64 = 100_000_000;
 /// Total fixed supply: 2 billion $COMME in raw units.
 pub const TOTAL_SUPPLY: u64 = 2_000_000_000 * UNITS_PER_COMME;
 
+/// Transaction fee split: 80% burned, 20% to charity treasury.
+/// The charity treasury accumulates until the annual vote, then is liquidated
+/// for the winning cause with a matching burn.
+pub const FEE_BURN_PERCENT: u64 = 80;
+pub const FEE_CHARITY_PERCENT: u64 = 20;
+
 /// 51% of network compute is reserved for communal products (storage, communication, AI,
 /// Humanities Archive). Also serves as emergency safeguard for user data protection.
 /// This constant is enforced in the compute job routing system.

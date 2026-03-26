@@ -64,7 +64,7 @@ The ideal Commputer validator is a regular person running one desktop at home. T
 
 ### Dual Burn Mechanics
 
-Supply only goes down. Milestone burns trigger automatically when the network hits capacity thresholds. Burst compute burns let holders spend $COMME on temporary compute beyond their tier — permanently burned. Plus an annual charitable burn voted on by holders. Details in Section 7.
+Supply only goes down. Milestone burns trigger automatically when the network hits capacity thresholds. Burst compute burns let holders spend $COMME on temporary compute beyond their tier — permanently burned. 20% of transaction fees fund a charity treasury; once per year holders vote on a cause, the treasury is sold for real money, and a matching amount is burned. Details in Section 7.
 
 ### P2P Networking
 
@@ -273,7 +273,7 @@ Floors are protocol-enforced. The remaining 60% floats to where demand is highes
 
 **The Will Function:** In the event of a holder's death, the protocol provides customizable execution options for their stored data. Every attempt will be made to contact listed persons throughout the grace period. For those listed contacts, no payment is required to download photos, videos, media, or any personal data. This is infrastructure designed for life, not a project interested in profiting from misfortune. Enforced when storage allocations go live. The transaction type exists in the protocol today; the execution logic activates when the network has storage capacity to protect.
 
-**3. Annual Charitable Burn** — Once per year, holders vote on a charitable cause. The protocol sells $COMME to fund the charity and burns a matching amount.
+**3. Annual Charitable Donation + Burn** — 20% of all transaction fees are directed to a charity treasury (the remaining 80% are burned as usual). The treasury balance is visible on the public dashboard at all times. Once per year, holders vote on a charitable cause. The treasury is liquidated — the $COMME is sold on the open market and the proceeds go to the winning cause. A matching amount of $COMME is burned from circulating supply. The charity gets real money. The supply shrinks. Both are visible on-chain.
 
 **What it may fund** (restricted to these categories, enshrined in this whitepaper):
 - Feed the hungry
