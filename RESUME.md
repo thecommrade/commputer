@@ -1,9 +1,12 @@
 # Commputer Development Resume Document
 
-**Last updated:** 2026-03-25 (overnight-experiment-2 session)
-**Last session test count:** 128 passing, 1 failing (pre-existing flaky network_sim)
-**Commits:** 169
-**Lines of Rust:** ~92,700
+**Last updated:** 2026-03-26
+**Commits on main:** 201
+**Lines of Rust:** ~37,500
+**Lines of HTML/CSS/JS:** ~3,400
+**Website:** https://commputer.xyz (live on Cloudflare Pages)
+**GitHub:** https://github.com/thecommrade/commputer (private)
+**Completion estimate:** ~70-75% to public testnet
 
 ## What This Is
 
