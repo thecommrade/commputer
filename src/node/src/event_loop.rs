@@ -17,6 +17,7 @@ use commputer_consensus::emission::{EmissionSchedule, ChannelAllocation};
 use commputer_consensus::epoch::EpochState;
 
 use commputer_storage::state::ChainState;
+use commputer_storage::job_pool::{JobPool, PoolJob, JobId as PoolJobId};
 
 use commputer_network::transport::{CommpNetwork, CommpBehaviourEvent};
 use commputer_network::topics;
@@ -129,6 +130,8 @@ pub struct EventLoop {
     pub seen_message_ids: HashSet<[u8; 32]>,
     /// Feature 9: Pending epoch summary to include in the next block.
     pub pending_epoch_summary: Option<commputer_core::block::EpochSummary>,
+    /// Item 18: In-memory job pool for compute job lifecycle management.
+    pub job_pool: JobPool,
 }
 
 impl EventLoop {
@@ -179,6 +182,7 @@ impl EventLoop {
             sig_cache: HashSet::new(),
             seen_message_ids: HashSet::new(),
             pending_epoch_summary: None,
+            job_pool: JobPool::new(),
         }
     }
 
@@ -378,6 +382,20 @@ impl EventLoop {
             }
         }
 
+        // Item 21: Load persisted job pool on startup.
+        if let Some(ref dir) = self.data_dir {
+            match JobPool::load_from_dir(dir) {
+                Ok(pool) => {
+                    let total = pool.total_count();
+                    self.job_pool = pool;
+                    info!("Loaded job pool from disk: {} jobs", total);
+                }
+                Err(e) => {
+                    debug!("No persisted job pool ({}), starting fresh", e);
+                }
+            }
+        }
+
         // Item 6: Load config on startup to pick up seed nodes etc.
         self.reload_config();
 
@@ -396,6 +414,8 @@ impl EventLoop {
         let mut seed_reconnect_interval = time::interval(Duration::from_secs(300));
         // Feature 11: Automatic peer rotation every 5 minutes.
         let mut peer_rotation_interval = time::interval(Duration::from_secs(300));
+        // Item 22: Job timeout enforcement every 30s.
+        let mut job_timeout_interval = time::interval(Duration::from_secs(30));
         // Feature 12: SIGHUP handler for config hot reload.
         let mut sighup = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::hangup(),
@@ -481,6 +501,18 @@ impl EventLoop {
                 _ = peer_rotation_interval.tick() => {
                     self.handle_peer_rotation();
                 }
+                _ = job_timeout_interval.tick() => {
+                    // Item 22: Enforce job timeouts (2 seconds per block).
+                    let height = self.state.blocks.height();
+                    let penalties = self.job_pool.enforce_timeouts(height, 2);
+                    for (job_id, executor) in &penalties {
+                        warn!(
+                            "Job {} timed out — executor {} penalized",
+                            hex::encode(&job_id.0[..8]),
+                            hex::encode(&executor.0[..8]),
+                        );
+                    }
+                }
                 _ = async {
                     if let Some(ref mut sig) = sighup {
                         sig.recv().await
@@ -537,6 +569,15 @@ impl EventLoop {
             );
         }
         info!("Orphan pool: {} parent hashes with pending blocks", self.orphan_pool.len());
+
+        // Item 21: Persist job pool on shutdown.
+        if let Some(ref dir) = self.data_dir {
+            if let Err(e) = self.job_pool.save_to_dir(dir) {
+                warn!("Failed to persist job pool: {}", e);
+            } else {
+                info!("Persisted job pool: {} jobs", self.job_pool.total_count());
+            }
+        }
 
         // Feature 8: Persist pending transactions to mempool.json.
         if !self.pending_txs.is_empty()
@@ -1250,6 +1291,9 @@ impl EventLoop {
             "kind": format!("{:?}", tx.kind).chars().take(50).collect::<String>(),
         }));
 
+        // Item 18-20: Wire compute job transactions into job pool.
+        self.process_job_tx(&tx);
+
         self.pending_txs.push(tx);
         self.update_rpc_status();
     }
@@ -1326,8 +1370,69 @@ impl EventLoop {
         let hash = tx.hash();
         self.seen_tx_hashes.insert(hash);
         debug!("Accepted transaction into mempool: {:?}", hash);
+
+        // Item 18-20: Wire compute job transactions into job pool.
+        self.process_job_tx(&tx);
+
         self.pending_txs.push(tx);
         self.enforce_mempool_limit();
+    }
+
+    /// Item 18-20: Process compute job transactions and update the job pool.
+    fn process_job_tx(&mut self, tx: &Transaction) {
+        let height = self.state.blocks.height();
+        match &tx.kind {
+            commputer_core::transaction::TxKind::SubmitJob {
+                job_spec_hash,
+                resources,
+                max_duration_secs,
+                comme_budget,
+                l2_id,
+            } => {
+                // Derive job ID from tx hash.
+                let tx_hash = tx.hash();
+                let pool_job = PoolJob {
+                    job_id: PoolJobId(tx_hash.0),
+                    submitter: tx.from,
+                    comme_budget: comme_budget.raw(),
+                    cpu_cores: resources.cpu_cores,
+                    gpu_vram_mb: resources.gpu_vram_mb,
+                    ram_mb: resources.ram_mb,
+                    storage_mb: resources.storage_mb,
+                    bandwidth_mbps: resources.bandwidth_mbps,
+                    max_duration_secs: *max_duration_secs,
+                    job_spec_hash: *job_spec_hash,
+                    status: commputer_storage::job_pool::PoolJobStatus::Pending,
+                    submitted_height: height,
+                    l2_id: l2_id.clone(),
+                };
+                self.job_pool.submit_job(pool_job);
+                info!("Job pool: submitted job {}", hex::encode(&tx_hash.0[..8]));
+            }
+            commputer_core::transaction::TxKind::ClaimJob { job_id } => {
+                let jid = PoolJobId(*job_id);
+                if self.job_pool.assign_job(&jid, tx.from, height) {
+                    info!("Job pool: assigned job {} to {}", hex::encode(&job_id[..8]), hex::encode(&tx.from.0[..8]));
+                } else {
+                    warn!("Job pool: failed to assign job {}", hex::encode(&job_id[..8]));
+                }
+            }
+            commputer_core::transaction::TxKind::CompleteJob { job_id, result_hash } => {
+                let jid = PoolJobId(*job_id);
+                if self.job_pool.complete_job(&jid, *result_hash, height) {
+                    info!("Job pool: completed job {}", hex::encode(&job_id[..8]));
+                } else {
+                    warn!("Job pool: failed to complete job {}", hex::encode(&job_id[..8]));
+                }
+            }
+            commputer_core::transaction::TxKind::DisputeJob { job_id, .. } => {
+                let jid = PoolJobId(*job_id);
+                if self.job_pool.dispute_job(&jid, tx.from) {
+                    info!("Job pool: disputed job {}", hex::encode(&job_id[..8]));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Maximum number of transactions in the mempool.

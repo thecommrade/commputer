@@ -1,7 +1,10 @@
 //! End-to-end compute job integration test.
 //! Simulates: submit job -> assign to validator -> execute -> verify -> result returned.
+//! Item 23: Updated to use real JobPool for full lifecycle testing.
 
 use sha2::{Sha256, Digest};
+use commputer_storage::job_pool::{JobPool, PoolJob, PoolJobStatus, JobId};
+use commputer_core::identity::Address;
 
 fn mock_job_id(submitter: &str, nonce: u64) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -18,6 +21,28 @@ fn mock_result_hash(input: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&hash);
     out
+}
+
+fn make_address(byte: u8) -> Address {
+    Address([byte; 32])
+}
+
+fn make_pool_job(id_bytes: [u8; 32], submitter: Address, budget: u64) -> PoolJob {
+    PoolJob {
+        job_id: JobId(id_bytes),
+        submitter,
+        comme_budget: budget,
+        cpu_cores: 4,
+        gpu_vram_mb: 0,
+        ram_mb: 8192,
+        storage_mb: 0,
+        bandwidth_mbps: 0,
+        max_duration_secs: 3600,
+        job_spec_hash: [0xCC; 32],
+        status: PoolJobStatus::Pending,
+        submitted_height: 100,
+        l2_id: None,
+    }
 }
 
 #[test]
@@ -125,4 +150,74 @@ fn test_dynamic_pricing() {
     let multiplier = f64::max(1.0, (load_95pct / 0.5).powi(2));
     let price_high = (base_rate as f64 * multiplier) as u64;
     assert!(price_high > base_rate, "Price should increase at high utilization");
+}
+
+/// Item 23: Full lifecycle integration test using real JobPool.
+#[test]
+fn test_job_pool_full_lifecycle() {
+    let mut pool = JobPool::new();
+    let submitter = make_address(0xAA);
+    let executor = make_address(0xBB);
+    let job_id_bytes = mock_job_id("integration_test", 42);
+    let budget: u64 = 50_000_000;
+
+    // Step 1: Submit job
+    let job = make_pool_job(job_id_bytes, submitter, budget);
+    pool.submit_job(job);
+    assert_eq!(pool.pending_count(), 1);
+    assert_eq!(pool.total_count(), 1);
+
+    // Step 2: Claim/assign job
+    let jid = JobId(job_id_bytes);
+    assert!(pool.assign_job(&jid, executor, 150));
+    assert_eq!(pool.pending_count(), 0);
+    assert_eq!(pool.active_count(), 1);
+
+    // Step 3: Complete job
+    let result_hash = mock_result_hash(b"integration test result");
+    assert!(pool.complete_job(&jid, result_hash, 200));
+    assert_eq!(pool.completed_count(), 1);
+    assert_eq!(pool.active_count(), 0);
+
+    // Step 4: Verify result is stored
+    let completed_job = pool.get(&jid).unwrap();
+    if let PoolJobStatus::Completed {
+        executor: ex,
+        result_hash: rh,
+        completed_height,
+    } = completed_job.status
+    {
+        assert_eq!(ex, executor);
+        assert_eq!(rh, result_hash);
+        assert_eq!(completed_height, 200);
+    } else {
+        panic!("Expected Completed status");
+    }
+}
+
+/// Item 23: Test job pool persistence roundtrip.
+#[test]
+fn test_job_pool_persistence_roundtrip() {
+    let mut pool = JobPool::new();
+    let submitter = make_address(0xAA);
+
+    // Add various jobs in different states
+    for i in 0..5u8 {
+        pool.submit_job(make_pool_job([i; 32], submitter, (i as u64 + 1) * 1_000_000));
+    }
+    pool.assign_job(&JobId([2; 32]), make_address(0xBB), 100);
+    pool.complete_job(&JobId([2; 32]), [0xFF; 32], 150);
+
+    // Serialize and deserialize
+    let json = pool.to_json().expect("serialization should succeed");
+    let restored = JobPool::from_json(&json).expect("deserialization should succeed");
+
+    assert_eq!(restored.total_count(), pool.total_count());
+    assert_eq!(restored.pending_count(), pool.pending_count());
+    assert_eq!(restored.completed_count(), pool.completed_count());
+
+    // Verify a specific job survived the roundtrip
+    let job = restored.get(&JobId([0; 32])).unwrap();
+    assert_eq!(job.comme_budget, 1_000_000);
+    assert!(matches!(job.status, PoolJobStatus::Pending));
 }

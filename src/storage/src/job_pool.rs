@@ -339,6 +339,66 @@ impl JobPool {
     }
 }
 
+/// Serializable snapshot of the job pool for persistence.
+#[derive(Serialize, Deserialize)]
+struct JobPoolSnapshot {
+    jobs: Vec<PoolJob>,
+    completed_count: u64,
+    failed_count: u64,
+}
+
+impl JobPool {
+    /// Serialize the job pool to JSON bytes for persistence.
+    pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let snapshot = JobPoolSnapshot {
+            jobs: self.jobs.values().cloned().collect(),
+            completed_count: self.completed_count,
+            failed_count: self.failed_count,
+        };
+        serde_json::to_vec_pretty(&snapshot)
+    }
+
+    /// Deserialize a job pool from JSON bytes.
+    pub fn from_json(data: &[u8]) -> Result<Self, serde_json::Error> {
+        let snapshot: JobPoolSnapshot = serde_json::from_slice(data)?;
+        let mut pool = Self::new();
+        pool.completed_count = snapshot.completed_count;
+        pool.failed_count = snapshot.failed_count;
+        for job in snapshot.jobs {
+            let id = job.job_id;
+            let budget = job.comme_budget;
+            if matches!(job.status, PoolJobStatus::Pending) {
+                pool.pending_by_budget
+                    .insert((std::cmp::Reverse(budget), id), ());
+            }
+            if let PoolJobStatus::Assigned { executor, .. }
+                | PoolJobStatus::Running { executor, .. } = job.status
+            {
+                pool.assigned_to_validator
+                    .entry(executor)
+                    .or_default()
+                    .push(id);
+            }
+            pool.jobs.insert(id, job);
+        }
+        Ok(pool)
+    }
+
+    /// Save the job pool to a file in the given directory.
+    pub fn save_to_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        let path = dir.join("job_pool.json");
+        let data = self.to_json().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(path, data)
+    }
+
+    /// Load the job pool from a file in the given directory.
+    pub fn load_from_dir(dir: &std::path::Path) -> std::io::Result<Self> {
+        let path = dir.join("job_pool.json");
+        let data = std::fs::read(&path)?;
+        Self::from_json(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }
+}
+
 impl Default for JobPool {
     fn default() -> Self {
         Self::new()

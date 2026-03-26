@@ -210,6 +210,21 @@ enum Commands {
         #[arg(long, default_value = "9944")]
         rpc_port: u16,
     },
+    /// Item 24: Submit a burst compute job
+    Burst {
+        /// Number of CPU cores to request
+        #[arg(long)]
+        cpu: u16,
+        /// RAM amount (e.g. "8gb")
+        #[arg(long)]
+        ram: String,
+        /// Duration (e.g. "1h", "30m")
+        #[arg(long)]
+        duration: String,
+        /// RPC port of the running node
+        #[arg(long, default_value = "9944")]
+        rpc_port: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -531,6 +546,28 @@ fn cmd_wallet_show(testnet: bool) -> Result<()> {
         println!("  Balance:   0 COMME");
         println!("  Tier:      None");
         println!("  (Account not yet on chain)");
+    }
+
+    // Item 25: Query active jobs from the RPC node if reachable.
+    let job_pool_path = data_dir(testnet).join("job_pool.json");
+    if job_pool_path.exists() {
+        if let Ok(pool) = commputer_storage::job_pool::JobPool::load_from_dir(&data_dir(testnet)) {
+            let addr_hex = hex::encode(addr.0);
+            let my_jobs: Vec<_> = pool.all_jobs().into_iter()
+                .filter(|j| hex::encode(j.submitter.0) == addr_hex)
+                .collect();
+            if !my_jobs.is_empty() {
+                println!();
+                println!("  Active Jobs: {}", my_jobs.len());
+                for job in &my_jobs {
+                    println!("    - {} ({:?}, budget: {} raw)",
+                        hex::encode(&job.job_id.0[..8]),
+                        job.status,
+                        job.comme_budget,
+                    );
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1109,6 +1146,9 @@ async fn main() -> Result<()> {
         Commands::ComplianceCheck { rpc_port } => {
             cmd_compliance_check(rpc_port).await?;
         }
+        Commands::Burst { cpu, ram, duration, rpc_port } => {
+            cmd_burst(cpu, &ram, &duration, rpc_port).await?;
+        }
     }
 
     Ok(())
@@ -1241,6 +1281,105 @@ async fn cmd_compliance_check(rpc_port: u16) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Item 24: Burst compute CLI — submit a SubmitJob transaction via RPC.
+async fn cmd_burst(cpu: u16, ram: &str, duration: &str, rpc_port: u16) -> Result<()> {
+    // Parse RAM (e.g. "8gb" -> 8192 MB)
+    let ram_mb = parse_ram_string(ram)?;
+    // Parse duration (e.g. "1h" -> 3600 secs)
+    let duration_secs = parse_duration_string(duration)?;
+
+    // Calculate a base budget: cpu_cores * duration_secs * 1_000_000 raw units per core-hour
+    let core_hours = (cpu as u64 * duration_secs) / 3600;
+    let comme_budget = core_hours.max(1) * 1_000_000; // 0.01 COMME per core-hour minimum
+
+    // Create a job spec hash from the parameters
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(cpu.to_le_bytes());
+    hasher.update(ram_mb.to_le_bytes());
+    hasher.update(duration_secs.to_le_bytes());
+    hasher.update(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    let hash_result = hasher.finalize();
+    let mut job_spec_hash = [0u8; 32];
+    job_spec_hash.copy_from_slice(&hash_result);
+
+    let submit_req = serde_json::json!({
+        "job_spec_hash_hex": hex::encode(job_spec_hash),
+        "cpu_cores": cpu,
+        "gpu_vram_mb": 0,
+        "ram_mb": ram_mb,
+        "storage_mb": 0,
+        "bandwidth_mbps": 0,
+        "max_duration_secs": duration_secs,
+        "comme_budget": comme_budget,
+        "l2_id": null,
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{}", rpc_port);
+
+    println!("Submitting burst compute job...");
+    println!("  CPU cores:  {}", cpu);
+    println!("  RAM:        {} MB", ram_mb);
+    println!("  Duration:   {} secs", duration_secs);
+    println!("  Budget:     {} raw units ({:.4} COMME)", comme_budget, comme_budget as f64 / 100_000_000.0);
+
+    let resp: serde_json::Value = client
+        .post(format!("{}/jobs/submit", base))
+        .json(&submit_req)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    if resp["accepted"].as_bool().unwrap_or(false) {
+        println!("  Job ID:     {}", resp["job_id_hex"].as_str().unwrap_or("?"));
+        println!("  Status:     Submitted successfully");
+    } else {
+        let err = resp["error"].as_str().unwrap_or("unknown error");
+        println!("  Error:      {}", err);
+    }
+
+    Ok(())
+}
+
+fn parse_ram_string(s: &str) -> Result<u64> {
+    let s = s.to_lowercase();
+    if let Some(num) = s.strip_suffix("gb") {
+        let n: u64 = num.trim().parse().map_err(|_| anyhow::anyhow!("Invalid RAM: {}", s))?;
+        Ok(n * 1024)
+    } else if let Some(num) = s.strip_suffix("mb") {
+        let n: u64 = num.trim().parse().map_err(|_| anyhow::anyhow!("Invalid RAM: {}", s))?;
+        Ok(n)
+    } else {
+        let n: u64 = s.trim().parse().map_err(|_| anyhow::anyhow!("Invalid RAM: {}. Use e.g. 8gb or 1024mb", s))?;
+        Ok(n) // assume MB
+    }
+}
+
+fn parse_duration_string(s: &str) -> Result<u64> {
+    let s = s.to_lowercase();
+    if let Some(num) = s.strip_suffix('h') {
+        let n: u64 = num.trim().parse().map_err(|_| anyhow::anyhow!("Invalid duration: {}", s))?;
+        Ok(n * 3600)
+    } else if let Some(num) = s.strip_suffix('m') {
+        let n: u64 = num.trim().parse().map_err(|_| anyhow::anyhow!("Invalid duration: {}", s))?;
+        Ok(n * 60)
+    } else if let Some(num) = s.strip_suffix('s') {
+        let n: u64 = num.trim().parse().map_err(|_| anyhow::anyhow!("Invalid duration: {}", s))?;
+        Ok(n)
+    } else {
+        let n: u64 = s.trim().parse().map_err(|_| anyhow::anyhow!("Invalid duration: {}. Use e.g. 1h, 30m, or 3600s", s))?;
+        Ok(n) // assume seconds
+    }
 }
 
 // ── Feature 187: Backup and restore ──
