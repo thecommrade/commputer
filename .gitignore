@@ -46,3 +46,6 @@ snapshot-*.json
 # Claude / Superpowers
 .superpowers/
 docs/superpowers/
+
+# Wrangler / Cloudflare
+.wrangler/
