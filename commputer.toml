@@ -9,7 +9,7 @@ chain_id = "commputer-testnet-1"
 
 # Seed nodes to connect to on startup
 # These are the default testnet seed nodes
-seeds = ["198.51.100.254:9000"]
+seeds = ["seed.commputer.xyz:9000"]
 
 # P2P listening port
 port = 9000

@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 /// Default testnet seed nodes.
-pub const DEFAULT_TESTNET_SEEDS: &[&str] = &["198.51.100.254:9000"];
+/// Update these to your seed node's address before running.
+pub const DEFAULT_TESTNET_SEEDS: &[&str] = &["seed.commputer.xyz:9000"];
 
 /// Default chain ID for testnet.
 pub const DEFAULT_TESTNET_CHAIN_ID: &str = "commputer-testnet-1";

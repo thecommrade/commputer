@@ -5,7 +5,7 @@
 // Route: api.commputer.xyz/*
 //
 // Environment variables (set in Cloudflare dashboard or wrangler.toml):
-//   SEED_RPC_URL — e.g. "http://198.51.100.254:9944"
+//   SEED_RPC_URL — e.g. "http://your-seed-node-ip:9944"
 
 const ALLOWED_ORIGINS = [
     'https://commputer.xyz',

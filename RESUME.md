@@ -206,7 +206,6 @@ cd ~/Coin/src && cargo run -p commputer-sim -- --validators 10000 --epochs 1000
 ## Git Identity (Local Only)
 
 Name: The Commrade
-Email: commrade@commputer.xyz
 
 ## Founder Context
 
