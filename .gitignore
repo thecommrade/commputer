@@ -12,9 +12,37 @@ target/
 .DS_Store
 Thumbs.db
 
-# Env
+# Env / Secrets
 .env
 *.key
 *.pem
+*.secret
+
+# Node data directories
 src/commputer-testnet/
 src/commputer-data/
+commputer-testnet/
+commputer-data/
+
+# RocksDB
+*.sst
+*.log
+LOCK
+MANIFEST-*
+CURRENT
+OPTIONS-*
+
+# Wallet files (never commit private keys)
+*.keystore
+wallet.json
+
+# Snapshots (generated at runtime)
+src/snapshot-*.json
+snapshot-*.json
+
+# Cargo lock for libraries (keep for binaries)
+# src/Cargo.lock is committed intentionally
+
+# Claude / Superpowers
+.superpowers/
+docs/superpowers/
