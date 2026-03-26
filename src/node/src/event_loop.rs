@@ -128,6 +128,8 @@ pub struct EventLoop {
     /// Item 18: Recent gossipsub message IDs for duplicate suppression.
     /// Gossipsub has built-in dedup, but this catches application-level duplicates.
     pub seen_message_ids: HashSet<[u8; 32]>,
+    /// Item 51: Mempool transaction expiry tracking — maps tx hash to when it was added.
+    pub mempool_added_at: HashMap<TxHash, std::time::Instant>,
     /// Feature 9: Pending epoch summary to include in the next block.
     pub pending_epoch_summary: Option<commputer_core::block::EpochSummary>,
     /// Item 18: In-memory job pool for compute job lifecycle management.
@@ -183,6 +185,7 @@ impl EventLoop {
             seen_message_ids: HashSet::new(),
             pending_epoch_summary: None,
             job_pool: JobPool::new(),
+            mempool_added_at: HashMap::new(),
         }
     }
 
@@ -399,6 +402,32 @@ impl EventLoop {
         // Item 6: Load config on startup to pick up seed nodes etc.
         self.reload_config();
 
+        // Item 54: Chain verification on startup — verify last 10 blocks chain properly.
+        {
+            let height = self.state.blocks.height();
+            let check_start = height.saturating_sub(9);
+            let mut chain_ok = true;
+            for h in (check_start + 1)..=height {
+                if let (Some(block), Some(parent_block)) = (
+                    self.state.blocks.get_by_height(h),
+                    self.state.blocks.get_by_height(h - 1),
+                ) {
+                    if block.header.parent_hash != parent_block.hash() {
+                        warn!(
+                            "Chain integrity warning: block {} parent hash does not match block {} hash",
+                            h, h - 1
+                        );
+                        chain_ok = false;
+                    }
+                }
+            }
+            if chain_ok {
+                info!("Chain integrity check passed (blocks {} to {})", check_start, height);
+            } else {
+                warn!("Chain integrity check found inconsistencies! Consider running verify-chain.");
+            }
+        }
+
         let mut epoch_interval = time::interval(Duration::from_secs(3600));
         let mut block_interval = time::interval(Duration::from_secs(2));
         let mut consensus_interval = time::interval(Duration::from_millis(500));
@@ -546,6 +575,21 @@ impl EventLoop {
     /// Flush state to disk and clean up before exit.
     /// Feature 133: Save consensus state (pending blocks) for recovery on restart.
     fn shutdown(&mut self) {
+        // Item 50: Publish a "goodbye" message on the blocks topic before closing.
+        let goodbye = serde_json::json!({
+            "type": "goodbye",
+            "peer_id": self.network.local_peer_id.to_string(),
+            "height": self.state.blocks.height(),
+        });
+        if let Ok(data) = serde_json::to_vec(&goodbye) {
+            let topic = topics::block_topic();
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, data) {
+                debug!("Failed to publish goodbye message: {}", e);
+            } else {
+                info!("Published goodbye message to peers");
+            }
+        }
+
         info!("Flushing chain state to disk...");
         if let Err(e) = self.state.flush() {
             warn!("Failed to flush state on shutdown: {}", e);
@@ -1294,6 +1338,8 @@ impl EventLoop {
         // Item 18-20: Wire compute job transactions into job pool.
         self.process_job_tx(&tx);
 
+        // Item 51: Track when transaction was added for expiry.
+        self.mempool_added_at.insert(tx_hash, std::time::Instant::now());
         self.pending_txs.push(tx);
         self.update_rpc_status();
     }
@@ -1504,6 +1550,23 @@ impl EventLoop {
             }
         }
 
+        // Item 53: Detailed epoch transition logging.
+        info!("--- Epoch {} Transition ---", epoch);
+        info!("  Validators:       {}", validator_count);
+        info!("  Total emission:   {:.4} COMME", epoch_emission as f64 / UNITS_PER_COMME as f64);
+        info!("  Actual emission:  {:.4} COMME (capped to remaining supply)", actual_emission as f64 / UNITS_PER_COMME as f64);
+        info!("  Total burned:     {:.4} COMME", self.state.total_burned as f64 / UNITS_PER_COMME as f64);
+        info!("  Remaining supply: {:.4} COMME", remaining as f64 / UNITS_PER_COMME as f64);
+        {
+            let compliant = self.state.accounts.iter()
+                .filter(|a| a.is_validator && a.compliance == commputer_core::compliance::ComplianceStatus::Compliant)
+                .count();
+            let nerfed = self.state.accounts.iter()
+                .filter(|a| a.is_validator && a.compliance != commputer_core::compliance::ComplianceStatus::Compliant)
+                .count();
+            info!("  Compliant validators: {}, Nerfed: {}", compliant, nerfed);
+        }
+
         // Feature 114: Finalize proof results with difficulty weighting.
         let proof_summaries = self.proof_manager.finalize_epoch_with_difficulty(
             &self.epoch_state.difficulty_multiplier,
@@ -1693,6 +1756,26 @@ impl EventLoop {
     }
 
     fn handle_block_tick(&mut self) {
+        // Item 51: Expire mempool transactions older than 1 hour.
+        let now = std::time::Instant::now();
+        let expiry_threshold = Duration::from_secs(3600);
+        let expired: Vec<TxHash> = self.mempool_added_at.iter()
+            .filter(|(_, added_at)| now.duration_since(**added_at) >= expiry_threshold)
+            .map(|(hash, _)| *hash)
+            .collect();
+        if !expired.is_empty() {
+            let expired_set: HashSet<TxHash> = expired.iter().copied().collect();
+            let before = self.pending_txs.len();
+            self.pending_txs.retain(|tx| !expired_set.contains(&tx.hash()));
+            for hash in &expired {
+                self.mempool_added_at.remove(hash);
+            }
+            let removed = before - self.pending_txs.len();
+            if removed > 0 {
+                info!("Expired {} mempool transactions older than 1 hour", removed);
+            }
+        }
+
         // Only produce blocks if we're a registered validator.
         if self.validator.status() != ValidatorStatus::Active {
             return;
@@ -1733,6 +1816,33 @@ impl EventLoop {
         let view_change_timeout = self.last_block_seen_time
             .map(|t| t.elapsed().as_secs() >= 30)
             .unwrap_or(false);
+
+        // Item 52: Block production fairness — if multiple validators are active,
+        // rotate based on sorted validator index. The validator whose position
+        // matches height mod active_count gets priority to produce.
+        {
+            let active_validators: Vec<Address> = self.state.accounts.iter()
+                .filter(|a| a.is_validator)
+                .map(|a| a.address)
+                .collect();
+            if active_validators.len() > 1 {
+                let our_addr = *self.wallet.address();
+                let mut sorted = active_validators.clone();
+                sorted.sort_by_key(|a| a.0);
+                if let Some(our_idx) = sorted.iter().position(|a| *a == our_addr) {
+                    let expected_slot = (next_height as usize) % sorted.len();
+                    if our_idx != expected_slot && !view_change_timeout {
+                        debug!(
+                            "Item 52: Not our turn to produce block at height {} (slot {} != our idx {})",
+                            next_height, expected_slot, our_idx
+                        );
+                        if self.last_block_seen_time.map(|t| t.elapsed().as_secs() < 10).unwrap_or(true) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
 
         // Don't produce if there's already an active vote at this height
         // (unless view change timeout has elapsed).

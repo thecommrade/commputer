@@ -93,6 +93,12 @@ enum Commands {
         /// Feature 255: Enable terminal dashboard (continuously updating status)
         #[arg(long, default_value = "false")]
         dashboard: bool,
+        /// Item 48: Enable structured JSON logging output
+        #[arg(long, default_value = "false")]
+        json_log: bool,
+        /// Item 55: Comma-separated CORS allowed origins (default: "*" for testnet)
+        #[arg(long, default_value = "*")]
+        cors_origins: String,
     },
     /// Wallet management
     Wallet {
@@ -367,10 +373,8 @@ fn create_genesis_for_dir(data_dir: Option<&std::path::Path>) -> Block {
             tx_root: [0u8; 32],
             proof_root: [0u8; 32],
             state_root: [0u8; 32],
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            // Item 44: Fixed genesis timestamp (2026-03-22 00:00:00 UTC).
+            timestamp: 1774022400,
             producer: Address([0u8; 32]), // No producer for genesis.
             epoch: 0,
             producer_public_key: vec![],
@@ -394,6 +398,8 @@ fn print_banner() {
     println!("  ║      $COMME · 2B supply · burn-heavy         ║");
     println!("  ║      Scale hurts. Patience rewards.          ║");
     println!("  ╚═══════════════════════════════════════════════╝");
+    // Item 49: Show version and git commit hash in startup banner.
+    println!("  Version: {} (git: {})", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
     println!();
 }
 
@@ -809,14 +815,22 @@ async fn run_node(
     seeds: Vec<String>,
     dns_seeds: Vec<String>,
     password: Option<String>,
+    json_log: bool,
+    cors_origins: String,
 ) -> Result<()> {
-    // Initialize logging.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| log_level.parse().unwrap_or_default()),
-        )
-        .init();
+    // Initialize logging. Item 48: Support structured JSON output.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| log_level.parse().unwrap_or_default());
+    if json_log {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     print_banner();
 
@@ -988,6 +1002,7 @@ async fn run_node(
         api_key: None,
         rate_limits: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         validator_performance: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        cors_origins: cors_origins.clone(),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
@@ -1040,8 +1055,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds, password, wallet: _, dashboard: _, rpc_key: _ } => {
-            run_node(testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds, password).await?;
+        Commands::Run { testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds, password, wallet: _, dashboard: _, rpc_key: _, json_log, cors_origins } => {
+            run_node(testnet, log_level, port, rpc_port, contribution_percent, relay, seeds, dns_seeds, password, json_log, cors_origins).await?;
         }
         Commands::Wallet { action } => match action {
             WalletAction::Create { testnet } => cmd_wallet_create(testnet)?,

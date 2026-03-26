@@ -92,6 +92,8 @@ pub struct RpcState {
     pub api_key: Option<String>,
     /// Feature 16: Per-IP rate limiting — (request_count, window_start).
     pub rate_limits: Mutex<HashMap<String, (u32, Instant)>>,
+    /// Item 55: Configurable CORS allowed origins (comma-separated or "*").
+    pub cors_origins: String,
 }
 
 /// Response for a submitted transaction.
@@ -836,7 +838,9 @@ async fn auth_middleware(
 }
 
 /// Item 58: Security headers middleware.
+/// Item 55: CORS origin is now read from RpcState.cors_origins.
 async fn security_headers(
+    State(state): State<Arc<RpcState>>,
     req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
@@ -850,8 +854,20 @@ async fn security_headers(
         "Content-Security-Policy",
         "default-src 'self'; script-src 'none'".parse().unwrap(),
     );
-    // Item 57: CORS — localhost only (already bound to 127.0.0.1).
-    headers.insert("Access-Control-Allow-Origin", "http://localhost:*".parse().unwrap_or_else(|_| "http://localhost".parse().unwrap()));
+    // Item 55: Configurable CORS origins (default "*" for testnet).
+    let cors_value = state.cors_origins.as_str();
+    headers.insert(
+        "Access-Control-Allow-Origin",
+        cors_value.parse().unwrap_or_else(|_| "*".parse().unwrap()),
+    );
+    headers.insert(
+        "Access-Control-Allow-Methods",
+        "GET, POST, OPTIONS".parse().unwrap(),
+    );
+    headers.insert(
+        "Access-Control-Allow-Headers",
+        "Content-Type, X-API-Key".parse().unwrap(),
+    );
     response
 }
 
@@ -932,9 +948,11 @@ pub async fn start_rpc_server(
     rpc_port: u16,
     rpc_state: Arc<RpcState>,
 ) {
+    let security_state = rpc_state.clone();
     let app = build_router(rpc_state)
         // Item 58: Security headers on all RPC responses.
-        .layer(axum::middleware::from_fn(security_headers));
+        // Item 55: Configurable CORS via RpcState.cors_origins.
+        .layer(axum::middleware::from_fn_with_state(security_state, security_headers));
 
     // Item 57: Already bound to 127.0.0.1 (localhost only) for CORS safety.
     let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", rpc_port)).await {
@@ -1000,6 +1018,7 @@ mod tests {
             api_key: None,
             rate_limits: Mutex::new(HashMap::new()),
             validator_performance: Mutex::new(HashMap::new()),
+            cors_origins: "*".to_string(),
         });
         (state, rx)
     }
