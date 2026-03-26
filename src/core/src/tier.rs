@@ -76,11 +76,7 @@ impl AccessPath {
     ) -> Self {
         // Post-mining era: all coins mined → free for all.
         if total_emitted >= crate::token::TOTAL_SUPPLY && is_contributing {
-<<<<<<< HEAD
-            return AccessPath::EmergencyAccess; // Full access for any contributor
-=======
             return AccessPath::EmergencyAccess;
->>>>>>> af652b2 (fix: restore personal info removal and IP placeholders after merge revert)
         }
 
         // Sub-1M emergency access: any contribution = full access.
@@ -121,10 +117,7 @@ impl AccessPath {
             AccessPath::PartialContributor {
                 contribution_percent,
             } => {
-<<<<<<< HEAD
                 // Proportional: 50%+ gets Compute, 25%+ gets Storage, any gets Base.
-=======
->>>>>>> af652b2 (fix: restore personal info removal and IP placeholders after merge revert)
                 if *contribution_percent >= 50 {
                     HolderTier::Compute
                 } else if *contribution_percent >= 25 {

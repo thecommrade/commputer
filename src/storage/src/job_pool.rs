@@ -340,11 +340,8 @@ impl JobPool {
 
     /// Route jobs respecting the 51/49 split and dynamic reserve.
     /// Returns (flagship_jobs, user_jobs) that can be assigned given capacity constraints.
-<<<<<<< HEAD
-    /// `total_capacity` is the total available compute slots.
+    /// `total_capacity` is total available compute slots.
     /// `churn_rate` is validator churn for dynamic reserve calculation.
-=======
->>>>>>> af652b2 (fix: restore personal info removal and IP placeholders after merge revert)
     pub fn route_jobs_with_capacity(
         &self,
         total_capacity: u64,
@@ -354,16 +351,8 @@ impl JobPool {
             dynamic_reserve_percent, FLAGSHIP_COMPUTE_SHARE, HOLDER_COMPUTE_SHARE,
         };
 
-<<<<<<< HEAD
-        // Subtract dynamic reserve from total capacity.
         let reserve_pct = dynamic_reserve_percent(churn_rate);
         let usable_capacity = total_capacity.saturating_sub(total_capacity * reserve_pct / 100);
-
-        // 51/49 split of usable capacity.
-=======
-        let reserve_pct = dynamic_reserve_percent(churn_rate);
-        let usable_capacity = total_capacity.saturating_sub(total_capacity * reserve_pct / 100);
->>>>>>> af652b2 (fix: restore personal info removal and IP placeholders after merge revert)
         let flagship_capacity = usable_capacity * FLAGSHIP_COMPUTE_SHARE / 100;
         let user_capacity = usable_capacity * HOLDER_COMPUTE_SHARE / 100;
 
