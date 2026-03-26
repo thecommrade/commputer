@@ -7,6 +7,58 @@
     <link rel="stylesheet" href="style.css">
 </head>
 <body class="theme-system">
+    <!-- Item 194: Onboarding tutorial overlay -->
+    <div id="onboarding-overlay" class="overlay hidden">
+        <div class="onboarding">
+            <div id="onboarding-step-1" class="onboarding-step">
+                <h2>Welcome to Commputer</h2>
+                <p>A communal supercomputer for the people, by the people.</p>
+                <p>This dashboard connects to your running Commputer node and shows:</p>
+                <ul>
+                    <li>Your wallet balance and tier progress</li>
+                    <li>Mining status and proof scores</li>
+                    <li>Network peers and compliance</li>
+                    <li>Transaction history</li>
+                </ul>
+                <button onclick="onboardingNext(2)">Next</button>
+            </div>
+            <div id="onboarding-step-2" class="onboarding-step hidden">
+                <h2>Your Wallet</h2>
+                <p>The <strong>Wallet</strong> panel on the left shows your address, balance, and tier.</p>
+                <p>Your tier determines what communal resources you can access:</p>
+                <ul>
+                    <li><strong>Base</strong> (1+ COMME): Analytics access</li>
+                    <li><strong>Storage</strong> (10+ COMME): Communal storage</li>
+                    <li><strong>Compute</strong> (20+ COMME): Communal compute</li>
+                    <li><strong>Full</strong> (33+ COMME): Full personal computer + AI</li>
+                </ul>
+                <button onclick="onboardingNext(3)">Next</button>
+                <button onclick="onboardingPrev(1)" class="secondary">Back</button>
+            </div>
+            <div id="onboarding-step-3" class="onboarding-step hidden">
+                <h2>Mining & Contributions</h2>
+                <p>The <strong>Contribution</strong> slider controls how much of your resources to share.</p>
+                <p>The <strong>Mining Status</strong> panel shows your proof scores across 5 channels:</p>
+                <p>CPU, GPU, Storage, RAM, and Bandwidth.</p>
+                <button onclick="onboardingNext(4)">Next</button>
+                <button onclick="onboardingPrev(2)" class="secondary">Back</button>
+            </div>
+            <div id="onboarding-step-4" class="onboarding-step hidden">
+                <h2>Keyboard Shortcuts</h2>
+                <p>Use these shortcuts for quick access:</p>
+                <ul>
+                    <li><kbd>Ctrl+S</kbd> &mdash; Open Send dialog</li>
+                    <li><kbd>Ctrl+W</kbd> &mdash; Focus Wallet panel</li>
+                    <li><kbd>Ctrl+M</kbd> &mdash; Focus Mining panel</li>
+                    <li><kbd>Ctrl+L</kbd> &mdash; Toggle Log viewer</li>
+                    <li><kbd>Escape</kbd> &mdash; Close dialogs</li>
+                </ul>
+                <button onclick="onboardingFinish()">Get Started</button>
+                <button onclick="onboardingPrev(3)" class="secondary">Back</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Item 40: First-run wizard overlay -->
     <div id="wizard-overlay" class="overlay hidden">
         <div class="wizard">
@@ -17,14 +69,18 @@
                 <button onclick="wizardCreate()">Create New Wallet</button>
                 <button onclick="wizardRecover()" class="secondary">Recover Existing Wallet</button>
             </div>
-            <!-- Item 25: Wallet creation wizard -->
+            <!-- Item 178: Seed phrase display with copy + print -->
             <div id="wizard-step-2" class="wizard-step hidden">
                 <h3>Your Seed Phrase</h3>
-                <p class="warning">Write these words down. You cannot recover them later.</p>
+                <p class="warning">Write these words down and store them safely. You cannot recover them later.</p>
                 <div id="seed-phrase-display" class="seed-phrase"></div>
+                <div class="seed-actions">
+                    <button onclick="copySeedPhrase()" class="secondary" title="Copy to clipboard">Copy</button>
+                    <button onclick="printSeedPhrase()" class="secondary" title="Print seed phrase">Print</button>
+                </div>
                 <button onclick="wizardConfirm()">I've Written It Down</button>
             </div>
-            <!-- Item 25: Confirmation step -->
+            <!-- Confirmation step -->
             <div id="wizard-step-3" class="wizard-step hidden">
                 <h3>Confirm Your Seed Phrase</h3>
                 <p>Enter word #<span id="confirm-word-num">1</span>:</p>
@@ -32,7 +88,7 @@
                 <button onclick="wizardVerify()">Verify</button>
                 <p id="confirm-error" class="error hidden">Incorrect word. Try again.</p>
             </div>
-            <!-- Item 26: Wallet recovery -->
+            <!-- Wallet recovery -->
             <div id="wizard-step-recover" class="wizard-step hidden">
                 <h3>Recover Wallet</h3>
                 <p>Enter your 24-word seed phrase:</p>
@@ -47,18 +103,24 @@
         </div>
     </div>
 
-    <!-- Item 22: Main window layout -->
+    <!-- Main app layout -->
     <div class="app">
         <!-- Left sidebar -->
         <aside class="sidebar">
-            <!-- Item 32: Node status indicator -->
+            <!-- Node status indicator -->
             <div class="status-indicator">
                 <span id="status-dot" class="dot red"></span>
                 <span id="status-text">Disconnected</span>
             </div>
 
-            <!-- Item 24: Wallet display -->
-            <div class="panel" id="wallet-panel">
+            <!-- Item 193: Error status bar -->
+            <div id="error-bar" class="error-bar hidden">
+                <span id="error-message"></span>
+                <button onclick="dismissError()" class="error-dismiss">&times;</button>
+            </div>
+
+            <!-- Wallet display -->
+            <div class="panel" id="wallet-panel" data-panel="wallet">
                 <h3>Wallet</h3>
                 <div class="field">
                     <label>Address</label>
@@ -68,25 +130,28 @@
                     <label>Balance</label>
                     <span id="wallet-balance">0 COMME</span>
                 </div>
-                <!-- Item 37: Tier progress -->
+                <!-- Item 186: Tier progress -->
                 <div class="field">
                     <label>Tier</label>
-                    <span id="wallet-tier">Explorer</span>
+                    <span id="wallet-tier">None</span>
                 </div>
                 <div class="progress-bar">
                     <div id="tier-progress" class="progress-fill" style="width: 0%"></div>
                 </div>
-                <small id="tier-next">0 / 1 COMME to Contributor</small>
+                <small id="tier-next">0 / 1 COMME to Base</small>
+                <!-- Item 199: Export wallet button -->
+                <button onclick="showExportDialog()" class="secondary btn-small">Export Wallet</button>
             </div>
 
-            <!-- Item 35: Compliance status -->
-            <div class="panel" id="compliance-panel">
+            <!-- Compliance status -->
+            <div class="panel" id="compliance-panel" data-panel="compliance">
                 <h3>Compliance</h3>
                 <div id="compliance-status" class="compliance-ok">Compliant</div>
+                <small id="compliance-explanation"></small>
             </div>
 
-            <!-- Item 36: Grace period -->
-            <div class="panel" id="grace-panel">
+            <!-- Item 185: Grace period -->
+            <div class="panel" id="grace-panel" data-panel="grace">
                 <h3>Grace Period</h3>
                 <div class="tank">
                     <div id="grace-fill" class="tank-fill" style="height: 100%"></div>
@@ -94,18 +159,25 @@
                 <small id="grace-text">Full</small>
             </div>
 
-            <!-- Item 23: Resource contribution slider -->
-            <div class="panel" id="contribution-panel">
+            <!-- Resource contribution slider (Item 179) -->
+            <div class="panel" id="contribution-panel" data-panel="contribution">
                 <h3>Contribution</h3>
                 <input type="range" id="contribution-slider" min="1" max="100" value="100">
                 <span id="contribution-value">100%</span>
+            </div>
+
+            <!-- Sidebar bottom buttons -->
+            <div class="sidebar-actions">
+                <button onclick="openSettings()" class="secondary btn-small">Settings</button>
+                <button onclick="toggleLogViewer()" class="secondary btn-small">Logs</button>
+                <button onclick="showOnboarding()" class="secondary btn-small">Help</button>
             </div>
         </aside>
 
         <!-- Main content area -->
         <main class="content">
-            <!-- Item 27: Mining status panel -->
-            <div class="panel mining-panel">
+            <!-- Mining status panel (Item 180) -->
+            <div class="panel mining-panel" id="mining-panel" data-panel="mining">
                 <h3>Mining Status</h3>
                 <div class="stats-grid">
                     <div class="stat">
@@ -121,18 +193,18 @@
                         <span id="mining-daily">0 COMME</span>
                     </div>
                 </div>
-                <!-- Item 34: Proof challenge visualization -->
+                <!-- Proof challenge visualization -->
                 <div class="proof-channels">
-                    <div class="channel"><label>CPU</label><div class="progress-bar"><div id="proof-cpu" class="progress-fill" style="width: 0%"></div></div></div>
-                    <div class="channel"><label>GPU</label><div class="progress-bar"><div id="proof-gpu" class="progress-fill" style="width: 0%"></div></div></div>
-                    <div class="channel"><label>Storage</label><div class="progress-bar"><div id="proof-storage" class="progress-fill" style="width: 0%"></div></div></div>
-                    <div class="channel"><label>RAM</label><div class="progress-bar"><div id="proof-ram" class="progress-fill" style="width: 0%"></div></div></div>
-                    <div class="channel"><label>Bandwidth</label><div class="progress-bar"><div id="proof-bw" class="progress-fill" style="width: 0%"></div></div></div>
+                    <div class="channel"><label>CPU</label><div class="progress-bar"><div id="proof-cpu" class="progress-fill" style="width: 0%"></div></div><span class="score" id="proof-cpu-score">0</span></div>
+                    <div class="channel"><label>GPU</label><div class="progress-bar"><div id="proof-gpu" class="progress-fill" style="width: 0%"></div></div><span class="score" id="proof-gpu-score">0</span></div>
+                    <div class="channel"><label>Storage</label><div class="progress-bar"><div id="proof-storage" class="progress-fill" style="width: 0%"></div></div><span class="score" id="proof-storage-score">0</span></div>
+                    <div class="channel"><label>RAM</label><div class="progress-bar"><div id="proof-ram" class="progress-fill" style="width: 0%"></div></div><span class="score" id="proof-ram-score">0</span></div>
+                    <div class="channel"><label>Bandwidth</label><div class="progress-bar"><div id="proof-bw" class="progress-fill" style="width: 0%"></div></div><span class="score" id="proof-bw-score">0</span></div>
                 </div>
             </div>
 
-            <!-- Network stats -->
-            <div class="panel">
+            <!-- Network stats & peer display (Item 183) -->
+            <div class="panel" id="network-panel" data-panel="network">
                 <h3>Network</h3>
                 <div class="stats-grid">
                     <div class="stat">
@@ -152,10 +224,22 @@
                         <span id="net-circulating">0 COMME</span>
                     </div>
                 </div>
+                <!-- Item 198: Network visualization -->
+                <div id="peer-map" class="peer-map hidden">
+                    <h4>Connected Peers</h4>
+                    <pre id="peer-map-text"></pre>
+                    <table id="peer-table" class="peer-table">
+                        <thead>
+                            <tr><th>Peer ID</th><th>IP</th><th>Status</th></tr>
+                        </thead>
+                        <tbody id="peer-table-body"></tbody>
+                    </table>
+                </div>
+                <button onclick="togglePeerMap()" class="secondary btn-small">Show Peers</button>
             </div>
 
-            <!-- Item 33: Block explorer view -->
-            <div class="panel">
+            <!-- Recent blocks -->
+            <div class="panel" data-panel="blocks">
                 <h3>Recent Blocks</h3>
                 <table id="blocks-table">
                     <thead>
@@ -170,8 +254,8 @@
                 </table>
             </div>
 
-            <!-- Item 38: Transaction history -->
-            <div class="panel">
+            <!-- Item 182: Transaction history -->
+            <div class="panel" id="transactions-panel" data-panel="transactions">
                 <h3>Transactions</h3>
                 <table id="tx-table">
                     <thead>
@@ -186,12 +270,12 @@
                 </table>
             </div>
 
-            <!-- Item 28: Send transaction dialog -->
-            <div class="panel send-panel">
+            <!-- Item 181: Send transaction dialog -->
+            <div class="panel send-panel" id="send-panel" data-panel="send">
                 <h3>Send COMME</h3>
                 <div class="field">
                     <label>Recipient</label>
-                    <input type="text" id="send-to" placeholder="Address (hex)">
+                    <input type="text" id="send-to" placeholder="Address (64 hex chars)">
                 </div>
                 <div class="field">
                     <label>Amount</label>
@@ -202,11 +286,42 @@
                     <span id="send-fee">0.0001 COMME</span>
                 </div>
                 <button id="send-btn" onclick="sendTransaction()">Send</button>
+                <div id="send-result" class="hidden"></div>
+            </div>
+
+            <!-- Item 197: Log viewer -->
+            <div class="panel log-panel hidden" id="log-viewer" data-panel="logs">
+                <h3>Log Viewer</h3>
+                <div id="log-container" class="log-container">
+                    <div id="log-entries"></div>
+                </div>
+                <div class="log-controls">
+                    <button onclick="clearLogs()" class="secondary btn-small">Clear</button>
+                    <button onclick="toggleLogViewer()" class="secondary btn-small">Close</button>
+                </div>
             </div>
         </main>
     </div>
 
-    <!-- Item 30: Settings page (modal) -->
+    <!-- Item 199: Export wallet confirmation dialog -->
+    <div id="export-overlay" class="overlay hidden">
+        <div class="dialog">
+            <h3>Export Wallet</h3>
+            <p class="warning">Your seed phrase gives full access to your funds. Never share it.</p>
+            <p>Are you sure you want to export your wallet?</p>
+            <div id="export-result" class="hidden">
+                <h4>Seed Phrase</h4>
+                <div id="export-seed-display" class="seed-phrase"></div>
+                <button onclick="copyExportedSeed()" class="secondary">Copy</button>
+            </div>
+            <div id="export-actions">
+                <button onclick="confirmExport()">Yes, Export</button>
+                <button onclick="closeExportDialog()" class="secondary">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings page (modal) -->
     <div id="settings-overlay" class="overlay hidden">
         <div class="settings">
             <h2>Settings</h2>

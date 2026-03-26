@@ -1,39 +1,92 @@
-//! Commputer Desktop App — Tauri-based GUI for the Commputer node.
+//! Commputer Desktop App — web-based dashboard for the Commputer node.
 //!
-//! Items 21-40: Desktop application wrapping the commputer node with a
-//! native window showing wallet info, mining status, network stats, and more.
+//! Block J (Items 176-200): Full desktop application that serves a web
+//! frontend and proxies to the node RPC at localhost:9944.
 //!
 //! Architecture:
-//! - Rust backend communicates with the running node via RPC (localhost:9944)
-//! - Frontend is plain HTML/CSS/JS served from the `frontend/` directory
-//! - No framework dependency — vanilla JS for maximum compatibility
-//!
-//! This binary is a placeholder until Tauri is integrated. For now it serves
-//! the frontend via a local HTTP server and opens the default browser.
+//! - Rust HTTP server (axum) serves the frontend from embedded assets
+//! - Backend API endpoints handle wallet, config, and node communication
+//! - Frontend is plain HTML/CSS/JS for maximum compatibility
+//! - The app communicates with a RUNNING node via RPC — it does NOT run consensus
 
-use std::path::PathBuf;
+use std::sync::Arc;
 
-mod rpc_client;
-mod state;
+mod auto_start;
 mod commands;
+mod notifier;
+mod rpc_client;
+mod server;
+mod state;
+mod tray;
+mod update_checker;
 
-fn main() {
-    println!("Commputer Desktop App");
-    println!("This is a placeholder — Tauri integration pending.");
-    println!("For now, use the CLI node: commputer run --testnet");
-    println!();
-    println!("Frontend files are in: {}", frontend_dir().display());
-}
+#[tokio::main]
+async fn main() {
+    // Initialize tracing.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
-/// Path to the frontend assets directory.
-fn frontend_dir() -> PathBuf {
-    let mut dir = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    dir.pop(); // Remove binary name
-    dir.push("frontend");
-    if !dir.exists() {
-        // Fall back to source directory.
-        dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("frontend");
+    // Load config.
+    let config = state::AppConfig::load();
+    let dashboard_port = config.dashboard_port;
+
+    tracing::info!("Commputer Desktop Dashboard starting...");
+    tracing::info!("Node RPC: http://127.0.0.1:{}", config.rpc_port);
+    tracing::info!("Dashboard: http://127.0.0.1:{}", dashboard_port);
+
+    // Create shared app state.
+    let app_state = Arc::new(server::AppState::new(config));
+
+    // Initialize tray icon (Item 187).
+    {
+        let mut tray = app_state.tray.write().await;
+        tray.show();
     }
-    dir
+
+    // Item 192: Check for updates on startup.
+    let state_clone = Arc::clone(&app_state);
+    tokio::spawn(async move {
+        let checker = update_checker::UpdateChecker::new("commputer/commputer");
+        let result = checker.check().await;
+        if result.update_available {
+            if let Some(ver) = &result.latest_version {
+                tracing::info!("Update available: v{ver}");
+                let mut notifier = state_clone.notifier.write().await;
+                notifier.notify_update_available(ver);
+            }
+        }
+    });
+
+    // Item 188: Auto-start setup check.
+    {
+        let config = app_state.config.read().await;
+        if config.auto_start {
+            let exe = std::env::current_exe().unwrap_or_default();
+            let auto = auto_start::AutoStart::new("commputer-desktop", exe);
+            if !auto.is_enabled() {
+                tracing::info!("Auto-start is configured but not installed; enabling...");
+                if let Err(e) = auto.enable() {
+                    tracing::warn!("Failed to enable auto-start: {e}");
+                }
+            }
+        }
+    }
+
+    // Build the router.
+    let router = server::build_router(app_state);
+
+    // Start the server.
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", dashboard_port))
+        .await
+        .expect("Failed to bind dashboard port");
+
+    tracing::info!("Dashboard ready at http://127.0.0.1:{}", dashboard_port);
+
+    axum::serve(listener, router)
+        .await
+        .expect("Dashboard server failed");
 }

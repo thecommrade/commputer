@@ -1,4 +1,4 @@
-/* Commputer Desktop App — Items 22, 31 */
+/* Commputer Desktop App — Block J (Items 176-200) */
 
 :root {
     --bg: #1a1a2e;
@@ -14,7 +14,7 @@
     --input-bg: #1a1a2e;
 }
 
-/* Item 31: Light theme */
+/* Item 189: Light theme */
 .theme-light {
     --bg: #f5f5f5;
     --bg-panel: #ffffff;
@@ -26,7 +26,22 @@
     --input-bg: #fff;
 }
 
-/* Item 31: System theme */
+/* Item 189: Dark theme (explicit) */
+.theme-dark {
+    --bg: #1a1a2e;
+    --bg-panel: #16213e;
+    --text: #e0e0e0;
+    --text-muted: #8899aa;
+    --accent: #0f3460;
+    --accent-bright: #e94560;
+    --green: #2ecc71;
+    --yellow: #f1c40f;
+    --red: #e74c3c;
+    --border: #2a2a4a;
+    --input-bg: #1a1a2e;
+}
+
+/* Item 189: System theme detection */
 @media (prefers-color-scheme: light) {
     .theme-system {
         --bg: #f5f5f5;
@@ -49,7 +64,7 @@ body {
     min-height: 100vh;
 }
 
-/* Item 22: Main layout */
+/* Main layout */
 .app {
     display: flex;
     height: 100vh;
@@ -90,7 +105,7 @@ body {
     letter-spacing: 0.5px;
 }
 
-/* Item 32: Status indicator */
+/* Status indicator */
 .status-indicator {
     display: flex;
     align-items: center;
@@ -108,6 +123,29 @@ body {
 .dot.green { background: var(--green); box-shadow: 0 0 8px var(--green); }
 .dot.yellow { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); }
 .dot.red { background: var(--red); box-shadow: 0 0 8px var(--red); }
+
+/* Item 193: Error status bar */
+.error-bar {
+    background: rgba(231, 76, 60, 0.15);
+    border: 1px solid var(--red);
+    border-radius: 4px;
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 13px;
+    color: var(--red);
+}
+
+.error-dismiss {
+    background: none;
+    border: none;
+    color: var(--red);
+    cursor: pointer;
+    font-size: 18px;
+    padding: 0 4px;
+    margin: 0;
+}
 
 /* Fields */
 .field {
@@ -127,7 +165,7 @@ body {
     color: var(--accent-bright);
 }
 
-/* Item 37: Progress bar */
+/* Progress bar */
 .progress-bar {
     height: 8px;
     background: var(--accent);
@@ -143,7 +181,7 @@ body {
     transition: width 0.3s ease;
 }
 
-/* Item 36: Grace period tank */
+/* Grace period tank */
 .tank {
     width: 40px;
     height: 100px;
@@ -163,7 +201,7 @@ body {
     transition: height 0.5s ease;
 }
 
-/* Item 35: Compliance */
+/* Compliance */
 .compliance-ok {
     color: var(--green);
     font-weight: bold;
@@ -192,7 +230,7 @@ body {
     font-weight: bold;
 }
 
-/* Item 34: Proof channels */
+/* Proof channels */
 .proof-channels {
     margin-top: 12px;
 }
@@ -212,6 +250,13 @@ body {
 
 .channel .progress-bar {
     flex: 1;
+}
+
+.channel .score {
+    font-size: 11px;
+    color: var(--text-muted);
+    width: 30px;
+    text-align: right;
 }
 
 /* Tables */
@@ -235,7 +280,31 @@ td {
     border-bottom: 1px solid var(--border);
 }
 
-/* Item 23: Contribution slider */
+/* Transaction status badges */
+.tx-status {
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: bold;
+}
+
+.tx-pending { background: rgba(241, 196, 15, 0.2); color: var(--yellow); }
+.tx-confirmed { background: rgba(46, 204, 113, 0.2); color: var(--green); }
+.tx-failed { background: rgba(231, 76, 60, 0.2); color: var(--red); }
+
+/* Peer status badges */
+.peer-status {
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: bold;
+}
+
+.peer-compliant { background: rgba(46, 204, 113, 0.2); color: var(--green); }
+.peer-nerfed { background: rgba(231, 76, 60, 0.2); color: var(--red); }
+.peer-unknown { background: rgba(136, 153, 170, 0.2); color: var(--text-muted); }
+
+/* Contribution slider */
 input[type="range"] {
     width: 100%;
     accent-color: var(--accent-bright);
@@ -276,6 +345,11 @@ button.secondary {
     color: var(--text);
 }
 
+button.btn-small {
+    padding: 4px 10px;
+    font-size: 12px;
+}
+
 /* Overlays */
 .overlay {
     position: fixed;
@@ -290,19 +364,22 @@ button.secondary {
     z-index: 100;
 }
 
-.wizard, .settings {
+.wizard, .settings, .dialog, .onboarding {
     background: var(--bg-panel);
     border: 1px solid var(--border);
     border-radius: 12px;
     padding: 32px;
     max-width: 500px;
     width: 90%;
+    max-height: 90vh;
+    overflow-y: auto;
 }
 
-.wizard h2, .settings h2 {
+.wizard h2, .settings h2, .dialog h3, .onboarding h2 {
     margin-bottom: 16px;
 }
 
+/* Item 178: Seed phrase display */
 .seed-phrase {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -317,6 +394,12 @@ button.secondary {
     padding: 4px 8px;
     border-radius: 4px;
     text-align: center;
+}
+
+.seed-actions {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
 }
 
 .warning {
@@ -339,6 +422,20 @@ button.secondary {
     max-width: 400px;
 }
 
+.send-error {
+    color: var(--red);
+    padding: 8px;
+    margin-top: 8px;
+    font-size: 13px;
+}
+
+.send-success {
+    color: var(--green);
+    padding: 8px;
+    margin-top: 8px;
+    font-size: 13px;
+}
+
 /* Mining panel */
 .mining-panel {
     border-left: 3px solid var(--accent-bright);
@@ -347,4 +444,106 @@ button.secondary {
 small {
     color: var(--text-muted);
     font-size: 11px;
+}
+
+/* Sidebar actions */
+.sidebar-actions {
+    margin-top: auto;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+/* Item 198: Peer map */
+.peer-map {
+    margin-top: 12px;
+    padding: 12px;
+    background: var(--bg);
+    border-radius: 4px;
+}
+
+.peer-map h4 {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+}
+
+.peer-map pre {
+    font-family: monospace;
+    font-size: 12px;
+    color: var(--green);
+    white-space: pre-wrap;
+    margin-bottom: 12px;
+}
+
+.peer-table {
+    font-size: 12px;
+}
+
+/* Item 197: Log viewer */
+.log-panel {
+    border-left: 3px solid var(--yellow);
+}
+
+.log-container {
+    height: 300px;
+    overflow-y: auto;
+    background: var(--bg);
+    border-radius: 4px;
+    padding: 8px;
+    font-family: monospace;
+    font-size: 12px;
+}
+
+.log-entry {
+    padding: 2px 4px;
+    border-bottom: 1px solid rgba(42, 42, 74, 0.5);
+}
+
+.log-info { color: var(--text); }
+.log-debug { color: var(--text-muted); }
+.log-warn { color: var(--yellow); }
+.log-error { color: var(--red); }
+
+.log-controls {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+/* Item 194: Onboarding tutorial */
+.onboarding ul {
+    margin: 12px 0;
+    padding-left: 20px;
+}
+
+.onboarding li {
+    margin-bottom: 4px;
+    line-height: 1.5;
+}
+
+.onboarding kbd {
+    background: var(--accent);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: monospace;
+    font-size: 12px;
+    border: 1px solid var(--border);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .app {
+        flex-direction: column;
+    }
+    .sidebar {
+        width: 100%;
+        height: auto;
+        max-height: 40vh;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+    }
+    .seed-phrase {
+        grid-template-columns: repeat(3, 1fr);
+    }
 }

@@ -14,4 +14,11 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
 dirs = "5"
+hex = "0.4"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
