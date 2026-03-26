@@ -52,14 +52,13 @@ impl DiversityTracker {
 
     /// Remove a peer from tracking (e.g., when a peer disconnects).
     pub fn remove_peer(&mut self, ip: &str) {
-        if let Some(subnet) = extract_subnet_16(ip) {
-            if let Some(count) = self.subnet_counts.get_mut(&subnet) {
+        if let Some(subnet) = extract_subnet_16(ip)
+            && let Some(count) = self.subnet_counts.get_mut(&subnet) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     self.subnet_counts.remove(&subnet);
                 }
             }
-        }
     }
 }
 

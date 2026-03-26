@@ -21,6 +21,8 @@ pub const META_NERF_RATE_BPS: &str = "nerf_rate_bps";
 pub const META_SCHEMA_VERSION: &str = "schema_version";
 /// Feature 186: Current schema version.
 pub const CURRENT_SCHEMA_VERSION: u64 = 1;
+/// Item 15: Clean shutdown marker key.
+pub const META_CLEAN_SHUTDOWN: &str = "clean_shutdown";
 
 /// Persistent storage layer backed by RocksDB.
 /// Used alongside in-memory stores — this is the durable layer.
@@ -34,6 +36,16 @@ pub struct RocksStore {
 }
 
 impl RocksStore {
+    /// Item 16: Attempt to repair a corrupted database before opening.
+    pub fn try_repair(path: &Path) {
+        tracing::info!("Attempting database repair at {}", path.display());
+        if let Err(e) = DB::repair(&Options::default(), path) {
+            tracing::warn!("Database repair failed: {}", e);
+        } else {
+            tracing::info!("Database repair completed successfully");
+        }
+    }
+
     /// Open or create a RocksDB store at the given filesystem path.
     pub fn open(path: &Path) -> Result<Self, rocksdb::Error> {
         let mut opts = Options::default();
@@ -42,7 +54,7 @@ impl RocksStore {
         // Feature 189: Ensure WAL is enabled (RocksDB default, but be explicit).
         opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::PointInTime);
 
-        let cf_names = vec![CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED];
+        let cf_names = [CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED];
         let cfs: Vec<ColumnFamilyDescriptor> = cf_names
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
@@ -64,10 +76,27 @@ impl RocksStore {
         // Feature 186: Run migrations on open.
         store.run_migrations()?;
 
+        // Item 15: Detect unclean shutdown.
+        let was_clean = store.get_meta_u64(META_CLEAN_SHUTDOWN)
+            .unwrap_or(None)
+            .unwrap_or(0) == 1;
+        if !was_clean {
+            tracing::warn!("Detected unclean shutdown — RocksDB WAL recovery in progress");
+        }
+        // Clear the clean shutdown marker (will be set again on clean shutdown).
+        let _ = store.put_meta_u64(META_CLEAN_SHUTDOWN, 0);
+
         // Feature 189: Verify WAL integrity.
         store.verify_wal();
 
         Ok(store)
+    }
+
+    /// Item 15: Mark a clean shutdown so next startup knows it was graceful.
+    pub fn mark_clean_shutdown(&self) {
+        if let Err(e) = self.put_meta_u64(META_CLEAN_SHUTDOWN, 1) {
+            tracing::warn!("Failed to mark clean shutdown: {}", e);
+        }
     }
 
     /// Feature 186: Run any needed database migrations.
@@ -187,11 +216,10 @@ impl RocksStore {
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         let mut accounts = Vec::new();
         for item in iter {
-            if let Ok((_key, value)) = item {
-                if let Ok(account) = borsh::from_slice::<Account>(&value) {
+            if let Ok((_key, value)) = item
+                && let Ok(account) = borsh::from_slice::<Account>(&value) {
                     accounts.push(account);
                 }
-            }
         }
         accounts
     }
@@ -203,13 +231,11 @@ impl RocksStore {
         let iter = self.db.iterator_cf(&cf_heights, rocksdb::IteratorMode::Start);
         let mut blocks = Vec::new();
         for item in iter {
-            if let Ok((_height_key, hash_bytes)) = item {
-                if let Ok(Some(data)) = self.db.get_cf(&cf_blocks, &*hash_bytes) {
-                    if let Ok(block) = borsh::from_slice::<Block>(&data) {
+            if let Ok((_height_key, hash_bytes)) = item
+                && let Ok(Some(data)) = self.db.get_cf(&cf_blocks, &*hash_bytes)
+                    && let Ok(block) = borsh::from_slice::<Block>(&data) {
                         blocks.push(block);
                     }
-                }
-            }
         }
         blocks
     }
@@ -321,13 +347,11 @@ impl RocksStore {
     pub fn estimate_db_size(&self) -> u64 {
         let mut total: u64 = 0;
         for cf_name in &[CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED] {
-            if let Some(cf) = self.db.cf_handle(cf_name) {
-                if let Ok(Some(size_str)) = self.db.property_value_cf(&cf, "rocksdb.estimate-live-data-size") {
-                    if let Ok(size) = size_str.parse::<u64>() {
+            if let Some(cf) = self.db.cf_handle(cf_name)
+                && let Ok(Some(size_str)) = self.db.property_value_cf(&cf, "rocksdb.estimate-live-data-size")
+                    && let Ok(size) = size_str.parse::<u64>() {
                         total += size;
                     }
-                }
-            }
         }
         total
     }

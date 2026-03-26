@@ -1,0 +1,30 @@
+# Item 91: Commputer testnet configuration template
+# Copy to your data directory and modify as needed.
+
+# ── Network ──
+# Comma-separated seed node multiaddrs
+# seeds = "/ip4/1.2.3.4/tcp/9000/p2p/PEER_ID,/ip4/5.6.7.8/tcp/9000/p2p/PEER_ID"
+
+# Maximum number of peers
+max_peer_count = 50
+
+# ── Node ──
+# Resource contribution percentage (1-100)
+contribution_percent = 100
+
+# Logging level: error, warn, info, debug, trace
+log_level = "info"
+
+# ── RPC ──
+# RPC port (default 9944)
+# rpc_port = 9944
+
+# API key for non-localhost access (leave empty for localhost-only)
+# api_key = ""
+
+# ── Mining ──
+# Block production interval in seconds (from genesis config)
+# block_time_secs = 2
+
+# Proof challenge interval in seconds (from genesis config)
+# proof_challenge_interval_secs = 300

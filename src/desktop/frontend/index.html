@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Commputer</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="theme-system">
+    <!-- Item 40: First-run wizard overlay -->
+    <div id="wizard-overlay" class="overlay hidden">
+        <div class="wizard">
+            <h2>Welcome to Commputer</h2>
+            <div id="wizard-step-1" class="wizard-step">
+                <p>A communal supercomputer for the people, by the people.</p>
+                <p>Let's set up your wallet to get started.</p>
+                <button onclick="wizardCreate()">Create New Wallet</button>
+                <button onclick="wizardRecover()" class="secondary">Recover Existing Wallet</button>
+            </div>
+            <!-- Item 25: Wallet creation wizard -->
+            <div id="wizard-step-2" class="wizard-step hidden">
+                <h3>Your Seed Phrase</h3>
+                <p class="warning">Write these words down. You cannot recover them later.</p>
+                <div id="seed-phrase-display" class="seed-phrase"></div>
+                <button onclick="wizardConfirm()">I've Written It Down</button>
+            </div>
+            <!-- Item 25: Confirmation step -->
+            <div id="wizard-step-3" class="wizard-step hidden">
+                <h3>Confirm Your Seed Phrase</h3>
+                <p>Enter word #<span id="confirm-word-num">1</span>:</p>
+                <input type="text" id="confirm-word-input" placeholder="Enter word...">
+                <button onclick="wizardVerify()">Verify</button>
+                <p id="confirm-error" class="error hidden">Incorrect word. Try again.</p>
+            </div>
+            <!-- Item 26: Wallet recovery -->
+            <div id="wizard-step-recover" class="wizard-step hidden">
+                <h3>Recover Wallet</h3>
+                <p>Enter your 24-word seed phrase:</p>
+                <textarea id="recover-phrase" rows="4" placeholder="word1 word2 word3..."></textarea>
+                <button onclick="wizardDoRecover()">Recover</button>
+            </div>
+            <div id="wizard-step-done" class="wizard-step hidden">
+                <h3>Wallet Ready</h3>
+                <p>Address: <code id="wizard-address"></code></p>
+                <button onclick="wizardFinish()">Start Mining</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Item 22: Main window layout -->
+    <div class="app">
+        <!-- Left sidebar -->
+        <aside class="sidebar">
+            <!-- Item 32: Node status indicator -->
+            <div class="status-indicator">
+                <span id="status-dot" class="dot red"></span>
+                <span id="status-text">Disconnected</span>
+            </div>
+
+            <!-- Item 24: Wallet display -->
+            <div class="panel" id="wallet-panel">
+                <h3>Wallet</h3>
+                <div class="field">
+                    <label>Address</label>
+                    <code id="wallet-address">-</code>
+                </div>
+                <div class="field">
+                    <label>Balance</label>
+                    <span id="wallet-balance">0 COMME</span>
+                </div>
+                <!-- Item 37: Tier progress -->
+                <div class="field">
+                    <label>Tier</label>
+                    <span id="wallet-tier">Explorer</span>
+                </div>
+                <div class="progress-bar">
+                    <div id="tier-progress" class="progress-fill" style="width: 0%"></div>
+                </div>
+                <small id="tier-next">0 / 1 COMME to Contributor</small>
+            </div>
+
+            <!-- Item 35: Compliance status -->
+            <div class="panel" id="compliance-panel">
+                <h3>Compliance</h3>
+                <div id="compliance-status" class="compliance-ok">Compliant</div>
+            </div>
+
+            <!-- Item 36: Grace period -->
+            <div class="panel" id="grace-panel">
+                <h3>Grace Period</h3>
+                <div class="tank">
+                    <div id="grace-fill" class="tank-fill" style="height: 100%"></div>
+                </div>
+                <small id="grace-text">Full</small>
+            </div>
+
+            <!-- Item 23: Resource contribution slider -->
+            <div class="panel" id="contribution-panel">
+                <h3>Contribution</h3>
+                <input type="range" id="contribution-slider" min="1" max="100" value="100">
+                <span id="contribution-value">100%</span>
+            </div>
+        </aside>
+
+        <!-- Main content area -->
+        <main class="content">
+            <!-- Item 27: Mining status panel -->
+            <div class="panel mining-panel">
+                <h3>Mining Status</h3>
+                <div class="stats-grid">
+                    <div class="stat">
+                        <label>Epoch</label>
+                        <span id="mining-epoch">0</span>
+                    </div>
+                    <div class="stat">
+                        <label>Total Mined</label>
+                        <span id="mining-total">0 COMME</span>
+                    </div>
+                    <div class="stat">
+                        <label>Daily Est.</label>
+                        <span id="mining-daily">0 COMME</span>
+                    </div>
+                </div>
+                <!-- Item 34: Proof challenge visualization -->
+                <div class="proof-channels">
+                    <div class="channel"><label>CPU</label><div class="progress-bar"><div id="proof-cpu" class="progress-fill" style="width: 0%"></div></div></div>
+                    <div class="channel"><label>GPU</label><div class="progress-bar"><div id="proof-gpu" class="progress-fill" style="width: 0%"></div></div></div>
+                    <div class="channel"><label>Storage</label><div class="progress-bar"><div id="proof-storage" class="progress-fill" style="width: 0%"></div></div></div>
+                    <div class="channel"><label>RAM</label><div class="progress-bar"><div id="proof-ram" class="progress-fill" style="width: 0%"></div></div></div>
+                    <div class="channel"><label>Bandwidth</label><div class="progress-bar"><div id="proof-bw" class="progress-fill" style="width: 0%"></div></div></div>
+                </div>
+            </div>
+
+            <!-- Network stats -->
+            <div class="panel">
+                <h3>Network</h3>
+                <div class="stats-grid">
+                    <div class="stat">
+                        <label>Height</label>
+                        <span id="net-height">0</span>
+                    </div>
+                    <div class="stat">
+                        <label>Peers</label>
+                        <span id="net-peers">0</span>
+                    </div>
+                    <div class="stat">
+                        <label>Pending Txs</label>
+                        <span id="net-pending">0</span>
+                    </div>
+                    <div class="stat">
+                        <label>Circulating</label>
+                        <span id="net-circulating">0 COMME</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Item 33: Block explorer view -->
+            <div class="panel">
+                <h3>Recent Blocks</h3>
+                <table id="blocks-table">
+                    <thead>
+                        <tr>
+                            <th>Height</th>
+                            <th>Hash</th>
+                            <th>Txs</th>
+                            <th>Time</th>
+                        </tr>
+                    </thead>
+                    <tbody id="blocks-body"></tbody>
+                </table>
+            </div>
+
+            <!-- Item 38: Transaction history -->
+            <div class="panel">
+                <h3>Transactions</h3>
+                <table id="tx-table">
+                    <thead>
+                        <tr>
+                            <th>Type</th>
+                            <th>Amount</th>
+                            <th>Time</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tx-body"></tbody>
+                </table>
+            </div>
+
+            <!-- Item 28: Send transaction dialog -->
+            <div class="panel send-panel">
+                <h3>Send COMME</h3>
+                <div class="field">
+                    <label>Recipient</label>
+                    <input type="text" id="send-to" placeholder="Address (hex)">
+                </div>
+                <div class="field">
+                    <label>Amount</label>
+                    <input type="number" id="send-amount" placeholder="0.0" step="0.0001" min="0">
+                </div>
+                <div class="field">
+                    <label>Est. Fee</label>
+                    <span id="send-fee">0.0001 COMME</span>
+                </div>
+                <button id="send-btn" onclick="sendTransaction()">Send</button>
+            </div>
+        </main>
+    </div>
+
+    <!-- Item 30: Settings page (modal) -->
+    <div id="settings-overlay" class="overlay hidden">
+        <div class="settings">
+            <h2>Settings</h2>
+            <div class="field">
+                <label>Contribution %</label>
+                <input type="number" id="settings-contribution" min="1" max="100" value="100">
+            </div>
+            <div class="field">
+                <label>Auto-start on boot</label>
+                <input type="checkbox" id="settings-autostart">
+            </div>
+            <div class="field">
+                <label>Notifications</label>
+                <input type="checkbox" id="settings-notifications" checked>
+            </div>
+            <div class="field">
+                <label>Theme</label>
+                <select id="settings-theme">
+                    <option value="system">System</option>
+                    <option value="dark">Dark</option>
+                    <option value="light">Light</option>
+                </select>
+            </div>
+            <div class="field">
+                <label>Log Level</label>
+                <select id="settings-loglevel">
+                    <option value="info">Info</option>
+                    <option value="debug">Debug</option>
+                    <option value="warn">Warn</option>
+                </select>
+            </div>
+            <div class="field">
+                <label>Data Directory</label>
+                <input type="text" id="settings-datadir" value="./commputer-testnet">
+            </div>
+            <button onclick="saveSettings()">Save</button>
+            <button onclick="closeSettings()" class="secondary">Cancel</button>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

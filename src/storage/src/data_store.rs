@@ -18,6 +18,12 @@ pub struct DataStore {
     pub total_size_bytes: u64,
 }
 
+impl Default for DataStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DataStore {
     pub fn new() -> Self {
         Self {

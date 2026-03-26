@@ -17,6 +17,12 @@ pub struct UsageAnalytics {
     pub stats: HashMap<String, HolderUsageStats>,
 }
 
+impl Default for UsageAnalytics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UsageAnalytics {
     pub fn new() -> Self {
         Self {

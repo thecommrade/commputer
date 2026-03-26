@@ -253,8 +253,8 @@ impl JobPool {
         let mut penalties = Vec::new();
 
         for job_id in timed_out {
-            if let Some(job) = self.jobs.get_mut(&job_id) {
-                if let PoolJobStatus::Assigned { executor, .. } = job.status {
+            if let Some(job) = self.jobs.get_mut(&job_id)
+                && let PoolJobStatus::Assigned { executor, .. } = job.status {
                     penalties.push((job_id, executor));
                     // Reset to pending so it can be reassigned
                     job.status = PoolJobStatus::Pending;
@@ -265,7 +265,6 @@ impl JobPool {
                         assigned.retain(|id| *id != job_id);
                     }
                 }
-            }
         }
 
         penalties

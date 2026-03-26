@@ -13,16 +13,32 @@ pub struct GenesisConfig {
     pub chain_id: String,
     /// Total token supply in raw units.
     pub total_supply: u64,
-    /// Duration of one epoch in seconds.
+    /// Duration of one epoch in seconds (Item 8).
     pub epoch_duration_secs: u64,
-    /// Base emission rate per epoch in raw units.
+    /// Base emission rate per epoch in raw units (Item 10).
     pub emission_base_rate: u64,
-    /// Floor emission rate per epoch in raw units.
+    /// Floor emission rate per epoch in raw units (Item 10).
     pub emission_floor_rate: u64,
-    /// Per-channel floor allocation ratios (channel name -> fraction 0.0..1.0).
+    /// Per-channel floor allocation ratios (channel name -> fraction 0.0..1.0) (Item 11).
     #[serde(default)]
     pub channel_floors: HashMap<String, f64>,
+    /// Item 9: Proof challenge interval in seconds (default 300 = 5 minutes).
+    #[serde(default = "default_proof_interval")]
+    pub proof_challenge_interval_secs: u64,
+    /// Item 12: Block production interval in seconds (default 2).
+    #[serde(default = "default_block_time")]
+    pub block_time_secs: u64,
+    /// Item 10: Emission decay rate per epoch (0.0..1.0, default 0.0001).
+    #[serde(default = "default_emission_decay")]
+    pub emission_decay_rate: f64,
+    /// Genesis timestamp (Item 5). If 0, uses current time on first boot.
+    #[serde(default)]
+    pub genesis_timestamp: u64,
 }
+
+fn default_proof_interval() -> u64 { 300 }
+fn default_block_time() -> u64 { 2 }
+fn default_emission_decay() -> f64 { 0.0001 }
 
 impl Default for GenesisConfig {
     fn default() -> Self {
@@ -46,6 +62,10 @@ pub fn default_genesis() -> GenesisConfig {
         emission_base_rate: 100 * crate::token::UNITS_PER_COMME,
         emission_floor_rate: 10 * crate::token::UNITS_PER_COMME,
         channel_floors,
+        proof_challenge_interval_secs: 300,
+        block_time_secs: 2,
+        emission_decay_rate: 0.0001,
+        genesis_timestamp: 0,
     }
 }
 

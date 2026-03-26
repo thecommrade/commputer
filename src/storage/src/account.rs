@@ -212,7 +212,7 @@ fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.len() == 1 {
         return leaves[0];
     }
-    let mut next = Vec::with_capacity((leaves.len() + 1) / 2);
+    let mut next = Vec::with_capacity(leaves.len().div_ceil(2));
     for pair in leaves.chunks(2) {
         let mut hasher = Sha256::new();
         hasher.update(pair[0]);

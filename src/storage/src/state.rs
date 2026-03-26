@@ -199,8 +199,18 @@ impl ChainState {
     /// Open a persistent ChainState backed by RocksDB at the given path.
     /// Loads all state from disk into the in-memory stores.
     pub fn open(path: &Path) -> Result<Self, StateError> {
-        let rocks = RocksStore::open(path)
-            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        // Item 16: Try to open, and if it fails, attempt repair then retry.
+        let rocks = match RocksStore::open(path) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Database open failed: {}. Attempting repair...", e);
+                RocksStore::try_repair(path);
+                RocksStore::open(path)
+                    .map_err(|e2| StateError::StorageError(
+                        format!("database open failed after repair: {}", e2)
+                    ))?
+            }
+        };
 
         // Load meta counters.
         let total_emitted = rocks
@@ -269,6 +279,13 @@ impl ChainState {
         Ok(())
     }
 
+    /// Item 15: Mark a clean shutdown in the database.
+    pub fn mark_clean_shutdown(&self) {
+        if let Some(ref rocks) = self.rocks {
+            rocks.mark_clean_shutdown();
+        }
+    }
+
     /// Retrieve a block by height. Checks in-memory first, falls back to RocksDB.
     pub fn get_block_by_height(&self, height: u64) -> Option<Block> {
         // Try in-memory first.
@@ -276,11 +293,10 @@ impl ChainState {
             return Some(block.clone());
         }
         // Fall back to RocksDB for pruned blocks.
-        if let Some(ref rocks) = self.rocks {
-            if let Ok(Some(block)) = rocks.get_block_by_height(height) {
+        if let Some(ref rocks) = self.rocks
+            && let Ok(Some(block)) = rocks.get_block_by_height(height) {
                 return Some(block);
             }
-        }
         None
     }
 
@@ -365,21 +381,20 @@ impl ChainState {
         let mut before_states: HashMap<Address, (u64, u64)> = HashMap::new();
         for tx in &block.transactions {
             // Record sender before-state.
-            if !before_states.contains_key(&tx.from) {
+            if let std::collections::hash_map::Entry::Vacant(e) = before_states.entry(tx.from) {
                 let (bal, nonce) = self.accounts.get(&tx.from)
                     .map(|a| (a.balance.raw(), a.nonce))
                     .unwrap_or((0, 0));
-                before_states.insert(tx.from, (bal, nonce));
+                e.insert((bal, nonce));
             }
             // Record recipient before-state for transfers.
-            if let TxKind::Transfer { to, .. } = &tx.kind {
-                if !before_states.contains_key(to) {
+            if let TxKind::Transfer { to, .. } = &tx.kind
+                && !before_states.contains_key(to) {
                     let (bal, nonce) = self.accounts.get(to)
                         .map(|a| (a.balance.raw(), a.nonce))
                         .unwrap_or((0, 0));
                     before_states.insert(*to, (bal, nonce));
                 }
-            }
         }
 
         // Process transactions.
@@ -397,7 +412,7 @@ impl ChainState {
                     old_balance: *old_bal,
                     new_balance: new_bal,
                     old_nonce: *old_nonce,
-                    new_nonce: new_nonce,
+                    new_nonce,
                 });
             }
         }
@@ -440,13 +455,11 @@ impl ChainState {
         }
 
         // Verify parent hash matches (except genesis).
-        if block.height() > 0 {
-            if let Some(latest) = self.blocks.latest() {
-                if block.header.parent_hash != latest.hash() {
+        if block.height() > 0
+            && let Some(latest) = self.blocks.latest()
+                && block.header.parent_hash != latest.hash() {
                     return Err(StateError::InvalidBlock("parent hash mismatch".into()));
                 }
-            }
-        }
 
         // Verify chain_id (allow empty for backwards compat).
         if !block.header.chain_id.is_empty()
@@ -513,13 +526,12 @@ impl ChainState {
         tx: &commputer_core::transaction::Transaction,
     ) -> Result<(), StateError> {
         // Feature 251: Validate memo length.
-        if let Some(ref memo) = tx.memo {
-            if memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
+        if let Some(ref memo) = tx.memo
+            && memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
                 return Err(StateError::InvalidBlock(format!(
                     "memo exceeds max length of {} bytes", commputer_core::transaction::Transaction::MAX_MEMO_LENGTH
                 )));
             }
-        }
 
         // Feature 260: Validate timelock.
         if let Some(timelock) = tx.timelock {
@@ -532,14 +544,13 @@ impl ChainState {
         }
 
         // Feature 14: Reject dust transfers before taking mutable borrow on sender.
-        if let TxKind::Transfer { amount, .. } = &tx.kind {
-            if amount.raw() < commputer_core::transaction::DUST_LIMIT {
+        if let TxKind::Transfer { amount, .. } = &tx.kind
+            && amount.raw() < commputer_core::transaction::DUST_LIMIT {
                 return Err(StateError::InvalidBlock(format!(
                     "transfer amount {} below dust limit of {}",
                     amount.raw(), commputer_core::transaction::DUST_LIMIT,
                 )));
             }
-        }
         // Feature 13: Account creation cost — check before mutable sender borrow.
         if let TxKind::Transfer { to, .. } = &tx.kind {
             let recipient_exists = self.accounts.get(to).is_some();
@@ -820,6 +831,28 @@ impl ChainState {
                 }
                 sender.nonce += 1;
             }
+
+            TxKind::MiningReward { to, amount, .. } => {
+                // Item 13: Mining reward — protocol-issued, no nonce or fee.
+                // The actual balance change happens in the epoch processing;
+                // this tx just records it for history visibility.
+                let recipient = self.accounts.get_or_create(*to);
+                let _ = recipient; // Already credited in epoch processing.
+                let _ = amount;
+            }
+
+            TxKind::ValidatorDeregister => {
+                // Item 14: Clean validator deregistration.
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "cannot deregister: not a validator".into(),
+                    ));
+                }
+                sender.is_validator = false;
+                sender.validator_registered_height = None;
+                sender.nonce += 1;
+                info!("Validator {} deregistered cleanly", tx.from);
+            }
         }
 
         Ok(())
@@ -1030,7 +1063,7 @@ impl ChainState {
             .collect();
 
         for addr in &to_cold {
-            if let Some(account) = self.accounts.get_mut(&addr) {
+            if let Some(account) = self.accounts.get_mut(addr) {
                 account.is_hot = false;
                 cold_count += 1;
                 // Flush to RocksDB for durability.
@@ -1056,13 +1089,12 @@ impl ChainState {
             return self.accounts.get(address);
         }
         // Try loading from RocksDB.
-        if let Some(ref rocks) = self.rocks {
-            if let Ok(Some(mut account)) = rocks.get_account(address) {
+        if let Some(ref rocks) = self.rocks
+            && let Ok(Some(mut account)) = rocks.get_account(address) {
                 account.is_hot = true;
                 self.accounts.put(account);
                 return self.accounts.get(address);
             }
-        }
         None
     }
 
@@ -1086,20 +1118,19 @@ impl ChainState {
         // Capture before-state for diffs.
         let mut before_states: HashMap<Address, (u64, u64)> = HashMap::new();
         for tx in &block.transactions {
-            if !before_states.contains_key(&tx.from) {
+            if let std::collections::hash_map::Entry::Vacant(e) = before_states.entry(tx.from) {
                 let (bal, nonce) = self.accounts.get(&tx.from)
                     .map(|a| (a.balance.raw(), a.nonce))
                     .unwrap_or((0, 0));
-                before_states.insert(tx.from, (bal, nonce));
+                e.insert((bal, nonce));
             }
-            if let TxKind::Transfer { to, .. } = &tx.kind {
-                if !before_states.contains_key(to) {
+            if let TxKind::Transfer { to, .. } = &tx.kind
+                && !before_states.contains_key(to) {
                     let (bal, nonce) = self.accounts.get(to)
                         .map(|a| (a.balance.raw(), a.nonce))
                         .unwrap_or((0, 0));
                     before_states.insert(*to, (bal, nonce));
                 }
-            }
         }
 
         // Process all transactions. If any fails, we return error
@@ -1120,7 +1151,7 @@ impl ChainState {
                     old_balance: *old_bal,
                     new_balance: new_bal,
                     old_nonce: *old_nonce,
-                    new_nonce: new_nonce,
+                    new_nonce,
                 });
             }
         }
@@ -1370,7 +1401,7 @@ impl ChainState {
 
         // Feature 135: Refuse to reorg past checkpoint blocks.
         // Any checkpoint between fork_height and our_height blocks the reorg.
-        let first_checkpoint_after_fork = if fork_height % CHECKPOINT_INTERVAL == 0 {
+        let first_checkpoint_after_fork = if fork_height.is_multiple_of(CHECKPOINT_INTERVAL) {
             fork_height
         } else {
             (fork_height / CHECKPOINT_INTERVAL + 1) * CHECKPOINT_INTERVAL
@@ -1472,13 +1503,14 @@ impl ChainState {
         Ok(())
     }
 
-    /// Persist all in-memory accounts to RocksDB.
+    /// Item 66: Persist all in-memory accounts to RocksDB using a single WriteBatch.
     fn flush_accounts(&self, rocks: &RocksStore) -> Result<(), StateError> {
+        let mut batch = rocks.new_write_batch();
         for account in self.accounts.iter() {
-            rocks.put_account(account)
-                .map_err(|e| StateError::StorageError(e.to_string()))?;
+            rocks.batch_put_account(&mut batch, account);
         }
-        Ok(())
+        rocks.write_batch(batch)
+            .map_err(|e| StateError::StorageError(e.to_string()))
     }
 }
 

@@ -128,6 +128,20 @@ pub enum TxKind {
         job_id: [u8; 32],
         evidence_hash: [u8; 32],
     },
+
+    /// Item 13: Mining reward — synthetic tx created during epoch processing.
+    /// Shows up in transaction history so users can see their earnings.
+    MiningReward {
+        /// Recipient validator address.
+        to: Address,
+        /// Reward amount in raw units.
+        amount: Amount,
+        /// Epoch in which the reward was earned.
+        epoch: u64,
+    },
+
+    /// Item 14: Validator deregistration — clean network leave.
+    ValidatorDeregister,
 }
 
 /// Minimum transaction fee in raw units (0.0001 COMME = 100_000 raw units).

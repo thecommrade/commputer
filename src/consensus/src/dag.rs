@@ -100,13 +100,12 @@ impl Dag {
 
     /// Mark a vertex as finalized (decided by Snowball).
     pub fn finalize(&mut self, hash: &BlockHash) -> bool {
-        if let Some(vertex) = self.vertices.get_mut(hash) {
-            if !vertex.finalized {
+        if let Some(vertex) = self.vertices.get_mut(hash)
+            && !vertex.finalized {
                 vertex.finalized = true;
                 self.finalized_order.push(*hash);
                 return true;
             }
-        }
         false
     }
 

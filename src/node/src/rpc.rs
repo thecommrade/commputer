@@ -129,8 +129,8 @@ async fn submit_tx(
             }),
         );
     }
-    if let Some(ref memo) = tx.memo {
-        if memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
+    if let Some(ref memo) = tx.memo
+        && memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(SubmitTxResponse {
@@ -140,7 +140,6 @@ async fn submit_tx(
                 }),
             );
         }
-    }
 
     // Basic validation before forwarding to event loop.
     if !tx.verify() {
@@ -705,14 +704,13 @@ async fn faucet(
 
     // Rate limit: 1 request per address per epoch.
     let mut claims = state.faucet_claims.lock().await;
-    if let Some(&last_epoch) = claims.get(&req.address) {
-        if last_epoch >= current_epoch {
+    if let Some(&last_epoch) = claims.get(&req.address)
+        && last_epoch >= current_epoch {
             return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
                 "error": "faucet already claimed this epoch",
                 "next_available_epoch": current_epoch + 1,
             })));
         }
-    }
 
     claims.insert(req.address.clone(), current_epoch);
 
@@ -726,6 +724,84 @@ async fn faucet(
         "epoch": current_epoch,
         "note": "1 COMME dispensed from faucet (testnet only)",
     })))
+}
+
+/// Item 95: Testnet leaderboard — top validators by total mined.
+async fn get_leaderboard(
+    State(state): State<Arc<RpcState>>,
+) -> Json<serde_json::Value> {
+    let balances = state.balances.lock().await;
+    let mut validators: Vec<_> = balances.values()
+        .filter(|b| b.is_validator)
+        .map(|b| serde_json::json!({
+            "address": b.address,
+            "total_mined": b.total_mined,
+            "balance": b.balance,
+            "tier": b.tier,
+        }))
+        .collect();
+
+    // Sort by total_mined descending.
+    validators.sort_by(|a, b| {
+        let a_mined = a["total_mined"].as_u64().unwrap_or(0);
+        let b_mined = b["total_mined"].as_u64().unwrap_or(0);
+        b_mined.cmp(&a_mined)
+    });
+
+    // Top 50.
+    validators.truncate(50);
+
+    Json(serde_json::json!({
+        "leaderboard": validators,
+        "count": validators.len(),
+    }))
+}
+
+/// Item 96: Testnet statistics page — HTML page with network stats.
+async fn get_stats_page(
+    State(state): State<Arc<RpcState>>,
+) -> Html<String> {
+    let status = state.status.lock().await;
+    let metrics = state.metrics.lock().await;
+    let balances = state.balances.lock().await;
+
+    let validator_count = balances.values().filter(|b| b.is_validator).count();
+    let total_mined: u64 = balances.values().map(|b| b.total_mined).sum();
+    let units = commputer_core::token::UNITS_PER_COMME;
+
+    Html(format!(r#"<!DOCTYPE html>
+<html><head><title>Commputer Testnet Stats</title>
+<meta http-equiv="refresh" content="10">
+<style>
+body {{ font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }}
+h1 {{ color: #e94560; }}
+.stat {{ margin: 8px 0; }}
+.label {{ color: #8899aa; display: inline-block; width: 200px; }}
+</style></head><body>
+<h1>Commputer Testnet Statistics</h1>
+<div class="stat"><span class="label">Height:</span> {}</div>
+<div class="stat"><span class="label">Epoch:</span> {}</div>
+<div class="stat"><span class="label">Accounts:</span> {}</div>
+<div class="stat"><span class="label">Active Validators:</span> {}</div>
+<div class="stat"><span class="label">Total Emitted:</span> {} COMME</div>
+<div class="stat"><span class="label">Total Burned:</span> {} COMME</div>
+<div class="stat"><span class="label">Circulating:</span> {} COMME</div>
+<div class="stat"><span class="label">Total Mined (all):</span> {} COMME</div>
+<div class="stat"><span class="label">Peers Connected:</span> {}</div>
+<div class="stat"><span class="label">Pending Txs:</span> {}</div>
+<div class="stat"><span class="label">Banned Peers:</span> {}</div>
+<p style="color: #666; margin-top: 20px;">Auto-refreshes every 10 seconds.</p>
+</body></html>"#,
+        status.height, status.epoch, status.accounts,
+        validator_count,
+        status.emitted / units,
+        status.burned / units,
+        status.circulating / units,
+        total_mined / units,
+        metrics.peers_connected,
+        metrics.pending_txs,
+        metrics.peers_banned,
+    ))
 }
 
 // ── Feature 15: RPC API key authentication middleware ──
@@ -757,6 +833,26 @@ async fn auth_middleware(
         }
     }
     next.run(req).await
+}
+
+/// Item 58: Security headers middleware.
+async fn security_headers(
+    req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    headers.insert("Cache-Control", "no-store".parse().unwrap());
+    headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
+    headers.insert(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'none'".parse().unwrap(),
+    );
+    // Item 57: CORS — localhost only (already bound to 127.0.0.1).
+    headers.insert("Access-Control-Allow-Origin", "http://localhost:*".parse().unwrap_or_else(|_| "http://localhost".parse().unwrap()));
+    response
 }
 
 // ── Feature 16: RPC per-IP rate limiting middleware ──
@@ -824,6 +920,8 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/fee-estimate", get(get_fee_estimate))
         .route("/rewards/{address}", get(get_pending_rewards))
         .route("/faucet", post(faucet))
+        .route("/leaderboard", get(get_leaderboard))
+        .route("/stats", get(get_stats_page))
         .route_layer(middleware::from_fn_with_state(rpc_state.clone(), auth_middleware))
         .route_layer(middleware::from_fn_with_state(rpc_state.clone(), rate_limit_middleware))
         .with_state(rpc_state)
@@ -834,8 +932,11 @@ pub async fn start_rpc_server(
     rpc_port: u16,
     rpc_state: Arc<RpcState>,
 ) {
-    let app = build_router(rpc_state);
+    let app = build_router(rpc_state)
+        // Item 58: Security headers on all RPC responses.
+        .layer(axum::middleware::from_fn(security_headers));
 
+    // Item 57: Already bound to 127.0.0.1 (localhost only) for CORS safety.
     let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", rpc_port)).await {
         Ok(l) => l,
         Err(e) => {

@@ -186,6 +186,30 @@ enum Commands {
         #[arg(long, default_value = "9944")]
         rpc_port: u16,
     },
+    /// Item 106: Mining statistics
+    MiningStats {
+        #[arg(long, default_value = "9944")]
+        rpc_port: u16,
+    },
+    /// Item 107: Network info
+    NetworkInfo {
+        #[arg(long, default_value = "9944")]
+        rpc_port: u16,
+    },
+    /// Item 111: Validator status
+    ValidatorStatus {
+        /// Validator address (hex)
+        address: String,
+        #[arg(long, default_value = "9944")]
+        rpc_port: u16,
+    },
+    /// Item 119: System requirements check
+    SysCheck,
+    /// Item 120: Compliance status with resolution instructions
+    ComplianceCheck {
+        #[arg(long, default_value = "9944")]
+        rpc_port: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -243,13 +267,36 @@ fn data_dir(testnet: bool) -> PathBuf {
     }
 }
 
+/// Item 4: Wallet directory is separate from chain data — lives in ~/.commputer/wallet/.
+fn wallet_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".commputer")
+        .join("wallet")
+}
+
 fn wallet_path(testnet: bool) -> PathBuf {
-    data_dir(testnet).join("wallet.json")
+    let dir = wallet_dir();
+    if testnet {
+        dir.join("wallet-testnet.json")
+    } else {
+        dir.join("wallet.json")
+    }
 }
 
 /// Feature 245: Get the path for a named wallet.
 fn wallet_path_named(testnet: bool, name: &str) -> PathBuf {
-    data_dir(testnet).join("wallets").join(format!("{}.json", name))
+    let dir = wallet_dir();
+    let suffix = if testnet { "-testnet" } else { "" };
+    dir.join("wallets").join(format!("{}{}.json", name, suffix))
+}
+
+/// Item 3: Path for the persistent libp2p peer identity keypair.
+fn peer_key_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".commputer")
+        .join("peer_key.bin")
 }
 
 fn read_password(prompt: &str) -> String {
@@ -305,7 +352,10 @@ fn create_genesis_for_dir(data_dir: Option<&std::path::Path>) -> Block {
             tx_root: [0u8; 32],
             proof_root: [0u8; 32],
             state_root: [0u8; 32],
-            timestamp: 0, // Epoch zero.
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             producer: Address([0u8; 32]), // No producer for genesis.
             epoch: 0,
             producer_public_key: vec![],
@@ -822,8 +872,9 @@ async fn run_node(
     info!("  GPU:     {}", hardware.gpu_model.as_deref().unwrap_or("none"));
     info!("  OS:      {}", hardware.os_family);
 
-    // Set up network.
-    let mut network = CommpNetwork::new(port)
+    // Set up network with persistent peer identity (Item 3).
+    let peer_key = peer_key_path();
+    let mut network = CommpNetwork::new_with_keypair_path(port, Some(&peer_key))
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     info!("P2P peer ID: {}", network.local_peer_id);
 
@@ -1043,6 +1094,150 @@ async fn main() -> Result<()> {
         Commands::Send { to, amount, testnet, rpc_port } => {
             cmd_send(&to, amount, testnet, rpc_port).await?;
         }
+        Commands::MiningStats { rpc_port } => {
+            cmd_mining_stats(rpc_port).await?;
+        }
+        Commands::NetworkInfo { rpc_port } => {
+            cmd_network_info(rpc_port).await?;
+        }
+        Commands::ValidatorStatus { address, rpc_port } => {
+            cmd_validator_status(&address, rpc_port).await?;
+        }
+        Commands::SysCheck => {
+            cmd_sys_check();
+        }
+        Commands::ComplianceCheck { rpc_port } => {
+            cmd_compliance_check(rpc_port).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Item 106: Mining statistics CLI.
+async fn cmd_mining_stats(rpc_port: u16) -> Result<()> {
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{}", rpc_port);
+
+    let status: serde_json::Value = client.get(format!("{}/status", base))
+        .send().await?.json().await?;
+    let metrics: serde_json::Value = client.get(format!("{}/metrics", base))
+        .send().await?.json().await?;
+
+    let units = UNITS_PER_COMME;
+    let height = status["height"].as_u64().unwrap_or(0);
+    let epoch = status["epoch"].as_u64().unwrap_or(0);
+    let emitted = status["emitted"].as_u64().unwrap_or(0);
+
+    println!("Mining Statistics:");
+    println!("  Height:           {}", height);
+    println!("  Epoch:            {}", epoch);
+    println!("  Total Emitted:    {} COMME", emitted / units);
+    println!("  Pending Txs:      {}", metrics["pending_txs"].as_u64().unwrap_or(0));
+    println!("  Peers Connected:  {}", metrics["peers_connected"].as_u64().unwrap_or(0));
+
+    Ok(())
+}
+
+/// Item 107: Network info CLI.
+async fn cmd_network_info(rpc_port: u16) -> Result<()> {
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{}", rpc_port);
+
+    let peers: Vec<serde_json::Value> = client.get(format!("{}/peers", base))
+        .send().await?.json().await?;
+    let health: serde_json::Value = client.get(format!("{}/network", base))
+        .send().await?.json().await?;
+
+    println!("Network Info:");
+    println!("  Peers:   {}", peers.len());
+    for (i, peer) in peers.iter().enumerate() {
+        let id = peer["peer_id"].as_str().unwrap_or("?");
+        let ip = peer["ip"].as_str().unwrap_or("?");
+        println!("  {}. {} ({})", i + 1, &id[..12.min(id.len())], ip);
+    }
+    if let Some(risk) = health["partition_risk"].as_str() {
+        println!("  Partition Risk: {}", risk);
+    }
+
+    Ok(())
+}
+
+/// Item 111: Validator status CLI.
+async fn cmd_validator_status(address: &str, rpc_port: u16) -> Result<()> {
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{}", rpc_port);
+
+    let balance: serde_json::Value = client.get(format!("{}/balance/{}", base, address))
+        .send().await?.json().await?;
+    let perf: serde_json::Value = client.get(format!("{}/validator/{}/performance", base, address))
+        .send().await?.json().await?;
+
+    let units = UNITS_PER_COMME;
+    println!("Validator Status: {}", &address[..16.min(address.len())]);
+    println!("  Balance:    {} COMME", balance["balance"].as_u64().unwrap_or(0) / units);
+    println!("  Tier:       {}", balance["tier"].as_str().unwrap_or("?"));
+    println!("  Validator:  {}", balance["is_validator"].as_bool().unwrap_or(false));
+    println!("  Mined:      {} COMME", balance["total_mined"].as_u64().unwrap_or(0) / units);
+
+    if let Some(blocks) = perf["blocks_produced"].as_u64() {
+        println!("  Blocks:     {}", blocks);
+    }
+
+    Ok(())
+}
+
+/// Item 119: System requirements check CLI.
+fn cmd_sys_check() {
+    let hw = commputer_core::identity::HardwareFingerprint::detect();
+    println!("System Requirements Check:");
+    println!("  CPU:     {} ({} cores)", hw.cpu_model, hw.cpu_cores);
+    println!("  RAM:     {} MB", hw.ram_total_mb);
+    println!("  Storage: {} MB", hw.storage_total_mb);
+    println!("  GPU:     {}", hw.gpu_model.as_deref().unwrap_or("none"));
+    println!("  OS:      {}", hw.os_family);
+    println!();
+
+    // Compare against reference node
+    let mut issues = Vec::new();
+    if hw.cpu_cores < 2 { issues.push("CPU: Need at least 2 cores"); }
+    if hw.ram_total_mb < 2048 { issues.push("RAM: Need at least 2 GB"); }
+    if hw.storage_total_mb < 10240 { issues.push("Storage: Need at least 10 GB"); }
+
+    if issues.is_empty() {
+        println!("  Result: PASS — meets minimum requirements");
+    } else {
+        println!("  Result: WARNING — below recommended specs:");
+        for issue in &issues {
+            println!("    - {}", issue);
+        }
+    }
+}
+
+/// Item 120: Compliance status CLI.
+async fn cmd_compliance_check(rpc_port: u16) -> Result<()> {
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{}", rpc_port);
+
+    let compliance: serde_json::Value = client.get(format!("{}/compliance", base))
+        .send().await?.json().await?;
+
+    println!("Compliance Status:");
+    if let Some(status) = compliance["status"].as_str() {
+        println!("  Status: {}", status);
+    }
+    if let Some(nerf) = compliance["nerf_rate"].as_f64() {
+        if nerf < 1.0 {
+            println!("  Nerf Rate: {:.0}%", nerf * 100.0);
+            println!();
+            println!("  Resolution:");
+            println!("    1. Check if you're running multiple nodes on the same IP");
+            println!("    2. Ensure your node has a unique IP address");
+            println!("    3. If behind NAT, use --relay flag or configure port forwarding");
+            println!("    4. Nerf rate can only increase — it never decreases");
+        } else {
+            println!("  You are fully compliant.");
+        }
     }
 
     Ok(())
@@ -1198,13 +1393,11 @@ fn address_book_path() -> PathBuf {
 
 fn load_address_book() -> std::collections::HashMap<String, String> {
     let path = address_book_path();
-    if path.exists() {
-        if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(book) = serde_json::from_str(&data) {
+    if path.exists()
+        && let Ok(data) = std::fs::read_to_string(&path)
+            && let Ok(book) = serde_json::from_str(&data) {
                 return book;
             }
-        }
-    }
     std::collections::HashMap::new()
 }
 

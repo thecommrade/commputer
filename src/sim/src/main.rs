@@ -399,7 +399,7 @@ fn simulate_tier_accessibility(output_dir: &str) {
             let target_raw = threshold * UNITS_PER_COMME;
             let per_epoch = daily_rate / 24; // hourly epochs
             let epochs_needed = if per_epoch > 0 {
-                (target_raw + per_epoch - 1) / per_epoch // ceiling division
+                target_raw.div_ceil(per_epoch) // ceiling division
             } else {
                 u64::MAX
             };

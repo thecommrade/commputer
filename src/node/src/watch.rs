@@ -2,7 +2,7 @@
 //!
 //! Polls a node's RPC endpoint to monitor balance changes for a given address.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Local;
 use tokio::signal;
 

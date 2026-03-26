@@ -1,0 +1,350 @@
+/* Commputer Desktop App — Items 22, 31 */
+
+:root {
+    --bg: #1a1a2e;
+    --bg-panel: #16213e;
+    --text: #e0e0e0;
+    --text-muted: #8899aa;
+    --accent: #0f3460;
+    --accent-bright: #e94560;
+    --green: #2ecc71;
+    --yellow: #f1c40f;
+    --red: #e74c3c;
+    --border: #2a2a4a;
+    --input-bg: #1a1a2e;
+}
+
+/* Item 31: Light theme */
+.theme-light {
+    --bg: #f5f5f5;
+    --bg-panel: #ffffff;
+    --text: #1a1a2e;
+    --text-muted: #666;
+    --accent: #e8e8f0;
+    --accent-bright: #e94560;
+    --border: #ddd;
+    --input-bg: #fff;
+}
+
+/* Item 31: System theme */
+@media (prefers-color-scheme: light) {
+    .theme-system {
+        --bg: #f5f5f5;
+        --bg-panel: #ffffff;
+        --text: #1a1a2e;
+        --text-muted: #666;
+        --accent: #e8e8f0;
+        --accent-bright: #e94560;
+        --border: #ddd;
+        --input-bg: #fff;
+    }
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+}
+
+/* Item 22: Main layout */
+.app {
+    display: flex;
+    height: 100vh;
+}
+
+.sidebar {
+    width: 280px;
+    background: var(--bg-panel);
+    border-right: 1px solid var(--border);
+    padding: 16px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.content {
+    flex: 1;
+    padding: 16px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.panel {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+}
+
+.panel h3 {
+    font-size: 14px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 12px;
+    letter-spacing: 0.5px;
+}
+
+/* Item 32: Status indicator */
+.status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 0;
+}
+
+.dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.dot.green { background: var(--green); box-shadow: 0 0 8px var(--green); }
+.dot.yellow { background: var(--yellow); box-shadow: 0 0 8px var(--yellow); }
+.dot.red { background: var(--red); box-shadow: 0 0 8px var(--red); }
+
+/* Fields */
+.field {
+    margin-bottom: 8px;
+}
+
+.field label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 2px;
+}
+
+.field code {
+    font-size: 11px;
+    word-break: break-all;
+    color: var(--accent-bright);
+}
+
+/* Item 37: Progress bar */
+.progress-bar {
+    height: 8px;
+    background: var(--accent);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 4px 0;
+}
+
+.progress-fill {
+    height: 100%;
+    background: var(--accent-bright);
+    border-radius: 4px;
+    transition: width 0.3s ease;
+}
+
+/* Item 36: Grace period tank */
+.tank {
+    width: 40px;
+    height: 100px;
+    border: 2px solid var(--border);
+    border-radius: 4px;
+    position: relative;
+    overflow: hidden;
+    margin: 8px auto;
+}
+
+.tank-fill {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: linear-gradient(to top, var(--green), var(--yellow));
+    transition: height 0.5s ease;
+}
+
+/* Item 35: Compliance */
+.compliance-ok {
+    color: var(--green);
+    font-weight: bold;
+}
+
+.compliance-nerfed {
+    color: var(--red);
+    font-weight: bold;
+}
+
+/* Stats grid */
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 12px;
+}
+
+.stat label {
+    display: block;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.stat span {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+/* Item 34: Proof channels */
+.proof-channels {
+    margin-top: 12px;
+}
+
+.channel {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.channel label {
+    width: 70px;
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.channel .progress-bar {
+    flex: 1;
+}
+
+/* Tables */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+th {
+    text-align: left;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+}
+
+td {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+}
+
+/* Item 23: Contribution slider */
+input[type="range"] {
+    width: 100%;
+    accent-color: var(--accent-bright);
+}
+
+/* Inputs */
+input[type="text"],
+input[type="number"],
+textarea,
+select {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--input-bg);
+    color: var(--text);
+    font-size: 14px;
+}
+
+/* Buttons */
+button {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 4px;
+    background: var(--accent-bright);
+    color: white;
+    cursor: pointer;
+    font-size: 14px;
+    margin-top: 8px;
+}
+
+button:hover {
+    opacity: 0.9;
+}
+
+button.secondary {
+    background: var(--accent);
+    color: var(--text);
+}
+
+/* Overlays */
+.overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+}
+
+.wizard, .settings {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px;
+    max-width: 500px;
+    width: 90%;
+}
+
+.wizard h2, .settings h2 {
+    margin-bottom: 16px;
+}
+
+.seed-phrase {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin: 16px 0;
+    font-family: monospace;
+    font-size: 14px;
+}
+
+.seed-phrase span {
+    background: var(--accent);
+    padding: 4px 8px;
+    border-radius: 4px;
+    text-align: center;
+}
+
+.warning {
+    color: var(--red);
+    font-weight: bold;
+    margin: 8px 0;
+}
+
+.error {
+    color: var(--red);
+    font-size: 13px;
+}
+
+.hidden {
+    display: none !important;
+}
+
+/* Send panel */
+.send-panel {
+    max-width: 400px;
+}
+
+/* Mining panel */
+.mining-panel {
+    border-left: 3px solid var(--accent-bright);
+}
+
+small {
+    color: var(--text-muted);
+    font-size: 11px;
+}

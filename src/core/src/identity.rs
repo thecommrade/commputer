@@ -18,6 +18,26 @@ impl Address {
     }
 }
 
+impl Address {
+    /// Item 104: Validate a hex-encoded address string.
+    /// Returns Ok(Address) if the string is a valid 64-character hex string.
+    pub fn from_hex(hex_str: &str) -> Result<Self, String> {
+        let bytes = hex::decode(hex_str)
+            .map_err(|e| format!("invalid hex: {}", e))?;
+        if bytes.len() != 32 {
+            return Err(format!("address must be 32 bytes (64 hex chars), got {} bytes", bytes.len()));
+        }
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&bytes);
+        Ok(Self(addr))
+    }
+
+    /// Check if this is the zero address (used for protocol-issued txs).
+    pub fn is_zero(&self) -> bool {
+        self.0.iter().all(|&b| b == 0)
+    }
+}
+
 impl std::fmt::Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "comme:{}", hex::encode(&self.0[..8]))
@@ -115,7 +135,7 @@ fn detect_gpu() -> (Option<String>, Option<u64>) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if line.contains("VGA") || line.contains("3D controller") {
-                    let model = line.split(':').last()
+                    let model = line.split(':').next_back()
                         .map(|s| s.trim().to_string());
                     return (model, None);
                 }

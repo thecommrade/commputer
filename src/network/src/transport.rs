@@ -1,5 +1,5 @@
 use libp2p::{
-    gossipsub, identify, kad, noise, tcp, yamux, quic,
+    gossipsub, identify, kad, noise, tcp, yamux,
     relay, dcutr, upnp,
     Multiaddr, PeerId as Libp2pPeerId, Swarm, SwarmBuilder,
 };
@@ -39,7 +39,40 @@ pub struct CommpBehaviour {
 impl CommpNetwork {
     /// Create a new CommpNetwork listening on the given port via TCP and QUIC.
     pub fn new(listen_port: u16) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut swarm = SwarmBuilder::with_new_identity()
+        Self::new_with_keypair_path(listen_port, None)
+    }
+
+    /// Item 3: Create a CommpNetwork with a persistent keypair.
+    /// If `keypair_path` is provided, loads the keypair from disk or generates
+    /// and saves a new one. This ensures the peer ID survives restarts.
+    pub fn new_with_keypair_path(listen_port: u16, keypair_path: Option<&std::path::Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let identity = if let Some(path) = keypair_path {
+            if path.exists() {
+                let bytes = std::fs::read(path)?;
+                let keypair = libp2p::identity::Keypair::from_protobuf_encoding(&bytes)?;
+                info!("Loaded persistent peer identity from {}", path.display());
+                keypair
+            } else {
+                let keypair = libp2p::identity::Keypair::generate_ed25519();
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let bytes = keypair.to_protobuf_encoding()?;
+                std::fs::write(path, &bytes)?;
+                // Set restrictive permissions on the key file (Unix only).
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                }
+                info!("Generated and saved new peer identity to {}", path.display());
+                keypair
+            }
+        } else {
+            libp2p::identity::Keypair::generate_ed25519()
+        };
+
+        let mut swarm = SwarmBuilder::with_existing_identity(identity)
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
@@ -98,15 +131,20 @@ impl CommpNetwork {
 
         let local_peer_id = *swarm.local_peer_id();
 
-        // Listen on TCP (traditional)
-        let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?;
-        swarm.listen_on(tcp_addr)?;
+        // Item 7: If listen_port is 0, run in outbound-only mode (no listening).
+        if listen_port > 0 {
+            // Listen on TCP (traditional)
+            let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?;
+            swarm.listen_on(tcp_addr)?;
 
-        // Listen on QUIC (UDP — better NAT/VPN traversal)
-        let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1").parse()?;
-        swarm.listen_on(quic_addr)?;
+            // Listen on QUIC (UDP — better NAT/VPN traversal)
+            let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1").parse()?;
+            swarm.listen_on(quic_addr)?;
 
-        info!("P2P transport: TCP + QUIC (dual-stack)");
+            info!("P2P transport: TCP + QUIC (dual-stack)");
+        } else {
+            info!("P2P transport: outbound-only mode (no listening ports)");
+        }
         info!("P2P encryption: Noise (TCP) / TLS 1.3 (QUIC)");
         info!("P2P features: relay, hole-punching (DCUtR), UPnP");
         info!("P2P protocol: /commputer/0.1.0");
@@ -141,11 +179,10 @@ impl CommpNetwork {
     pub fn connect_to_seeds(&mut self) -> usize {
         let mut connected = 0;
         for addr_str in SEED_NODES {
-            if let Ok(addr) = addr_str.parse::<Multiaddr>() {
-                if self.dial(addr).is_ok() {
+            if let Ok(addr) = addr_str.parse::<Multiaddr>()
+                && self.dial(addr).is_ok() {
                     connected += 1;
                 }
-            }
         }
         connected
     }
@@ -212,19 +249,17 @@ impl CommpNetwork {
                             ),
                         };
                         // Try TCP
-                        if let Ok(multiaddr) = tcp_str.parse::<Multiaddr>() {
-                            if self.dial(multiaddr).is_ok() {
+                        if let Ok(multiaddr) = tcp_str.parse::<Multiaddr>()
+                            && self.dial(multiaddr).is_ok() {
                                 info!("Dialed DNS seed {} -> {} (TCP)", domain, tcp_str);
                                 connected += 1;
                             }
-                        }
                         // Also try QUIC
-                        if let Ok(multiaddr) = quic_str.parse::<Multiaddr>() {
-                            if self.dial(multiaddr).is_ok() {
+                        if let Ok(multiaddr) = quic_str.parse::<Multiaddr>()
+                            && self.dial(multiaddr).is_ok() {
                                 info!("Dialed DNS seed {} -> {} (QUIC)", domain, quic_str);
                                 connected += 1;
                             }
-                        }
                     }
                 }
                 Err(e) => {

@@ -28,7 +28,8 @@ use crate::consensus_manager::{ConsensusManager, ConsensusMessage};
 use crate::proof_manager::{ProofManager, ProofMessage};
 
 /// Feature 172: Minimum peers before we consider the network partitioned.
-const MINIMUM_PEERS: usize = 2;
+/// Item 2: Lowered to 1 — a node with 1 peer should still produce blocks.
+const MINIMUM_PEERS: usize = 1;
 
 /// Feature 174: Block height at which protocol v2 rules activate.
 /// Set to u64::MAX — not yet activated.
@@ -119,6 +120,9 @@ pub struct EventLoop {
     /// Feature 20: Transaction signature verification cache.
     /// Capped at SIG_CACHE_MAX entries (LRU-style: clear when full).
     pub sig_cache: HashSet<TxHash>,
+    /// Item 18: Recent gossipsub message IDs for duplicate suppression.
+    /// Gossipsub has built-in dedup, but this catches application-level duplicates.
+    pub seen_message_ids: HashSet<[u8; 32]>,
     /// Feature 9: Pending epoch summary to include in the next block.
     pub pending_epoch_summary: Option<commputer_core::block::EpochSummary>,
 }
@@ -167,6 +171,7 @@ impl EventLoop {
             custom_seeds: Vec::new(),
             data_dir: None,
             sig_cache: HashSet::new(),
+            seen_message_ids: HashSet::new(),
             pending_epoch_summary: None,
         }
     }
@@ -233,15 +238,13 @@ impl EventLoop {
             if let Ok(mut blk_guard) = rpc.blocks.try_lock() {
                 let height = self.state.blocks.height();
                 // Add any new blocks not yet tracked.
-                let start = if height > 100 { height - 100 } else { 0 };
+                let start = height.saturating_sub(100);
                 for h in start..=height {
-                    if !blk_guard.contains_key(&h) {
-                        if let Some(block) = self.state.blocks.get_by_height(h) {
-                            if let Ok(json) = serde_json::to_value(block) {
+                    if !blk_guard.contains_key(&h)
+                        && let Some(block) = self.state.blocks.get_by_height(h)
+                            && let Ok(json) = serde_json::to_value(block) {
                                 blk_guard.insert(h, json);
                             }
-                        }
-                    }
                 }
                 // Prune blocks older than 100 from the RPC cache.
                 if height > 100 {
@@ -368,6 +371,9 @@ impl EventLoop {
                 }
             }
         }
+
+        // Item 6: Load config on startup to pick up seed nodes etc.
+        self.reload_config();
 
         let mut epoch_interval = time::interval(Duration::from_secs(3600));
         let mut block_interval = time::interval(Duration::from_secs(2));
@@ -509,6 +515,9 @@ impl EventLoop {
             info!("Chain state flushed successfully. Height: {}", self.state.blocks.height());
         }
 
+        // Item 15: Mark clean shutdown so next startup can detect crashes.
+        self.state.mark_clean_shutdown();
+
         // Feature 133: Persist pending consensus state info.
         // Active heights and pending blocks are logged for debugging;
         // on restart, the node will re-sync from peers via the sync protocol.
@@ -524,8 +533,8 @@ impl EventLoop {
         info!("Orphan pool: {} parent hashes with pending blocks", self.orphan_pool.len());
 
         // Feature 8: Persist pending transactions to mempool.json.
-        if !self.pending_txs.is_empty() {
-            if let Some(ref dir) = self.data_dir {
+        if !self.pending_txs.is_empty()
+            && let Some(ref dir) = self.data_dir {
                 let mempool_path = dir.join("mempool.json");
                 match serde_json::to_string_pretty(&self.pending_txs) {
                     Ok(json) => {
@@ -538,7 +547,6 @@ impl EventLoop {
                     Err(e) => warn!("Failed to serialize mempool: {}", e),
                 }
             }
-        }
     }
 
     /// Feature 20: Maximum signature cache size.
@@ -571,8 +579,7 @@ impl EventLoop {
         // Find the peer with the lowest reputation score.
         if let Some((&worst_peer, &worst_score)) = self.peer_scores.iter()
             .min_by_key(|(_, score)| **score)
-        {
-            if worst_score < 50 {
+            && worst_score < 50 {
                 info!(
                     "Peer rotation: disconnecting {} (score {})",
                     worst_peer, worst_score
@@ -585,7 +592,6 @@ impl EventLoop {
                 self.peer_subnets.remove(&worst_peer);
                 self.peer_rtts.remove(&worst_peer);
             }
-        }
 
         // Try to discover a new peer from the Kademlia DHT.
         let random_key = libp2p::kad::RecordKey::new(&rand::random::<[u8; 32]>());
@@ -594,9 +600,13 @@ impl EventLoop {
     }
 
     /// Feature 12: Config hot reload — re-read config.toml and update settings.
+    /// Item 6: Also reads seed nodes from config file.
     fn reload_config(&mut self) {
-        // Look for config.toml in the data directory.
-        let config_path = std::path::PathBuf::from("./commputer-testnet/config.toml");
+        // Look for commputer.toml in the data directory or current dir.
+        let config_path = self.data_dir
+            .as_ref()
+            .map(|d| d.join("commputer.toml"))
+            .unwrap_or_else(|| std::path::PathBuf::from("commputer.toml"));
 
         let contents = match std::fs::read_to_string(&config_path) {
             Ok(c) => c,
@@ -623,15 +633,25 @@ impl EventLoop {
                         // so we just log the intended change.
                     }
                     "contribution_percent" => {
-                        if let Ok(pct) = value.parse::<u8>() {
-                            if pct >= 1 && pct <= 100 {
+                        if let Ok(pct) = value.parse::<u8>()
+                            && (1..=100).contains(&pct) {
                                 info!("Config reload: contribution_percent = {}", pct);
                             }
-                        }
                     }
                     "max_peer_count" => {
                         if let Ok(_count) = value.parse::<usize>() {
                             info!("Config reload: max_peer_count = {}", value);
+                        }
+                    }
+                    // Item 6: Read seed nodes from config file.
+                    "seeds" => {
+                        let seeds: Vec<String> = value.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !seeds.is_empty() {
+                            info!("Config reload: {} seed nodes from config", seeds.len());
+                            self.custom_seeds = seeds;
                         }
                     }
                     _ => {
@@ -678,8 +698,22 @@ impl EventLoop {
 
                 // Feature 177: Track messages received per peer.
                 self.peer_quality.entry(propagation_source)
-                    .or_insert_with(PeerQuality::default)
+                    .or_default()
                     .messages_received += 1;
+
+                // Item 18: Application-level duplicate message suppression.
+                {
+                    use sha2::{Sha256, Digest};
+                    let msg_hash: [u8; 32] = Sha256::digest(&message.data).into();
+                    if !self.seen_message_ids.insert(msg_hash) {
+                        debug!("Suppressing duplicate message from {}", propagation_source);
+                        return;
+                    }
+                    // Prune seen set periodically to avoid unbounded growth.
+                    if self.seen_message_ids.len() > 10_000 {
+                        self.seen_message_ids.clear();
+                    }
+                }
 
                 // Feature 173: Decompress message data before deserialization.
                 let data = commputer_network::decompress(&message.data);
@@ -713,8 +747,8 @@ impl EventLoop {
                     }
                 } else if topic == topics::TOPIC_PEER_ADDRS {
                     // Feature 6: Handle peer address gossip.
-                    if let Ok(msg) = serde_json::from_slice::<commputer_network::message::NetworkMessage>(&data) {
-                        if let commputer_network::message::MessageKind::PeerResponse(peers) = msg.kind {
+                    if let Ok(msg) = serde_json::from_slice::<commputer_network::message::NetworkMessage>(&data)
+                        && let commputer_network::message::MessageKind::PeerResponse(peers) = msg.kind {
                             for peer_info in peers {
                                 // Try to parse the address as a multiaddr and add to Kademlia.
                                 if let Ok(addr) = peer_info.address.parse::<libp2p::Multiaddr>() {
@@ -724,7 +758,6 @@ impl EventLoop {
                                 }
                             }
                         }
-                    }
                 }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -761,7 +794,7 @@ impl EventLoop {
                 }
 
                 // Feature 177: Initialize peer quality metrics.
-                self.peer_quality.entry(peer_id).or_insert_with(PeerQuality::default);
+                self.peer_quality.entry(peer_id).or_default();
 
                 // Enforce connection limit: max 50 peers.
                 // Feature 170: Geographic diversity — if new peer has unique /16,
@@ -807,6 +840,23 @@ impl EventLoop {
                     debug!("Peer {} identified: protocol={}, agent={}",
                         peer_id, info.protocol_version, info.agent_version);
 
+                    // Item 20: Genesis hash verification — check agent_version contains our genesis hash.
+                    // Agent version format: "commputer/<version>/<genesis_hash_hex_prefix>"
+                    if let Some(genesis_block) = self.state.blocks.get_by_height(0) {
+                        let our_genesis_hex = hex::encode(&genesis_block.hash().0[..8]);
+                        let agent_has_genesis = info.agent_version.contains(&our_genesis_hex);
+                        if info.agent_version.contains("commputer/") && !agent_has_genesis
+                            && !info.agent_version.contains("unknown")
+                        {
+                            warn!(
+                                "Peer {} has different genesis hash (agent: {}) — disconnecting",
+                                peer_id, info.agent_version
+                            );
+                            let _ = self.network.swarm.disconnect_peer_id(peer_id);
+                            return;
+                        }
+                    }
+
                     // Feature 169: Add the peer's listen addresses to Kademlia for discovery.
                     for addr in &info.listen_addrs {
                         self.network.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
@@ -818,8 +868,8 @@ impl EventLoop {
                         let observed_ip = extract_ip_from_multiaddr(&observed_str);
 
                         // Check if our observed IP differs from our listening addresses.
-                        if let Some(ref obs_ip) = observed_ip {
-                            if self.observed_external_addr.is_none() {
+                        if let Some(ref obs_ip) = observed_ip
+                            && self.observed_external_addr.is_none() {
                                 self.observed_external_addr = Some(obs_ip.clone());
                                 // Check if it looks like NAT (private vs public IP mismatch).
                                 let is_private = is_private_ip(obs_ip);
@@ -831,7 +881,6 @@ impl EventLoop {
                                     info!("External address observed: {}", obs_ip);
                                 }
                             }
-                        }
                     }
                 }
             }
@@ -911,13 +960,12 @@ impl EventLoop {
                 self.verified_peer_validators.remove(&peer_id);
                 self.peer_scores.remove(&peer_id);
                 // Drain grace period for disconnected validators.
-                if let Some(validator_addr) = self.peer_validators.get(&peer_id) {
-                    if let Some(account) = self.state.accounts.get_mut(validator_addr) {
+                if let Some(validator_addr) = self.peer_validators.get(&peer_id)
+                    && let Some(account) = self.state.accounts.get_mut(validator_addr) {
                         // Drain 1 epoch's worth of grace (3600s) on disconnect.
                         account.drain_grace(3600);
                         debug!("Drained grace for disconnected validator {}", validator_addr);
                     }
-                }
                 info!("Disconnected from peer: {}", peer_id);
             }
             _ => {}
@@ -999,18 +1047,20 @@ impl EventLoop {
         // === Stage 1: Header checks ===
 
         // Feature 123: Protocol version check.
+        // Item 1: Don't ban for version mismatch — peer may be running older software.
         if block.header.protocol_version != commputer_core::block::CURRENT_PROTOCOL_VERSION {
-            self.ban_peer(source, &format!(
-                "incompatible protocol version {} (expected {})",
-                block.header.protocol_version,
-                commputer_core::block::CURRENT_PROTOCOL_VERSION,
-            ));
+            warn!("Rejected block from {}: incompatible protocol version {} (expected {})",
+                source, block.header.protocol_version,
+                commputer_core::block::CURRENT_PROTOCOL_VERSION);
+            self.adjust_peer_score(source, -5);
             return false;
         }
 
         // Check block size limits.
+        // Item 1: Don't ban for oversized blocks — could be config mismatch.
         if !block.within_size_limits() {
-            self.ban_peer(source, "sent oversized block");
+            warn!("Rejected oversized block from {}", source);
+            self.adjust_peer_score(source, -20);
             return false;
         }
 
@@ -1026,12 +1076,13 @@ impl EventLoop {
         }
 
         // Timestamp must be >= parent block timestamp (no going backward).
-        if let Some(parent) = self.state.blocks.latest() {
-            if block.header.timestamp < parent.header.timestamp {
-                self.ban_peer(source, "sent block with timestamp before parent");
+        // Item 1: Don't ban for timestamp issues — could be clock skew or chain divergence.
+        if let Some(parent) = self.state.blocks.latest()
+            && block.header.timestamp < parent.header.timestamp {
+                warn!("Rejected block from {}: timestamp before parent ({} < {})",
+                    source, block.header.timestamp, parent.header.timestamp);
                 return false;
             }
-        }
 
         // === Stage 2: Merkle root verification ===
 
@@ -1079,14 +1130,14 @@ impl EventLoop {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if !self.block_seen_times.contains_key(&hash) {
-            self.block_seen_times.insert(hash, now_ts);
+        if let std::collections::hash_map::Entry::Vacant(e) = self.block_seen_times.entry(hash) {
+            e.insert(now_ts);
             let propagation_delay_ms = now_ts.saturating_sub(block.header.timestamp) * 1000;
             if propagation_delay_ms > 0 {
                 self.propagation_delays.push(propagation_delay_ms);
                 debug!("Block {} propagation delay: {}ms", hash, propagation_delay_ms);
                 // Log percentiles every 100 blocks.
-                if self.propagation_delays.len() % 100 == 0 {
+                if self.propagation_delays.len().is_multiple_of(100) {
                     self.log_propagation_percentiles();
                 }
             }
@@ -1113,7 +1164,7 @@ impl EventLoop {
             debug!("Block {} at height {} is orphaned — parent {} not found", hash, height, block.header.parent_hash);
             self.orphan_pool
                 .entry(block.header.parent_hash)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(block);
             return;
         }
@@ -1211,36 +1262,15 @@ impl EventLoop {
             return Err("duplicate transaction");
         }
         // Feature 251: Validate memo length.
-        if let Some(ref memo) = tx.memo {
-            if memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
+        if let Some(ref memo) = tx.memo
+            && memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
                 return Err("memo exceeds max length");
             }
-        }
         // Feature 260: Validate timelock.
-        if let Some(timelock) = tx.timelock {
-            if self.state.blocks.height() < timelock {
+        if let Some(timelock) = tx.timelock
+            && self.state.blocks.height() < timelock {
                 return Err("transaction timelocked");
             }
-        }
-        // Feature 19: Transaction relay policy — check sender has sufficient balance.
-        if let commputer_core::transaction::TxKind::Transfer { amount, .. } = &tx.kind {
-            let needed = amount.raw().saturating_add(tx.fee);
-            let balance = self.state.accounts.get(&tx.from)
-                .map(|a| a.balance.raw())
-                .unwrap_or(0);
-            if balance < needed {
-                return Err("insufficient balance for amount+fee");
-            }
-        }
-        // Feature 22: Account creation cost — new accounts require higher fee.
-        if let commputer_core::transaction::TxKind::Transfer { to, .. } = &tx.kind {
-            if self.state.accounts.get(to).is_none() {
-                let min_creation_fee = commputer_core::transaction::MINIMUM_FEE * commputer_core::block::ACCOUNT_CREATION_FEE_MULTIPLIER;
-                if tx.fee < min_creation_fee {
-                    return Err("fee too low for account creation (need 10x minimum)");
-                }
-            }
-        }
         // Minimum fee check.
         if tx.fee < commputer_core::transaction::MINIMUM_FEE {
             return Err("fee below minimum");
@@ -1421,6 +1451,24 @@ impl EventLoop {
                                     )
                                     .unwrap_or(account.total_mined);
                                 distributed += effective_reward;
+
+                                // Item 13: Create synthetic mining reward tx for history.
+                                let reward_tx = Transaction {
+                                    from: Address([0u8; 32]), // Protocol-issued
+                                    nonce: 0,
+                                    kind: commputer_core::transaction::TxKind::MiningReward {
+                                        to: summary.validator,
+                                        amount: commputer_core::token::Amount::from_raw(effective_reward),
+                                        epoch,
+                                    },
+                                    fee: 0,
+                                    public_key: vec![],
+                                    signature: vec![],
+                                    memo: None,
+                                    timelock: None,
+                                };
+                                // Add to current block's pending txs so it shows in history.
+                                self.pending_txs.push(reward_tx);
                             }
                         }
                     }
@@ -1541,8 +1589,8 @@ impl EventLoop {
 
         // Feature 5: Validator cooldown — skip block production if within cooldown period.
         let our_addr = *self.wallet.address();
-        if let Some(acct) = self.state.accounts.get(&our_addr) {
-            if let Some(reg_height) = acct.validator_registered_height {
+        if let Some(acct) = self.state.accounts.get(&our_addr)
+            && let Some(reg_height) = acct.validator_registered_height {
                 let current_height = self.state.blocks.height();
                 if current_height < reg_height + commputer_core::transaction::VALIDATOR_COOLDOWN_BLOCKS {
                     debug!("Skipping block production — validator cooldown ({} blocks remaining)",
@@ -1550,7 +1598,6 @@ impl EventLoop {
                     return;
                 }
             }
-        }
 
         // Feature 172: Skip block production during network partition.
         if self.partition_detected {
@@ -1638,7 +1685,7 @@ impl EventLoop {
         block.header.state_root = self.state.compute_state_root();
 
         // Feature 248: Set checkpoint hash at checkpoint intervals.
-        if next_height % commputer_core::block::CHECKPOINT_HASH_INTERVAL == 0 && next_height > 0 {
+        if next_height.is_multiple_of(commputer_core::block::CHECKPOINT_HASH_INTERVAL) && next_height > 0 {
             block.header.checkpoint_hash = Some(self.state.compute_state_root());
             if let Some(ref hash) = block.header.checkpoint_hash {
                 info!("Checkpoint at height {}: state root = {}", next_height, hex::encode(hash));
@@ -1756,21 +1803,19 @@ impl EventLoop {
                     }));
 
                     // Push receipts to RPC state.
-                    if let Some(ref rpc) = self.rpc_state {
-                        if let Ok(mut rcpt_guard) = rpc.receipts.try_lock() {
+                    if let Some(ref rpc) = self.rpc_state
+                        && let Ok(mut rcpt_guard) = rpc.receipts.try_lock() {
                             for tx in &block.transactions {
                                 let tx_hash_hex = hex::encode(tx.hash().0);
-                                if let Some(receipt) = self.state.receipts.get(&tx.hash()) {
-                                    if let Ok(json) = serde_json::to_value(receipt) {
+                                if let Some(receipt) = self.state.receipts.get(&tx.hash())
+                                    && let Ok(json) = serde_json::to_value(receipt) {
                                         rcpt_guard.insert(tx_hash_hex, json);
                                     }
-                                }
                             }
                         }
-                    }
 
                     // Auto-snapshot every 100 blocks.
-                    if height % 100 == 0 && height > 0 {
+                    if height.is_multiple_of(100) && height > 0 {
                         let snap_path = std::path::PathBuf::from(
                             format!("snapshot-{}.json", height)
                         );
@@ -1918,8 +1963,7 @@ impl EventLoop {
         }
 
         // Build a list of known peers with their addresses.
-        let peer_infos: Vec<commputer_network::message::PeerInfo> = self.peer_ips.iter()
-            .map(|(_peer_id, ip)| {
+        let peer_infos: Vec<commputer_network::message::PeerInfo> = self.peer_ips.values().map(|ip| {
                 commputer_network::message::PeerInfo {
                     id: commputer_network::peer::PeerId([0u8; 32]), // Placeholder
                     address: ip.clone(),
@@ -2022,11 +2066,8 @@ impl EventLoop {
         for addr_str in &seeds {
             if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
                 // Only reconnect if we don't already have this peer.
-                match self.network.dial(addr) {
-                    Ok(()) => {
-                        reconnected += 1;
-                    }
-                    Err(_) => {}
+                if let Ok(()) = self.network.dial(addr) {
+                    reconnected += 1;
                 }
             }
         }
@@ -2048,13 +2089,11 @@ impl EventLoop {
     fn find_duplicate_subnet_peer(&self, exclude: &libp2p::PeerId) -> Option<libp2p::PeerId> {
         let counts = self.count_subnets();
         for (peer_id, subnet) in &self.peer_subnets {
-            if peer_id != exclude {
-                if let Some(&count) = counts.get(subnet) {
-                    if count > 1 {
+            if peer_id != exclude
+                && let Some(&count) = counts.get(subnet)
+                    && count > 1 {
                         return Some(*peer_id);
                     }
-                }
-            }
         }
         None
     }

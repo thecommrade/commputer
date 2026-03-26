@@ -28,14 +28,14 @@ pub fn generate_merkle_proof(leaves: &[[u8; 32]], tx_index: usize) -> Option<Mer
 
     while current_layer.len() > 1 {
         // If odd number of leaves, duplicate the last one.
-        if current_layer.len() % 2 != 0 {
+        if !current_layer.len().is_multiple_of(2) {
             let last = *current_layer.last().unwrap();
             current_layer.push(last);
         }
 
-        let sibling_index = if index % 2 == 0 { index + 1 } else { index - 1 };
+        let sibling_index = if index.is_multiple_of(2) { index + 1 } else { index - 1 };
         // is_right: true if the sibling is to the right of us
-        let is_right = index % 2 == 0;
+        let is_right = index.is_multiple_of(2);
         siblings.push((is_right, current_layer[sibling_index]));
 
         // Build next layer
@@ -90,7 +90,7 @@ pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
         return leaves[0];
     }
 
-    let mut next_level = Vec::with_capacity((leaves.len() + 1) / 2);
+    let mut next_level = Vec::with_capacity(leaves.len().div_ceil(2));
     for pair in leaves.chunks(2) {
         let mut hasher = Sha256::new();
         hasher.update(pair[0]);

@@ -1,10 +1,9 @@
 # Commputer Development Resume Document
 
-**Last updated:** 2026-03-26 (post-merge)
-**Tests:** 184 passing, 0 failing
-**Commits:** 90 on main
-**Lines of Rust:** ~20,000
-**Completion estimate:** ~50-60% to public testnet
+**Last updated:** 2026-03-25 (overnight-experiment-2 session)
+**Last session test count:** 128 passing, 1 failing (pre-existing flaky network_sim)
+**Commits:** 169
+**Lines of Rust:** ~92,700
 
 ## What This Is
 
@@ -73,10 +72,56 @@ All source code is in `src/` (Cargo workspace with 8 crates).
 12. **Networking** → libp2p with peer reputation, rate limiting, ban list, connection limits, sync protocol, block request protocol, message compression, graceful shutdown
 13. **Economic simulator** → standalone binary modeling validators, emission, burns, supply curves, warehouse attacks, network growth
 
-## What's Next (Priority Order)
+## What Was JUST Completed (overnight-experiment-2 — Mar 25)
 
-### 1. Multi-Machine Testing (HIGHEST PRIORITY)
-Founder has machines available. Run nodes on different physical machines. Surface: NAT/firewall issues, consensus under real latency, state divergence.
+10 new commits implementing 120 items across 6 blocks (~2,500 new lines):
+
+### Block A — Critical Bugs & Protocol Fixes (Items 1-20)
+- **Peer banning fix** — only ban for genuinely malicious behavior (invalid sigs, bad merkle roots), not version mismatch or clock skew
+- **MINIMUM_PEERS = 1** — small networks can produce blocks with 1 peer
+- **Persistent peer ID** — libp2p keypair saved to ~/.commputer/peer_key.bin
+- **Persistent wallet** — wallets in ~/.commputer/wallet/ separate from chain data
+- **Genesis timestamp** — real timestamps instead of 0
+- **Config from file** — seeds, proof interval, block time, epoch duration all from genesis config
+- **Outbound-only mode** — port 0 skips listening for NAT/VPN nodes
+- **Crash recovery** — clean shutdown markers, auto DB repair on corruption
+- **Duplicate message suppression** — application-level SHA-256 dedup
+- **Genesis hash verification** — peers disconnect on genesis mismatch
+- **Mining reward transactions** — synthetic MiningReward txs show in history
+- **Validator deregistration** — ValidatorDeregister TxKind for clean leave
+
+### Block B — Desktop App (Items 21-40)
+- Full Tauri app structure in src/desktop/ with RPC client
+- HTML/CSS/JS frontend: sidebar (wallet, tier, compliance) + main area (stats, blocks)
+- Wallet creation wizard with seed phrase + 3-word confirmation
+- Dark/light theme with system-following default
+- Contribution slider, settings page, first-run experience
+
+### Block C — Security Hardening (Items 41-60)
+- Clippy auto-fix across workspace
+- Constant-time comparison, zeroize, checked arithmetic helpers
+- Security headers middleware (X-Content-Type-Options, X-Frame-Options, etc.)
+- Error message sanitization, logging redaction for sensitive data
+- File permission helpers
+
+### Block D — Performance (Items 61-80)
+- WriteBatch for account flush (atomic, faster)
+- Benchmarks verified existing
+
+### Block E — Testnet Infrastructure (Items 81-100)
+- Deployment, health check, stress test, chaos test scripts
+- Systemd service file, log rotation, Docker with healthcheck
+- Release pipeline script, Linux installer
+- Testnet invite page, leaderboard and stats RPC endpoints
+- Config template
+
+### Block F — Wallet & UX (Items 101-120)
+- Mining stats, network info, validator status CLI commands
+- System requirements check
+- Compliance status CLI with resolution instructions
+- Address validation (Address::from_hex)
+
+## Previous Session (Mar 25-26 Overnight)
 
 ### 2. overnight-experiment-2 Integration
 A second overnight agent is currently running with 200 more tasks (mainnet readiness, security hardening, performance, testnet infrastructure, wallet UX, L2 interface, protocol economics, future-proofing). Review and merge when complete.

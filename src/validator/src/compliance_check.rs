@@ -162,8 +162,8 @@ impl ComplianceChecker {
             }
 
             // Same /16 subnet.
-            if let (Some(s), Some(other_s)) = (&subnet16, subnet_16(other_ip)) {
-                if *s == other_s {
+            if let (Some(s), Some(other_s)) = (&subnet16, subnet_16(other_ip))
+                && *s == other_s {
                     flags.push(ComplianceFlag::SameSubnet16 {
                         peer_address: *other_addr,
                     });
@@ -171,7 +171,6 @@ impl ComplianceChecker {
                         peer_address: *other_addr,
                     });
                 }
-            }
         }
 
         // Same ASN.
@@ -384,12 +383,11 @@ impl ComplianceChecker {
                 if other_addr == addr {
                     continue;
                 }
-                if let (Some(s), Some(other_s)) = (&subnet, subnet_24(other_ip)) {
-                    if *s == other_s {
+                if let (Some(s), Some(other_s)) = (&subnet, subnet_24(other_ip))
+                    && *s == other_s {
                         score += 25;
                         break;
                     }
-                }
             }
         }
 
@@ -404,11 +402,10 @@ impl ComplianceChecker {
         }
 
         // +25 for datacenter pattern (behavioral).
-        if let Some(profile) = self.behavior_profiles.get(addr) {
-            if profile.is_datacenter_pattern() || profile.is_flat_resource() {
+        if let Some(profile) = self.behavior_profiles.get(addr)
+            && (profile.is_datacenter_pattern() || profile.is_flat_resource()) {
                 score += 25;
             }
-        }
 
         // +25 for geographic proximity (same /16 or same ASN or datacenter IP).
         let mut geo_flag = false;
@@ -421,12 +418,11 @@ impl ComplianceChecker {
                 if other_addr == addr {
                     continue;
                 }
-                if let (Some(s), Some(other_s)) = (&s16, subnet_16(other_ip)) {
-                    if *s == other_s {
+                if let (Some(s), Some(other_s)) = (&s16, subnet_16(other_ip))
+                    && *s == other_s {
                         geo_flag = true;
                         break;
                     }
-                }
             }
         }
         if let Some(asn) = self.node_asn.get(addr) {
@@ -486,18 +482,16 @@ impl ComplianceChecker {
             }
 
             // Same /24 subnet → NerfedIncidental.
-            if let (Some(s), Some(other_s)) = (&subnet24, subnet_24(other_ip)) {
-                if *s == other_s {
+            if let (Some(s), Some(other_s)) = (&subnet24, subnet_24(other_ip))
+                && *s == other_s {
                     return ComplianceStatus::NerfedIncidental;
                 }
-            }
 
             // Feature 138: Same /16 subnet → NerfedIncidental.
-            if let (Some(s), Some(other_s)) = (&subnet16, subnet_16(other_ip)) {
-                if *s == other_s {
+            if let (Some(s), Some(other_s)) = (&subnet16, subnet_16(other_ip))
+                && *s == other_s {
                     return ComplianceStatus::NerfedIncidental;
                 }
-            }
         }
 
         // Feature 138: Same ASN → NerfedIncidental.

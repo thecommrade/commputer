@@ -1,0 +1,29 @@
+# Item 84: Systemd service file for commputer node
+[Unit]
+Description=Commputer Node
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=commputer
+Group=commputer
+ExecStart=/usr/local/bin/commputer run --testnet --port 9000 --rpc-port 9944
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65535
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/commputer
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=commputer
+
+[Install]
+WantedBy=multi-user.target
