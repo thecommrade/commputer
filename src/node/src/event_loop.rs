@@ -117,6 +117,10 @@ pub struct EventLoop {
     pub custom_seeds: Vec<String>,
     /// Feature 8: Data directory path for mempool persistence.
     pub data_dir: Option<std::path::PathBuf>,
+    /// Whether this node connected to seeds (non-seed nodes should wait before producing blocks).
+    pub is_seed_connector: bool,
+    /// Whether this node has ever successfully connected to a peer.
+    pub has_ever_connected: bool,
     /// Feature 20: Transaction signature verification cache.
     /// Capped at SIG_CACHE_MAX entries (LRU-style: clear when full).
     pub sig_cache: HashSet<TxHash>,
@@ -170,6 +174,8 @@ impl EventLoop {
             peer_quality: HashMap::new(),
             custom_seeds: Vec::new(),
             data_dir: None,
+            is_seed_connector: false,
+            has_ever_connected: false,
             sig_cache: HashSet::new(),
             seen_message_ids: HashSet::new(),
             pending_epoch_summary: None,

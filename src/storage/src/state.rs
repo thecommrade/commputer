@@ -591,9 +591,9 @@ impl ChainState {
         match &tx.kind {
             TxKind::Transfer { to, amount } => {
                 // Feature 23: Dust limit — reject transfers below minimum.
-                if amount.raw() < commputer_core::block::DUST_LIMIT {
+                if amount.raw() < commputer_core::transaction::DUST_LIMIT {
                     return Err(StateError::InvalidBlock(
-                        format!("transfer amount {} below dust limit {}", amount.raw(), commputer_core::block::DUST_LIMIT)
+                        format!("transfer amount {} below dust limit {}", amount.raw(), commputer_core::transaction::DUST_LIMIT)
                     ));
                 }
                 let sender_balance = sender.balance;
@@ -868,9 +868,9 @@ impl ChainState {
         match op {
             TxKind::Transfer { to, amount } => {
                 // Feature 23: Dust limit — reject transfers below minimum.
-                if amount.raw() < commputer_core::block::DUST_LIMIT {
+                if amount.raw() < commputer_core::transaction::DUST_LIMIT {
                     return Err(StateError::InvalidBlock(
-                        format!("transfer amount {} below dust limit {}", amount.raw(), commputer_core::block::DUST_LIMIT)
+                        format!("transfer amount {} below dust limit {}", amount.raw(), commputer_core::transaction::DUST_LIMIT)
                     ));
                 }
                 let sender = self.accounts.get_or_create(from);
