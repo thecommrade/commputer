@@ -389,8 +389,8 @@ fn create_genesis_for_dir(data_dir: Option<&std::path::Path>) -> Block {
             tx_root: [0u8; 32],
             proof_root: [0u8; 32],
             state_root: [0u8; 32],
-            // Item 44: Fixed genesis timestamp (2026-03-22 00:00:00 UTC).
-            timestamp: 1774022400,
+            // Genesis timestamp: 2022-03-22 00:00:00 UTC.
+            timestamp: 1647907200,
             producer: Address([0u8; 32]), // No producer for genesis.
             epoch: 0,
             producer_public_key: vec![],
