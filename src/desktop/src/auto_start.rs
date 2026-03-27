@@ -49,6 +49,7 @@ impl AutoStart {
     }
 
     /// Disable auto-start for the current platform.
+    #[allow(dead_code)]
     pub fn disable(&self) -> Result<(), String> {
         match Platform::current() {
             Platform::Linux => self.disable_linux(),
@@ -107,6 +108,7 @@ impl AutoStart {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn disable_linux(&self) -> Result<(), String> {
         let path = self.linux_service_path();
         if path.exists() {
@@ -162,6 +164,7 @@ impl AutoStart {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn disable_macos(&self) -> Result<(), String> {
         let path = self.macos_plist_path();
         if path.exists() {
@@ -183,12 +186,14 @@ impl AutoStart {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn disable_windows(&self) -> Result<(), String> {
         tracing::info!("Windows auto-start: would remove registry key");
         Ok(())
     }
 
     /// Generate the systemd unit content (for testing without disk writes).
+    #[allow(dead_code)]
     pub fn systemd_unit_content(&self) -> String {
         format!(
             "[Unit]\n\
@@ -208,6 +213,7 @@ impl AutoStart {
     }
 
     /// Generate the macOS plist content (for testing without disk writes).
+    #[allow(dead_code)]
     pub fn macos_plist_content(&self) -> String {
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\

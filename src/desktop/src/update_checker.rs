@@ -88,6 +88,7 @@ impl UpdateChecker {
     }
 
     /// Get the repo URL being checked.
+    #[allow(dead_code)]
     pub fn repo_url(&self) -> &str {
         &self.repo_url
     }

@@ -63,6 +63,7 @@ pub struct ComplianceInfo {
 }
 
 /// Item 182: Transaction receipt from /receipt/{tx_hash}.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxReceipt {
     pub tx_hash: String,
@@ -103,6 +104,7 @@ pub struct MempoolEntry {
 }
 
 /// Item 197: Log entry from node.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub level: String,
@@ -112,6 +114,7 @@ pub struct LogEntry {
 }
 
 /// Item 198: Network quality info.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkQuality {
     pub latency_ms: u64,
@@ -121,6 +124,7 @@ pub struct NetworkQuality {
 }
 
 /// Block info from /block/{height}.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockInfo {
     pub height: u64,
@@ -223,6 +227,7 @@ impl NodeClient {
     }
 
     /// Item 182: Get transaction receipt.
+    #[allow(dead_code)]
     pub async fn receipt(&self, tx_hash: &str) -> Result<TxReceipt, String> {
         let url = format!("{}/receipt/{}", self.base_url, tx_hash);
         let resp = self.client.get(&url).send().await
@@ -232,6 +237,7 @@ impl NodeClient {
     }
 
     /// Get block by height.
+    #[allow(dead_code)]
     pub async fn block(&self, height: u64) -> Result<BlockInfo, String> {
         let url = format!("{}/block/{}", self.base_url, height);
         let resp = self.client.get(&url).send().await
@@ -241,6 +247,7 @@ impl NodeClient {
     }
 
     /// Item 198: Get network quality metrics.
+    #[allow(dead_code)]
     pub async fn network_quality(&self) -> Result<NetworkQuality, String> {
         let url = format!("{}/network/quality", self.base_url);
         let resp = self.client.get(&url).send().await

@@ -2,10 +2,10 @@
 //! Items 177, 178, 180, 181, 182, 183, 184, 185, 186, 193, 199.
 
 use serde::{Deserialize, Serialize};
-use crate::rpc_client::{NodeClient, PeerInfo, render_peer_map};
-use crate::state::AppConfig;
+use crate::rpc_client::{PeerInfo, render_peer_map};
 
 /// Item 24: Wallet display data.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WalletDisplay {
     pub address: String,
@@ -42,6 +42,7 @@ pub struct ProofScores {
 }
 
 /// Item 28: Send transaction request.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct SendRequest {
     pub recipient: String,
@@ -49,6 +50,7 @@ pub struct SendRequest {
 }
 
 /// Item 28: Send transaction result.
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct SendResult {
     pub tx_hash: String,
@@ -58,6 +60,7 @@ pub struct SendResult {
 }
 
 /// Item 33: Block explorer entry.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlockEntry {
     pub height: u64,
@@ -95,6 +98,7 @@ pub struct TierProgress {
 }
 
 /// Item 182: Transaction history entry.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TxHistoryEntry {
     pub tx_hash: String,

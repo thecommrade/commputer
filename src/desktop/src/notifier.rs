@@ -46,11 +46,13 @@ impl Notifier {
     }
 
     /// Check if notifications are enabled.
+    #[allow(dead_code)]
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
     /// Enable or disable notifications.
+    #[allow(dead_code)]
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
@@ -61,6 +63,7 @@ impl Notifier {
     }
 
     /// Clear notification history.
+    #[allow(dead_code)]
     pub fn clear_history(&mut self) {
         self.history.clear();
     }
@@ -91,6 +94,7 @@ impl Notifier {
     }
 
     /// Convenience: notify mining reward.
+    #[allow(dead_code)]
     pub fn notify_mining_reward(&mut self, amount_formatted: &str) -> bool {
         self.notify(
             NotificationType::MiningReward,
@@ -100,6 +104,7 @@ impl Notifier {
     }
 
     /// Convenience: notify tier change.
+    #[allow(dead_code)]
     pub fn notify_tier_change(&mut self, old_tier: &str, new_tier: &str) -> bool {
         let direction = if new_tier > old_tier { "upgraded" } else { "changed" };
         self.notify(
@@ -110,6 +115,7 @@ impl Notifier {
     }
 
     /// Convenience: notify compliance change.
+    #[allow(dead_code)]
     pub fn notify_compliance_change(&mut self, status: &str) -> bool {
         self.notify(
             NotificationType::ComplianceChange,

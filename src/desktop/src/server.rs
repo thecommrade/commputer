@@ -5,7 +5,7 @@ use axum::{
     Router,
     routing::{get, post},
     response::{Html, IntoResponse},
-    extract::{Path, State},
+    extract::State,
     http::StatusCode,
     Json,
 };
@@ -15,9 +15,9 @@ use tokio::sync::RwLock;
 
 use crate::commands::{
     self, WalletCreated, ComplianceDisplay, GracePeriodDisplay, TierProgress,
-    MiningStatus, ProofScores, ErrorEntry, PeerVisualization, WalletExport,
+    ProofScores, ErrorEntry, WalletExport,
 };
-use crate::notifier::{Notifier, NotificationType};
+use crate::notifier::Notifier;
 use crate::rpc_client::NodeClient;
 use crate::state::AppConfig;
 use crate::tray::{TrayIcon, TrayIconState};
@@ -68,6 +68,7 @@ impl AppState {
     }
 
     /// Add a log line to the buffer (Item 197).
+    #[allow(dead_code)]
     pub async fn push_log(&self, level: &str, message: &str) {
         let line = LogLine {
             level: level.to_string(),
@@ -250,6 +251,7 @@ async fn api_export_wallet(
     }
 }
 
+#[allow(dead_code)]
 #[derive(Serialize)]
 struct WalletInfo {
     address: String,
@@ -516,6 +518,7 @@ async fn api_get_notifications(State(state): State<Arc<AppState>>) -> Json<serde
     Json(serde_json::to_value(history).unwrap_or_default())
 }
 
+#[allow(dead_code)]
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

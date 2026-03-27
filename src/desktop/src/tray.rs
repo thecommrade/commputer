@@ -18,6 +18,7 @@ pub enum TrayIconState {
 
 impl TrayIconState {
     /// Icon name/identifier for each state.
+    #[allow(dead_code)]
     pub fn icon_name(&self) -> &'static str {
         match self {
             TrayIconState::Active => "tray-active",
@@ -81,12 +82,14 @@ impl TrayIcon {
     }
 
     /// Hide the tray icon.
+    #[allow(dead_code)]
     pub fn hide(&mut self) {
         self.visible = false;
         tracing::info!("System tray icon hidden");
     }
 
     /// Whether the tray icon is visible.
+    #[allow(dead_code)]
     pub fn is_visible(&self) -> bool {
         self.visible
     }
@@ -102,11 +105,13 @@ impl TrayIcon {
     }
 
     /// Get current state.
+    #[allow(dead_code)]
     pub fn state(&self) -> TrayIconState {
         self.state
     }
 
     /// Get menu items (for rendering).
+    #[allow(dead_code)]
     pub fn menu_items(&self) -> &[TrayMenuItem] {
         &self.menu_items
     }

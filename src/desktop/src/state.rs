@@ -100,6 +100,7 @@ impl AppConfig {
     }
 
     /// Load config from a specific path (for testing).
+    #[allow(dead_code)]
     pub fn load_from(path: &std::path::Path) -> Self {
         if path.exists() {
             if let Ok(data) = std::fs::read_to_string(path) {
@@ -130,12 +131,14 @@ impl AppConfig {
     }
 
     /// Item 179: Update contribution percentage and persist.
+    #[allow(dead_code)]
     pub fn set_contribution(&mut self, percent: u8) -> Result<(), String> {
         self.contribution_percent = percent.clamp(1, 100);
         self.save()
     }
 
     /// Item 189: Set theme and persist.
+    #[allow(dead_code)]
     pub fn set_theme(&mut self, theme: &str) -> Result<(), String> {
         match theme {
             "dark" | "light" | "system" => {
@@ -147,6 +150,7 @@ impl AppConfig {
     }
 
     /// Item 196: Update window state.
+    #[allow(dead_code)]
     pub fn set_window_state(&mut self, state: WindowState) -> Result<(), String> {
         self.window = state;
         self.save()
@@ -171,6 +175,7 @@ pub fn config_dir() -> PathBuf {
 }
 
 /// Item 32: Node connection status.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeStatus {
     /// Node is synced and producing blocks.
@@ -181,6 +186,7 @@ pub enum NodeStatus {
     Disconnected,
 }
 
+#[allow(dead_code)]
 impl NodeStatus {
     /// CSS color class for the status indicator dot.
     pub fn color(&self) -> &'static str {
