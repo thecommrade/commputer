@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <linearGradient id="glow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#00ff88" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#00ff88" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="textGlow">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="barGlow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="630" fill="#0a0a0a"/>
+
+  <!-- Subtle gradient overlay at top -->
+  <rect width="1200" height="630" fill="url(#glow)"/>
+
+  <!-- Subtle grid lines for tech feel -->
+  <line x1="0" y1="210" x2="1200" y2="210" stroke="#151515" stroke-width="1"/>
+  <line x1="0" y1="420" x2="1200" y2="420" stroke="#151515" stroke-width="1"/>
+  <line x1="400" y1="0" x2="400" y2="630" stroke="#151515" stroke-width="1"/>
+  <line x1="800" y1="0" x2="800" y2="630" stroke="#151515" stroke-width="1"/>
+
+  <!-- Border -->
+  <rect x="0" y="0" width="1200" height="630" fill="none" stroke="#222222" stroke-width="2"/>
+
+  <!-- Logo: 5 ascending bars (scaled up, centered vertically at left area) -->
+  <g transform="translate(120, 180)" filter="url(#barGlow)">
+    <rect x="0"   y="200" width="30" height="40"  rx="4" fill="#00ff88"/>
+    <rect x="42"   y="160" width="30" height="80"  rx="4" fill="#00ff88"/>
+    <rect x="84"  y="110" width="30" height="130" rx="4" fill="#00ff88"/>
+    <rect x="126" y="60"  width="30" height="180" rx="4" fill="#00ff88"/>
+    <rect x="168" y="0"   width="30" height="240" rx="4" fill="#00ff88"/>
+  </g>
+
+  <!-- COMMPUTER text -->
+  <text x="460" y="290" font-family="monospace, 'Courier New'" font-size="72" font-weight="700" fill="#00ff88" letter-spacing="8" filter="url(#textGlow)">COMMPUTER</text>
+
+  <!-- Tagline -->
+  <text x="460" y="340" font-family="monospace, 'Courier New'" font-size="20" fill="#e0e0e0" letter-spacing="1">A communal supercomputer for the people, by the people.</text>
+
+  <!-- Subtitle line -->
+  <text x="460" y="385" font-family="monospace, 'Courier New'" font-size="15" fill="#666666" letter-spacing="1">Layer 1 blockchain. 5-channel Proof of Work. Anti-scale by design.</text>
+
+  <!-- $COMME pill -->
+  <rect x="460" y="410" width="110" height="32" rx="16" fill="none" stroke="#00ff88" stroke-width="1.5" opacity="0.7"/>
+  <text x="485" y="431" font-family="monospace, 'Courier New'" font-size="14" font-weight="700" fill="#00ff88" opacity="0.9">$COMME</text>
+
+  <!-- commputer.xyz -->
+  <text x="460" y="530" font-family="monospace, 'Courier New'" font-size="16" fill="#444444" letter-spacing="2">commputer.xyz</text>
+
+  <!-- Thin accent line -->
+  <rect x="460" y="545" width="200" height="1" fill="#00ff88" opacity="0.3"/>
+</svg>
