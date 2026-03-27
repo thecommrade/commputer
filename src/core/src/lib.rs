@@ -22,6 +22,7 @@ pub mod charitable;
 pub mod carbon;
 pub mod l2_client;
 pub mod tier_access;
+pub mod state;
 #[cfg(test)]
 mod fuzz_tests;
 
