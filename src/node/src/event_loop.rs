@@ -1997,9 +1997,11 @@ impl EventLoop {
         }
 
         // Feature 5: Validator cooldown — skip block production if within cooldown period.
+        // Exempt validators registered in the first few blocks (bootstrap validators).
         let our_addr = *self.wallet.address();
         if let Some(acct) = self.state.accounts.get(&our_addr)
-            && let Some(reg_height) = acct.validator_registered_height {
+            && let Some(reg_height) = acct.validator_registered_height
+            && reg_height >= commputer_core::transaction::VALIDATOR_COOLDOWN_BLOCKS {
                 let current_height = self.state.blocks.height();
                 if current_height < reg_height + commputer_core::transaction::VALIDATOR_COOLDOWN_BLOCKS {
                     debug!("Skipping block production — validator cooldown ({} blocks remaining)",
