@@ -137,6 +137,10 @@ pub struct EventLoop {
     pub job_pool: JobPool,
     /// Connection count per peer (TCP+QUIC can create multiple connections).
     pub peer_connection_count: HashMap<libp2p::PeerId, usize>,
+    /// Whether this node has a genesis block. False on fresh nodes joining a network.
+    pub has_genesis: bool,
+    /// Deferred contribution percent for validator registration after genesis sync.
+    pub deferred_contribution_percent: Option<u8>,
     /// When the event loop started (for first-node timeout detection).
     pub event_loop_start: std::time::Instant,
     /// Whether initial sync with the network is complete.
@@ -154,6 +158,7 @@ impl EventLoop {
     ) -> Self {
         let epoch_state = EpochState::new(0, 0);
         let our_address = *wallet.address();
+        let has_genesis = !state.blocks.is_empty();
         Self {
             state,
             wallet,
@@ -199,6 +204,8 @@ impl EventLoop {
             event_loop_start: std::time::Instant::now(),
             sync_complete: false,
             network_height: 0,
+            has_genesis,
+            deferred_contribution_percent: None,
         }
     }
 
@@ -530,6 +537,15 @@ impl EventLoop {
                     self.reconnect_seeds();
                 }
                 _ = sync_timer.tick() => {
+                    // Genesis sync: keep requesting block 0 until we have it.
+                    if !self.has_genesis {
+                        if !self.peer_ips.is_empty() {
+                            debug!("Retrying genesis block request...");
+                            self.request_block(0);
+                        }
+                        continue;
+                    }
+
                     if !self.sync_complete {
                         let our_height = self.state.blocks.height();
 
@@ -537,7 +553,7 @@ impl EventLoop {
                             // We've caught up to the network.
                             info!("Initial sync complete at height {}", our_height);
                             self.sync_complete = true;
-                        } else if self.peer_ips.is_empty() && self.event_loop_start.elapsed().as_secs() >= 30 {
+                        } else if self.peer_ips.is_empty() && self.has_genesis && self.event_loop_start.elapsed().as_secs() >= 30 {
                             // No peers after 30 seconds. We're the first/only node.
                             info!("No peers found after 30s — starting as genesis producer");
                             self.sync_complete = true;
@@ -929,6 +945,11 @@ impl EventLoop {
                             }
                         }
                     }
+                    // Request genesis from seed if we don't have it yet.
+                    if !self.has_genesis {
+                        info!("Requesting genesis block from peer {}", peer_id);
+                        self.request_block(0);
+                    }
                 }
                 // Reject connections from banned peers (before connection counting).
                 if self.banned_peers.contains(&peer_id) {
@@ -1011,6 +1032,7 @@ impl EventLoop {
                         let agent_has_genesis = info.agent_version.contains(&our_genesis_hex);
                         if info.agent_version.contains("commputer/") && !agent_has_genesis
                             && !info.agent_version.contains("unknown")
+                            && !info.agent_version.contains("awaiting-genesis")
                         {
                             warn!(
                                 "Peer {} has different genesis hash (agent: {}) — disconnecting",
@@ -1207,6 +1229,39 @@ impl EventLoop {
                 if height > self.network_height {
                     self.network_height = height;
                 }
+
+                // Genesis sync: apply block 0 directly to bootstrap the chain.
+                if !self.has_genesis && height == 0 {
+                    info!("Received genesis block from network: {}", block.hash());
+                    match self.state.apply_block(&block) {
+                        Ok(()) => {
+                            self.has_genesis = true;
+                            info!("Genesis block applied. Chain initialized at height 0.");
+
+                            // Deferred validator registration.
+                            if let Some(pct) = self.deferred_contribution_percent.take() {
+                                self.auto_register_validator(pct);
+                                // Broadcast registration tx (first-connect window already passed).
+                                for tx in &self.pending_txs {
+                                    if matches!(tx.kind, commputer_core::transaction::TxKind::ValidatorRegister { .. }) {
+                                        if let Ok(data) = serde_json::to_vec(tx) {
+                                            let compressed = commputer_network::compress(&data);
+                                            let topic = topics::tx_topic();
+                                            let _ = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed);
+                                            info!("Broadcast ValidatorRegister tx after genesis sync");
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to apply genesis block from network: {}", e);
+                        }
+                    }
+                    return;
+                }
+
                 if height == requested_height && !self.state.blocks.contains(&block.hash()) {
                     self.consensus.add_candidate(block);
                     self.consensus.try_finalize_round(height, self.peer_ips.len());
@@ -1673,6 +1728,9 @@ impl EventLoop {
     }
 
     fn handle_epoch_tick(&mut self) {
+        if !self.has_genesis {
+            return;
+        }
         let epoch = self.epoch_state.epoch;
         let validator_count = self.epoch_state.validator_count() as u64;
 
@@ -1983,8 +2041,8 @@ impl EventLoop {
             }
         }
 
-        // Don't produce blocks until initial sync is complete.
-        if !self.sync_complete {
+        // Don't produce blocks without genesis or before sync completes.
+        if !self.has_genesis || !self.sync_complete {
             return;
         }
 
@@ -2169,6 +2227,9 @@ impl EventLoop {
     /// Consensus round tick (500ms): for each active height, publish a query
     /// and attempt to finalize the round from accumulated responses.
     fn handle_consensus_tick(&mut self) {
+        if !self.has_genesis {
+            return;
+        }
         let peer_count = self.peer_ips.len();
         self.consensus.update_params_for_network_size(peer_count);
 
