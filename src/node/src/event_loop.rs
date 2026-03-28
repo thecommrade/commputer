@@ -2177,9 +2177,21 @@ impl EventLoop {
         let peer_count = self.peer_ips.len();
         self.consensus.update_params_for_network_size(peer_count);
 
+        // Publish queries FIRST so peers can respond before we try to finalize.
+        // If we finalize first, the height gets cleaned up and queries never go out.
         let active = self.consensus.active_heights();
         for height in &active {
-            // Try to finalize from any responses accumulated so far.
+            if let Some(pref) = self.consensus.query_preference(*height) {
+                let query = ConsensusMessage::SnowballQuery {
+                    height: *height,
+                    querier_preference: pref,
+                };
+                self.publish_consensus_message(&query);
+            }
+        }
+
+        // Now try to finalize from any responses accumulated in previous ticks.
+        for height in &active {
             self.consensus.try_finalize_round(*height, peer_count);
         }
 
@@ -2192,18 +2204,6 @@ impl EventLoop {
 
         // Clean up stale consensus state below applied chain tip.
         self.consensus.cleanup_below(self.state.blocks.height());
-
-        // Publish queries for still-active heights.
-        let still_active = self.consensus.active_heights();
-        for height in still_active {
-            if let Some(pref) = self.consensus.query_preference(height) {
-                let query = ConsensusMessage::SnowballQuery {
-                    height,
-                    querier_preference: pref,
-                };
-                self.publish_consensus_message(&query);
-            }
-        }
     }
 
     /// If the consensus manager has a finalized block at `height`, apply it
