@@ -1014,8 +1014,12 @@ async fn run_node(
     info!("Hardware: {} ({} cores), {} MB RAM", hardware.cpu_model, hardware.cpu_cores, hardware.ram_total_mb);
 
     // Set up network with persistent peer identity (Item 3).
+    // Include genesis hash in identify agent_version for peer chain verification.
     let peer_key = peer_key_path();
-    let mut network = CommpNetwork::new_with_keypair_path(port, Some(&peer_key))
+    let genesis_hash_hex = state.blocks.get_by_height(0)
+        .map(|b| hex::encode(&b.hash().0[..8]))
+        .unwrap_or_default();
+    let mut network = CommpNetwork::new_with_keypair_path(port, Some(&peer_key), &genesis_hash_hex)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     info!("P2P peer ID: {}", network.local_peer_id);
 

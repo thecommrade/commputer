@@ -8,8 +8,17 @@ use commputer_core::block::{Block, BlockHash, BlockHeader};
 use commputer_core::identity::Address;
 use commputer_consensus::snowball::{SnowballParams, SnowballVoter};
 
-/// Feature 129: Consensus timeout — if no block finalized within this duration, force re-election.
-pub const CONSENSUS_TIMEOUT_SECS: u64 = 30;
+/// Consensus timeout scales with network size.
+/// Small network (0-3 peers): 6s (3 block times)
+/// Medium network (4-20): 10s
+/// Large network (20+): 30s (original Avalanche assumption)
+fn consensus_timeout_secs(peer_count: usize) -> u64 {
+    match peer_count {
+        0..=3 => 6,
+        4..=20 => 10,
+        _ => 30,
+    }
+}
 
 /// Feature 126: Minimum block interval per validator (seconds).
 pub const MIN_BLOCK_INTERVAL_SECS: u64 = 2;
@@ -138,6 +147,25 @@ impl ConsensusManager {
         }
     }
 
+    /// Scale Snowball parameters to current network size.
+    /// On small networks, sample_size and quorum shrink so voting can converge.
+    /// On large networks, use the full params for Byzantine fault tolerance.
+    pub fn update_params_for_network_size(&mut self, peer_count: usize) {
+        let base_sample = 3usize;
+        let effective_sample = if peer_count == 0 {
+            1
+        } else {
+            base_sample.min(peer_count)
+        };
+        let effective_quorum = if effective_sample <= 1 {
+            1
+        } else {
+            (effective_sample * 2 + 2) / 3 // ceil(2/3)
+        };
+        self.params.sample_size = effective_sample;
+        self.params.quorum = effective_quorum;
+    }
+
     /// Create a consensus manager with custom Snowball parameters (Feature 131).
     pub fn with_params(params: SnowballParams) -> Self {
         Self {
@@ -222,37 +250,31 @@ impl ConsensusManager {
     }
 
     /// Feed accumulated responses into the voter and reset for the next round.
-    /// Also handles the single-candidate fast-path: if only one candidate exists,
-    /// finalize immediately without requiring peer responses.
-    /// Feature 129: If elapsed > 30s, force re-election by finalizing on any candidate.
+    /// Finalization happens through real Snowball voting or via a scaled timeout.
+    /// `peer_count` is used to scale the timeout to network size.
     /// Returns true if this round caused finalization.
-    pub fn try_finalize_round(&mut self, height: u64) -> bool {
+    pub fn try_finalize_round(&mut self, height: u64, peer_count: usize) -> bool {
         if let Some(state) = self.heights.get_mut(&height) {
             if state.voter.is_finalized() {
                 return false;
             }
 
-            // Single-candidate fast-path: no need for multi-round voting.
-            if state.candidates.len() == 1 {
-                let hash = match state.candidates.keys().next() {
-                    Some(h) => *h,
-                    None => return false,
-                };
-                let mut responses = HashMap::new();
-                responses.insert(hash, self.params.sample_size);
-                for _ in 0..self.params.decision_threshold {
-                    state.voter.record_round(&responses);
-                }
-                debug!("Single candidate at height {} — finalized immediately", height);
-                return true;
-            }
+            // No single-candidate fast-path. Finalization happens only through
+            // real Snowball voting rounds with peer responses, or via the
+            // timeout below. This matches Avalanche's design: even if there is
+            // only one candidate, peers must vote on it before it is finalized.
 
-            // Feature 129: Consensus timeout — force finalization after 30s.
+            // Consensus timeout — force finalization. Timeout scales with network size.
+            let timeout = consensus_timeout_secs(peer_count);
             if let Some(start) = self.height_start_time.get(&height)
-                && start.elapsed().as_secs() >= CONSENSUS_TIMEOUT_SECS {
-                    // Force finalize on the current preference or first candidate.
-                    let hash = match state.voter.preference()
-                        .or_else(|| state.candidates.keys().next().copied()) {
+                && start.elapsed().as_secs() >= timeout {
+                    // Deterministic tie-breaking: prefer most-voted block,
+                    // then smallest hash for determinism across all nodes.
+                    let hash = match state.round_responses.iter()
+                        .max_by_key(|(_, count)| *count)
+                        .map(|(h, _)| *h)
+                        .or_else(|| state.voter.preference())
+                        .or_else(|| state.candidates.keys().min().copied()) {
                         Some(h) => h,
                         None => return false, // no candidates at all
                     };
@@ -307,6 +329,15 @@ impl ConsensusManager {
         let hash = self.finalized_at_height(height)?;
         let state = self.heights.remove(&height)?;
         state.candidates.into_values().find(|b| b.hash() == hash)
+    }
+
+    /// Remove consensus state for heights at or below the applied chain tip.
+    /// Prevents memory leaks from stale entries that were finalized but never taken,
+    /// or heights that timed out and were superseded.
+    pub fn cleanup_below(&mut self, applied_height: u64) {
+        self.heights.retain(|h, _| *h > applied_height);
+        self.height_start_time.retain(|h, _| *h > applied_height);
+        self.validator_blocks.retain(|(_, h), _| *h > applied_height);
     }
 
     /// How many candidates exist at a given height.
@@ -559,15 +590,22 @@ mod tests {
     // ---- Existing tests ----
 
     #[test]
-    fn single_candidate_finalizes_immediately() {
+    fn single_candidate_requires_voting() {
         let mut cm = ConsensusManager::new();
         let block = make_test_block(1);
         let hash = block.hash();
         cm.add_candidate(block);
-        // Not finalized until we run a round.
+        // Not finalized without peer responses, even with one candidate.
         assert_eq!(cm.finalized_at_height(1), None);
-        // Single-candidate fast-path triggers on try_finalize_round.
-        cm.try_finalize_round(1);
+        cm.try_finalize_round(1, 3);
+        // Still not finalized — no peer votes received.
+        assert_eq!(cm.finalized_at_height(1), None);
+        // Finalize via peer voting: 5 rounds (decision_threshold), 2 votes each (quorum).
+        for _ in 0..5 {
+            cm.record_response(1, hash);
+            cm.record_response(1, hash);
+            cm.try_finalize_round(1, 3);
+        }
         assert_eq!(cm.finalized_at_height(1), Some(hash));
     }
 
@@ -597,7 +635,7 @@ mod tests {
         for _ in 0..5 {
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_a);
-            cm.try_finalize_round(1);
+            cm.try_finalize_round(1, 3);
         }
         assert_eq!(cm.finalized_at_height(1), Some(hash_a));
     }
@@ -608,7 +646,12 @@ mod tests {
         let block = make_test_block(1);
         let hash = block.hash();
         cm.add_candidate(block);
-        cm.try_finalize_round(1);
+        // Finalize via voting (no fast-path).
+        for _ in 0..5 {
+            cm.record_response(1, hash);
+            cm.record_response(1, hash);
+            cm.try_finalize_round(1, 3);
+        }
 
         let taken = cm.take_finalized(1);
         assert!(taken.is_some());
@@ -664,8 +707,8 @@ mod tests {
             cm_b.record_response(1, majority_hash);
             cm_b.record_response(1, minority_hash);
 
-            cm_a.try_finalize_round(1);
-            cm_b.try_finalize_round(1);
+            cm_a.try_finalize_round(1, 3);
+            cm_b.try_finalize_round(1, 3);
 
             // Check if both finalized.
             let final_a = cm_a.finalized_at_height(1);
@@ -712,7 +755,7 @@ mod tests {
             cm.record_response(1, hash_b);
             cm.record_response(1, hash_b);
             cm.record_response(1, hash_a);
-            cm.try_finalize_round(1);
+            cm.try_finalize_round(1, 3);
         }
         assert_eq!(cm.finalized_at_height(1), None, "Should not finalize after only 2 rounds");
 
@@ -721,7 +764,7 @@ mod tests {
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_a);
-            cm.try_finalize_round(1);
+            cm.try_finalize_round(1, 3);
         }
 
         // block_a should win since it had strong majority in later rounds.
@@ -743,7 +786,7 @@ mod tests {
         for _ in 0..3 {
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_a);
-            cm.try_finalize_round(1);
+            cm.try_finalize_round(1, 3);
         }
         assert_eq!(cm.finalized_at_height(1), None);
     }
@@ -1019,7 +1062,7 @@ mod tests {
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_b);
-            cm.try_finalize_round(1);
+            cm.try_finalize_round(1, 3);
         }
 
         let winner = cm.finalized_at_height(1);
@@ -1046,11 +1089,11 @@ mod tests {
         for _ in 0..6 {
             cm_1.record_response(1, hash_a);
             cm_1.record_response(1, hash_a);
-            cm_1.try_finalize_round(1);
+            cm_1.try_finalize_round(1, 3);
 
             cm_2.record_response(1, hash_a);
             cm_2.record_response(1, hash_a);
-            cm_2.try_finalize_round(1);
+            cm_2.try_finalize_round(1, 3);
         }
 
         let final_1 = cm_1.finalized_at_height(1);
@@ -1114,7 +1157,7 @@ mod tests {
             for _ in 0..7 {
                 cm.record_response(1, hash_a);
             }
-            cm.try_finalize_round(1);
+            cm.try_finalize_round(1, 3);
         }
         assert_eq!(cm.finalized_at_height(1), None);
 
@@ -1122,7 +1165,7 @@ mod tests {
         for _ in 0..7 {
             cm.record_response(1, hash_a);
         }
-        cm.try_finalize_round(1);
+        cm.try_finalize_round(1, 3);
         assert_eq!(cm.finalized_at_height(1), Some(hash_a));
     }
 

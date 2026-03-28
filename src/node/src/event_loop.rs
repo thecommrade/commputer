@@ -135,6 +135,14 @@ pub struct EventLoop {
     pub pending_epoch_summary: Option<commputer_core::block::EpochSummary>,
     /// Item 18: In-memory job pool for compute job lifecycle management.
     pub job_pool: JobPool,
+    /// Connection count per peer (TCP+QUIC can create multiple connections).
+    pub peer_connection_count: HashMap<libp2p::PeerId, usize>,
+    /// When the event loop started (for first-node timeout detection).
+    pub event_loop_start: std::time::Instant,
+    /// Whether initial sync with the network is complete.
+    pub sync_complete: bool,
+    /// Highest block height heard from any peer.
+    pub network_height: u64,
 }
 
 impl EventLoop {
@@ -187,6 +195,10 @@ impl EventLoop {
             pending_epoch_summary: None,
             job_pool: JobPool::new(),
             mempool_added_at: HashMap::new(),
+            peer_connection_count: HashMap::new(),
+            event_loop_start: std::time::Instant::now(),
+            sync_complete: false,
+            network_height: 0,
         }
     }
 
@@ -455,9 +467,7 @@ impl EventLoop {
         info!("P2P encryption: Noise protocol active");
         info!("Event loop started at height {}. Listening for peers...", self.state.blocks.height());
 
-        // Initial sync: request any missing blocks we might have missed.
-        // This runs once at startup after peers connect.
-        let mut sync_requested = false;
+        // Sync timer: periodically check sync status and request missing blocks.
         let mut sync_timer = time::interval(Duration::from_secs(5));
 
         // Item 73: Periodic status line every 60 seconds.
@@ -520,15 +530,31 @@ impl EventLoop {
                     self.reconnect_seeds();
                 }
                 _ = sync_timer.tick() => {
-                    // If we have peers but haven't synced yet, request the next block.
-                    if !sync_requested && !self.peer_ips.is_empty() {
+                    if !self.sync_complete {
                         let our_height = self.state.blocks.height();
-                        // Request the next few blocks we might be missing.
-                        for h in (our_height + 1)..=(our_height + 10) {
-                            self.request_block(h);
+
+                        if our_height >= self.network_height && self.network_height > 0 {
+                            // We've caught up to the network.
+                            info!("Initial sync complete at height {}", our_height);
+                            self.sync_complete = true;
+                        } else if self.peer_ips.is_empty() && self.event_loop_start.elapsed().as_secs() >= 30 {
+                            // No peers after 30 seconds. We're the first/only node.
+                            info!("No peers found after 30s — starting as genesis producer");
+                            self.sync_complete = true;
+                        } else if !self.peer_ips.is_empty() && our_height < self.network_height {
+                            // Behind the network, keep syncing.
+                            let batch_end = (our_height + 10).min(self.network_height);
+                            for h in (our_height + 1)..=batch_end {
+                                self.request_block(h);
+                            }
+                            debug!("Syncing: height {} / {}", our_height, self.network_height);
+                        } else if !self.peer_ips.is_empty() {
+                            // Have peers but haven't heard their height yet. Request blocks.
+                            let our_height = self.state.blocks.height();
+                            for h in (our_height + 1)..=(our_height + 10) {
+                                self.request_block(h);
+                            }
                         }
-                        sync_requested = true;
-                        info!("Initial sync: requested blocks {} to {}", our_height + 1, our_height + 10);
                     }
                 }
                 _ = peer_rotation_interval.tick() => {
@@ -904,11 +930,18 @@ impl EventLoop {
                         }
                     }
                 }
-                // Reject connections from banned peers.
+                // Reject connections from banned peers (before connection counting).
                 if self.banned_peers.contains(&peer_id) {
                     info!("Rejecting connection from banned peer {}", peer_id);
                     let _ = self.network.swarm.disconnect_peer_id(peer_id);
                     return;
+                }
+                // Deduplicate TCP/QUIC dual-stack connections per peer.
+                let conn_count = self.peer_connection_count.entry(peer_id).or_insert(0);
+                *conn_count += 1;
+                if *conn_count > 1 {
+                    debug!("Additional connection to peer {} (now {} connections)", peer_id, conn_count);
+                    return; // Already tracked as connected
                 }
                 // Extract the IP address from the multiaddr.
                 let addr_str = endpoint.get_remote_address().to_string();
@@ -1079,19 +1112,30 @@ impl EventLoop {
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                // Clean up peer tracking.
+                // Deduplicate: only clean up when all connections to this peer are gone.
+                if let Some(count) = self.peer_connection_count.get_mut(&peer_id) {
+                    *count = count.saturating_sub(1);
+                    if *count > 0 {
+                        debug!("Connection closed to peer {} ({} remaining)", peer_id, count);
+                        return;
+                    }
+                    self.peer_connection_count.remove(&peer_id);
+                }
+                // All connections to this peer are gone. Clean up peer tracking.
                 self.peer_ips.remove(&peer_id);
                 self.peer_subnets.remove(&peer_id);
                 self.peer_rtts.remove(&peer_id);
                 self.ping_timestamps.remove(&peer_id);
                 self.peer_quality.remove(&peer_id);
-                if let Some(validator_addr) = self.peer_validators.remove(&peer_id) {
-                    self.compliance.deregister_node(&validator_addr);
+                // Save validator addr before removing (for grace drain below).
+                let validator_addr = self.peer_validators.remove(&peer_id);
+                if let Some(ref addr) = validator_addr {
+                    self.compliance.deregister_node(addr);
                 }
                 self.verified_peer_validators.remove(&peer_id);
                 self.peer_scores.remove(&peer_id);
                 // Drain grace period for disconnected validators.
-                if let Some(validator_addr) = self.peer_validators.get(&peer_id)
+                if let Some(ref validator_addr) = validator_addr
                     && let Some(account) = self.state.accounts.get_mut(validator_addr) {
                         // Drain 1 epoch's worth of grace (3600s) on disconnect.
                         account.drain_grace(3600);
@@ -1110,6 +1154,11 @@ impl EventLoop {
                 let hash = block.hash();
                 let height = block.height();
 
+                // Track highest block height seen from peers (for sync gate).
+                if height > self.network_height {
+                    self.network_height = height;
+                }
+
                 if self.state.blocks.contains(&hash) {
                     return; // Already finalized this block.
                 }
@@ -1123,10 +1172,14 @@ impl EventLoop {
                 self.consensus.add_candidate(block);
 
                 // Attempt finalization (handles single-candidate fast-path).
-                self.consensus.try_finalize_round(height);
+                self.consensus.try_finalize_round(height, self.peer_ips.len());
                 self.try_apply_finalized(height);
             }
             ConsensusMessage::SnowballQuery { height, querier_preference: _ } => {
+                // Track highest height seen from peers.
+                if height > self.network_height {
+                    self.network_height = height;
+                }
                 // Respond with our preference for this height.
                 if let Some(pref) = self.consensus.query_preference(height) {
                     let response = ConsensusMessage::SnowballResponse {
@@ -1151,9 +1204,12 @@ impl EventLoop {
             ConsensusMessage::BlockResponse { block: Some(block), requested_height } => {
                 debug!("Received block response for height {}", requested_height);
                 let height = block.height();
+                if height > self.network_height {
+                    self.network_height = height;
+                }
                 if height == requested_height && !self.state.blocks.contains(&block.hash()) {
                     self.consensus.add_candidate(block);
-                    self.consensus.try_finalize_round(height);
+                    self.consensus.try_finalize_round(height, self.peer_ips.len());
                     self.try_apply_finalized(height);
                 }
             }
@@ -1212,8 +1268,10 @@ impl EventLoop {
         }
 
         // Timestamp must be >= parent block timestamp (no going backward).
-        // Item 1: Don't ban for timestamp issues — could be clock skew or chain divergence.
-        if let Some(parent) = self.state.blocks.latest()
+        // Compare against the block's actual parent (by parent_hash), not our local
+        // chain tip. During sync or fork choice, the incoming block's parent may be
+        // at a different height than our tip.
+        if let Some(parent) = self.state.blocks.get(&block.header.parent_hash)
             && block.header.timestamp < parent.header.timestamp {
                 warn!("Rejected block from {}: timestamp before parent ({} < {})",
                     source, block.header.timestamp, parent.header.timestamp);
@@ -1231,7 +1289,12 @@ impl EventLoop {
         // === Stage 3: Transaction signature verification ===
 
         // Verify all transaction signatures in the block.
+        // Protocol-issued transactions (MiningReward, MilestoneBurn) come from the zero
+        // address and have no signature — skip verification for those.
         for tx in &block.transactions {
+            if tx.from.is_zero() {
+                continue; // Protocol-issued tx, no signature expected
+            }
             if !tx.verify() {
                 self.ban_peer(
                     source,
@@ -1317,7 +1380,7 @@ impl EventLoop {
         self.consensus.add_candidate(block);
 
         // Attempt finalization (handles single-candidate fast-path).
-        self.consensus.try_finalize_round(height);
+        self.consensus.try_finalize_round(height, self.peer_ips.len());
         self.try_apply_finalized(height);
     }
 
@@ -1344,7 +1407,7 @@ impl EventLoop {
                 let height = orphan.height();
                 debug!("Processing orphan block {} at height {} (parent now available)", hash, height);
                 self.consensus.add_candidate(orphan);
-                self.consensus.try_finalize_round(height);
+                self.consensus.try_finalize_round(height, self.peer_ips.len());
                 self.try_apply_finalized(height);
             }
         }
@@ -1920,6 +1983,11 @@ impl EventLoop {
             }
         }
 
+        // Don't produce blocks until initial sync is complete.
+        if !self.sync_complete {
+            return;
+        }
+
         // Only produce blocks if we're a registered validator.
         if self.validator.status() != ValidatorStatus::Active {
             return;
@@ -2093,18 +2161,21 @@ impl EventLoop {
         // Use add_local_candidate to avoid false equivocation detection on retries.
         self.consensus.add_local_candidate(block);
 
-        // Attempt finalization (handles single-candidate fast-path).
-        self.consensus.try_finalize_round(next_height);
-        self.try_apply_finalized(next_height);
+        // Don't try to finalize here. Wait for the consensus tick (500ms) to
+        // collect peer votes before attempting finalization. This prevents
+        // solo-finalization before peers have a chance to participate.
     }
 
     /// Consensus round tick (500ms): for each active height, publish a query
     /// and attempt to finalize the round from accumulated responses.
     fn handle_consensus_tick(&mut self) {
+        let peer_count = self.peer_ips.len();
+        self.consensus.update_params_for_network_size(peer_count);
+
         let active = self.consensus.active_heights();
         for height in &active {
             // Try to finalize from any responses accumulated so far.
-            self.consensus.try_finalize_round(*height);
+            self.consensus.try_finalize_round(*height, peer_count);
         }
 
         // Apply any newly finalized blocks (in height order).
@@ -2113,6 +2184,9 @@ impl EventLoop {
         for height in finalized {
             self.try_apply_finalized(height);
         }
+
+        // Clean up stale consensus state below applied chain tip.
+        self.consensus.cleanup_below(self.state.blocks.height());
 
         // Publish queries for still-active heights.
         let still_active = self.consensus.active_heights();

@@ -153,13 +153,15 @@ pub struct CommpBehaviour {
 impl CommpNetwork {
     /// Create a new CommpNetwork listening on the given port via TCP and QUIC.
     pub fn new(listen_port: u16) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_keypair_path(listen_port, None)
+        Self::new_with_keypair_path(listen_port, None, "")
     }
 
     /// Item 3: Create a CommpNetwork with a persistent keypair.
     /// If `keypair_path` is provided, loads the keypair from disk or generates
     /// and saves a new one. This ensures the peer ID survives restarts.
-    pub fn new_with_keypair_path(listen_port: u16, keypair_path: Option<&std::path::Path>) -> Result<Self, Box<dyn std::error::Error>> {
+    /// `genesis_hash_hex` is included in the identify agent_version so peers
+    /// can verify chain compatibility during handshake.
+    pub fn new_with_keypair_path(listen_port: u16, keypair_path: Option<&std::path::Path>, genesis_hash_hex: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let identity = if let Some(path) = keypair_path {
             if path.exists() {
                 let bytes = std::fs::read(path)?;
@@ -215,12 +217,18 @@ impl CommpNetwork {
                     kad::store::MemoryStore::new(peer_id),
                 );
 
-                // Identify with our protocol version
+                // Identify with our protocol version and genesis hash
+                let agent_version = if genesis_hash_hex.is_empty() {
+                    "commputer/0.1.0".to_string()
+                } else {
+                    format!("commputer/0.1.0/{}", genesis_hash_hex)
+                };
                 let identify = identify::Behaviour::new(
                     identify::Config::new(
                         "/commputer/0.1.0".to_string(),
                         key.public(),
-                    ),
+                    )
+                    .with_agent_version(agent_version),
                 );
 
                 // DCUtR for direct connection upgrades after relay

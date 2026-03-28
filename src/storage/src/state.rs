@@ -477,7 +477,12 @@ impl ChainState {
         }
 
         // Cryptographically verify all transaction signatures.
+        // Protocol-issued transactions (MiningReward, MilestoneBurn) come from the zero
+        // address and have no signature — skip verification for those.
         for tx in &block.transactions {
+            if tx.from.is_zero() {
+                continue;
+            }
             if !tx.verify() {
                 return Err(StateError::InvalidSignature(
                     format!("transaction from {:?} failed signature verification", tx.from)
