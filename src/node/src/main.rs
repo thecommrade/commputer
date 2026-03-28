@@ -902,18 +902,16 @@ async fn run_node(
 
     let mut state = ChainState::open(&dir)?;
 
+    // Filter out empty seed strings (--seeds "" gives vec![""] not vec![]).
+    let seeds: Vec<String> = seeds.into_iter().filter(|s| !s.is_empty()).collect();
+
     // Apply genesis block if this is a fresh chain.
+    // Genesis is deterministic — every node creates the identical block from
+    // the hardcoded config. This is how Bitcoin and Ethereum handle it.
     if state.blocks.is_empty() {
-        if seeds.is_empty() {
-            // No seeds — we ARE the genesis producer (first node).
-            let genesis = create_genesis();
-            info!("Genesis block hash: {}", genesis.hash());
-            state.apply_block(&genesis)?;
-        } else {
-            // Seeds configured — joining an existing network.
-            // Genesis will be downloaded from seed during initial sync.
-            info!("Fresh node with seeds configured — will download genesis from network");
-        }
+        let genesis = create_genesis();
+        info!("Genesis block hash: {}", genesis.hash());
+        state.apply_block(&genesis)?;
     } else {
         info!(
             "Resumed chain at height {} with {} accounts",
@@ -1034,7 +1032,7 @@ async fn run_node(
     let peer_key = peer_key_path();
     let genesis_hash_hex = state.blocks.get_by_height(0)
         .map(|b| hex::encode(&b.hash().0[..8]))
-        .unwrap_or_else(|| "awaiting-genesis".to_string());
+        .expect("genesis block must exist at this point");
     let mut network = CommpNetwork::new_with_keypair_path(port, Some(&peer_key), &genesis_hash_hex)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     info!("P2P peer ID: {}", network.local_peer_id);
@@ -1125,15 +1123,9 @@ async fn run_node(
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
-    let has_genesis = !state.blocks.is_empty();
     let mut event_loop = EventLoop::new(state, wallet, network, hardware);
     event_loop.attach_rpc(tx_receiver, rpc_state.clone());
-    if has_genesis {
-        event_loop.auto_register_validator(contribution_percent);
-    } else {
-        // Defer registration until genesis is downloaded from seed.
-        event_loop.deferred_contribution_percent = Some(contribution_percent);
-    }
+    event_loop.auto_register_validator(contribution_percent);
 
     // Feature 178: Store custom seeds for periodic reconnection.
     // Mark as seed connector if custom seeds were provided — this node
