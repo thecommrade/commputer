@@ -2034,15 +2034,15 @@ impl EventLoop {
             .map(|t| t.elapsed().as_secs() >= 30)
             .unwrap_or(false);
 
-        // Item 52: Block production fairness — if multiple validators are active,
-        // rotate based on sorted validator index. The validator whose position
-        // matches height mod active_count gets priority to produce.
+        // Item 52: Block production fairness — if enough validators are active,
+        // rotate based on sorted validator index. Disabled for small networks
+        // (< 10 validators) where phantom validator slots cause deadlocks.
         {
             let active_validators: Vec<Address> = self.state.accounts.iter()
                 .filter(|a| a.is_validator)
                 .map(|a| a.address)
                 .collect();
-            if active_validators.len() > 1 {
+            if active_validators.len() >= 10 {
                 let our_addr = *self.wallet.address();
                 let mut sorted = active_validators.clone();
                 sorted.sort_by_key(|a| a.0);
