@@ -66,6 +66,14 @@ impl SnowballVoter {
         self.preference
     }
 
+    /// Set initial preference so queries can start before any voting rounds.
+    /// Only sets if no preference exists yet. Does not affect confidence or counts.
+    pub fn set_initial_preference(&mut self, hash: BlockHash) {
+        if self.preference.is_none() {
+            self.preference = Some(hash);
+        }
+    }
+
     /// The finalized block hash, if decided.
     pub fn finalized_hash(&self) -> Option<BlockHash> {
         if self.finalized {

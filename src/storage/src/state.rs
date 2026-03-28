@@ -630,7 +630,11 @@ impl ChainState {
 
             TxKind::ValidatorRegister { .. } => {
                 // Feature 4: Check minimum validator stake.
-                if sender.balance.raw() < commputer_core::transaction::MINIMUM_VALIDATOR_STAKE {
+                // Exempt during genesis era (no coins emitted yet) so first validators
+                // can bootstrap the network. Once emission starts, stake is required.
+                if self.total_emitted > 0
+                    && sender.balance.raw() < commputer_core::transaction::MINIMUM_VALIDATOR_STAKE
+                {
                     return Err(StateError::InvalidBlock(format!(
                         "insufficient balance for validator registration: need {} raw, have {}",
                         commputer_core::transaction::MINIMUM_VALIDATOR_STAKE,

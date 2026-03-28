@@ -233,6 +233,8 @@ impl ConsensusManager {
         }
 
         state.candidates.insert(hash, block);
+        // Set initial preference so Snowball queries can start immediately.
+        state.voter.set_initial_preference(hash);
         debug!("Candidate added at height {}: {} (total: {})", height, hash, state.candidates.len());
     }
 

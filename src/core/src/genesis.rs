@@ -65,7 +65,7 @@ pub fn default_genesis() -> GenesisConfig {
         proof_challenge_interval_secs: 300,
         block_time_secs: 2,
         emission_decay_rate: 0.0001,
-        genesis_timestamp: 1647907200, // 2022-03-22 00:00:00 UTC
+        genesis_timestamp: 0, // 0 = use current time on first boot (testnet)
     }
 }
 

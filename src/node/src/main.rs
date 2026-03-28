@@ -382,6 +382,16 @@ fn create_genesis_for_dir(data_dir: Option<&std::path::Path>) -> Block {
         commputer_core::genesis::default_genesis()
     };
 
+    // Use genesis_timestamp from config. If 0, use current time (testnet default).
+    let timestamp = if _genesis_config.genesis_timestamp == 0 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    } else {
+        _genesis_config.genesis_timestamp
+    };
+
     Block {
         header: BlockHeader {
             protocol_version: 1, height: 0,
@@ -389,8 +399,7 @@ fn create_genesis_for_dir(data_dir: Option<&std::path::Path>) -> Block {
             tx_root: [0u8; 32],
             proof_root: [0u8; 32],
             state_root: [0u8; 32],
-            // Genesis timestamp: 2022-03-22 00:00:00 UTC.
-            timestamp: 1647907200,
+            timestamp,
             producer: Address([0u8; 32]), // No producer for genesis.
             epoch: 0,
             producer_public_key: vec![],
