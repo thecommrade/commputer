@@ -3,6 +3,8 @@ pub mod transaction;
 pub mod proof;
 pub mod identity;
 pub mod token;
+pub mod fmt;
+pub mod color;
 pub mod compliance;
 pub mod tier;
 pub mod error;
