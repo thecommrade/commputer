@@ -1008,8 +1008,8 @@ async fn run_node(
         println!("  Wallet saved to: {}", wallet_file.display());
         println!();
 
-        // Wait for user confirmation before starting
-        if password.is_none() {
+        // Wait for user confirmation before starting (skip in headless/automated mode)
+        if password.is_none() && std::env::var("COMMPUTER_WALLET_PASSWORD").is_err() {
             read_line("Press ENTER to start the node...");
         }
 
