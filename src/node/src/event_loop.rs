@@ -139,6 +139,8 @@ pub struct EventLoop {
     pub peer_connection_count: HashMap<libp2p::PeerId, usize>,
     /// When the event loop started (for first-node timeout detection).
     pub event_loop_start: std::time::Instant,
+    /// Snowball query round counter (nonce to prevent gossipsub dedup).
+    pub snowball_round: u64,
     /// Whether initial sync with the network is complete.
     pub sync_complete: bool,
     /// Highest block height heard from any peer.
@@ -197,6 +199,7 @@ impl EventLoop {
             mempool_added_at: HashMap::new(),
             peer_connection_count: HashMap::new(),
             event_loop_start: std::time::Instant::now(),
+            snowball_round: 0,
             sync_complete: false,
             network_height: 0,
         }
@@ -1177,7 +1180,7 @@ impl EventLoop {
                 self.consensus.try_finalize_round(height, self.peer_ips.len());
                 self.try_apply_finalized(height);
             }
-            ConsensusMessage::SnowballQuery { height, querier_preference: _ } => {
+            ConsensusMessage::SnowballQuery { height, querier_preference: _, .. } => {
                 // Track highest height seen from peers.
                 if height > self.network_height {
                     self.network_height = height;
@@ -2183,12 +2186,14 @@ impl EventLoop {
         let active = self.consensus.active_heights();
         for height in &active {
             if let Some(pref) = self.consensus.query_preference(*height) {
+                self.snowball_round += 1;
                 let query = ConsensusMessage::SnowballQuery {
                     height: *height,
                     querier_preference: pref,
+                    round: self.snowball_round,
                 };
                 self.publish_consensus_message(&query);
-                info!("Published Snowball query for height {} (preference: {})", height, pref);
+                info!("Published Snowball query for height {} round {} (preference: {})", height, self.snowball_round, pref);
             }
         }
 

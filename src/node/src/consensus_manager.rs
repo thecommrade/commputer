@@ -55,9 +55,13 @@ pub enum ConsensusMessage {
         block: Block,
     },
     /// Query: "At this height, which block do you prefer?"
+    /// `round` is a nonce that makes each query unique so gossipsub
+    /// doesn't deduplicate repeated queries for the same height.
     SnowballQuery {
         height: u64,
         querier_preference: BlockHash,
+        #[serde(default)]
+        round: u64,
     },
     /// Response: "At this height, I prefer this block."
     SnowballResponse {
@@ -162,8 +166,14 @@ impl ConsensusManager {
         } else {
             (effective_sample * 2 + 2) / 3 // ceil(2/3)
         };
+        // Scale decision_threshold: fewer rounds needed on small networks.
+        // Large network (3+ peers): 5 rounds for BFT confidence.
+        // Small network (1-2 peers): 3 rounds (faster finalization).
+        let effective_threshold = if peer_count <= 2 { 3 } else { 5 };
+
         self.params.sample_size = effective_sample;
         self.params.quorum = effective_quorum;
+        self.params.decision_threshold = effective_threshold;
     }
 
     /// Create a consensus manager with custom Snowball parameters (Feature 131).
@@ -261,24 +271,28 @@ impl ConsensusManager {
                 return false;
             }
 
-            // No single-candidate fast-path. Finalization happens only through
-            // real Snowball voting rounds with peer responses, or via the
-            // timeout below. This matches Avalanche's design: even if there is
-            // only one candidate, peers must vote on it before it is finalized.
+            // Try to finalize from accumulated peer votes FIRST.
+            if !state.round_responses.is_empty() {
+                let responses = std::mem::take(&mut state.round_responses);
+                let finalized = state.voter.record_round(&responses);
+                if finalized {
+                    info!(
+                        "Snowball finalized at height {}: {:?}",
+                        height,
+                        state.voter.finalized_hash()
+                    );
+                    return true;
+                }
+            }
 
-            // Consensus timeout — force finalization. Timeout scales with network size.
+            // Timeout fallback — only if voting hasn't converged yet.
             let timeout = consensus_timeout_secs(peer_count);
             if let Some(start) = self.height_start_time.get(&height)
                 && start.elapsed().as_secs() >= timeout {
-                    // Deterministic tie-breaking: prefer most-voted block,
-                    // then smallest hash for determinism across all nodes.
-                    let hash = match state.round_responses.iter()
-                        .max_by_key(|(_, count)| *count)
-                        .map(|(h, _)| *h)
-                        .or_else(|| state.voter.preference())
+                    let hash = match state.voter.preference()
                         .or_else(|| state.candidates.keys().min().copied()) {
                         Some(h) => h,
-                        None => return false, // no candidates at all
+                        None => return false,
                     };
                     let mut responses = HashMap::new();
                     responses.insert(hash, self.params.sample_size);
@@ -289,19 +303,7 @@ impl ConsensusManager {
                     return true;
                 }
 
-            if state.round_responses.is_empty() {
-                return false;
-            }
-            let responses = std::mem::take(&mut state.round_responses);
-            let finalized = state.voter.record_round(&responses);
-            if finalized {
-                info!(
-                    "Snowball finalized at height {}: {:?}",
-                    height,
-                    state.voter.finalized_hash()
-                );
-            }
-            finalized
+            false
         } else {
             false
         }
