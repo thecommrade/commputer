@@ -100,6 +100,29 @@ pub enum ConsensusMessage {
         state_root: [u8; 32],
         validator: Address,
     },
+
+    /// Block proposal — carries the full block so peers can validate and vote
+    /// in one round-trip. This IS the Snowball query on first broadcast.
+    BlockProposal {
+        block: Block,
+        #[serde(default)]
+        round: u64,
+    },
+    /// Lightweight retry query — references a block by height and preference hash.
+    /// If the peer hasn't seen this block, it requests it via BlockRequest.
+    BlockQuery {
+        height: u64,
+        preference: BlockHash,
+        #[serde(default)]
+        round: u64,
+    },
+    /// Vote response — peer's preference after evaluating a proposal or query.
+    VoteResponse {
+        height: u64,
+        preference: BlockHash,
+        #[serde(default)]
+        round: u64,
+    },
 }
 
 /// Per-height voting state: the voter plus all candidate blocks.
@@ -108,6 +131,8 @@ struct HeightState {
     candidates: HashMap<BlockHash, Block>,
     /// Accumulated responses for the current round.
     round_responses: HashMap<BlockHash, usize>,
+    /// Whether the full block proposal has been sent at least once for this height.
+    proposal_sent: bool,
 }
 
 /// Manages Snowball consensus across active heights.
@@ -238,6 +263,7 @@ impl ConsensusManager {
             voter: SnowballVoter::new(self.params.clone()),
             candidates: HashMap::new(),
             round_responses: HashMap::new(),
+            proposal_sent: false,
         });
 
         // Don't re-add duplicates.
@@ -254,6 +280,25 @@ impl ConsensusManager {
     /// Returns the voter's current preference at a given height, if any.
     pub fn query_preference(&self, height: u64) -> Option<BlockHash> {
         self.heights.get(&height).and_then(|s| s.voter.preference())
+    }
+
+    /// Get the preferred candidate block at a height (for re-proposing).
+    pub fn get_candidate_block(&self, height: u64) -> Option<Block> {
+        let state = self.heights.get(&height)?;
+        let pref = state.voter.preference()?;
+        state.candidates.get(&pref).cloned()
+    }
+
+    /// Whether the full block proposal has been sent for this height.
+    pub fn proposal_sent(&self, height: u64) -> bool {
+        self.heights.get(&height).map(|s| s.proposal_sent).unwrap_or(false)
+    }
+
+    /// Mark that the full block proposal has been sent for this height.
+    pub fn mark_proposal_sent(&mut self, height: u64) {
+        if let Some(state) = self.heights.get_mut(&height) {
+            state.proposal_sent = true;
+        }
     }
 
     /// Record a peer's response for a given height.

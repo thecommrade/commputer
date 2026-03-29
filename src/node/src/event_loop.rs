@@ -1153,6 +1153,7 @@ impl EventLoop {
     }
 
     /// Handle a consensus protocol message from a peer.
+    #[allow(unreachable_patterns)]
     fn handle_consensus_message(&mut self, msg: ConsensusMessage, source: libp2p::PeerId) {
         match msg {
             ConsensusMessage::BlockCandidate { block } => {
@@ -1176,27 +1177,32 @@ impl EventLoop {
                 debug!("Received block candidate {} at height {}", hash, height);
                 self.consensus.add_candidate(block);
 
-                // Attempt finalization (handles single-candidate fast-path).
                 self.consensus.try_finalize_round(height, self.peer_ips.len());
                 self.try_apply_finalized(height);
-            }
-            ConsensusMessage::SnowballQuery { height, querier_preference: _, round, .. } => {
-                // Track highest height seen from peers.
-                if height > self.network_height {
-                    self.network_height = height;
-                }
-                // Respond with our preference, echoing the round nonce.
+
+                // Legacy compat: also respond with vote.
                 if let Some(pref) = self.consensus.query_preference(height) {
-                    let response = ConsensusMessage::SnowballResponse {
-                        height,
-                        preference: pref,
-                        round,
+                    let response = ConsensusMessage::VoteResponse {
+                        height, preference: pref, round: 0,
                     };
                     self.publish_consensus_message(&response);
                 }
             }
+            ConsensusMessage::SnowballQuery { height, querier_preference: _, round, .. } => {
+                // Legacy: respond or request block if we don't have it.
+                if height > self.network_height {
+                    self.network_height = height;
+                }
+                if let Some(pref) = self.consensus.query_preference(height) {
+                    let response = ConsensusMessage::VoteResponse {
+                        height, preference: pref, round,
+                    };
+                    self.publish_consensus_message(&response);
+                } else {
+                    self.request_block(height);
+                }
+            }
             ConsensusMessage::SnowballResponse { height, preference, .. } => {
-                info!("Received Snowball vote for height {}: {}", height, preference);
                 self.consensus.record_response(height, preference);
             }
             ConsensusMessage::BlockRequest { height } => {
@@ -1235,6 +1241,57 @@ impl EventLoop {
                 // Feature 133: Record checkpoint vote from a validator.
                 debug!("Checkpoint commitment from {} at height {}", validator, height);
                 self.consensus.record_checkpoint_vote(height, validator, state_root);
+            }
+            ConsensusMessage::BlockProposal { block, round } => {
+                let hash = block.hash();
+                let height = block.height();
+
+                if height > self.network_height {
+                    self.network_height = height;
+                }
+
+                if self.state.blocks.contains(&hash) {
+                    return;
+                }
+
+                if !self.validate_block_from_peer(&block, source) {
+                    return;
+                }
+
+                debug!("Received block proposal {} at height {}", hash, height);
+                self.consensus.add_candidate(block);
+                self.consensus.try_finalize_round(height, self.peer_ips.len());
+                self.try_apply_finalized(height);
+
+                // Immediately respond with our vote.
+                if let Some(pref) = self.consensus.query_preference(height) {
+                    let response = ConsensusMessage::VoteResponse {
+                        height,
+                        preference: pref,
+                        round,
+                    };
+                    self.publish_consensus_message(&response);
+                }
+            }
+            ConsensusMessage::BlockQuery { height, preference: _, round } => {
+                if height > self.network_height {
+                    self.network_height = height;
+                }
+
+                if let Some(pref) = self.consensus.query_preference(height) {
+                    let response = ConsensusMessage::VoteResponse {
+                        height,
+                        preference: pref,
+                        round,
+                    };
+                    self.publish_consensus_message(&response);
+                } else {
+                    // We don't have this block. Request it so we can vote next round.
+                    self.request_block(height);
+                }
+            }
+            ConsensusMessage::VoteResponse { height, preference, .. } => {
+                self.consensus.record_response(height, preference);
             }
         }
     }
@@ -2140,11 +2197,14 @@ impl EventLoop {
 
         info!("Produced block candidate at height {}", next_height);
 
-        // Broadcast as BlockCandidate on the consensus topic.
-        let candidate_msg = ConsensusMessage::BlockCandidate {
+        // Broadcast block proposal — the full block IS the Snowball query.
+        // Peers validate the block and respond with their vote in one round-trip.
+        self.snowball_round += 1;
+        let proposal = ConsensusMessage::BlockProposal {
             block: block.clone(),
+            round: self.snowball_round,
         };
-        self.publish_consensus_message(&candidate_msg);
+        self.publish_consensus_message(&proposal);
 
         // Feature 7: Broadcast compact BlockAnnounce on the blocks topic instead of full block.
         // Peers that need the full block will request it via the block request protocol.
@@ -2182,19 +2242,33 @@ impl EventLoop {
         let peer_count = self.peer_ips.len();
         self.consensus.update_params_for_network_size(peer_count);
 
-        // Publish queries FIRST so peers can respond before we try to finalize.
-        // If we finalize first, the height gets cleaned up and queries never go out.
+        // Publish proposals or lightweight queries for active heights.
+        // First tick for a height: send full BlockProposal (block + query in one message).
+        // Subsequent ticks: send lightweight BlockQuery (hash only, no block data).
         let active = self.consensus.active_heights();
         for height in &active {
-            if let Some(pref) = self.consensus.query_preference(*height) {
-                self.snowball_round += 1;
-                let query = ConsensusMessage::SnowballQuery {
-                    height: *height,
-                    querier_preference: pref,
-                    round: self.snowball_round,
-                };
-                self.publish_consensus_message(&query);
-                info!("Published Snowball query for height {} round {} (preference: {})", height, self.snowball_round, pref);
+            if !self.consensus.proposal_sent(*height) {
+                // First time: send full block proposal.
+                if let Some(block) = self.consensus.get_candidate_block(*height) {
+                    self.snowball_round += 1;
+                    let proposal = ConsensusMessage::BlockProposal {
+                        block,
+                        round: self.snowball_round,
+                    };
+                    self.publish_consensus_message(&proposal);
+                    self.consensus.mark_proposal_sent(*height);
+                }
+            } else {
+                // Retry: lightweight query (just hash, no block data).
+                if let Some(pref) = self.consensus.query_preference(*height) {
+                    self.snowball_round += 1;
+                    let query = ConsensusMessage::BlockQuery {
+                        height: *height,
+                        preference: pref,
+                        round: self.snowball_round,
+                    };
+                    self.publish_consensus_message(&query);
+                }
             }
         }
 
