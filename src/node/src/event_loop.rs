@@ -547,18 +547,12 @@ impl EventLoop {
                             info!("No network blocks found after 30s — starting block production");
                             self.sync_complete = true;
                         } else if !self.peer_ips.is_empty() && our_height < self.network_height {
-                            // Behind the network, keep syncing.
-                            let batch_end = (our_height + 10).min(self.network_height);
-                            for h in (our_height + 1)..=batch_end {
-                                self.request_block(h);
-                            }
+                            // Behind the network — request next block sequentially.
+                            self.request_block(our_height + 1);
                             debug!("Syncing: height {} / {}", our_height, self.network_height);
                         } else if !self.peer_ips.is_empty() {
-                            // Have peers but haven't heard their height yet. Request blocks.
-                            let our_height = self.state.blocks.height();
-                            for h in (our_height + 1)..=(our_height + 10) {
-                                self.request_block(h);
-                            }
+                            // Have peers but haven't heard their height yet.
+                            self.request_block(our_height + 1);
                         }
                     }
                 }
