@@ -2388,17 +2388,55 @@ impl EventLoop {
         // Only apply if this is the next expected height.
         let expected = self.state.blocks.height() + 1;
         if height != expected {
+            if height > expected {
+                // We're behind — request missing blocks via sync protocol.
+                for h in expected..height {
+                    self.request_block(h);
+                }
+            }
             return;
         }
 
         if let Some(block) = self.consensus.take_finalized(height) {
             let hash = block.hash();
-            // Record all tx hashes from this block as seen (double-spend prevention).
+
+            // Fork detection: check if this block's parent matches our chain tip.
+            let our_tip_hash = self.state.blocks.latest()
+                .map(|b| b.hash())
+                .unwrap_or(commputer_core::block::BlockHash::GENESIS);
+
+            if block.header.parent_hash != our_tip_hash {
+                // Fork detected — this block extends a different chain.
+                warn!("Fork detected at height {}: parent {} != our tip {}",
+                    height, block.header.parent_hash, our_tip_hash);
+
+                // Attempt reorg: revert our tip and try to apply the fork block.
+                let target = height.saturating_sub(1);
+                match self.state.revert_to(target) {
+                    Ok(reverted) => {
+                        info!("Reorg: reverted {} blocks to height {}", reverted, target);
+                        match self.state.apply_block_validated(&block) {
+                            Ok(()) => {
+                                info!("Reorg: applied fork block {} at height {}", hash, height);
+                                self.print_status();
+                            }
+                            Err(e) => {
+                                warn!("Reorg failed: could not apply fork block: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Reorg failed: could not revert: {}", e);
+                    }
+                }
+                return;
+            }
+
+            // Normal path: block extends our chain.
             for tx in &block.transactions {
                 self.seen_tx_hashes.insert(tx.hash());
             }
 
-            // Log block time delta from previous block.
             if let Some(prev) = self.state.blocks.latest() {
                 let delta = block.header.timestamp.saturating_sub(prev.header.timestamp);
                 if delta > 0 {

@@ -90,6 +90,17 @@ impl BlockStore {
         }
         pruned
     }
+
+    /// Remove the block at the given height. Updates latest_height if needed.
+    /// Used by revert_block to undo the chain tip.
+    pub fn remove_at_height(&mut self, height: u64) {
+        if let Some(hash) = self.height_index.remove(&height) {
+            self.blocks.remove(&hash);
+        }
+        if height == self.latest_height && height > 0 {
+            self.latest_height = height - 1;
+        }
+    }
 }
 
 #[cfg(test)]

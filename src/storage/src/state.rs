@@ -959,6 +959,66 @@ impl ChainState {
         self.total_emitted = self.total_emitted.saturating_add(amount);
     }
 
+    /// Revert the block at the given height, undoing all account state changes.
+    /// Uses the StateDiff recorded during apply_block. Can only revert the tip.
+    pub fn revert_block(&mut self, height: u64) -> Result<(), StateError> {
+        if height != self.blocks.height() {
+            return Err(StateError::InvalidBlock(format!(
+                "can only revert tip: tip is {}, asked to revert {}", self.blocks.height(), height
+            )));
+        }
+        if height == 0 {
+            return Err(StateError::InvalidBlock("cannot revert genesis block".into()));
+        }
+
+        // Restore account states from the diff
+        if let Some(diff) = self.state_diffs.remove(&height) {
+            for (addr, account_diff) in &diff.changes {
+                if let Some(account) = self.accounts.get_mut(addr) {
+                    account.balance = Amount::from_raw(account_diff.old_balance);
+                    account.nonce = account_diff.old_nonce;
+                }
+            }
+        }
+
+        // Reverse burn tracking from this block's transactions
+        if let Some(block) = self.blocks.get_by_height(height).cloned() {
+            for tx in &block.transactions {
+                let burn = tx.burn_amount().raw();
+                if burn > 0 {
+                    self.total_burned = self.total_burned.saturating_sub(burn);
+                }
+            }
+        }
+
+        // Remove the block and update height
+        self.blocks.remove_at_height(height);
+        tracing::info!("Reverted block at height {}", height);
+        Ok(())
+    }
+
+    /// Revert blocks from the tip down to `target_height` (the block at
+    /// target_height stays applied). Respects FINALITY_DEPTH.
+    pub fn revert_to(&mut self, target_height: u64) -> Result<u64, StateError> {
+        let current = self.blocks.height();
+        if target_height >= current {
+            return Ok(0);
+        }
+        let depth = current - target_height;
+        if depth > FINALITY_DEPTH {
+            return Err(StateError::InvalidBlock(format!(
+                "cannot revert {} blocks (max finality depth: {})", depth, FINALITY_DEPTH
+            )));
+        }
+        let mut reverted = 0;
+        for height in (target_height + 1..=current).rev() {
+            self.revert_block(height)?;
+            reverted += 1;
+        }
+        tracing::info!("Reverted {} blocks: height {} -> {}", reverted, current, target_height);
+        Ok(reverted)
+    }
+
     /// Whether this ChainState is backed by persistent storage.
     pub fn is_persistent(&self) -> bool {
         self.rocks.is_some()
@@ -2381,7 +2441,9 @@ mod tests {
         state.apply_block(&genesis_block()).unwrap();
 
         // Fund sender with less than MINIMUM_VALIDATOR_STAKE.
+        // Also set total_emitted above the threshold so the bootstrap exemption doesn't fire.
         let sender_addr = addr(1);
+        state.total_emitted = commputer_core::transaction::MINIMUM_VALIDATOR_STAKE as u64;
         let acct = state.accounts.get_or_create(sender_addr);
         acct.balance = Amount::from_raw(commputer_core::transaction::MINIMUM_VALIDATOR_STAKE - 1);
 
@@ -2438,5 +2500,112 @@ mod tests {
         };
         state.apply_block(&block2).expect("Validator register with sufficient stake should succeed");
         assert!(state.accounts.get(&sender_addr).unwrap().is_validator);
+    }
+
+    #[test]
+    fn revert_block_restores_balance() {
+        let mut state = ChainState::new();
+        let genesis = genesis_block();
+        state.apply_block(&genesis).unwrap();
+
+        // Create sender with enough for transfer + fee, and pre-create recipient
+        let sender = Address([1u8; 32]);
+        let recipient = Address([2u8; 32]);
+        state.accounts.get_or_create(sender).balance = Amount::from_raw(10_000_000);
+        state.accounts.get_or_create(recipient); // Pre-create so no account creation fee
+        let balance_before = state.accounts.get(&sender).unwrap().balance.raw();
+
+        let block = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: genesis.hash(),
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                timestamp: 1774656002, producer: Address([0u8; 32]), epoch: 0,
+                producer_public_key: vec![], signature: vec![],
+                checkpoint_hash: None, chain_id: "commputer-testnet-1".to_string(),
+            },
+            transactions: vec![Transaction {
+                from: sender,
+                nonce: 0, fee: 100_000,
+                kind: TxKind::Transfer { to: recipient, amount: Amount::from_raw(500_000) },
+                public_key: vec![], signature: vec![], memo: None, timelock: None,
+            }],
+            proof_summaries: vec![], compliance_summary: None, epoch_summary: None,
+        };
+        state.apply_block(&block).unwrap();
+        assert_eq!(state.blocks.height(), 1);
+
+        // Revert
+        state.revert_block(1).unwrap();
+        assert_eq!(state.accounts.get(&sender).unwrap().balance.raw(), balance_before);
+        assert_eq!(state.blocks.height(), 0);
+    }
+
+    #[test]
+    fn revert_to_multi_block() {
+        let mut state = ChainState::new();
+        let genesis = genesis_block();
+        state.apply_block(&genesis).unwrap();
+
+        let sender = Address([1u8; 32]);
+        let recipient = Address([2u8; 32]);
+        state.accounts.get_or_create(sender).balance = Amount::from_raw(10_000_000);
+        state.accounts.get_or_create(recipient); // Pre-create recipient
+
+        let mut parent = genesis.hash();
+        for h in 1..=5u64 {
+            let block = Block {
+                header: BlockHeader {
+                    protocol_version: 1, height: h,
+                    parent_hash: parent,
+                    tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                    timestamp: 1774656000 + h, producer: Address([0u8; 32]), epoch: 0,
+                    producer_public_key: vec![], signature: vec![],
+                    checkpoint_hash: None, chain_id: "commputer-testnet-1".to_string(),
+                },
+                transactions: vec![Transaction {
+                    from: sender,
+                    nonce: h - 1, fee: 100_000,
+                    kind: TxKind::Transfer { to: recipient, amount: Amount::from_raw(100_000) },
+                    public_key: vec![], signature: vec![], memo: None, timelock: None,
+                }],
+                proof_summaries: vec![], compliance_summary: None, epoch_summary: None,
+            };
+            parent = block.hash();
+            state.apply_block(&block).unwrap();
+        }
+
+        assert_eq!(state.blocks.height(), 5);
+        // 10M - 5*(100K transfer + 100K fee) = 10M - 1M = 9M
+        assert_eq!(state.accounts.get(&sender).unwrap().balance.raw(), 9_000_000);
+
+        // Revert to height 2: undo blocks 3, 4, 5
+        let reverted = state.revert_to(2).unwrap();
+        assert_eq!(reverted, 3);
+        assert_eq!(state.blocks.height(), 2);
+        // 10M - 2*(100K + 100K) = 10M - 400K = 9.6M
+        assert_eq!(state.accounts.get(&sender).unwrap().balance.raw(), 9_600_000);
+    }
+
+    #[test]
+    fn revert_beyond_finality_depth_fails() {
+        let mut state = ChainState::new();
+        let genesis = genesis_block();
+        state.apply_block(&genesis).unwrap();
+
+        // We need to revert 0 blocks from height 0, which is fine
+        // But requesting revert_to deeper than FINALITY_DEPTH should fail
+        assert_eq!(state.blocks.height(), 0);
+        // Can't revert genesis anyway
+        assert!(state.revert_block(0).is_err());
+    }
+
+    #[test]
+    fn revert_wrong_height_fails() {
+        let mut state = ChainState::new();
+        let genesis = genesis_block();
+        state.apply_block(&genesis).unwrap();
+        // Try to revert height 5 when we're at height 0
+        assert!(state.revert_block(5).is_err());
     }
 }
