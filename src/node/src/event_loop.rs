@@ -1180,21 +1180,22 @@ impl EventLoop {
                 self.consensus.try_finalize_round(height, self.peer_ips.len());
                 self.try_apply_finalized(height);
             }
-            ConsensusMessage::SnowballQuery { height, querier_preference: _, .. } => {
+            ConsensusMessage::SnowballQuery { height, querier_preference: _, round, .. } => {
                 // Track highest height seen from peers.
                 if height > self.network_height {
                     self.network_height = height;
                 }
-                // Respond with our preference for this height.
+                // Respond with our preference, echoing the round nonce.
                 if let Some(pref) = self.consensus.query_preference(height) {
                     let response = ConsensusMessage::SnowballResponse {
                         height,
                         preference: pref,
+                        round,
                     };
                     self.publish_consensus_message(&response);
                 }
             }
-            ConsensusMessage::SnowballResponse { height, preference } => {
+            ConsensusMessage::SnowballResponse { height, preference, .. } => {
                 info!("Received Snowball vote for height {}: {}", height, preference);
                 self.consensus.record_response(height, preference);
             }

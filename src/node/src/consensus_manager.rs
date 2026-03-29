@@ -64,9 +64,12 @@ pub enum ConsensusMessage {
         round: u64,
     },
     /// Response: "At this height, I prefer this block."
+    /// `round` echoes the query's round nonce to prevent gossipsub dedup.
     SnowballResponse {
         height: u64,
         preference: BlockHash,
+        #[serde(default)]
+        round: u64,
     },
     /// Request a specific block by height (sync protocol).
     BlockRequest {
