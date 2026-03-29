@@ -703,9 +703,11 @@ dependencies = [
 name = "commputer-network"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "borsh",
  "commputer-core",
  "flate2",
+ "futures",
  "hex",
  "libp2p",
  "rand 0.8.5",
@@ -1964,6 +1966,7 @@ dependencies = [
  "libp2p-noise",
  "libp2p-quic",
  "libp2p-relay",
+ "libp2p-request-response",
  "libp2p-swarm",
  "libp2p-tcp",
  "libp2p-upnp",
@@ -2277,6 +2280,26 @@ dependencies = [
  "rand 0.8.5",
  "static_assertions",
  "thiserror 1.0.69",
+ "tracing",
+ "void",
+ "web-time",
+]
+
+[[package]]
+name = "libp2p-request-response"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1356c9e376a94a75ae830c42cdaea3d4fe1290ba409a22c809033d1b7dcab0a6"
+dependencies = [
+ "async-trait",
+ "futures",
+ "futures-bounded",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "rand 0.8.5",
+ "smallvec",
  "tracing",
  "void",
  "web-time",

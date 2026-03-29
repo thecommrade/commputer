@@ -837,7 +837,10 @@ impl EventLoop {
                 } else {
                     entry.0 += 1;
                     if entry.0 > MAX_MSGS_PER_SEC {
-                        self.ban_peer(propagation_source, "exceeded message rate limit");
+                        // Log but don't ban — high volume is normal during sync.
+                        // The dedicated sync protocol handles bulk transfers.
+                        debug!("Peer {} exceeded gossipsub rate limit ({}/s), dropping message",
+                            propagation_source, entry.0);
                         return;
                     }
                 }
@@ -1114,6 +1117,97 @@ impl EventLoop {
                     libp2p::upnp::Event::ExpiredExternalAddr(addr) => {
                         debug!("UPnP: external address expired: {}", addr);
                     }
+                }
+            }
+            // Sync protocol — direct peer-to-peer block download.
+            SwarmEvent::Behaviour(CommpBehaviourEvent::Sync(event)) => {
+                use libp2p::request_response::{Event as RrEvent, Message as RrMessage};
+                use commputer_network::sync_protocol::{SyncRequest, SyncResponse};
+                match event {
+                    RrEvent::Message { peer, message } => {
+                        match message {
+                            RrMessage::Request { request, channel, .. } => {
+                                // Peer is requesting blocks from us.
+                                match request {
+                                    SyncRequest::GetBlock { height } => {
+                                        let block_bytes = self.state.blocks.get_by_height(height)
+                                            .and_then(|b| serde_json::to_vec(b).ok());
+                                        let resp = SyncResponse::Block(block_bytes);
+                                        let _ = self.network.swarm.behaviour_mut().sync
+                                            .send_response(channel, resp);
+                                    }
+                                    SyncRequest::GetBlocks { start, end } => {
+                                        let mut blocks = Vec::new();
+                                        for h in start..=end.min(start + 100) {
+                                            if let Some(b) = self.state.blocks.get_by_height(h) {
+                                                if let Ok(data) = serde_json::to_vec(b) {
+                                                    blocks.push(data);
+                                                }
+                                            }
+                                        }
+                                        let resp = SyncResponse::Blocks(blocks);
+                                        let _ = self.network.swarm.behaviour_mut().sync
+                                            .send_response(channel, resp);
+                                    }
+                                    SyncRequest::GetHeight => {
+                                        let resp = SyncResponse::Height(self.state.blocks.height());
+                                        let _ = self.network.swarm.behaviour_mut().sync
+                                            .send_response(channel, resp);
+                                    }
+                                }
+                            }
+                            RrMessage::Response { response, .. } => {
+                                // We received blocks from a peer.
+                                match response {
+                                    SyncResponse::Block(Some(data)) => {
+                                        if let Ok(block) = serde_json::from_slice::<commputer_core::block::Block>(&data) {
+                                            let height = block.height();
+                                            if height > self.network_height {
+                                                self.network_height = height;
+                                            }
+                                            if !self.state.blocks.contains(&block.hash()) {
+                                                if self.validate_block_from_peer(&block, peer) {
+                                                    self.consensus.add_candidate(block);
+                                                    self.consensus.try_finalize_round(height, self.peer_ips.len());
+                                                    self.try_apply_finalized(height);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    SyncResponse::Blocks(blocks) => {
+                                        for data in blocks {
+                                            if let Ok(block) = serde_json::from_slice::<commputer_core::block::Block>(&data) {
+                                                let height = block.height();
+                                                if height > self.network_height {
+                                                    self.network_height = height;
+                                                }
+                                                if !self.state.blocks.contains(&block.hash()) {
+                                                    if self.validate_block_from_peer(&block, peer) {
+                                                        self.consensus.add_candidate(block);
+                                                        self.consensus.try_finalize_round(height, self.peer_ips.len());
+                                                        self.try_apply_finalized(height);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    SyncResponse::Height(h) => {
+                                        if h > self.network_height {
+                                            self.network_height = h;
+                                        }
+                                    }
+                                    SyncResponse::Block(None) => {}
+                                }
+                            }
+                        }
+                    }
+                    RrEvent::OutboundFailure { peer, error, .. } => {
+                        debug!("Sync request to {} failed: {}", peer, error);
+                    }
+                    RrEvent::InboundFailure { peer, error, .. } => {
+                        debug!("Sync response to {} failed: {}", peer, error);
+                    }
+                    RrEvent::ResponseSent { .. } => {}
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -2362,10 +2456,21 @@ impl EventLoop {
     }
 
     /// Request a block at a specific height from the network.
+    /// Request a block via the dedicated sync protocol (direct peer-to-peer).
+    /// Falls back to gossipsub BlockRequest if no peers support sync.
     pub fn request_block(&mut self, height: u64) {
-        let msg = ConsensusMessage::BlockRequest { height };
-        self.publish_consensus_message(&msg);
-        debug!("Requested block at height {}", height);
+        // Try the sync protocol first — direct request to a connected peer.
+        let peers: Vec<libp2p::PeerId> = self.peer_ips.keys().copied().collect();
+        if let Some(&peer) = peers.first() {
+            let request = commputer_network::sync_protocol::SyncRequest::GetBlock { height };
+            self.network.swarm.behaviour_mut().sync.send_request(&peer, request);
+            debug!("Sync: requested block {} from peer {}", height, peer);
+        } else {
+            // No peers — fall back to gossipsub broadcast.
+            let msg = ConsensusMessage::BlockRequest { height };
+            self.publish_consensus_message(&msg);
+            debug!("Gossipsub: requested block at height {}", height);
+        }
     }
 
     /// Publish a ConsensusMessage on the consensus gossipsub topic.

@@ -148,6 +148,9 @@ pub struct CommpBehaviour {
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub upnp: upnp::tokio::Behaviour,
+    /// Dedicated sync protocol — direct peer-to-peer block download,
+    /// separate from gossipsub. No rate limiting.
+    pub sync: libp2p::request_response::Behaviour<crate::sync_protocol::SyncCodec>,
 }
 
 impl CommpNetwork {
@@ -237,6 +240,9 @@ impl CommpNetwork {
                 // UPnP for automatic port mapping
                 let upnp = upnp::tokio::Behaviour::default();
 
+                // Dedicated sync protocol — direct peer-to-peer, no gossipsub
+                let sync = crate::sync_protocol::sync_behaviour();
+
                 Ok(CommpBehaviour {
                     gossipsub,
                     kademlia,
@@ -244,6 +250,7 @@ impl CommpNetwork {
                     relay_client,
                     dcutr,
                     upnp,
+                    sync,
                 })
             })?
             .with_swarm_config(|cfg| {
