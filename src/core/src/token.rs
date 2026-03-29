@@ -164,6 +164,32 @@ pub fn format_with_commas(amount: Amount) -> String {
     }
 }
 
+/// Result of splitting a transaction fee into burn and charity portions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeeSplit {
+    /// Amount to permanently burn (80%).
+    pub burn: u64,
+    /// Amount to add to charity treasury (20%).
+    pub charity: u64,
+}
+
+/// Split a transaction fee into burn (80%) and charity (20%) portions.
+/// Burn gets the remainder to avoid dust loss.
+pub fn split_fee(fee: u64) -> FeeSplit {
+    let charity = fee * FEE_CHARITY_PERCENT / 100;
+    let burn = fee - charity;
+    FeeSplit { burn, charity }
+}
+
+/// Apply the diversity bonus multiplier to a raw CRS reward.
+/// `active_channels` is how many of the 5 proof channels the validator contributed to.
+/// Returns the adjusted reward (max 5% bonus for all 5 channels).
+pub fn apply_diversity_bonus(raw_reward: u64, active_channels: usize) -> u64 {
+    let idx = active_channels.min(5);
+    let multiplier = DIVERSITY_MULTIPLIER[idx];
+    ((raw_reward as u128 * multiplier as u128) / 100) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +278,40 @@ mod tests {
             format_with_commas(Amount::from_raw(123_456_789_000_000)),
             "1,234,567.89000000 COMME"
         );
+    }
+
+    #[test]
+    fn fee_split_80_20() {
+        let s = split_fee(100);
+        assert_eq!(s.burn, 80);
+        assert_eq!(s.charity, 20);
+    }
+
+    #[test]
+    fn fee_split_no_dust_loss() {
+        let s = split_fee(99);
+        assert_eq!(s.burn + s.charity, 99);
+    }
+
+    #[test]
+    fn fee_split_zero() {
+        let s = split_fee(0);
+        assert_eq!(s.burn, 0);
+        assert_eq!(s.charity, 0);
+    }
+
+    #[test]
+    fn diversity_bonus_one_channel() {
+        assert_eq!(apply_diversity_bonus(1000, 1), 1000); // 1.00x
+    }
+
+    #[test]
+    fn diversity_bonus_all_five() {
+        assert_eq!(apply_diversity_bonus(1000, 5), 1050); // 1.05x
+    }
+
+    #[test]
+    fn diversity_bonus_capped() {
+        assert_eq!(apply_diversity_bonus(1000, 10), 1050); // Still 1.05x
     }
 }
