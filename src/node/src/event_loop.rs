@@ -1192,6 +1192,7 @@ impl EventLoop {
                 }
             }
             ConsensusMessage::SnowballResponse { height, preference } => {
+                info!("Received Snowball vote for height {}: {}", height, preference);
                 self.consensus.record_response(height, preference);
             }
             ConsensusMessage::BlockRequest { height } => {
@@ -2187,6 +2188,7 @@ impl EventLoop {
                     querier_preference: pref,
                 };
                 self.publish_consensus_message(&query);
+                info!("Published Snowball query for height {} (preference: {})", height, pref);
             }
         }
 
