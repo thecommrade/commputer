@@ -1159,13 +1159,9 @@ impl EventLoop {
                                             if height > self.network_height {
                                                 self.network_height = height;
                                             }
-                                            if !self.state.blocks.contains(&block.hash()) {
-                                                if self.validate_block_from_peer(&block, peer) {
-                                                    self.consensus.add_candidate(block);
-                                                    self.consensus.try_finalize_round(height, self.peer_ips.len());
-                                                    self.try_apply_finalized(height);
-                                                }
-                                            }
+                                            // Synced blocks are already consensus-finalized by the network.
+                                            // Apply directly — don't route through Snowball.
+                                            self.apply_synced_block(block, peer);
                                         }
                                     }
                                     SyncResponse::Blocks(blocks) => {
@@ -1175,13 +1171,7 @@ impl EventLoop {
                                                 if height > self.network_height {
                                                     self.network_height = height;
                                                 }
-                                                if !self.state.blocks.contains(&block.hash()) {
-                                                    if self.validate_block_from_peer(&block, peer) {
-                                                        self.consensus.add_candidate(block);
-                                                        self.consensus.try_finalize_round(height, self.peer_ips.len());
-                                                        self.try_apply_finalized(height);
-                                                    }
-                                                }
+                                                self.apply_synced_block(block, peer);
                                             }
                                         }
                                     }
@@ -2330,39 +2320,37 @@ impl EventLoop {
         let peer_count = self.peer_ips.len();
         self.consensus.update_params_for_network_size(peer_count);
 
-        // Publish proposals or lightweight queries for active heights.
-        // First tick for a height: send full BlockProposal (block + query in one message).
-        // Subsequent ticks: send lightweight BlockQuery (hash only, no block data).
-        let active = self.consensus.active_heights();
-        for height in &active {
-            if !self.consensus.proposal_sent(*height) {
+        // Only propose/query for the NEXT height (tip+1).
+        // Synced blocks bypass Snowball entirely, so we never need to
+        // propose for old heights. This prevents stale height accumulation.
+        let next_height = self.state.blocks.height() + 1;
+        if self.consensus.has_height(next_height) {
+            if !self.consensus.proposal_sent(next_height) {
                 // First time: send full block proposal.
-                if let Some(block) = self.consensus.get_candidate_block(*height) {
+                if let Some(block) = self.consensus.get_candidate_block(next_height) {
                     self.snowball_round += 1;
                     let proposal = ConsensusMessage::BlockProposal {
                         block,
                         round: self.snowball_round,
                     };
                     self.publish_consensus_message(&proposal);
-                    self.consensus.mark_proposal_sent(*height);
+                    self.consensus.mark_proposal_sent(next_height);
                 }
             } else {
                 // Retry: lightweight query (just hash, no block data).
-                if let Some(pref) = self.consensus.query_preference(*height) {
+                if let Some(pref) = self.consensus.query_preference(next_height) {
                     self.snowball_round += 1;
                     let query = ConsensusMessage::BlockQuery {
-                        height: *height,
+                        height: next_height,
                         preference: pref,
                         round: self.snowball_round,
                     };
                     self.publish_consensus_message(&query);
                 }
             }
-        }
 
-        // Now try to finalize from any responses accumulated in previous ticks.
-        for height in &active {
-            self.consensus.try_finalize_round(*height, peer_count);
+            // Try to finalize from responses accumulated in previous ticks.
+            self.consensus.try_finalize_round(next_height, peer_count);
         }
 
         // Apply any newly finalized blocks (in height order).
@@ -2502,6 +2490,66 @@ impl EventLoop {
             let msg = ConsensusMessage::BlockRequest { height };
             self.publish_consensus_message(&msg);
             debug!("Gossipsub: requested block at height {}", height);
+        }
+    }
+
+    /// Apply a block received via the sync protocol directly to chain state.
+    /// Synced blocks are already consensus-finalized — no Snowball needed.
+    /// Blocks must arrive in order (height == tip+1) or they are buffered as orphans.
+    fn apply_synced_block(&mut self, block: Block, source: libp2p::PeerId) {
+        let height = block.height();
+        let hash = block.hash();
+
+        if self.state.blocks.contains(&hash) {
+            return; // Already have it.
+        }
+
+        if !self.validate_block_from_peer(&block, source) {
+            warn!("Sync: rejected invalid block {} at height {}", hash, height);
+            return;
+        }
+
+        let expected = self.state.blocks.height() + 1;
+        if height != expected {
+            if height > expected {
+                // Out of order — buffer as orphan, request missing blocks.
+                debug!("Sync: buffering block at height {} (expected {})", height, expected);
+                self.orphan_pool
+                    .entry(block.header.parent_hash)
+                    .or_default()
+                    .push(block);
+                for h in expected..height {
+                    self.request_block(h);
+                }
+            }
+            return;
+        }
+
+        // Mark txs as seen.
+        for tx in &block.transactions {
+            self.seen_tx_hashes.insert(tx.hash());
+        }
+
+        match self.state.apply_block_validated(&block) {
+            Ok(()) => {
+                info!("Sync: applied block {} at height {}", hash, height);
+                self.print_status();
+
+                // Broadcast to WebSocket clients.
+                self.broadcast_ws_event(&serde_json::json!({
+                    "type": "new_block",
+                    "height": height,
+                    "hash": hex::encode(hash.0),
+                    "tx_count": block.transactions.len(),
+                    "timestamp": block.header.timestamp,
+                }));
+
+                // Process any orphans that can now be applied.
+                self.process_orphans(hash);
+            }
+            Err(e) => {
+                warn!("Sync: failed to apply block {} at height {}: {}", hash, height, e);
+            }
         }
     }
 
