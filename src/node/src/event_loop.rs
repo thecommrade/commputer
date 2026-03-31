@@ -1198,6 +1198,83 @@ impl EventLoop {
                     RrEvent::ResponseSent { .. } => {}
                 }
             }
+            // === Consensus request-response protocol ===
+            // Direct block proposals and votes — replaces gossipsub for consensus.
+            SwarmEvent::Behaviour(CommpBehaviourEvent::Consensus(event)) => {
+                use libp2p::request_response::{Event as RrEvent, Message as RrMessage};
+                use commputer_network::consensus_protocol::{ConsensusRequest, ConsensusResponse};
+                match event {
+                    RrEvent::Message { peer, message } => {
+                        match message {
+                            RrMessage::Request { request, channel, .. } => {
+                                match request {
+                                    ConsensusRequest::BlockProposal { block_bytes, height } => {
+                                        if let Ok(block) = serde_json::from_slice::<commputer_core::block::Block>(&block_bytes) {
+                                            let hash = block.hash();
+                                            if height > self.network_height {
+                                                self.network_height = height;
+                                                self.node_state.set_network_height(height);
+                                            }
+                                            if !self.state.blocks.contains(&hash) && self.validate_block_from_peer(&block, peer) {
+                                                self.consensus.add_candidate(block);
+                                                self.consensus.try_finalize_round(height, self.peer_ips.len());
+                                                self.try_apply_finalized(height);
+                                            }
+                                            // Respond with our vote.
+                                            let response = if self.node_state.is_active() {
+                                                if let Some(pref) = self.consensus.query_preference(height) {
+                                                    ConsensusResponse::Vote {
+                                                        height,
+                                                        preference: pref.0,
+                                                        accept: true,
+                                                    }
+                                                } else {
+                                                    ConsensusResponse::NotReady { height }
+                                                }
+                                            } else {
+                                                ConsensusResponse::NotReady { height }
+                                            };
+                                            let _ = self.network.swarm.behaviour_mut().consensus.send_response(channel, response);
+                                        }
+                                    }
+                                    ConsensusRequest::VoteRequest { height, block_hash: _ } => {
+                                        let response = if let Some(pref) = self.consensus.query_preference(height) {
+                                            ConsensusResponse::Vote {
+                                                height,
+                                                preference: pref.0,
+                                                accept: true,
+                                            }
+                                        } else {
+                                            ConsensusResponse::NotReady { height }
+                                        };
+                                        let _ = self.network.swarm.behaviour_mut().consensus.send_response(channel, response);
+                                    }
+                                }
+                            }
+                            RrMessage::Response { response, .. } => {
+                                // We received a vote back from a peer we sent a proposal to.
+                                match response {
+                                    ConsensusResponse::Vote { height, preference, accept } => {
+                                        if accept {
+                                            self.consensus.record_response(height, BlockHash(preference));
+                                        }
+                                    }
+                                    ConsensusResponse::NotReady { .. } => {
+                                        // Peer is syncing, ignore.
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    RrEvent::OutboundFailure { peer, error, .. } => {
+                        debug!("Consensus request to {} failed: {}", peer, error);
+                    }
+                    RrEvent::InboundFailure { peer, error, .. } => {
+                        debug!("Consensus response to {} failed: {}", peer, error);
+                    }
+                    RrEvent::ResponseSent { .. } => {}
+                }
+            }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 // Deduplicate: only clean up when all connections to this peer are gone.
                 if let Some(count) = self.peer_connection_count.get_mut(&peer_id) {
@@ -2288,14 +2365,18 @@ impl EventLoop {
 
         info!("Produced block candidate at height {}", next_height);
 
-        // Broadcast block proposal — the full block IS the Snowball query.
-        // Peers validate the block and respond with their vote in one round-trip.
-        self.snowball_round += 1;
-        let proposal = ConsensusMessage::BlockProposal {
-            block: block.clone(),
-            round: self.snowball_round,
-        };
-        self.publish_consensus_message(&proposal);
+        // Send block proposal directly to each peer via consensus request-response.
+        // Direct delivery — no gossipsub mesh issues, guaranteed delivery.
+        let block_bytes = serde_json::to_vec(&block).unwrap_or_default();
+        let peers: Vec<libp2p::PeerId> = self.peer_ips.keys().copied().collect();
+        for peer in &peers {
+            let request = commputer_network::consensus_protocol::ConsensusRequest::BlockProposal {
+                block_bytes: block_bytes.clone(),
+                height: next_height,
+            };
+            self.network.swarm.behaviour_mut().consensus.send_request(peer, request);
+        }
+        debug!("Sent block proposal for height {} to {} peers via request-response", next_height, peers.len());
 
         // Feature 7: Broadcast compact BlockAnnounce on the blocks topic instead of full block.
         // Peers that need the full block will request it via the block request protocol.
@@ -2338,32 +2419,34 @@ impl EventLoop {
         let peer_count = self.peer_ips.len();
         self.consensus.update_params_for_network_size(peer_count);
 
-        // Only propose/query for the NEXT height (tip+1).
-        // Synced blocks bypass Snowball entirely, so we never need to
-        // propose for old heights. This prevents stale height accumulation.
+        // Only vote/finalize for the NEXT height (tip+1).
         let next_height = self.state.blocks.height() + 1;
         if self.consensus.has_height(next_height) {
             if !self.consensus.proposal_sent(next_height) {
-                // First time: send full block proposal.
+                // First time: send full block proposal to all peers via request-response.
                 if let Some(block) = self.consensus.get_candidate_block(next_height) {
-                    self.snowball_round += 1;
-                    let proposal = ConsensusMessage::BlockProposal {
-                        block,
-                        round: self.snowball_round,
-                    };
-                    self.publish_consensus_message(&proposal);
+                    let block_bytes = serde_json::to_vec(&block).unwrap_or_default();
+                    let peers: Vec<libp2p::PeerId> = self.peer_ips.keys().copied().collect();
+                    for peer in &peers {
+                        let request = commputer_network::consensus_protocol::ConsensusRequest::BlockProposal {
+                            block_bytes: block_bytes.clone(),
+                            height: next_height,
+                        };
+                        self.network.swarm.behaviour_mut().consensus.send_request(peer, request);
+                    }
                     self.consensus.mark_proposal_sent(next_height);
                 }
             } else {
-                // Retry: lightweight query (just hash, no block data).
+                // Retry: send lightweight vote request to peers who haven't responded.
                 if let Some(pref) = self.consensus.query_preference(next_height) {
-                    self.snowball_round += 1;
-                    let query = ConsensusMessage::BlockQuery {
-                        height: next_height,
-                        preference: pref,
-                        round: self.snowball_round,
-                    };
-                    self.publish_consensus_message(&query);
+                    let peers: Vec<libp2p::PeerId> = self.peer_ips.keys().copied().collect();
+                    for peer in &peers {
+                        let request = commputer_network::consensus_protocol::ConsensusRequest::VoteRequest {
+                            height: next_height,
+                            block_hash: pref.0,
+                        };
+                        self.network.swarm.behaviour_mut().consensus.send_request(peer, request);
+                    }
                 }
             }
 
