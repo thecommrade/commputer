@@ -123,7 +123,7 @@ impl request_response::Codec for SyncCodec {
 /// High capacity for initial block download — nodes may request hundreds of blocks.
 pub fn sync_behaviour() -> request_response::Behaviour<SyncCodec> {
     let config = request_response::Config::default()
-        .with_max_concurrent_streams(256);
+        .with_max_concurrent_streams(4);
     request_response::Behaviour::new(
         [(SYNC_PROTOCOL, request_response::ProtocolSupport::Full)],
         config,

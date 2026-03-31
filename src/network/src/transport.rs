@@ -196,10 +196,18 @@ impl CommpNetwork {
             .with_tcp(
                 tcp::Config::default(),
                 noise::Config::new,
-                yamux::Config::default,
+                || {
+                    let mut cfg = yamux::Config::default();
+                    cfg.set_max_num_streams(24);
+                    cfg
+                },
             )?
             .with_quic()
-            .with_relay_client(noise::Config::new, yamux::Config::default)?
+            .with_relay_client(noise::Config::new, || {
+                let mut cfg = yamux::Config::default();
+                cfg.set_max_num_streams(24);
+                cfg
+            })?
             .with_behaviour(|key, relay_client| {
                 // Gossipsub with 1-second heartbeat
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
