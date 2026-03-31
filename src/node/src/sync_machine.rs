@@ -19,13 +19,13 @@ use tracing::{debug, info, warn};
 pub const SYNC_BATCH_SIZE: u64 = 10;
 
 /// Seconds before a batch request is considered timed out.
-pub const BATCH_TIMEOUT_SECS: u64 = 5;
+pub const BATCH_TIMEOUT_SECS: u64 = 10;
 
 /// Seconds before a height query round is considered timed out.
 pub const HEIGHT_QUERY_TIMEOUT_SECS: u64 = 5;
 
 /// Number of failures before a peer is considered exhausted.
-pub const MAX_PEER_FAILURES: u32 = 3;
+pub const MAX_PEER_FAILURES: u32 = 10;
 
 /// States of the sync lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
