@@ -2539,6 +2539,7 @@ impl EventLoop {
             match self.state.apply_block_validated(&block) {
                 Ok(()) => {
                     info!("Finalized and applied block {} at height {}", hash, height);
+                    self.last_block_seen_time = Some(std::time::Instant::now());
                     self.print_status();
 
                     // Feature 241: Broadcast block event to WebSocket clients.
@@ -2640,6 +2641,7 @@ impl EventLoop {
         match self.state.apply_block_validated(&block) {
             Ok(()) => {
                 info!("Sync: applied block {} at height {}", hash, height);
+                self.last_block_seen_time = Some(std::time::Instant::now());
                 self.print_status();
 
                 // Broadcast to WebSocket clients.
