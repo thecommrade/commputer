@@ -2200,17 +2200,20 @@ impl EventLoop {
 
         // Leader election: only produce if we're the elected leader for this height.
         // Round-robin with view change fallback every 6 seconds.
+        // Skip leader check during bootstrap (< 2 known validators on-chain).
         let validators: Vec<Address> = self.state.accounts.iter()
             .filter(|a| a.is_validator)
             .map(|a| a.address)
             .collect();
-        let our_addr = *self.wallet.address();
-        let seconds_waiting = self.last_block_seen_time
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
+        if validators.len() >= 2 {
+            let our_addr = *self.wallet.address();
+            let seconds_waiting = self.last_block_seen_time
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
 
-        if !commputer::leader::is_valid_leader(next_height, &our_addr, &validators, seconds_waiting) {
-            return;
+            if !commputer::leader::is_valid_leader(next_height, &our_addr, &validators, seconds_waiting) {
+                return;
+            }
         }
 
         // Don't produce if there's already an active vote at this height.
