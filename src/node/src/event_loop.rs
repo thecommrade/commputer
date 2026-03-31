@@ -543,8 +543,10 @@ impl EventLoop {
                     if !self.sync_complete {
                         let our_height = self.state.blocks.height();
 
-                        if our_height >= self.network_height && self.network_height > 0 {
-                            info!("Initial sync complete at height {}", our_height);
+                        // Consider "caught up" if within 2 blocks of network height.
+                        // Exact match races with incoming blocks from the active producer.
+                        if self.network_height > 0 && our_height + 2 >= self.network_height {
+                            info!("Initial sync complete at height {} (network at {})", our_height, self.network_height);
                             self.sync_complete = true;
                             self.node_state.force_active();
                         } else if self.event_loop_start.elapsed().as_secs() >= 30
