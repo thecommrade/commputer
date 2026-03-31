@@ -2168,49 +2168,24 @@ impl EventLoop {
             );
         }
 
-        // Feature 130: View change protocol — if no block seen at the expected
-        // height for 30s, allow any validator to produce a block.
-        let view_change_timeout = self.last_block_seen_time
-            .map(|t| t.elapsed().as_secs() >= 30)
-            .unwrap_or(false);
+        // Leader election: only produce if we're the elected leader for this height.
+        // Round-robin with view change fallback every 6 seconds.
+        let validators: Vec<Address> = self.state.accounts.iter()
+            .filter(|a| a.is_validator)
+            .map(|a| a.address)
+            .collect();
+        let our_addr = *self.wallet.address();
+        let seconds_waiting = self.last_block_seen_time
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
 
-        // Item 52: Block production fairness — if enough validators are active,
-        // rotate based on sorted validator index. Disabled for small networks
-        // (< 10 validators) where phantom validator slots cause deadlocks.
-        {
-            let active_validators: Vec<Address> = self.state.accounts.iter()
-                .filter(|a| a.is_validator)
-                .map(|a| a.address)
-                .collect();
-            if active_validators.len() >= 10 {
-                let our_addr = *self.wallet.address();
-                let mut sorted = active_validators.clone();
-                sorted.sort_by_key(|a| a.0);
-                if let Some(our_idx) = sorted.iter().position(|a| *a == our_addr) {
-                    let expected_slot = (next_height as usize) % sorted.len();
-                    if our_idx != expected_slot && !view_change_timeout {
-                        debug!(
-                            "Item 52: Not our turn to produce block at height {} (slot {} != our idx {})",
-                            next_height, expected_slot, our_idx
-                        );
-                        if self.last_block_seen_time.map(|t| t.elapsed().as_secs() < 10).unwrap_or(true) {
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Don't produce if there's already an active vote at this height
-        // (unless view change timeout has elapsed).
-        if !view_change_timeout
-            && (self.consensus.has_active_vote(next_height) || self.consensus.has_height(next_height))
-        {
+        if !commputer::leader::is_valid_leader(next_height, &our_addr, &validators, seconds_waiting) {
             return;
         }
 
-        if view_change_timeout {
-            warn!("View change: no block at height {} for 30s — producing fallback block", next_height);
+        // Don't produce if there's already an active vote at this height.
+        if self.consensus.has_active_vote(next_height) || self.consensus.has_height(next_height) {
+            return;
         }
 
         let parent = self
