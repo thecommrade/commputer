@@ -147,6 +147,8 @@ pub struct EventLoop {
     pub network_height: u64,
     /// Node operating state: Syncing, Active, or Stale.
     pub node_state: commputer::node_state::NodeStateMachine,
+    /// Sync state machine: controlled batch downloading with backpressure.
+    pub sync_machine: commputer::sync_machine::SyncMachine,
 }
 
 impl EventLoop {
@@ -204,6 +206,7 @@ impl EventLoop {
             snowball_round: 0,
             sync_complete: false,
             node_state: commputer::node_state::NodeStateMachine::new(),
+            sync_machine: commputer::sync_machine::SyncMachine::new(),
             network_height: 0,
         }
     }
@@ -543,22 +546,82 @@ impl EventLoop {
                     if !self.sync_complete {
                         let our_height = self.state.blocks.height();
 
-                        // Consider "caught up" if within 2 blocks of network height.
-                        // Exact match races with incoming blocks from the active producer.
-                        if self.network_height > 0 && our_height + 2 >= self.network_height {
-                            info!("Initial sync complete at height {} (network at {})", our_height, self.network_height);
-                            self.sync_complete = true;
-                            self.node_state.force_active();
-                        } else if self.event_loop_start.elapsed().as_secs() >= 30
+                        // Solo node timeout: if no peers have blocks after 30s, start producing.
+                        if self.event_loop_start.elapsed().as_secs() >= 30
                             && self.network_height == 0 {
                             info!("No network blocks found after 30s — starting block production");
                             self.sync_complete = true;
+                            self.sync_machine.reset();
                             self.node_state.force_active();
-                        } else if !self.peer_ips.is_empty() && our_height < self.network_height {
-                            self.request_block(our_height + 1);
-                            debug!("Syncing: height {} / {}", our_height, self.network_height);
-                        } else if !self.peer_ips.is_empty() {
-                            self.request_block(our_height + 1);
+                        }
+                        // Drive the sync state machine.
+                        else if !self.peer_ips.is_empty() {
+                            use commputer::sync_machine::SyncState;
+                            let peers: Vec<libp2p::PeerId> = self.peer_ips.keys().copied().collect();
+
+                            match self.sync_machine.state().clone() {
+                                SyncState::Idle => {
+                                    // Start syncing.
+                                    self.sync_machine.start();
+                                    // Send GetHeight to up to 3 peers.
+                                    for peer in peers.iter().take(3) {
+                                        let req = commputer_network::sync_protocol::SyncRequest::GetHeight;
+                                        self.network.swarm.behaviour_mut().sync.send_request(peer, req);
+                                    }
+                                }
+                                SyncState::QueryHeight => {
+                                    if self.sync_machine.should_start_downloading(our_height) {
+                                        let target = self.sync_machine.begin_downloading(our_height);
+                                        if our_height + 2 >= target {
+                                            // Already close enough — skip to complete.
+                                            info!("Initial sync complete at height {} (network at {})", our_height, target);
+                                            self.sync_complete = true;
+                                            self.sync_machine.reset();
+                                            self.node_state.force_active();
+                                        }
+                                    }
+                                }
+                                SyncState::Downloading => {
+                                    // Check for batch timeout.
+                                    if self.sync_machine.batch_timed_out() {
+                                        if let Some(peer) = self.sync_machine.select_peer(&peers) {
+                                            self.sync_machine.record_batch_failure(peer);
+                                        }
+                                    }
+                                    // Request next batch if none in flight.
+                                    if let Some((start, end)) = self.sync_machine.next_batch(our_height) {
+                                        if let Some(peer) = self.sync_machine.select_peer(&peers) {
+                                            let req = commputer_network::sync_protocol::SyncRequest::GetBlocks { start, end };
+                                            self.network.swarm.behaviour_mut().sync.send_request(&peer, req);
+                                            debug!("Sync: requested batch {}-{} from {}", start, end, peer);
+                                        }
+                                    }
+                                }
+                                SyncState::Verifying => {
+                                    // Re-query heights to verify we're caught up.
+                                    if self.sync_machine.verification_ready() {
+                                        if self.sync_machine.complete_verification(our_height) {
+                                            info!("Initial sync complete at height {}", our_height);
+                                            self.sync_complete = true;
+                                            self.sync_machine.reset();
+                                            self.node_state.force_active();
+                                        }
+                                        // else: back to Downloading, next tick will request.
+                                    } else {
+                                        // Send GetHeight to re-check.
+                                        for peer in peers.iter().take(3) {
+                                            let req = commputer_network::sync_protocol::SyncRequest::GetHeight;
+                                            self.network.swarm.behaviour_mut().sync.send_request(peer, req);
+                                        }
+                                    }
+                                }
+                                SyncState::Complete => {
+                                    info!("Initial sync complete at height {}", our_height);
+                                    self.sync_complete = true;
+                                    self.sync_machine.reset();
+                                    self.node_state.force_active();
+                                }
+                            }
                         }
                     }
                 }
@@ -1185,6 +1248,8 @@ impl EventLoop {
                                         if h > self.network_height {
                                             self.network_height = h;
                                         }
+                                        // Feed into sync state machine for height collection.
+                                        self.sync_machine.record_height(h);
                                     }
                                     SyncResponse::Block(None) => {}
                                 }
