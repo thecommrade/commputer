@@ -145,6 +145,8 @@ pub struct EventLoop {
     pub sync_complete: bool,
     /// Highest block height heard from any peer.
     pub network_height: u64,
+    /// Node operating state: Syncing, Active, or Stale.
+    pub node_state: commputer::node_state::NodeStateMachine,
 }
 
 impl EventLoop {
@@ -201,6 +203,7 @@ impl EventLoop {
             event_loop_start: std::time::Instant::now(),
             snowball_round: 0,
             sync_complete: false,
+            node_state: commputer::node_state::NodeStateMachine::new(),
             network_height: 0,
         }
     }
@@ -533,25 +536,26 @@ impl EventLoop {
                     self.reconnect_seeds();
                 }
                 _ = sync_timer.tick() => {
+                    // Feed the node state machine.
+                    self.node_state.set_our_height(self.state.blocks.height());
+                    self.node_state.set_network_height(self.network_height);
+
                     if !self.sync_complete {
                         let our_height = self.state.blocks.height();
 
                         if our_height >= self.network_height && self.network_height > 0 {
-                            // We've caught up to the network.
                             info!("Initial sync complete at height {}", our_height);
                             self.sync_complete = true;
+                            self.node_state.force_active();
                         } else if self.event_loop_start.elapsed().as_secs() >= 30
                             && self.network_height == 0 {
-                            // Nobody has blocks beyond genesis after 30s.
-                            // Start producing (we may be the first/only node, or peers are also at genesis).
                             info!("No network blocks found after 30s — starting block production");
                             self.sync_complete = true;
+                            self.node_state.force_active();
                         } else if !self.peer_ips.is_empty() && our_height < self.network_height {
-                            // Behind the network — request next block sequentially.
                             self.request_block(our_height + 1);
                             debug!("Syncing: height {} / {}", our_height, self.network_height);
                         } else if !self.peer_ips.is_empty() {
-                            // Have peers but haven't heard their height yet.
                             self.request_block(our_height + 1);
                         }
                     }
@@ -2152,8 +2156,8 @@ impl EventLoop {
             }
         }
 
-        // Don't produce blocks until initial sync is complete.
-        if !self.sync_complete {
+        // Don't produce blocks until node is Active (synced with network).
+        if !self.node_state.is_active() {
             return;
         }
 
@@ -2318,6 +2322,11 @@ impl EventLoop {
     /// Consensus round tick (500ms): for each active height, publish a query
     /// and attempt to finalize the round from accumulated responses.
     fn handle_consensus_tick(&mut self) {
+        // Don't participate in consensus while syncing.
+        if !self.node_state.is_active() {
+            return;
+        }
+
         let peer_count = self.peer_ips.len();
         self.consensus.update_params_for_network_size(peer_count);
 
