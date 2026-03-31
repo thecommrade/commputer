@@ -1414,13 +1414,14 @@ impl EventLoop {
             return false; // Don't ban — could be clock skew.
         }
 
-        // Timestamp must be >= parent block timestamp (no going backward).
+        // Timestamp must be close to parent block timestamp (no going far backward).
+        // Allow 5 seconds of clock skew — desktop nodes won't have perfect NTP.
         // Compare against the block's actual parent (by parent_hash), not our local
         // chain tip. During sync or fork choice, the incoming block's parent may be
         // at a different height than our tip.
         if let Some(parent) = self.state.blocks.get(&block.header.parent_hash)
-            && block.header.timestamp < parent.header.timestamp {
-                warn!("Rejected block from {}: timestamp before parent ({} < {})",
+            && block.header.timestamp + 5 < parent.header.timestamp {
+                warn!("Rejected block from {}: timestamp too far before parent ({} < {} - 5s tolerance)",
                     source, block.header.timestamp, parent.header.timestamp);
                 return false;
             }
