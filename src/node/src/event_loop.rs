@@ -572,13 +572,15 @@ impl EventLoop {
                                 SyncState::QueryHeight => {
                                     if self.sync_machine.should_start_downloading(our_height) {
                                         let target = self.sync_machine.begin_downloading(our_height);
-                                        if our_height + 2 >= target {
+                                        if target > 0 && our_height + 2 >= target {
                                             // Already close enough — skip to complete.
                                             info!("Initial sync complete at height {} (network at {})", our_height, target);
                                             self.sync_complete = true;
                                             self.sync_machine.reset();
                                             self.node_state.force_active();
                                         }
+                                        // If target == 0, peers haven't produced yet. Stay in Downloading,
+                                        // the next tick will re-check.
                                     }
                                 }
                                 SyncState::Downloading => {
