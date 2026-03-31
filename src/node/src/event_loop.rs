@@ -1421,6 +1421,32 @@ impl EventLoop {
                 return false;
             }
 
+        // === Stage 1b: Leader election validation ===
+
+        // Reject blocks from non-leaders (unless we're syncing old blocks).
+        let validators: Vec<Address> = self.state.accounts.iter()
+            .filter(|a| a.is_validator)
+            .map(|a| a.address)
+            .collect();
+        if validators.len() >= 2 {
+            let seconds_since_parent = if let Some(parent) = self.state.blocks.get(&block.header.parent_hash) {
+                block.header.timestamp.saturating_sub(parent.header.timestamp)
+            } else {
+                0 // Can't verify timing without parent — allow it (sync may deliver out of order)
+            };
+            if !commputer::leader::is_valid_leader(
+                block.height(),
+                &block.header.producer,
+                &validators,
+                seconds_since_parent,
+            ) {
+                warn!("Rejected block from {}: producer {} not valid leader for height {} ({}s since parent)",
+                    source, block.header.producer, block.height(), seconds_since_parent);
+                self.adjust_peer_score(source, -10);
+                return false;
+            }
+        }
+
         // === Stage 2: Merkle root verification ===
 
         // Check merkle roots.
