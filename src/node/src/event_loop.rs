@@ -2205,19 +2205,23 @@ impl EventLoop {
             .filter(|a| a.is_validator)
             .map(|a| a.address)
             .collect();
-        if validators.len() >= 2 {
-            let our_addr = *self.wallet.address();
-            let seconds_waiting = self.last_block_seen_time
-                .map(|t| t.elapsed().as_secs())
-                .unwrap_or(0);
+        let our_addr = *self.wallet.address();
+        let seconds_waiting = self.last_block_seen_time
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
 
+        if validators.len() >= 2 {
             if !commputer::leader::is_valid_leader(next_height, &our_addr, &validators, seconds_waiting) {
                 return;
             }
         }
 
-        // Don't produce if there's already an active vote at this height.
-        if self.consensus.has_active_vote(next_height) || self.consensus.has_height(next_height) {
+        // Don't produce if there's already an active vote at this height,
+        // UNLESS we're a fallback leader (view change — stale entries shouldn't block recovery).
+        let is_view_change = seconds_waiting >= 6;
+        if !is_view_change
+            && (self.consensus.has_active_vote(next_height) || self.consensus.has_height(next_height))
+        {
             return;
         }
 
