@@ -200,14 +200,14 @@ impl CommpNetwork {
                 noise::Config::new,
                 || {
                     let mut cfg = yamux::Config::default();
-                    cfg.set_max_num_streams(24);
+                    cfg.set_max_num_streams(64);
                     cfg
                 },
             )?
             .with_quic()
             .with_relay_client(noise::Config::new, || {
                 let mut cfg = yamux::Config::default();
-                cfg.set_max_num_streams(24);
+                cfg.set_max_num_streams(64);
                 cfg
             })?
             .with_behaviour(|key, relay_client| {
