@@ -572,30 +572,52 @@ impl EventLoop {
                                 SyncState::QueryHeight => {
                                     if self.sync_machine.should_start_downloading(our_height) {
                                         let target = self.sync_machine.begin_downloading(our_height);
-                                        if target > 0 && our_height + 2 >= target {
+                                        if target == 0 && self.event_loop_start.elapsed().as_secs() >= 30 {
+                                            // No peers have blocks after 30s — we're the first node.
+                                            info!("No network blocks found after 30s — starting block production");
+                                            self.sync_complete = true;
+                                            self.sync_machine.reset();
+                                            self.node_state.force_active();
+                                        } else if target > 0 && our_height + 2 >= target {
                                             // Already close enough — skip to complete.
                                             info!("Initial sync complete at height {} (network at {})", our_height, target);
                                             self.sync_complete = true;
                                             self.sync_machine.reset();
                                             self.node_state.force_active();
                                         }
-                                        // If target == 0, peers haven't produced yet. Stay in Downloading,
-                                        // the next tick will re-check.
+                                        // If target == 0 and < 30s: stay in Downloading, re-check next tick.
                                     }
                                 }
                                 SyncState::Downloading => {
-                                    // Check for batch timeout.
-                                    if self.sync_machine.batch_timed_out() {
-                                        if let Some(peer) = self.sync_machine.select_peer(&peers) {
-                                            self.sync_machine.record_batch_failure(peer);
+                                    // If target is 0, we're stuck — reset and re-query.
+                                    if self.sync_machine.target_height() == 0 {
+                                        if self.event_loop_start.elapsed().as_secs() >= 30 {
+                                            info!("No network blocks found after 30s — starting block production");
+                                            self.sync_complete = true;
+                                            self.sync_machine.reset();
+                                            self.node_state.force_active();
+                                        } else {
+                                            // Re-query heights.
+                                            self.sync_machine.reset();
+                                            self.sync_machine.start();
+                                            for peer in peers.iter().take(3) {
+                                                let req = commputer_network::sync_protocol::SyncRequest::GetHeight;
+                                                self.network.swarm.behaviour_mut().sync.send_request(peer, req);
+                                            }
                                         }
-                                    }
-                                    // Request next batch if none in flight.
-                                    if let Some((start, end)) = self.sync_machine.next_batch(our_height) {
-                                        if let Some(peer) = self.sync_machine.select_peer(&peers) {
-                                            let req = commputer_network::sync_protocol::SyncRequest::GetBlocks { start, end };
-                                            self.network.swarm.behaviour_mut().sync.send_request(&peer, req);
-                                            debug!("Sync: requested batch {}-{} from {}", start, end, peer);
+                                    } else {
+                                        // Normal batch download.
+                                        if self.sync_machine.batch_timed_out() {
+                                            if let Some(peer) = self.sync_machine.select_peer(&peers) {
+                                                self.sync_machine.record_batch_failure(peer);
+                                            }
+                                        }
+                                        if let Some((start, end)) = self.sync_machine.next_batch(our_height) {
+                                            if let Some(peer) = self.sync_machine.select_peer(&peers) {
+                                                let req = commputer_network::sync_protocol::SyncRequest::GetBlocks { start, end };
+                                                self.network.swarm.behaviour_mut().sync.send_request(&peer, req);
+                                                debug!("Sync: requested batch {}-{} from {}", start, end, peer);
+                                            }
                                         }
                                     }
                                 }
