@@ -1506,8 +1506,10 @@ impl EventLoop {
             }
 
         // === Stage 1b: Leader election validation ===
-
-        // Reject blocks from non-leaders (unless we're syncing old blocks).
+        // Warn but don't reject for now. The validator set takes time to
+        // converge across nodes, and strict rejection causes banning during
+        // bootstrap. Enable strict rejection once the network is stable.
+        // TODO: re-enable rejection after mainnet stabilizes
         let validators: Vec<Address> = self.state.accounts.iter()
             .filter(|a| a.is_validator)
             .map(|a| a.address)
@@ -1516,7 +1518,7 @@ impl EventLoop {
             let seconds_since_parent = if let Some(parent) = self.state.blocks.get(&block.header.parent_hash) {
                 block.header.timestamp.saturating_sub(parent.header.timestamp)
             } else {
-                0 // Can't verify timing without parent — allow it (sync may deliver out of order)
+                0
             };
             if !commputer::leader::is_valid_leader(
                 block.height(),
@@ -1524,10 +1526,8 @@ impl EventLoop {
                 &validators,
                 seconds_since_parent,
             ) {
-                warn!("Rejected block from {}: producer {} not valid leader for height {} ({}s since parent)",
-                    source, block.header.producer, block.height(), seconds_since_parent);
-                self.adjust_peer_score(source, -10);
-                return false;
+                debug!("Leader mismatch: producer {} not expected leader for height {} ({}s since parent) — accepting anyway",
+                    block.header.producer, block.height(), seconds_since_parent);
             }
         }
 
