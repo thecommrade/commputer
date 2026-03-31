@@ -151,6 +151,8 @@ pub struct CommpBehaviour {
     /// Dedicated sync protocol — direct peer-to-peer block download,
     /// separate from gossipsub. No rate limiting.
     pub sync: libp2p::request_response::Behaviour<crate::sync_protocol::SyncCodec>,
+    /// Direct consensus protocol — block proposals and votes via request-response.
+    pub consensus: libp2p::request_response::Behaviour<crate::consensus_protocol::ConsensusCodec>,
 }
 
 impl CommpNetwork {
@@ -250,6 +252,7 @@ impl CommpNetwork {
 
                 // Dedicated sync protocol — direct peer-to-peer, no gossipsub
                 let sync = crate::sync_protocol::sync_behaviour();
+                let consensus = crate::consensus_protocol::consensus_behaviour();
 
                 Ok(CommpBehaviour {
                     gossipsub,
@@ -259,6 +262,7 @@ impl CommpNetwork {
                     dcutr,
                     upnp,
                     sync,
+                    consensus,
                 })
             })?
             .with_swarm_config(|cfg| {

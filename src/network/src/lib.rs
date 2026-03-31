@@ -7,6 +7,7 @@ pub mod compress;
 pub mod validation;
 pub mod eclipse;
 pub mod sync_protocol;
+pub mod consensus_protocol;
 
 pub use message::{NetworkMessage, MessageKind, CompactBlock, CompactBlockRequest};
 pub use peer::{PeerId, PeerInfo, PeerStore, GeoScorer, ConnectionBackoff};
