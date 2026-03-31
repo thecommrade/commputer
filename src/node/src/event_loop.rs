@@ -2290,16 +2290,20 @@ impl EventLoop {
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
 
-        if validators.len() >= 2 {
+        if validators.len() >= 2 && seconds_waiting < 30 {
+            // Normal leader election: only the elected leader produces.
+            // After 30 seconds with no block, any validator can produce (emergency).
             if !commputer::leader::is_valid_leader(next_height, &our_addr, &validators, seconds_waiting) {
                 return;
             }
         }
+        if seconds_waiting >= 30 {
+            warn!("Emergency block production: no block for {}s at height {}", seconds_waiting, next_height);
+        }
 
         // Don't produce if there's already an active vote at this height,
-        // UNLESS we're a fallback leader (view change — stale entries shouldn't block recovery).
-        let is_view_change = seconds_waiting >= 6;
-        if !is_view_change
+        // UNLESS we've been waiting 6+ seconds (view change or emergency).
+        if seconds_waiting < 6
             && (self.consensus.has_active_vote(next_height) || self.consensus.has_height(next_height))
         {
             return;
