@@ -8,6 +8,17 @@ use commputer_core::block::{Block, BlockHash, BlockHeader};
 use commputer_core::identity::Address;
 use commputer_consensus::snowball::{SnowballParams, SnowballVoter};
 
+/// Result of a consensus finalization attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusRoundResult {
+    /// Voting is still in progress, not yet converged.
+    NotReady,
+    /// Snowball voting converged -- block is finalized.
+    Finalized,
+    /// Consensus timed out without convergence -- node should consider resyncing.
+    Stalled,
+}
+
 /// Consensus timeout scales with network size.
 /// Small network (0-3 peers): 6s (3 block times)
 /// Medium network (4-20): 10s
@@ -310,13 +321,12 @@ impl ConsensusManager {
     }
 
     /// Feed accumulated responses into the voter and reset for the next round.
-    /// Finalization happens through real Snowball voting or via a scaled timeout.
     /// `peer_count` is used to scale the timeout to network size.
-    /// Returns true if this round caused finalization.
-    pub fn try_finalize_round(&mut self, height: u64, peer_count: usize) -> bool {
+    /// Returns a `ConsensusRoundResult` indicating the outcome.
+    pub fn try_finalize_round(&mut self, height: u64, peer_count: usize) -> ConsensusRoundResult {
         if let Some(state) = self.heights.get_mut(&height) {
             if state.voter.is_finalized() {
-                return false;
+                return ConsensusRoundResult::NotReady;
             }
 
             // Try to finalize from accumulated peer votes FIRST.
@@ -329,31 +339,22 @@ impl ConsensusManager {
                         height,
                         state.voter.finalized_hash()
                     );
-                    return true;
+                    return ConsensusRoundResult::Finalized;
                 }
             }
 
-            // Timeout fallback — only if voting hasn't converged yet.
+            // Timeout detection -- signal stall instead of fabricating votes.
             let timeout = consensus_timeout_secs(peer_count);
             if let Some(start) = self.height_start_time.get(&height)
                 && start.elapsed().as_secs() >= timeout {
-                    let hash = match state.voter.preference()
-                        .or_else(|| state.candidates.keys().min().copied()) {
-                        Some(h) => h,
-                        None => return false,
-                    };
-                    let mut responses = HashMap::new();
-                    responses.insert(hash, self.params.sample_size);
-                    for _ in 0..self.params.decision_threshold {
-                        state.voter.record_round(&responses);
-                    }
-                    warn!("Consensus timeout at height {} — force-finalizing on {}", height, hash);
-                    return true;
+                    warn!("Consensus stalled at height {} (timeout {}s, {} peers)",
+                        height, timeout, peer_count);
+                    return ConsensusRoundResult::Stalled;
                 }
 
-            false
+            ConsensusRoundResult::NotReady
         } else {
-            false
+            ConsensusRoundResult::NotReady
         }
     }
 
@@ -390,6 +391,17 @@ impl ConsensusManager {
         self.heights.retain(|h, _| *h > applied_height);
         self.height_start_time.retain(|h, _| *h > applied_height);
         self.validator_blocks.retain(|(_, h), _| *h > applied_height);
+    }
+
+    /// Clear all consensus state. Used during chain resync.
+    pub fn clear(&mut self) {
+        self.heights.clear();
+        self.height_start_time.clear();
+        self.validator_blocks.clear();
+        self.slashed_validators.clear();
+        self.view_changes.clear();
+        self.last_block_time.clear();
+        self.checkpoint_votes.clear();
     }
 
     /// How many candidates exist at a given height.
@@ -1267,5 +1279,63 @@ mod tests {
         let block = make_test_block(1); // No transactions.
         let result = generate_light_client_proof(&block, [1u8; 32]);
         assert!(result.is_none());
+    }
+
+    // ---- ConsensusRoundResult enum tests ----
+
+    #[test]
+    fn real_votes_still_finalize() {
+        let mut cm = ConsensusManager::new();
+        let block = make_test_block(1);
+        let hash = block.hash();
+        let height = 1;
+
+        cm.add_candidate(block);
+
+        // Simulate enough rounds of unanimous votes to finalize.
+        // Each round must supply at least quorum votes so record_round can converge.
+        for _ in 0..cm.params.decision_threshold {
+            for _ in 0..cm.params.quorum {
+                cm.record_response(height, hash);
+            }
+            let result = cm.try_finalize_round(height, 1);
+            if result == ConsensusRoundResult::Finalized {
+                assert!(cm.finalized_at_height(height).is_some());
+                return;
+            }
+        }
+        panic!("expected finalization within {} rounds", cm.params.decision_threshold);
+    }
+
+    #[test]
+    fn timeout_returns_stalled() {
+        let mut cm = ConsensusManager::new();
+        let block = make_test_block(1);
+        cm.add_candidate(block);
+
+        // Set the start time to the past so timeout triggers immediately.
+        cm.height_start_time.insert(1, std::time::Instant::now() - std::time::Duration::from_secs(10));
+
+        let result = cm.try_finalize_round(1, 0);
+        assert_eq!(result, ConsensusRoundResult::Stalled);
+
+        // Verify no finalization happened (no fabricated votes).
+        assert!(cm.finalized_at_height(1).is_none());
+    }
+
+    #[test]
+    fn clear_wipes_all_heights() {
+        let mut cm = ConsensusManager::new();
+        let block1 = make_test_block(1);
+        let block2 = make_test_block(2);
+        cm.add_candidate(block1);
+        cm.add_candidate(block2);
+        assert!(cm.has_height(1));
+        assert!(cm.has_height(2));
+
+        cm.clear();
+        assert!(!cm.has_height(1));
+        assert!(!cm.has_height(2));
+        assert!(cm.active_heights().is_empty());
     }
 }

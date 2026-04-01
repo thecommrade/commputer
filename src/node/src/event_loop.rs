@@ -2584,7 +2584,7 @@ impl EventLoop {
             }
 
             // Try to finalize from responses accumulated in previous ticks.
-            self.consensus.try_finalize_round(next_height, peer_count);
+            let _result = self.consensus.try_finalize_round(next_height, peer_count);
         }
 
         // Apply any newly finalized blocks (in height order).
