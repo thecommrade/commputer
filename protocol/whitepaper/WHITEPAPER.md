@@ -222,20 +222,21 @@ This extends to AI. Training and running large models today requires massive dat
 
 The maximum supply can only decrease through burns. It never increases.
 
-### Emission — Hybrid Curve
+### Emission -- Bitcoin-Style Halvings
 
-The protocol targets ~0.09 $COMME per day per maxed reference node at launch. As the network grows, the per-node rate decays on a published, deterministic inverse square root curve:
+2 billion $COMME. Fixed supply. Emission follows Bitcoin's proven halving model: a fixed reward per block that halves every four years.
 
-| Network Size | Rate Per Node | Time to 33 $COMME |
-|---|---|---|
-| 1,000–10,000 validators | ~0.09/day | ~1 year |
-| 10,000–100,000 validators | ~0.065/day | ~1.5 years |
-| 100,000–1,000,000 validators | ~0.03/day | ~3 years |
-| 1,000,000–10,000,000 validators | ~0.01/day (floor) | ~9 years |
+| Era | Years | Block Reward | Total Emitted | Cumulative |
+|---|---|---|---|---|
+| 0 | 1-4 | ~15.85 COMME | 1,000,000,000 | 50% |
+| 1 | 5-8 | ~7.93 COMME | 500,000,000 | 75% |
+| 2 | 9-12 | ~3.96 COMME | 250,000,000 | 87.5% |
+| 3 | 13-16 | ~1.98 COMME | 125,000,000 | 93.75% |
+| 4+ | 17+ | continues halving | ... | approaches 100% |
 
-The floor rate of 0.01 $COMME per day never changes. Mining always produces something. The curve is published, verifiable, and visible on the public dashboard in real time.
+Blocks are produced every 2 seconds. Halvings occur every 63,072,000 blocks (~4 years). The block reward is split among all active validators for that epoch -- early adopters earn more because fewer people share the reward. As the network grows, per-node earnings decrease naturally. This is the incentive to show up early.
 
-With 2B supply and the hybrid curve, mining stretches across 65+ years at mass adoption before burns are even factored in.
+At 25 validators: ~27,405 COMME/day per node. At 10,000 validators: ~68.5 COMME/day per node. The total emission per day is the same -- it's just split among more people.
 
 ### Emergency Provisions
 

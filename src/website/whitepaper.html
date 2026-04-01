@@ -330,18 +330,18 @@
             <p><strong>2,000,000,000 $COMME. Fixed. Final.</strong></p>
             <p>The maximum supply can only decrease through burns. It never increases.</p>
 
-            <h3>Emission &mdash; Hybrid Curve</h3>
-            <p>The protocol targets ~0.09 $COMME per day per maxed reference node at launch. As the network grows, the per-node rate decays on a published, deterministic inverse square root curve:</p>
+            <h3>Emission -- Bitcoin-Style Halvings</h3>
+            <p>Emission follows Bitcoin's proven halving model: a fixed reward per block that halves every four years.</p>
             <table>
-                <thead><tr><th>Network Size</th><th>Rate Per Node</th><th>Time to 33 $COMME</th></tr></thead>
+                <thead><tr><th>Era</th><th>Years</th><th>Block Reward</th><th>Cumulative</th></tr></thead>
                 <tbody>
-                    <tr><td>1,000&ndash;10,000 validators</td><td>~0.09/day</td><td>~1 year</td></tr>
-                    <tr><td>10,000&ndash;100,000 validators</td><td>~0.065/day</td><td>~1.5 years</td></tr>
-                    <tr><td>100,000&ndash;1,000,000 validators</td><td>~0.03/day</td><td>~3 years</td></tr>
-                    <tr><td>1,000,000&ndash;10,000,000 validators</td><td>~0.01/day (floor)</td><td>~9 years</td></tr>
+                    <tr><td>0</td><td>1-4</td><td>~15.85 COMME</td><td>50%</td></tr>
+                    <tr><td>1</td><td>5-8</td><td>~7.93 COMME</td><td>75%</td></tr>
+                    <tr><td>2</td><td>9-12</td><td>~3.96 COMME</td><td>87.5%</td></tr>
+                    <tr><td>3</td><td>13-16</td><td>~1.98 COMME</td><td>93.75%</td></tr>
                 </tbody>
             </table>
-            <p>The floor rate of 0.01 $COMME per day never changes. Mining always produces something.</p>
+            <p>Blocks every 2 seconds. Halvings every ~4 years. Early adopters earn the most. The block reward is shared among all active validators -- show up early.</p>
 
             <h3>Emergency Provisions</h3>
             <p><strong>Sub-1M Supply Rule:</strong> Should total supply ever burn below 1,000,000 $COMME, any contribution &mdash; no matter how small &mdash; grants full access to the L1 and every product built on it.</p>
