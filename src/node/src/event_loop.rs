@@ -153,6 +153,10 @@ pub struct EventLoop {
     pub consensus_rate_limiter: commputer_network::consensus_rate_limiter::ConsensusRateLimiter,
     /// Peers who have voted for the current consensus height (avoids retry spam).
     pub voted_peers: HashSet<libp2p::PeerId>,
+    /// Fork detection circuit breaker.
+    pub fork_detector: commputer::fork_detector::ForkDetector,
+    /// Timestamp of the first consensus stall signal. None if no stall.
+    pub stall_start: Option<std::time::Instant>,
 }
 
 impl EventLoop {
@@ -214,6 +218,8 @@ impl EventLoop {
             consensus_rate_limiter: commputer_network::consensus_rate_limiter::ConsensusRateLimiter::new(),
             voted_peers: HashSet::new(),
             network_height: 0,
+            fork_detector: commputer::fork_detector::ForkDetector::new(),
+            stall_start: None,
         }
     }
 
@@ -226,6 +232,42 @@ impl EventLoop {
         self.rpc_rx = Some(rx);
         self.rpc_state = Some(state);
         self.update_rpc_status();
+    }
+
+    /// Wipe chain state and re-enter sync mode.
+    /// Called when fork detector or stall timer triggers.
+    fn initiate_chain_resync(&mut self, reason: &str) {
+        warn!("Initiating chain resync: {}", reason);
+
+        // 1. Force node state to Syncing.
+        self.node_state.force_syncing();
+
+        // 2. Wipe chain state.
+        if let Err(e) = self.state.reset_to_genesis() {
+            tracing::error!("Failed to reset chain state: {}", e);
+            return;
+        }
+
+        // 3. Clear consensus state.
+        self.consensus.clear();
+
+        // 4. Clear mempool and message dedup.
+        self.pending_txs.clear();
+        self.seen_tx_hashes.clear();
+        self.mempool_added_at.clear();
+        self.seen_message_ids.clear();
+
+        // 5. Reset sync flag so SyncMachine drives again.
+        self.sync_complete = false;
+
+        // 6. Reset fork detector and stall timer.
+        self.fork_detector.reset();
+        self.stall_start = None;
+
+        // 7. Reset voted peers tracking.
+        self.voted_peers.clear();
+
+        info!("Chain resync initiated. Waiting for sync from peers.");
     }
 
     /// Feature 241: Broadcast a JSON event to all connected WebSocket clients.
@@ -2584,7 +2626,29 @@ impl EventLoop {
             }
 
             // Try to finalize from responses accumulated in previous ticks.
-            let _result = self.consensus.try_finalize_round(next_height, peer_count);
+            let result = self.consensus.try_finalize_round(next_height, peer_count);
+            match result {
+                crate::consensus_manager::ConsensusRoundResult::Finalized => {
+                    // Consensus is working -- reset stall timer.
+                    // Block application is handled by the existing finalized_heights loop below.
+                    self.stall_start = None;
+                }
+                crate::consensus_manager::ConsensusRoundResult::Stalled => {
+                    // Start or check stall timer.
+                    let stall_start = *self.stall_start.get_or_insert_with(std::time::Instant::now);
+                    let elapsed = stall_start.elapsed().as_secs();
+                    if elapsed >= 60 {
+                        self.initiate_chain_resync(&format!(
+                            "consensus stall for {}s at height {}",
+                            elapsed, next_height
+                        ));
+                        return;
+                    }
+                }
+                crate::consensus_manager::ConsensusRoundResult::NotReady => {
+                    // Normal in-progress voting -- don't touch stall timer.
+                }
+            }
         }
 
         // Apply any newly finalized blocks (in height order).
@@ -2622,28 +2686,16 @@ impl EventLoop {
                 .unwrap_or(commputer_core::block::BlockHash::GENESIS);
 
             if block.header.parent_hash != our_tip_hash {
-                // Fork detected — this block extends a different chain.
                 warn!("Fork detected at height {}: parent {} != our tip {}",
                     height, block.header.parent_hash, our_tip_hash);
 
-                // Attempt reorg: revert our tip and try to apply the fork block.
-                let target = height.saturating_sub(1);
-                match self.state.revert_to(target) {
-                    Ok(reverted) => {
-                        info!("Reorg: reverted {} blocks to height {}", reverted, target);
-                        match self.state.apply_block_validated(&block) {
-                            Ok(()) => {
-                                info!("Reorg: applied fork block {} at height {}", hash, height);
-                                self.print_status();
-                            }
-                            Err(e) => {
-                                warn!("Reorg failed: could not apply fork block: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Reorg failed: could not revert: {}", e);
-                    }
+                self.fork_detector.record_mismatch();
+
+                if self.fork_detector.should_resync() {
+                    self.initiate_chain_resync(&format!(
+                        "fork detector triggered after {} consecutive mismatches at height {}",
+                        self.fork_detector.consecutive_mismatches(), height
+                    ));
                 }
                 return;
             }
@@ -2666,6 +2718,8 @@ impl EventLoop {
             match self.state.apply_block_validated(&block) {
                 Ok(()) => {
                     info!("Finalized and applied block {} at height {}", hash, height);
+                    self.fork_detector.record_success();
+                    self.stall_start = None;
                     self.last_block_seen_time = Some(std::time::Instant::now());
                     self.voted_peers.clear();
                     self.print_status();
