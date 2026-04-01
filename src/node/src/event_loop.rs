@@ -2632,15 +2632,24 @@ impl EventLoop {
                     self.stall_start = None;
                 }
                 crate::consensus_manager::ConsensusRoundResult::Stalled => {
-                    // Start or check stall timer.
-                    let stall_start = *self.stall_start.get_or_insert_with(std::time::Instant::now);
-                    let elapsed = stall_start.elapsed().as_secs();
-                    if elapsed >= 60 {
-                        self.initiate_chain_resync(&format!(
-                            "consensus stall for {}s at height {}",
-                            elapsed, next_height
-                        ));
-                        return;
+                    if peer_count == 0 {
+                        // Solo node: we ARE the network. Self-finalize by voting for our own block.
+                        // This is safe because there are no peers to disagree with.
+                        if let Some(pref) = self.consensus.query_preference(next_height) {
+                            self.consensus.record_response(next_height, pref);
+                            // Don't start stall timer for solo nodes -- stalling is expected.
+                        }
+                    } else {
+                        // Multi-node: start or check stall timer.
+                        let stall_start = *self.stall_start.get_or_insert_with(std::time::Instant::now);
+                        let elapsed = stall_start.elapsed().as_secs();
+                        if elapsed >= 60 {
+                            self.initiate_chain_resync(&format!(
+                                "consensus stall for {}s at height {}",
+                                elapsed, next_height
+                            ));
+                            return;
+                        }
                     }
                 }
                 crate::consensus_manager::ConsensusRoundResult::NotReady => {
