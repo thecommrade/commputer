@@ -31,16 +31,27 @@ During `apply_block_validated`, credit `block_reward(height)` to `block.header.p
 ```
 apply_block_validated(block):
   1. Validate block (parent hash, height, timestamp, etc.)
-  2. Compute reward = block_reward(block.height)     // from halving schedule
-  3. Credit reward to block.header.producer           // create account if needed
-  4. Increment total_emitted by reward
-  5. Apply all transactions in order                  // existing logic
-  6. Store block, update chain tip
+  2. Skip reward for genesis block (height 0, producer may be zero address)
+  3. Compute reward = min(block_reward(block.height), remaining_supply())
+  4. Credit reward to block.header.producer           // create account if needed
+  5. Increment account.total_mined by reward          // per-account tracking
+  6. Increment total_emitted by reward
+  7. Record reward in StateDiff for revert support
+  8. Apply all transactions in order                  // existing logic
+  9. Store block, update chain tip
 ```
 
 The reward amount is deterministic -- any node applying the same block at the same height computes the same reward from the halving schedule (`INITIAL_BLOCK_REWARD >> (height / HALVING_INTERVAL)`) and credits the same producer address from `block.header.producer`.
 
 No new transaction type. No new block fields. The reward is implicit.
+
+**Supply cap guard:** The reward is capped to `remaining_supply()` to prevent over-emission at the end of the halving schedule. This mirrors the existing epoch logic at event_loop.rs line 2111.
+
+**Genesis block (height 0):** Skip reward. The genesis block may have a zero-address producer and no coins should be created at height 0.
+
+**StateDiff integration:** The reward balance change must be captured in the block's `StateDiff` so that `revert_block` can undo it. This is the same pattern used for transaction-induced balance changes.
+
+**Per-account tracking:** Increment `account.total_mined` alongside `account.balance` so mining history is preserved for display/explorer purposes.
 
 **Ordering matters:** Reward is credited BEFORE transactions. This ensures the block producer has balance for any transactions in the same block (e.g., ValidatorRegister).
 
@@ -58,7 +69,7 @@ The epoch transition in `event_loop.rs` currently:
 2. Directly mutates account balances via `state.accounts.get_or_create().balance.checked_add()`
 3. Increments `state.total_emitted`
 
-**Remove:** All direct balance mutations from epoch transitions (step 2 and 3 above).
+**Remove:** All direct balance mutations from epoch transitions (step 2 and 3 above). Also remove `MiningReward` synthetic transaction creation -- this transaction type becomes dead code since rewards are now implicit in block application. Clean up `ChannelAllocation` and demand-weighted distribution code (no longer needed for coin creation).
 
 **Keep:** Everything that doesn't create coins:
 - Proof-of-contribution scoring (composite resource scores)
@@ -111,7 +122,7 @@ The `remaining_supply()` calculation (`TOTAL_SUPPLY - total_emitted`) continues 
 - Fork recovery (unchanged)
 - Block validation rules (unchanged, except adding reward credit)
 - Proof-of-contribution scoring (still happens at epochs, just doesn't create coins)
-- Compliance/nerfing (still tracked, affects epoch scores not block rewards)
+- Compliance/nerfing (still tracked, affects epoch scores not block rewards -- all block producers get the full reward regardless of compliance; nerfing is a social/reputation signal, not a reward multiplier)
 
 ## What This Changes
 
@@ -120,12 +131,18 @@ The `remaining_supply()` calculation (`TOTAL_SUPPLY - total_emitted`) continues 
 - Epoch transitions no longer create coins
 - `total_emitted` increments per-block, not per-epoch
 - Validator registration works in the same block as the producer's first reward
+- `MiningReward` transaction type and `ChannelAllocation` become dead code (removed)
+- Emission curve changes from staircase (epoch batches) to linear (per-block) -- total emission over any period is the same
 
 ---
 
 ## Edge Cases
 
-**Block reward at supply cap:** When `block_reward(height)` returns 0 (all halvings exhausted) or remaining supply is 0, no reward is credited. The chain continues with transaction fees only (which are burned).
+**Genesis block (height 0):** No reward credited. The genesis block has a placeholder producer and exists before any real validation.
+
+**Block reward at supply cap:** When `block_reward(height)` returns 0 (all halvings exhausted) or `remaining_supply()` is 0, no reward is credited. The `min(reward, remaining)` guard prevents over-emission. The chain continues with transaction fees only (which are burned).
+
+**Revert support:** Block reward balance changes are recorded in `StateDiff`. `revert_block` undoes the reward credit automatically via the diff. `reset_to_genesis` clears `total_emitted` as part of the full state wipe.
 
 **Block produced by non-registered validator (bootstrap):** The producer address is credited regardless of validator status. They become a validator via ValidatorRegister in the same block.
 
