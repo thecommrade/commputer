@@ -149,6 +149,8 @@ pub struct EventLoop {
     pub node_state: commputer::node_state::NodeStateMachine,
     /// Sync state machine: controlled batch downloading with backpressure.
     pub sync_machine: commputer::sync_machine::SyncMachine,
+    /// Consensus rate limiter -- prevents vote spam and duplicate votes.
+    pub consensus_rate_limiter: commputer_network::consensus_rate_limiter::ConsensusRateLimiter,
 }
 
 impl EventLoop {
@@ -207,6 +209,7 @@ impl EventLoop {
             sync_complete: false,
             node_state: commputer::node_state::NodeStateMachine::new(),
             sync_machine: commputer::sync_machine::SyncMachine::new(),
+            consensus_rate_limiter: commputer_network::consensus_rate_limiter::ConsensusRateLimiter::new(),
             network_height: 0,
         }
     }
@@ -1300,6 +1303,13 @@ impl EventLoop {
                             RrMessage::Request { request, channel, .. } => {
                                 match request {
                                     ConsensusRequest::BlockProposal { block_bytes, height } => {
+                                        // Rate limit: reject if this peer is spamming.
+                                        if !self.consensus_rate_limiter.check(peer.to_bytes()[..8].iter().fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64)), height) {
+                                            debug!("Rate limited consensus request from {} at height {}", peer, height);
+                                            let _ = self.network.swarm.behaviour_mut().consensus.send_response(
+                                                channel, ConsensusResponse::NotReady { height });
+                                            return;
+                                        }
                                         if let Ok(block) = serde_json::from_slice::<commputer_core::block::Block>(&block_bytes) {
                                             let hash = block.hash();
                                             if height > self.network_height {
@@ -1329,6 +1339,11 @@ impl EventLoop {
                                         }
                                     }
                                     ConsensusRequest::VoteRequest { height, block_hash: _ } => {
+                                        if !self.consensus_rate_limiter.check(peer.to_bytes()[..8].iter().fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64)), height) {
+                                            let _ = self.network.swarm.behaviour_mut().consensus.send_response(
+                                                channel, ConsensusResponse::NotReady { height });
+                                            return;
+                                        }
                                         let response = if let Some(pref) = self.consensus.query_preference(height) {
                                             ConsensusResponse::Vote {
                                                 height,
@@ -1703,10 +1718,15 @@ impl EventLoop {
             && self.state.blocks.height() + 1 != height
         {
             debug!("Block {} at height {} is orphaned — parent {} not found", hash, height, block.header.parent_hash);
-            self.orphan_pool
-                .entry(block.header.parent_hash)
-                .or_default()
-                .push(block);
+            // Cap orphan pool at 100 entries to prevent memory exhaustion (VULN-5).
+            if self.orphan_pool.len() < 100 {
+                self.orphan_pool
+                    .entry(block.header.parent_hash)
+                    .or_default()
+                    .push(block);
+            } else {
+                warn!("Orphan pool full (100 entries), dropping orphan block at height {}", height);
+            }
             return;
         }
 
@@ -2707,10 +2727,12 @@ impl EventLoop {
             if height > expected {
                 // Out of order — buffer as orphan, request missing blocks.
                 debug!("Sync: buffering block at height {} (expected {})", height, expected);
-                self.orphan_pool
-                    .entry(block.header.parent_hash)
-                    .or_default()
-                    .push(block);
+                if self.orphan_pool.len() < 100 {
+                    self.orphan_pool
+                        .entry(block.header.parent_hash)
+                        .or_default()
+                        .push(block);
+                }
                 for h in expected..height {
                     self.request_block(h);
                 }
