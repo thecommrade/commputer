@@ -58,6 +58,7 @@ impl ForkDetector {
 - `event_loop.rs`: In the fork detection path (currently line 2624), call `fork_detector.record_mismatch()` instead of attempting the shallow reorg
 - On successful block application, call `fork_detector.record_success()`
 - After each mismatch, check `fork_detector.should_resync()` and trigger resync if true
+- When resync is triggered, call `node_state.force_syncing()` (new method, analogous to existing `force_active()`). The `NodeStateMachine` remains the single authority on node state transitions.
 
 **Threshold: 3 consecutive mismatches.** One mismatch could be a race condition. Three is a pattern.
 
@@ -95,7 +96,14 @@ pub enum ConsensusRoundResult {
 
 When the timeout fires, return `Stalled` instead of fabricating votes. The event loop uses this signal to start a stall countdown.
 
-**Stall ceiling: 60 seconds.** If no height finalizes within 60 seconds of the first `Stalled` signal, the node triggers a chain wipe and resync. The timer resets whenever a block is successfully finalized.
+**Stall ceiling: 60 seconds.** If no height finalizes within 60 seconds of the first `Stalled` signal, the node triggers a chain wipe and resync.
+
+**Stall timer semantics:**
+- `Finalized` -- resets the stall timer (consensus is working)
+- `NotReady` -- does not advance or reset the timer (voting is in progress, not stalled)
+- `Stalled` -- starts or advances the timer (consensus has timed out at this height)
+
+This prevents false resyncs during slow-but-progressing voting rounds.
 
 **File:** Modified `src/node/src/consensus_manager.rs`
 
@@ -104,11 +112,13 @@ When the timeout fires, return `Stalled` instead of fabricating votes. The event
 When either trigger fires (3 fork mismatches OR 60s consensus stall), the event loop executes:
 
 1. Log warning: "Fork/stall detected, initiating chain resync from peers"
-2. Transition `node_state` to `Syncing`
+2. Transition `node_state` to `Syncing` via `node_state.force_syncing()`
 3. Call `self.state.reset_to_genesis()` -- clear all blocks and account state, reinitialize to genesis (height 0)
 4. Call `self.consensus.clear()` -- wipe all consensus state for all heights
-5. Reset `fork_detector` and stall timer
-6. The existing `SyncMachine` takes over and downloads blocks from connected peers
+5. Clear `pending_txs` mempool (transactions will be re-received from peers after resync)
+6. Set `self.sync_complete = false` so the SyncMachine is driven again
+7. Reset `fork_detector` and stall timer
+8. The existing `SyncMachine` takes over and downloads blocks from connected peers
 
 **What is preserved:**
 - Wallet identity and validator keypair
@@ -119,8 +129,11 @@ When either trigger fires (3 fork mismatches OR 60s consensus stall), the event 
 **What is wiped:**
 - Block storage (all blocks except genesis)
 - Account state (balances, nonces, validator registry)
+- State diffs, receipts, and account history index
 - Consensus state (all in-flight votes)
+- Transaction mempool (`pending_txs`)
 - Fork detector and stall timer state
+- `sync_complete` flag (set to false)
 
 **New method required:**
 
@@ -129,6 +142,11 @@ When either trigger fires (3 fork mismatches OR 60s consensus stall), the event 
 impl ChainState {
     /// Wipe all blocks and account state, reinitialize to genesis.
     /// Preserves nothing -- caller must re-download from peers.
+    ///
+    /// RocksDB strategy: clear all column families (blocks, accounts,
+    /// receipts, state_diffs, account_history_index), then replay
+    /// apply_genesis() to reinitialize height 0 with genesis state.
+    /// For in-memory storage, simply reset all HashMaps and re-apply genesis.
     pub fn reset_to_genesis(&mut self) -> Result<(), StateError>;
 }
 ```
@@ -150,11 +168,11 @@ impl ConsensusManager {
 Remove the two bypass paths in `handle_block_tick` that allow non-leaders to produce blocks:
 
 **Remove (event_loop.rs line 2417-2426):**
-- The `seconds_waiting >= 30` path that lets any validator produce
-- The `seconds_waiting >= 6` bypass of `has_active_vote`
+- The `seconds_waiting >= 30` path that lets any validator produce (emergency production)
 
 **Keep:**
 - Round-robin leader election via `is_valid_leader()` with view change fallback every 6s
+- The `seconds_waiting >= 6` bypass of `has_active_vote` -- this IS the view change mechanism (allows a new leader to produce when the current leader's block hasn't been seen). Removing it would break leader rotation recovery.
 - The `validators.len() < 2` bootstrap bypass (needed for initial network formation before validator set is established)
 
 If a node isn't the leader and consensus is stalled, the 60s stall detector (Section 2) handles it. The node doesn't try to produce its way out of the problem.
@@ -181,6 +199,20 @@ Successful resync:
 
 ---
 
+### NodeStateMachine Changes
+
+Add a `force_syncing()` method to `NodeStateMachine` (in `src/node/src/node_state.rs`), analogous to the existing `force_active()`. This keeps `NodeStateMachine` as the single authority on node state transitions. Both the `ForkDetector` trigger and the stall timer trigger call `node_state.force_syncing()` rather than setting state directly.
+
+```rust
+/// Force the node into Syncing state (used during chain resync).
+pub fn force_syncing(&mut self) {
+    self.state = NodeState::Syncing;
+    self.our_height = 0;
+}
+```
+
+---
+
 ## What This Does NOT Change
 
 - Snowball voting algorithm (untouched)
@@ -201,7 +233,7 @@ Successful resync:
 
 **Network partition heals:** When a partitioned node reconnects, it will receive blocks from the majority chain. If those blocks have mismatching parents (node was on wrong fork), the fork detector triggers after 3 mismatches, the node resyncs, and rejoins the correct chain.
 
-**All nodes stall simultaneously:** If the entire network stalls (e.g., all nodes lose connectivity to each other), every node hits the 60s ceiling and enters sync mode. When connectivity returns, nodes discover peers, attempt to sync, find they're all at the same height, and resume. The sync machine already handles the case where target_height equals our_height.
+**All nodes stall simultaneously:** If the entire network stalls (e.g., all nodes lose connectivity to each other), every node hits the 60s ceiling and enters sync mode. When connectivity returns, nodes discover peers, attempt to sync, find they're all at the same height, and the SyncMachine transitions through Downloading -> Verifying -> Complete (since `our_height >= target_height`). The node returns to Active. The next block tick (every 2s) fires, the elected leader produces a block, and consensus resumes normally. There is a brief window where all nodes are Active but waiting for their leader rotation slot -- this resolves within one block tick cycle.
 
 **Rapid height changes during resync:** The sync machine downloads in batches of 10 with backpressure. While resyncing, `node_state` is `Syncing`, which prevents block production and consensus participation. The node silently catches up.
 
