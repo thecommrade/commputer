@@ -2427,7 +2427,8 @@ impl EventLoop {
             }
 
         // Feature 172: Skip block production during network partition.
-        if self.partition_detected {
+        // Bootstrap leader (no seeds) is exempt -- it must produce the first blocks solo.
+        if self.partition_detected && self.is_seed_connector {
             debug!("Skipping block production — network partition detected");
             return;
         }
