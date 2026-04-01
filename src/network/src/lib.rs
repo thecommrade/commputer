@@ -8,6 +8,8 @@ pub mod validation;
 pub mod eclipse;
 pub mod sync_protocol;
 pub mod consensus_protocol;
+pub mod consensus_rate_limiter;
+pub mod eclipse_attack_detector;
 
 pub use message::{NetworkMessage, MessageKind, CompactBlock, CompactBlockRequest};
 pub use peer::{PeerId, PeerInfo, PeerStore, GeoScorer, ConnectionBackoff};
