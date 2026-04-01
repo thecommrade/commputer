@@ -9,11 +9,8 @@ pub const UNITS_PER_COMME: u64 = 100_000_000;
 /// Total fixed supply: 2 billion $COMME in raw units.
 pub const TOTAL_SUPPLY: u64 = 2_000_000_000 * UNITS_PER_COMME;
 
-/// Transaction fee split: 80% burned, 20% to charity treasury.
-/// The charity treasury accumulates until the annual vote, then is liquidated
-/// for the winning cause with a matching burn.
-pub const FEE_BURN_PERCENT: u64 = 80;
-pub const FEE_CHARITY_PERCENT: u64 = 20;
+/// Transaction fees: 100% burned. The protocol is neutral.
+pub const FEE_BURN_PERCENT: u64 = 100;
 
 /// 51% of network compute is reserved for communal products (storage, communication, AI,
 /// Humanities Archive). Also serves as emergency safeguard for user data protection.
@@ -164,21 +161,16 @@ pub fn format_with_commas(amount: Amount) -> String {
     }
 }
 
-/// Result of splitting a transaction fee into burn and charity portions.
+/// Result of splitting a transaction fee. Currently 100% burn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeeSplit {
-    /// Amount to permanently burn (80%).
+    /// Amount to permanently burn (100%).
     pub burn: u64,
-    /// Amount to add to charity treasury (20%).
-    pub charity: u64,
 }
 
-/// Split a transaction fee into burn (80%) and charity (20%) portions.
-/// Burn gets the remainder to avoid dust loss.
+/// All transaction fees are burned. The protocol is neutral.
 pub fn split_fee(fee: u64) -> FeeSplit {
-    let charity = fee * FEE_CHARITY_PERCENT / 100;
-    let burn = fee - charity;
-    FeeSplit { burn, charity }
+    FeeSplit { burn: fee }
 }
 
 /// Apply the diversity bonus multiplier to a raw CRS reward.
@@ -281,23 +273,21 @@ mod tests {
     }
 
     #[test]
-    fn fee_split_80_20() {
+    fn fee_split_100_burn() {
         let s = split_fee(100);
-        assert_eq!(s.burn, 80);
-        assert_eq!(s.charity, 20);
+        assert_eq!(s.burn, 100);
     }
 
     #[test]
     fn fee_split_no_dust_loss() {
         let s = split_fee(99);
-        assert_eq!(s.burn + s.charity, 99);
+        assert_eq!(s.burn, 99);
     }
 
     #[test]
     fn fee_split_zero() {
         let s = split_fee(0);
         assert_eq!(s.burn, 0);
-        assert_eq!(s.charity, 0);
     }
 
     #[test]
