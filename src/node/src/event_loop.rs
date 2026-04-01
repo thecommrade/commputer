@@ -2024,21 +2024,17 @@ impl EventLoop {
             return;
         }
 
-        let epoch_emission = self.emission.per_epoch_emission(validator_count);
+        let height = self.state.blocks.height();
+        let epoch_emission = self.emission.per_epoch_emission(height, validator_count);
         let remaining = self.state.remaining_supply();
         let actual_emission = epoch_emission.min(remaining);
-        // Feature 7: Block reward halving awareness.
+        // Halving awareness.
         {
-            let per_node_daily = self.emission.per_validator_daily_rate(validator_count);
-            let per_node_comme = per_node_daily as f64 / UNITS_PER_COMME as f64;
-            if per_node_comme < 0.01 {
-                warn!("Emission rate critically low: {:.6} COMME/day/node (below 0.01 floor)", per_node_comme);
-            } else if per_node_comme < 0.02 {
-                warn!("Emission rate very low: {:.6} COMME/day/node (below 0.02)", per_node_comme);
-            } else if per_node_comme < 0.03 {
-                warn!("Emission rate low: {:.6} COMME/day/node (below 0.03)", per_node_comme);
-            } else if per_node_comme < 0.05 {
-                warn!("Emission rate declining: {:.6} COMME/day/node (below 0.05)", per_node_comme);
+            let block_reward = self.emission.block_reward(height);
+            let reward_comme = block_reward as f64 / UNITS_PER_COMME as f64;
+            let era = height / commputer_consensus::emission::HALVING_INTERVAL;
+            if block_reward == 0 {
+                warn!("All COMME emitted -- block reward is 0 (era {})", era);
             }
         }
 

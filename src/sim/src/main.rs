@@ -162,7 +162,7 @@ impl SimNetwork {
 
 fn run_emission_epoch(network: &mut SimNetwork, schedule: &EmissionSchedule) -> u64 {
     let count = network.online_count().max(1);
-    let epoch_emission = schedule.per_epoch_emission(count);
+    let epoch_emission = schedule.per_epoch_emission(0, count);
 
     // Cap emission at remaining supply
     let remaining = TOTAL_SUPPLY.saturating_sub(network.total_emitted);
@@ -287,7 +287,7 @@ fn simulate_warehouse_attack() {
     let schedule = EmissionSchedule::new();
     let validator_count = 1000u64;
 
-    let daily_rate = schedule.per_validator_daily_rate(validator_count);
+    let daily_rate = schedule.per_validator_daily_rate(0, validator_count);
     let honest_reward = daily_rate;
 
     let attacker_nodes = 100u32;
@@ -332,7 +332,7 @@ fn simulate_warehouse_scenarios(output_dir: &str) {
     let network_sizes = [1_000u64, 10_000, 100_000];
 
     for &net_size in &network_sizes {
-        let daily_rate = schedule.per_validator_daily_rate(net_size);
+        let daily_rate = schedule.per_validator_daily_rate(0, net_size);
         let honest_reward = daily_rate as f64 / UNITS_PER_COMME as f64;
 
         // Strategy 1: Many small nodes (200 nodes on same subnet)
@@ -408,7 +408,7 @@ fn simulate_network_growth(output_dir: &str) {
         let t = epoch as f64;
         let n = (k / (1.0 + (-r * (t - t0)).exp())).max(100.0) as u64;
 
-        let per_val_daily = schedule.per_validator_daily_rate(n);
+        let per_val_daily = schedule.per_validator_daily_rate(0, n);
         let per_val_epoch = per_val_daily as f64 / 24.0;
         cumulative_reward += per_val_epoch;
 
@@ -452,7 +452,7 @@ fn simulate_emission_exhaustion() {
         if remaining == 0 || epoch >= max_epochs {
             break;
         }
-        let emission = schedule.per_epoch_emission(validator_count).min(remaining);
+        let emission = schedule.per_epoch_emission(0, validator_count).min(remaining);
         total_emitted += emission;
         epoch += 1;
     }
@@ -465,7 +465,7 @@ fn simulate_emission_exhaustion() {
     println!("Supply cap (2B): {:.2} COMME", TOTAL_SUPPLY as f64 / UNITS_PER_COMME as f64);
     println!("Verified: total_emitted <= TOTAL_SUPPLY: {}", total_emitted <= TOTAL_SUPPLY);
 
-    let floor_rate = schedule.per_validator_daily_rate(100_000_000);
+    let floor_rate = schedule.per_validator_daily_rate(0, 100_000_000);
     println!("Floor rate at 100M validators: {:.6} COMME/day", floor_rate as f64 / UNITS_PER_COMME as f64);
     assert!(floor_rate >= UNITS_PER_COMME / 100, "Floor rate violated!");
     println!("Floor rate >= 0.01 COMME/day: verified");
@@ -495,7 +495,7 @@ fn simulate_tier_accessibility(output_dir: &str) {
         "token_price_usd", "usd_value_at_tier"]).unwrap();
 
     for &size in &network_sizes {
-        let daily_rate = schedule.per_validator_daily_rate(size);
+        let daily_rate = schedule.per_validator_daily_rate(0, size);
         println!("\nNetwork size: {} validators (daily rate: {:.6} COMME)",
             size, daily_rate as f64 / UNITS_PER_COMME as f64);
 
@@ -556,7 +556,7 @@ fn simulate_burn_crossover(output_dir: &str) {
 
     for epoch in 0..max_epochs {
         let remaining = TOTAL_SUPPLY.saturating_sub(total_emitted);
-        let emission = schedule.per_epoch_emission(validator_count).min(remaining);
+        let emission = schedule.per_epoch_emission(0, validator_count).min(remaining);
         total_emitted += emission;
 
         let circulating = total_emitted.saturating_sub(total_burned);
@@ -755,7 +755,7 @@ fn simulate_charitable_burns(output_dir: &str) {
 
                 for _ in 0..total_epochs {
                     let remaining = TOTAL_SUPPLY.saturating_sub(total_emitted);
-                    let emission = schedule.per_epoch_emission(validators).min(remaining);
+                    let emission = schedule.per_epoch_emission(0, validators).min(remaining);
                     total_emitted += emission;
 
                     let circulating = total_emitted.saturating_sub(total_burned);
@@ -833,7 +833,7 @@ fn simulate_validator_churn(output_dir: &str, rng: &mut impl Rng) {
 
         // Sample monthly
         if epoch % epochs_per_month as u64 == 0 {
-            let daily_rate = schedule.per_validator_daily_rate(current_validators);
+            let daily_rate = schedule.per_validator_daily_rate(0, current_validators);
             let churn_rate = if current_validators > 0 {
                 (joins_this_month as f64 + leaves_this_month as f64) / current_validators as f64
             } else {
@@ -915,7 +915,7 @@ fn simulate_network_resilience(output_dir: &str, rng: &mut impl Rng) {
         }
 
         let emission = run_emission_epoch(&mut network, &schedule);
-        let daily_rate = schedule.per_validator_daily_rate(online);
+        let daily_rate = schedule.per_validator_daily_rate(0, online);
 
         wtr.write_record(&[
             epoch.to_string(),
@@ -972,7 +972,7 @@ fn simulate_sybil_cost(output_dir: &str) {
 
             // Attacker reward: each node on unique subnet (best case for attacker)
             let total_network = net_size + attacker_nodes;
-            let daily_rate = schedule.per_validator_daily_rate(total_network);
+            let daily_rate = schedule.per_validator_daily_rate(0, total_network);
             let daily_reward_comme = attacker_nodes as f64 * daily_rate as f64 / UNITS_PER_COMME as f64;
 
             // At $1/COMME, how many days to break even on year 1 costs?
@@ -1089,7 +1089,7 @@ fn run_sensitivity_sim(schedule: &EmissionSchedule, validators: u64, total_epoch
 
     for _ in 0..total_epochs {
         let remaining = TOTAL_SUPPLY.saturating_sub(total_emitted);
-        let emission = schedule.per_epoch_emission(validators).min(remaining);
+        let emission = schedule.per_epoch_emission(0, validators).min(remaining);
         total_emitted += emission;
 
         let circulating = total_emitted.saturating_sub(total_burned);
@@ -1098,7 +1098,7 @@ fn run_sensitivity_sim(schedule: &EmissionSchedule, validators: u64, total_epoch
     }
 
     let circulating = total_emitted.saturating_sub(total_burned);
-    let daily_rate = schedule.per_validator_daily_rate(validators);
+    let daily_rate = schedule.per_validator_daily_rate(0, validators);
 
     (
         circulating as f64 / UNITS_PER_COMME as f64,

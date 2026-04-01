@@ -922,12 +922,13 @@ async fn run_node(
 
     // Print emission schedule info.
     let schedule = EmissionSchedule::new();
-    let rate_1k = schedule.per_validator_daily_rate(1_000);
-    let rate_100k = schedule.per_validator_daily_rate(100_000);
+    let height = state.blocks.height();
+    let reward_comme = schedule.block_reward(height) as f64 / UNITS_PER_COMME as f64;
+    let era = height / commputer_consensus::emission::HALVING_INTERVAL;
     info!("Emission schedule:");
-    info!("  Rate @ 1K validators:   {:.4} COMME/day/node", rate_1k as f64 / UNITS_PER_COMME as f64);
-    info!("  Rate @ 100K validators: {:.4} COMME/day/node", rate_100k as f64 / UNITS_PER_COMME as f64);
-    info!("  Floor rate:             0.0100 COMME/day/node");
+    info!("  Block reward:     {:.4} COMME/block (era {})", reward_comme, era);
+    info!("  Halving every:    {} blocks (~4 years)", commputer_consensus::emission::HALVING_INTERVAL);
+    info!("  Next halving at:  block {}", (era + 1) * commputer_consensus::emission::HALVING_INTERVAL);
 
     // Print status via tracing for the node run.
     let total = TOTAL_SUPPLY / UNITS_PER_COMME;
