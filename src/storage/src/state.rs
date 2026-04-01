@@ -1581,6 +1581,38 @@ impl ChainState {
         rocks.write_batch(batch)
             .map_err(|e| StateError::StorageError(e.to_string()))
     }
+
+    /// Wipe all blocks and account state, reinitialize to genesis (height 0).
+    /// Used during chain resync after fork detection.
+    ///
+    /// Caller must also reset: consensus manager, mempool, sync_complete flag.
+    pub fn reset_to_genesis(&mut self) -> Result<(), StateError> {
+        info!("Resetting chain state to genesis");
+
+        // Clear in-memory stores.
+        self.accounts = AccountStore::new();
+        self.blocks = BlockStore::new();
+        self.total_emitted = 0;
+        self.total_burned = 0;
+        self.nerf_rate = NerfRate::INITIAL;
+        self.current_epoch = 0;
+        self.receipts = ReceiptStore::new();
+        self.history = AccountHistoryIndex::new();
+        self.cumulative_score = 0;
+        self.state_diffs.clear();
+        self.archived_accounts.clear();
+        self.snapshot_height = 0;
+        self.validator_performance.clear();
+
+        // If RocksDB-backed, clear all column families.
+        if let Some(ref rocks) = self.rocks {
+            rocks.clear_all()
+                .map_err(|e| StateError::StorageError(format!("failed to clear RocksDB: {}", e)))?;
+        }
+
+        info!("Chain state reset to genesis complete");
+        Ok(())
+    }
 }
 
 impl Default for ChainState {
@@ -2607,5 +2639,31 @@ mod tests {
         state.apply_block(&genesis).unwrap();
         // Try to revert height 5 when we're at height 0
         assert!(state.revert_block(5).is_err());
+    }
+
+    #[test]
+    fn reset_to_genesis() {
+        let mut state = ChainState::new();
+
+        // Simulate some state by manually setting fields.
+        state.total_emitted = 1000;
+        state.total_burned = 500;
+        state.current_epoch = 5;
+        state.cumulative_score = 42;
+        state.snapshot_height = 100;
+
+        // Reset.
+        state.reset_to_genesis().unwrap();
+
+        // Verify everything is zeroed.
+        assert_eq!(state.blocks.height(), 0);
+        assert_eq!(state.total_emitted, 0);
+        assert_eq!(state.total_burned, 0);
+        assert_eq!(state.current_epoch, 0);
+        assert_eq!(state.cumulative_score, 0);
+        assert_eq!(state.snapshot_height, 0);
+        assert!(state.state_diffs.is_empty());
+        assert!(state.validator_performance.is_empty());
+        assert!(state.archived_accounts.is_empty());
     }
 }
