@@ -75,9 +75,9 @@ type PeerVoteKey = (u64, u64); // (peer_id_hash, height)
 /// Rate limiter for consensus messages.
 ///
 /// # Usage
-/// ```rust
-/// let mut limiter = ConsensusRateLimiter::new();
-/// if limiter.check(peer_id_hash, height) {
+/// ```rust,no_run
+/// let mut limiter = commputer_network::consensus_rate_limiter::ConsensusRateLimiter::new();
+/// if limiter.check(12345u64, 100u64) {
 ///     // Process the message
 /// } else {
 ///     // Drop the message (logged internally)
@@ -107,27 +107,16 @@ impl ConsensusRateLimiter {
 
     /// Check whether a consensus message from `peer` at `height` should be processed.
     ///
-    /// Returns `true` if:
-    /// - This peer has not exceeded the rate limit, AND
-    /// - This peer has not already voted at this height.
-    ///
-    /// Returns `false` and logs a warning otherwise.
+    /// Check rate limit only (no vote dedup).
+    /// Returns `true` if the peer has not exceeded the rate limit.
+    /// Vote deduplication should be handled on the response side
+    /// (in ConsensusManager::record_response), not here, because
+    /// legitimate retries from the leader should not be blocked.
     pub fn check(&mut self, peer_hash: u64, height: u64) -> bool {
         // Update max height for pruning
         if height > self.max_height {
             self.max_height = height;
             self.maybe_prune(height);
-        }
-
-        // Check for duplicate vote
-        let vote_key = (peer_hash, height);
-        if self.seen_votes.contains(&vote_key) {
-            warn!(
-                peer = peer_hash,
-                height = height,
-                "consensus_rate_limiter: duplicate vote from peer at height"
-            );
-            return false;
         }
 
         // Check rate limit
@@ -143,8 +132,6 @@ impl ConsensusRateLimiter {
             return false;
         }
 
-        // Record this vote
-        self.seen_votes.insert(vote_key);
         true
     }
 

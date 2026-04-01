@@ -151,6 +151,8 @@ pub struct EventLoop {
     pub sync_machine: commputer::sync_machine::SyncMachine,
     /// Consensus rate limiter -- prevents vote spam and duplicate votes.
     pub consensus_rate_limiter: commputer_network::consensus_rate_limiter::ConsensusRateLimiter,
+    /// Peers who have voted for the current consensus height (avoids retry spam).
+    pub voted_peers: HashSet<libp2p::PeerId>,
 }
 
 impl EventLoop {
@@ -210,6 +212,7 @@ impl EventLoop {
             node_state: commputer::node_state::NodeStateMachine::new(),
             sync_machine: commputer::sync_machine::SyncMachine::new(),
             consensus_rate_limiter: commputer_network::consensus_rate_limiter::ConsensusRateLimiter::new(),
+            voted_peers: HashSet::new(),
             network_height: 0,
         }
     }
@@ -1378,6 +1381,7 @@ impl EventLoop {
                                     ConsensusResponse::Vote { height, preference, accept } => {
                                         if accept {
                                             self.consensus.record_response(height, BlockHash(preference));
+                                            self.voted_peers.insert(peer);
                                         }
                                     }
                                     ConsensusResponse::NotReady { .. } => {
@@ -2563,10 +2567,13 @@ impl EventLoop {
                     self.consensus.mark_proposal_sent(next_height);
                 }
             } else {
-                // Retry: send lightweight vote request to peers who haven't responded.
+                // Retry: send vote request only to peers who haven't responded yet.
                 if let Some(pref) = self.consensus.query_preference(next_height) {
-                    let peers: Vec<libp2p::PeerId> = self.peer_ips.keys().copied().collect();
-                    for peer in &peers {
+                    let non_voters: Vec<libp2p::PeerId> = self.peer_ips.keys()
+                        .filter(|p| !self.voted_peers.contains(p))
+                        .copied()
+                        .collect();
+                    for peer in &non_voters {
                         let request = commputer_network::consensus_protocol::ConsensusRequest::VoteRequest {
                             height: next_height,
                             block_hash: pref.0,
@@ -2660,6 +2667,7 @@ impl EventLoop {
                 Ok(()) => {
                     info!("Finalized and applied block {} at height {}", hash, height);
                     self.last_block_seen_time = Some(std::time::Instant::now());
+                    self.voted_peers.clear();
                     self.print_status();
 
                     // Feature 241: Broadcast block event to WebSocket clients.
