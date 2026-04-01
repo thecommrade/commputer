@@ -920,6 +920,23 @@ async fn run_node(
         );
     }
 
+    // Pre-flight: check NTP sync status.
+    {
+        let ntp_check = commputer::config_validator::ConfigValidator::check_ntp_status();
+        match ntp_check.severity {
+            commputer::config_validator::Severity::Error => {
+                warn!("NTP check FAILED: {}", ntp_check.message);
+                warn!("Clock sync is required for consensus. Fix NTP and restart.");
+            }
+            commputer::config_validator::Severity::Warning => {
+                warn!("NTP warning: {}", ntp_check.format_line());
+            }
+            _ => {
+                info!("NTP: {}", ntp_check.message);
+            }
+        }
+    }
+
     // Print emission schedule info.
     let schedule = EmissionSchedule::new();
     let height = state.blocks.height();

@@ -829,6 +829,21 @@ impl EventLoop {
                 self.peer_rtts.remove(&worst_peer);
             }
 
+        // Eclipse attack detection: check peer subnet diversity.
+        {
+            use commputer_network::eclipse_attack_detector::{EclipseDetector, PeerSubnet};
+            let subnets: Vec<PeerSubnet> = self.peer_ips.values()
+                .map(|ip| PeerSubnet::new(ip))
+                .collect();
+            if subnets.len() >= 3 {
+                let detector = EclipseDetector::new();
+                let alerts = detector.check(&subnets);
+                for alert in &alerts {
+                    warn!("Eclipse detection: {}", alert.description());
+                }
+            }
+        }
+
         // Try to discover a new peer from the Kademlia DHT.
         let random_key = libp2p::kad::RecordKey::new(&rand::random::<[u8; 32]>());
         self.network.swarm.behaviour_mut().kademlia.get_closest_peers(random_key.to_vec());
