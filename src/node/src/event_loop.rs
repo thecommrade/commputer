@@ -2470,8 +2470,15 @@ impl EventLoop {
             return;
         }
 
+        // Never produce a second block at the same height -- that's equivocation.
+        // The view change bypass (6s) allows a DIFFERENT validator to produce,
+        // not the same one to produce again.
+        if self.consensus.we_produced_at(next_height, &our_addr) {
+            return;
+        }
+
         // Don't produce if there's already an active vote at this height,
-        // UNLESS we've been waiting 6+ seconds (view change or emergency).
+        // UNLESS we've been waiting 6+ seconds (view change).
         if seconds_waiting < 6
             && (self.consensus.has_active_vote(next_height) || self.consensus.has_height(next_height))
         {

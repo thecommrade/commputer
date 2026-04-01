@@ -250,21 +250,18 @@ impl ConsensusManager {
         let producer = block.header.producer;
 
         // Feature 125: Check for equivocation — only flag blocks received from the
-        // network. Local retries at the same height are normal (e.g. after a rejected
-        // block) and should not trigger slashing.
+        // network. Local blocks are tracked (for we_produced_at) but don't trigger slashing.
         let key = (producer, height);
-        if from_network {
-            if let Some(existing_hash) = self.validator_blocks.get(&key) {
-                if *existing_hash != hash {
-                    warn!(
-                        "EQUIVOCATION DETECTED: validator {} signed two different blocks at height {} ({} and {})",
-                        producer, height, existing_hash, hash
-                    );
-                    self.slashed_validators.insert(producer);
-                }
-            } else {
-                self.validator_blocks.insert(key, hash);
+        if let Some(existing_hash) = self.validator_blocks.get(&key) {
+            if *existing_hash != hash && from_network {
+                warn!(
+                    "EQUIVOCATION DETECTED: validator {} signed two different blocks at height {} ({} and {})",
+                    producer, height, existing_hash, hash
+                );
+                self.slashed_validators.insert(producer);
             }
+        } else {
+            self.validator_blocks.insert(key, hash);
         }
 
         // Feature 129: Track height start time.
@@ -441,6 +438,12 @@ impl ConsensusManager {
     /// Whether we know about any activity at the given height.
     pub fn has_height(&self, height: u64) -> bool {
         self.heights.contains_key(&height)
+    }
+
+    /// Whether the given validator already produced a block at this height.
+    /// Used to prevent equivocation (producing two different blocks at the same height).
+    pub fn we_produced_at(&self, height: u64, our_addr: &Address) -> bool {
+        self.validator_blocks.contains_key(&(*our_addr, height))
     }
 
     /// Feature 121: Record a view change event.
