@@ -2463,6 +2463,10 @@ impl EventLoop {
             if !commputer::leader::is_valid_leader(next_height, &our_addr, &validators, seconds_waiting) {
                 return;
             }
+        } else if self.is_seed_connector {
+            // Bootstrap phase (< 2 validators): only the seed node (bootstrap leader) produces.
+            // Nodes started with --seeds defer to the seed to prevent competing blocks.
+            return;
         }
 
         // Don't produce if there's already an active vote at this height,
