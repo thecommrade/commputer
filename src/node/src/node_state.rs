@@ -93,6 +93,17 @@ impl NodeStateMachine {
         }
     }
 
+    /// Force the node into `Syncing` and reset our_height to 0.
+    /// Used during chain resync after fork detection or consensus stall.
+    pub fn force_syncing(&mut self) {
+        warn!(
+            previous_state = ?self.state,
+            "node_state: force-transitioning to Syncing (chain resync)"
+        );
+        self.state = NodeState::Syncing;
+        self.our_height = 0;
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -215,6 +226,20 @@ mod tests {
         assert_eq!(sm.state(), NodeState::Syncing);
         sm.force_active();
         assert_eq!(sm.state(), NodeState::Active);
+    }
+
+    #[test]
+    fn force_syncing() {
+        let mut sm = NodeStateMachine::new();
+        // Get to Active.
+        sm.set_network_height(10);
+        sm.set_our_height(10);
+        assert_eq!(sm.state(), NodeState::Active);
+
+        // Force back to Syncing.
+        sm.force_syncing();
+        assert_eq!(sm.state(), NodeState::Syncing);
+        assert_eq!(sm.our_height(), 0);
     }
 
     #[test]
