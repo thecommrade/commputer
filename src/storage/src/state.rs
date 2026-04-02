@@ -2726,4 +2726,96 @@ mod tests {
         assert!(state.validator_performance.is_empty());
         assert!(state.archived_accounts.is_empty());
     }
+
+    // ── Block reward tests ──
+
+    #[test]
+    fn block_reward_credited_to_producer() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let producer = addr(5);
+        let block = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                producer,
+                timestamp: 1000,
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                epoch: 0, producer_public_key: vec![], signature: vec![],
+                checkpoint_hash: None, chain_id: String::new(),
+            },
+            transactions: vec![],
+            proof_summaries: vec![],
+            compliance_summary: None, epoch_summary: None,
+        };
+        state.apply_block(&block).unwrap();
+
+        let account = state.accounts.get(&producer).expect("producer should exist");
+        // ~15.855 COMME = 1_585_489_599 raw
+        assert_eq!(account.balance.raw(), 1_585_489_599);
+        assert_eq!(account.total_mined.raw(), 1_585_489_599);
+        assert_eq!(state.total_emitted, 1_585_489_599);
+    }
+
+    #[test]
+    fn no_reward_at_genesis() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        assert_eq!(state.total_emitted, 0, "genesis should not emit");
+    }
+
+    #[test]
+    fn no_reward_for_zero_address_producer() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let block = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                producer: Address([0u8; 32]), // zero address
+                timestamp: 1000,
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                epoch: 0, producer_public_key: vec![], signature: vec![],
+                checkpoint_hash: None, chain_id: String::new(),
+            },
+            transactions: vec![],
+            proof_summaries: vec![],
+            compliance_summary: None, epoch_summary: None,
+        };
+        state.apply_block(&block).unwrap();
+        assert_eq!(state.total_emitted, 0, "zero-address producer should not get reward");
+    }
+
+    #[test]
+    fn reward_capped_to_remaining_supply() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        // Set total_emitted to near the supply cap, leaving only 100 raw units.
+        state.total_emitted = commputer_core::token::TOTAL_SUPPLY - 100;
+
+        let producer = addr(5);
+        let block = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: 1,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                producer,
+                timestamp: 1000,
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                epoch: 0, producer_public_key: vec![], signature: vec![],
+                checkpoint_hash: None, chain_id: String::new(),
+            },
+            transactions: vec![],
+            proof_summaries: vec![],
+            compliance_summary: None, epoch_summary: None,
+        };
+        state.apply_block(&block).unwrap();
+
+        // Should only get 100 raw, not the full block reward.
+        let account = state.accounts.get(&producer).expect("producer should exist");
+        assert_eq!(account.balance.raw(), 100);
+        assert_eq!(state.total_emitted, commputer_core::token::TOTAL_SUPPLY);
+    }
 }

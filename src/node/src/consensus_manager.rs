@@ -361,9 +361,11 @@ impl ConsensusManager {
     }
 
     /// Feature 125: Reset slashing state at epoch boundary.
+    /// Only clears slashed set. validator_blocks is retained for in-flight
+    /// heights to prevent cross-epoch equivocation. cleanup_below handles
+    /// pruning old entries after finalization.
     pub fn reset_epoch_slashing(&mut self) {
         self.slashed_validators.clear();
-        self.validator_blocks.clear();
     }
 
     /// If the vote at `height` is finalized, return the winning block hash.

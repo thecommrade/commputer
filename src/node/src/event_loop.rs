@@ -157,6 +157,8 @@ pub struct EventLoop {
     pub fork_detector: commputer::fork_detector::ForkDetector,
     /// Timestamp of the first consensus stall signal. None if no stall.
     pub stall_start: Option<std::time::Instant>,
+    /// Cooldown: when the last chain resync completed. Prevents resync loops from DoS.
+    pub last_resync: Option<std::time::Instant>,
 }
 
 impl EventLoop {
@@ -220,6 +222,7 @@ impl EventLoop {
             network_height: 0,
             fork_detector: commputer::fork_detector::ForkDetector::new(),
             stall_start: None,
+            last_resync: None,
         }
     }
 
@@ -236,7 +239,22 @@ impl EventLoop {
 
     /// Wipe chain state and re-enter sync mode.
     /// Called when fork detector or stall timer triggers.
+    /// Minimum seconds between resyncs to prevent DoS-triggered resync loops.
+    const RESYNC_COOLDOWN_SECS: u64 = 300; // 5 minutes
+
     fn initiate_chain_resync(&mut self, reason: &str) {
+        // Cooldown: don't resync again within 5 minutes of the last resync.
+        if let Some(last) = self.last_resync {
+            if last.elapsed().as_secs() < Self::RESYNC_COOLDOWN_SECS {
+                warn!(
+                    "Resync requested but cooldown active ({}s remaining): {}",
+                    Self::RESYNC_COOLDOWN_SECS - last.elapsed().as_secs(),
+                    reason
+                );
+                return;
+            }
+        }
+
         warn!("Initiating chain resync: {}", reason);
 
         // 1. Force node state to Syncing.
@@ -271,6 +289,9 @@ impl EventLoop {
 
         // 8. Reset voted peers tracking.
         self.voted_peers.clear();
+
+        // Record resync time for cooldown.
+        self.last_resync = Some(std::time::Instant::now());
 
         info!("Chain resync initiated. Waiting for sync from peers.");
     }
