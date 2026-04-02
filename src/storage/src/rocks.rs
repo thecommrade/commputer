@@ -342,18 +342,16 @@ impl RocksStore {
     }
 
     /// Clear all data from all column families. Used during chain resync.
+    /// Uses delete_range for O(1) bulk deletion instead of iterating all keys.
     pub fn clear_all(&self) -> Result<(), rocksdb::Error> {
+        let range_start: &[u8] = &[];
+        let range_end: &[u8] = &[0xFF; 128]; // Covers any key length
+        let mut batch = rocksdb::WriteBatch::default();
         for cf_name in &[CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED] {
             let cf = self.cf(cf_name);
-            let mut batch = rocksdb::WriteBatch::default();
-            let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
-            for item in iter {
-                if let Ok((key, _)) = item {
-                    batch.delete_cf(&cf, &key);
-                }
-            }
-            self.db.write(batch)?;
+            batch.delete_range_cf(&cf, range_start, range_end);
         }
+        self.db.write(batch)?;
         Ok(())
     }
 
