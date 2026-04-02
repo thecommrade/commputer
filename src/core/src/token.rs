@@ -9,6 +9,18 @@ pub const UNITS_PER_COMME: u64 = 100_000_000;
 /// Total fixed supply: 2 billion $COMME in raw units.
 pub const TOTAL_SUPPLY: u64 = 2_000_000_000 * UNITS_PER_COMME;
 
+/// Bitcoin-style halving emission constants.
+/// Block reward halves every HALVING_INTERVAL blocks (~4 years at 2s blocks).
+pub const INITIAL_BLOCK_REWARD: u64 = 1_585_489_599; // ~15.855 COMME/block
+pub const HALVING_INTERVAL: u64 = 63_072_000; // ~4 years at 2s blocks
+pub const MAX_HALVINGS: u32 = 32;
+
+/// Compute block reward for a given height (pure function, no state needed).
+pub fn block_reward(height: u64) -> u64 {
+    let era = height / HALVING_INTERVAL;
+    if era >= MAX_HALVINGS as u64 { 0 } else { INITIAL_BLOCK_REWARD >> era }
+}
+
 /// Transaction fees: 100% burned. The protocol is neutral.
 pub const FEE_BURN_PERCENT: u64 = 100;
 

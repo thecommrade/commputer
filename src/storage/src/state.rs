@@ -377,13 +377,7 @@ impl ChainState {
         }
 
         // Compute reward from halving schedule, capped to remaining supply.
-        // Inline the formula to avoid cross-crate dependency on commputer-consensus.
-        // block_reward(h) = INITIAL_BLOCK_REWARD >> (h / HALVING_INTERVAL)
-        const INITIAL_BLOCK_REWARD: u64 = 1_585_489_599;
-        const HALVING_INTERVAL: u64 = 63_072_000;
-        const MAX_HALVINGS: u64 = 32;
-        let era = block.height() / HALVING_INTERVAL;
-        let reward = if era >= MAX_HALVINGS { 0 } else { INITIAL_BLOCK_REWARD >> era };
+        let reward = commputer_core::token::block_reward(block.height());
         let remaining = self.remaining_supply();
         let actual_reward = reward.min(remaining);
 

@@ -2,28 +2,8 @@ use commputer_core::proof::ResourceChannel;
 use commputer_core::token::UNITS_PER_COMME;
 use std::collections::HashMap;
 
-/// Bitcoin-style emission with halvings.
-///
-/// Design:
-/// - 2B total supply, 2-second blocks (43,200 blocks/day)
-/// - ~15.85 COMME per block at launch
-/// - Halving every 63,072,000 blocks (~4 years)
-/// - 50% of supply emitted in first 4 years (like Bitcoin)
-/// - Early miners rewarded for taking the risk
-/// - Per-node earnings decrease as more validators join (same block reward, more nodes sharing)
-
-/// Blocks per halving era (~4 years at 2-second blocks).
-/// 43,200 blocks/day x 365 days x 4 years = 63,072,000
-pub const HALVING_INTERVAL: u64 = 63_072_000;
-
-/// Initial block reward in raw units.
-/// 1B COMME = 1,000,000,000 * 100,000,000 raw units = 10^17
-/// 10^17 / 63,072,000 blocks = 1,585,489,599 raw units/block (~15.855 COMME)
-pub const INITIAL_BLOCK_REWARD: u64 = 1_585_489_599;
-
-/// Maximum number of halvings before reward reaches 0.
-/// After 32 halvings the reward is negligible (< 1 raw unit).
-pub const MAX_HALVINGS: u32 = 32;
+// Re-export halving constants from commputer-core (single source of truth).
+pub use commputer_core::token::{INITIAL_BLOCK_REWARD, HALVING_INTERVAL, MAX_HALVINGS};
 
 /// The emission schedule.
 pub struct EmissionSchedule {
@@ -36,13 +16,9 @@ impl EmissionSchedule {
     }
 
     /// Block reward at a given block height.
-    /// Halves every HALVING_INTERVAL blocks, just like Bitcoin.
+    /// Delegates to commputer_core::token::block_reward (single source of truth).
     pub fn block_reward(&self, height: u64) -> u64 {
-        let era = height / HALVING_INTERVAL;
-        if era >= MAX_HALVINGS as u64 {
-            return 0;
-        }
-        INITIAL_BLOCK_REWARD >> era
+        commputer_core::token::block_reward(height)
     }
 
     /// Calculate per-validator daily emission rate given current block height
