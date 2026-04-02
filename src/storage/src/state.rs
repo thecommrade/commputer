@@ -364,6 +364,47 @@ impl ChainState {
     /// Apply a block to the chain state.
     /// Processes all transactions, updates balances, records burns.
     /// Feature 181: Captures state diffs per block.
+    /// Credit the per-block reward to the block producer.
+    /// Called during block application, BEFORE transactions.
+    /// Skips genesis block (height 0). Caps reward to remaining supply.
+    fn credit_block_reward(&mut self, block: &Block) {
+        // No reward at genesis or for zero-address producer (protocol blocks).
+        if block.height() == 0 || block.header.producer.is_zero() {
+            return;
+        }
+
+        // Compute reward from halving schedule, capped to remaining supply.
+        // Inline the formula to avoid cross-crate dependency on commputer-consensus.
+        // block_reward(h) = INITIAL_BLOCK_REWARD >> (h / HALVING_INTERVAL)
+        const INITIAL_BLOCK_REWARD: u64 = 1_585_489_599;
+        const HALVING_INTERVAL: u64 = 63_072_000;
+        const MAX_HALVINGS: u64 = 32;
+        let era = block.height() / HALVING_INTERVAL;
+        let reward = if era >= MAX_HALVINGS { 0 } else { INITIAL_BLOCK_REWARD >> era };
+        let remaining = self.remaining_supply();
+        let actual_reward = reward.min(remaining);
+
+        if actual_reward == 0 {
+            return;
+        }
+
+        // Credit producer.
+        let producer = block.header.producer;
+        let account = self.accounts.get_or_create(producer);
+        if let Some(new_balance) = account.balance.checked_add(
+            commputer_core::token::Amount::from_raw(actual_reward),
+        ) {
+            account.balance = new_balance;
+            // Track per-account mining total.
+            account.total_mined = account.total_mined
+                .checked_add(commputer_core::token::Amount::from_raw(actual_reward))
+                .unwrap_or(account.total_mined);
+        }
+
+        // Update global emission counter.
+        self.total_emitted = self.total_emitted.saturating_add(actual_reward);
+    }
+
     pub fn apply_block(&mut self, block: &Block) -> Result<(), StateError> {
         // Verify block connects to current chain.
         if block.height() > 0 {
@@ -379,6 +420,19 @@ impl ChainState {
         // Feature 181: Capture before-state for all addresses in this block.
         let mut diff = StateDiff::default();
         let mut before_states: HashMap<Address, (u64, u64)> = HashMap::new();
+
+        // Capture producer before-state BEFORE reward is credited.
+        if block.height() > 0 {
+            let producer = block.header.producer;
+            let (bal, nonce) = self.accounts.get(&producer)
+                .map(|a| (a.balance.raw(), a.nonce))
+                .unwrap_or((0, 0));
+            before_states.insert(producer, (bal, nonce));
+        }
+
+        // Credit per-block reward to producer before transactions.
+        self.credit_block_reward(block);
+
         for tx in &block.transactions {
             // Record sender before-state.
             if let std::collections::hash_map::Entry::Vacant(e) = before_states.entry(tx.from) {
@@ -489,6 +543,9 @@ impl ChainState {
                 ));
             }
         }
+
+        // Credit per-block reward to producer before transactions.
+        self.credit_block_reward(block);
 
         // Process transactions and generate receipts.
         let block_hash = block.hash();
