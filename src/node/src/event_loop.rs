@@ -315,8 +315,14 @@ impl EventLoop {
                 timelock: None,
             };
             commputer_core::signing::sign_transaction(&mut tx, &self.wallet);
+            // Broadcast to network so other nodes include it in their blocks.
+            if let Ok(data) = serde_json::to_vec(&tx) {
+                let compressed = commputer_network::compress(&data);
+                let topic = topics::tx_topic();
+                let _ = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed);
+            }
             self.pending_txs.push(tx);
-            info!("Re-queued ValidatorRegister transaction after resync");
+            info!("Re-queued and broadcast ValidatorRegister transaction after resync");
         }
 
         // Record resync time for cooldown.
