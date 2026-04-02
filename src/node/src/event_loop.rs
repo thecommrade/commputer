@@ -1424,6 +1424,7 @@ impl EventLoop {
                             RrMessage::Request { request, channel, .. } => {
                                 match request {
                                     ConsensusRequest::BlockProposal { block_bytes, height } => {
+                                        info!("Received BlockProposal at height {} from {}", height, peer);
                                         // Rate limit: reject if this peer is spamming.
                                         if !self.consensus_rate_limiter.check(peer.to_bytes()[..8].iter().fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64)), height) {
                                             debug!("Rate limited consensus request from {} at height {}", peer, height);
@@ -1482,13 +1483,18 @@ impl EventLoop {
                                 // We received a vote back from a peer we sent a proposal to.
                                 match response {
                                     ConsensusResponse::Vote { height, preference, accept } => {
+                                        info!("Received Vote from {} at height {} (accept={})", peer, height, accept);
                                         if accept {
                                             self.consensus.record_response(height, BlockHash(preference));
                                             self.voted_peers.insert(peer);
                                         }
                                     }
-                                    ConsensusResponse::NotReady { .. } => {
-                                        // Peer is syncing, ignore.
+                                    ConsensusResponse::NotReady { height } => {
+                                        // Peer is alive but syncing. Reset stall timer --
+                                        // a syncing peer will be ready soon. Only true
+                                        // silence (no response) should trigger resync.
+                                        self.stall_start = None;
+                                        debug!("Received NotReady from {} at height {}", peer, height);
                                     }
                                 }
                             }
@@ -2575,6 +2581,7 @@ impl EventLoop {
                         self.network.swarm.behaviour_mut().consensus.send_request(peer, request);
                     }
                     self.consensus.mark_proposal_sent(next_height);
+                    info!("Sent BlockProposal at height {} to {} peers", next_height, peers.len());
                 }
             } else {
                 // Retry: send vote request only to peers who haven't responded yet.
