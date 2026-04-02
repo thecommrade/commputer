@@ -13,7 +13,7 @@ use commputer_core::transaction::Transaction;
 use commputer_core::token::UNITS_PER_COMME;
 use commputer_core::wallet::Wallet;
 
-use commputer_consensus::emission::{EmissionSchedule, ChannelAllocation};
+use commputer_consensus::emission::EmissionSchedule;
 use commputer_consensus::epoch::EpochState;
 
 use commputer_storage::state::ChainState;
@@ -257,14 +257,19 @@ impl EventLoop {
         self.mempool_added_at.clear();
         self.seen_message_ids.clear();
 
-        // 5. Reset sync flag so SyncMachine drives again.
+        // 5. Reset sync flag and network height so SyncMachine re-engages properly.
         self.sync_complete = false;
+        self.network_height = 0;
+        self.sync_machine.reset();
 
-        // 6. Reset fork detector and stall timer.
+        // 6. Reset solo-node timeout so it doesn't fire immediately after resync.
+        self.event_loop_start = std::time::Instant::now();
+
+        // 7. Reset fork detector and stall timer.
         self.fork_detector.reset();
         self.stall_start = None;
 
-        // 7. Reset voted peers tracking.
+        // 8. Reset voted peers tracking.
         self.voted_peers.clear();
 
         info!("Chain resync initiated. Waiting for sync from peers.");

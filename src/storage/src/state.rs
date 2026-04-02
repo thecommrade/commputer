@@ -367,6 +367,9 @@ impl ChainState {
     /// Credit the per-block reward to the block producer.
     /// Called during block application, BEFORE transactions.
     /// Skips genesis block (height 0). Caps reward to remaining supply.
+    ///
+    /// IMPORTANT: Called from both `apply_block()` and `apply_block_validated()`.
+    /// If you change the reward logic, update both call sites.
     fn credit_block_reward(&mut self, block: &Block) {
         // No reward at genesis or for zero-address producer (protocol blocks).
         if block.height() == 0 || block.header.producer.is_zero() {
