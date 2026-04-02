@@ -2105,27 +2105,12 @@ impl EventLoop {
             return;
         }
 
-        let height = self.state.blocks.height();
-        let epoch_emission = self.emission.per_epoch_emission(height, validator_count);
-        let remaining = self.state.remaining_supply();
-        let actual_emission = epoch_emission.min(remaining);
-        // Halving awareness.
-        {
-            let block_reward = self.emission.block_reward(height);
-            let reward_comme = block_reward as f64 / UNITS_PER_COMME as f64;
-            let era = height / commputer_consensus::emission::HALVING_INTERVAL;
-            if block_reward == 0 {
-                warn!("All COMME emitted -- block reward is 0 (era {})", era);
-            }
-        }
-
-        // Item 53: Detailed epoch transition logging.
-        info!("--- Epoch {} Transition ---", epoch);
+        // Item 53: Epoch transition logging (bookkeeping only, no emission).
+        info!("--- Epoch {} Transition (bookkeeping) ---", epoch);
         info!("  Validators:       {}", validator_count);
-        info!("  Total emission:   {:.4} COMME", epoch_emission as f64 / UNITS_PER_COMME as f64);
-        info!("  Actual emission:  {:.4} COMME (capped to remaining supply)", actual_emission as f64 / UNITS_PER_COMME as f64);
+        info!("  Total emitted:    {:.4} COMME (via per-block rewards)", self.state.total_emitted as f64 / UNITS_PER_COMME as f64);
         info!("  Total burned:     {:.4} COMME", self.state.total_burned as f64 / UNITS_PER_COMME as f64);
-        info!("  Remaining supply: {:.4} COMME", remaining as f64 / UNITS_PER_COMME as f64);
+        info!("  Remaining supply: {:.4} COMME", self.state.remaining_supply() as f64 / UNITS_PER_COMME as f64);
         {
             let compliant = self.state.accounts.iter()
                 .filter(|a| a.is_validator && a.compliance == commputer_core::compliance::ComplianceStatus::Compliant)
@@ -2144,109 +2129,21 @@ impl EventLoop {
             self.epoch_state.record_summary(summary.clone());
         }
 
-        if actual_emission > 0 {
-            let _allocation =
-                ChannelAllocation::from_demand(actual_emission, &self.epoch_state.demand);
+        // Rewards are now credited per-block during apply_block_validated.
+        // Epoch transitions handle bookkeeping only: scoring, compliance, difficulty.
+        info!(
+            "Epoch {} complete: {} validators (rewards via per-block production)",
+            epoch, validator_count,
+        );
 
-            // Distribute rewards based on composite resource score
-            let summaries: Vec<_> = self.epoch_state.summaries.values().cloned().collect();
-            let total_score: u64 = summaries.iter().map(|s| s.composite_score()).sum();
-
-            if total_score > 0 {
-                let mut distributed = 0u64;
-                for summary in &summaries {
-                    // Feature 124: Only validators in the active set earn rewards.
-                    if !self.epoch_state.is_active_validator(&summary.validator) {
-                        debug!("Skipping reward for {} — not in active validator set", summary.validator);
-                        continue;
-                    }
-
-                    // Feature 125: Slashed validators earn zero.
-                    if self.consensus.is_slashed(&summary.validator) {
-                        warn!("Validator {} slashed for equivocation — zero reward", summary.validator);
-                        continue;
-                    }
-
-                    let score = summary.composite_score();
-                    let reward = actual_emission * score / total_score;
-
-                    if reward > 0 {
-                        // Check compliance — nerfed validators earn less
-                        let compliance = self.compliance.check(&summary.validator);
-                        let effective_reward = match compliance {
-                            commputer_core::compliance::ComplianceStatus::Compliant => reward,
-                            _ => {
-                                let multiplier = self.state.nerf_rate.reward_multiplier();
-                                (reward as f64 * multiplier).round() as u64
-                            }
-                        };
-
-                        if effective_reward > 0 {
-                            let account = self.state.accounts.get_or_create(summary.validator);
-                            if let Some(new_balance) = account.balance.checked_add(
-                                commputer_core::token::Amount::from_raw(effective_reward),
-                            ) {
-                                account.balance = new_balance;
-                                account.total_mined = account
-                                    .total_mined
-                                    .checked_add(
-                                        commputer_core::token::Amount::from_raw(effective_reward),
-                                    )
-                                    .unwrap_or(account.total_mined);
-                                distributed += effective_reward;
-
-                                // Item 13: Create synthetic mining reward tx for history.
-                                let reward_tx = Transaction {
-                                    from: Address([0u8; 32]), // Protocol-issued
-                                    nonce: 0,
-                                    kind: commputer_core::transaction::TxKind::MiningReward {
-                                        to: summary.validator,
-                                        amount: commputer_core::token::Amount::from_raw(effective_reward),
-                                        epoch,
-                                    },
-                                    fee: 0,
-                                    public_key: vec![],
-                                    signature: vec![],
-                                    memo: None,
-                                    timelock: None,
-                                };
-                                // Add to current block's pending txs so it shows in history.
-                                self.pending_txs.push(reward_tx);
-                            }
-                        }
-                    }
-                }
-
-                info!(
-                    "Epoch {} complete: {} validators, emitted {:.4} COMME, distributed to {} accounts",
-                    epoch,
-                    validator_count,
-                    distributed as f64 / UNITS_PER_COMME as f64,
-                    summaries.len(),
-                );
-
-                self.state.emit(distributed);
-
-                // Warn on low remaining supply.
-                let remaining_pct = (self.state.remaining_supply() as f64
-                    / commputer_core::token::TOTAL_SUPPLY as f64) * 100.0;
-                if self.state.is_emergency_access() {
-                    warn!("EMERGENCY ACCESS MODE: circulating supply below 1M COMME — any contribution = full access");
-                }
-                if remaining_pct <= 1.0 {
-                    warn!("CRITICAL: Only {:.2}% of supply remaining ({} raw units)",
-                        remaining_pct, self.state.remaining_supply());
-                } else if remaining_pct <= 5.0 {
-                    warn!("WARNING: Only {:.2}% of supply remaining", remaining_pct);
-                } else if remaining_pct <= 10.0 {
-                    info!("Supply milestone: {:.2}% remaining", remaining_pct);
-                }
-
-                // Persist updated account balances
-                if let Err(e) = self.state.flush() {
-                    warn!("Failed to flush state after epoch: {}", e);
-                }
-            }
+        // Supply status logging.
+        if self.state.is_emergency_access() {
+            warn!("EMERGENCY ACCESS MODE: circulating supply below 1M COMME — any contribution = full access");
+        }
+        let remaining_pct = (self.state.remaining_supply() as f64
+            / commputer_core::token::TOTAL_SUPPLY as f64) * 100.0;
+        if remaining_pct <= 5.0 {
+            warn!("WARNING: Only {:.2}% of supply remaining", remaining_pct);
         }
 
         // Refill grace period for our own validator (1 epoch = 3600s online).
@@ -2333,7 +2230,7 @@ impl EventLoop {
         let epoch_summary = commputer_consensus::epoch::EpochSummary {
             epoch,
             validator_count,
-            total_emission: actual_emission,
+            total_emission: 0, // Emission now per-block, not per-epoch
             difficulty_adjustments: next_difficulty.clone(),
             active_validator_count: self.epoch_state.active_validators.len(),
         };
@@ -2366,7 +2263,7 @@ impl EventLoop {
             .sum();
         self.pending_epoch_summary = Some(commputer_core::block::EpochSummary {
             epoch,
-            total_emission: actual_emission,
+            total_emission: 0, // Emission now per-block, not per-epoch
             total_burned: self.state.total_burned,
             validator_count,
             proof_scores_total,
