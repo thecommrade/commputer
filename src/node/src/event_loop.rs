@@ -290,6 +290,35 @@ impl EventLoop {
         // 8. Reset voted peers tracking.
         self.voted_peers.clear();
 
+        // 9. Re-queue ValidatorRegister transaction (cleared from mempool).
+        // After resync the chain has no validators, so re-registration is needed.
+        if self.validator.status() == ValidatorStatus::Active {
+            let nonce = 0; // Chain was wiped, nonce resets.
+            let mut tx = commputer_core::transaction::Transaction {
+                from: *self.wallet.address(),
+                nonce,
+                kind: commputer_core::transaction::TxKind::ValidatorRegister {
+                    hardware_fingerprint_hash: {
+                        use sha2::{Sha256, Digest};
+                        let hw_bytes = borsh::to_vec(&self.hardware).unwrap_or_default();
+                        let hash = Sha256::digest(&hw_bytes);
+                        let mut out = [0u8; 32];
+                        out.copy_from_slice(&hash);
+                        out
+                    },
+                    contribution_percent: self.validator.contribution_percent(),
+                },
+                fee: 0,
+                signature: vec![],
+                public_key: vec![],
+                memo: None,
+                timelock: None,
+            };
+            commputer_core::signing::sign_transaction(&mut tx, &self.wallet);
+            self.pending_txs.push(tx);
+            info!("Re-queued ValidatorRegister transaction after resync");
+        }
+
         // Record resync time for cooldown.
         self.last_resync = Some(std::time::Instant::now());
 
