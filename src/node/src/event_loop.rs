@@ -2584,18 +2584,25 @@ impl EventLoop {
                     info!("Sent BlockProposal at height {} to {} peers", next_height, peers.len());
                 }
             } else {
-                // Retry: send vote request only to peers who haven't responded yet.
-                if let Some(pref) = self.consensus.query_preference(next_height) {
+                // Retry: send full BlockProposal to peers who haven't voted yet.
+                // Late-joiners (peers who connected after the initial proposal) need the
+                // full block to vote. Sending just a VoteRequest (hash only) would cause
+                // them to respond NotReady because they don't have the block candidate.
+                if let Some(block) = self.consensus.get_candidate_block(next_height) {
+                    let block_bytes = serde_json::to_vec(&block).unwrap_or_default();
                     let non_voters: Vec<libp2p::PeerId> = self.peer_ips.keys()
                         .filter(|p| !self.voted_peers.contains(p))
                         .copied()
                         .collect();
                     for peer in &non_voters {
-                        let request = commputer_network::consensus_protocol::ConsensusRequest::VoteRequest {
+                        let request = commputer_network::consensus_protocol::ConsensusRequest::BlockProposal {
+                            block_bytes: block_bytes.clone(),
                             height: next_height,
-                            block_hash: pref.0,
                         };
                         self.network.swarm.behaviour_mut().consensus.send_request(peer, request);
+                    }
+                    if !non_voters.is_empty() {
+                        info!("Re-sent BlockProposal at height {} to {} non-voters", next_height, non_voters.len());
                     }
                 }
             }
