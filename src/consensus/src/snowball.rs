@@ -56,6 +56,12 @@ impl SnowballVoter {
         Self::new(SnowballParams::default())
     }
 
+    /// Update the voter's parameters (e.g. when network size changes).
+    /// Does not reset preference or confidence state.
+    pub fn set_params(&mut self, params: SnowballParams) {
+        self.params = params;
+    }
+
     /// Whether this voter has reached a final decision.
     pub fn is_finalized(&self) -> bool {
         self.finalized

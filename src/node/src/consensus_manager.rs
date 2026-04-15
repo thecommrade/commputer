@@ -213,6 +213,13 @@ impl ConsensusManager {
         self.params.sample_size = effective_sample;
         self.params.quorum = effective_quorum;
         self.params.decision_threshold = effective_threshold;
+
+        // Propagate to all existing voters so they use current network params.
+        // Without this, voters created at startup keep stale default params
+        // (quorum=2) which prevents finalization with 1 vote (quorum_choice = None).
+        for state in self.heights.values_mut() {
+            state.voter.set_params(self.params.clone());
+        }
     }
 
     /// Create a consensus manager with custom Snowball parameters (Feature 131).
