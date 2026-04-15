@@ -1444,7 +1444,17 @@ impl EventLoop {
                                                 self.try_apply_finalized(height);
                                             }
                                             // Respond with our vote.
-                                            let response = if self.node_state.is_active() {
+                                            // Priority: (1) if chain already has a block at this height,
+                                            // vote for that hash (helps peer converge on the canonical block).
+                                            // (2) else use consensus preference if active.
+                                            // (3) else NotReady.
+                                            let response = if let Some(applied) = self.state.blocks.get_by_height(height) {
+                                                ConsensusResponse::Vote {
+                                                    height,
+                                                    preference: applied.hash().0,
+                                                    accept: true,
+                                                }
+                                            } else if self.node_state.is_active() {
                                                 if let Some(pref) = self.consensus.query_preference(height) {
                                                     ConsensusResponse::Vote {
                                                         height,
@@ -1466,7 +1476,14 @@ impl EventLoop {
                                                 channel, ConsensusResponse::NotReady { height });
                                             return;
                                         }
-                                        let response = if let Some(pref) = self.consensus.query_preference(height) {
+                                        // Priority: if chain already has a block at this height, vote for it.
+                                        let response = if let Some(applied) = self.state.blocks.get_by_height(height) {
+                                            ConsensusResponse::Vote {
+                                                height,
+                                                preference: applied.hash().0,
+                                                accept: true,
+                                            }
+                                        } else if let Some(pref) = self.consensus.query_preference(height) {
                                             ConsensusResponse::Vote {
                                                 height,
                                                 preference: pref.0,
