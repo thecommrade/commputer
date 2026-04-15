@@ -2609,6 +2609,9 @@ impl EventLoop {
 
             // Try to finalize from responses accumulated in previous ticks.
             let result = self.consensus.try_finalize_round(next_height, peer_count);
+            // Clear voted_peers after each round so the next Snowball sampling
+            // round re-queries all peers (needed for decision_threshold rounds).
+            self.voted_peers.clear();
             match result {
                 crate::consensus_manager::ConsensusRoundResult::Finalized => {
                     // Consensus is working -- reset stall timer.
@@ -2619,10 +2622,16 @@ impl EventLoop {
                     if peer_count == 0 {
                         // Solo node: we ARE the network. Self-finalize by voting for our own block.
                         // This is safe because there are no peers to disagree with.
-                        if let Some(pref) = self.consensus.query_preference(next_height) {
-                            self.consensus.record_response(next_height, pref);
-                            // Don't start stall timer for solo nodes -- stalling is expected.
+                        match self.consensus.query_preference(next_height) {
+                            Some(pref) => {
+                                info!("Solo self-vote at height {} for {}", next_height, pref);
+                                self.consensus.record_response(next_height, pref);
+                            }
+                            None => {
+                                warn!("Solo stall at height {} but no preference -- voter not initialized?", next_height);
+                            }
                         }
+                        // Don't start stall timer for solo nodes -- stalling is expected.
                     } else {
                         // Multi-node: start or check stall timer.
                         let stall_start = *self.stall_start.get_or_insert_with(std::time::Instant::now);
