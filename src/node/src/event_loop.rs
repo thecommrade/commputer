@@ -2231,11 +2231,14 @@ impl EventLoop {
         }
 
         // Refill grace period for our own validator (1 epoch = 3600s online).
+        // Only update if our account exists on-chain (via block reward or registration).
+        // Creating an account here would cause state divergence across nodes.
         {
             let our_addr = *self.wallet.address();
-            let account = self.state.accounts.get_or_create(our_addr);
-            account.cumulative_uptime_secs += 3600;
-            account.refill_grace(3600);
+            if let Some(account) = self.state.accounts.get_mut(&our_addr) {
+                account.cumulative_uptime_secs += 3600;
+                account.refill_grace(3600);
+            }
         }
 
         // 120-year inactive wallet cleanup: mark wallets inactive if last active > 120 years ago.
