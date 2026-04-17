@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 use tracing::{info, warn, debug, error};
-use futures::StreamExt;
+use futures::{StreamExt, FutureExt};
 
 use commputer_core::block::{Block, BlockHeader, BlockHash};
 use commputer_core::identity::{Address, HardwareFingerprint};
@@ -614,8 +614,20 @@ impl EventLoop {
             };
 
             tokio::select! {
-                event = self.network.swarm.select_next_some() => {
-                    self.handle_swarm_event(event);
+                swarm_result = std::panic::AssertUnwindSafe(self.network.swarm.select_next_some()).catch_unwind() => {
+                    match swarm_result {
+                        Ok(event) => self.handle_swarm_event(event),
+                        Err(panic_info) => {
+                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            tracing::error!("Caught panic in libp2p swarm: {} — continuing", msg);
+                        }
+                    }
                 }
                 Some(tx) = rpc_recv => {
                     info!("Received transaction from RPC: {}", hex::encode(tx.hash().0));
