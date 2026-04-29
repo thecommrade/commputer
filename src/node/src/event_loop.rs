@@ -2398,6 +2398,34 @@ impl EventLoop {
             }
         }
 
+        // Re-broadcast self-signed ValidatorRegister until it lands on-chain.
+        // Why: the initial gossipsub.publish in auto_register_validator and the
+        // single-shot retry on ConnectionEstablished both race against gossipsub
+        // topic-mesh formation. If the mesh isn't ready, the message is silently
+        // dropped and the joiner is stuck as a non-validator forever.
+        if self.has_ever_connected && self.state.blocks.height() % 15 == 0 {
+            let our_addr = *self.wallet.address();
+            let already_registered = self.state.accounts.get(&our_addr)
+                .map(|a| a.is_validator)
+                .unwrap_or(false);
+            if !already_registered {
+                let pending_register = self.pending_txs.iter()
+                    .find(|tx| tx.from == our_addr
+                        && matches!(tx.kind, commputer_core::transaction::TxKind::ValidatorRegister { .. }))
+                    .cloned();
+                if let Some(tx) = pending_register
+                    && let Ok(data) = serde_json::to_vec(&tx)
+                {
+                    let compressed = commputer_network::compress(&data);
+                    let topic = topics::tx_topic();
+                    match self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed) {
+                        Ok(_) => info!("Re-broadcast ValidatorRegister tx (awaiting on-chain confirmation)"),
+                        Err(e) => debug!("ValidatorRegister re-broadcast failed: {}", e),
+                    }
+                }
+            }
+        }
+
         // Don't produce blocks until node is Active (synced with network).
         if !self.node_state.is_active() {
             return;
@@ -2490,6 +2518,17 @@ impl EventLoop {
 
         // Create a new block with pending transactions (capped to block size limit).
         let mut all_txs = std::mem::take(&mut self.pending_txs);
+        // Drop txs whose nonce is below the sender's current chain nonce —
+        // they were already applied or are duplicates and would fail validation.
+        // Without this filter, stale ValidatorRegister txs (re-broadcast before
+        // the registrant's account is confirmed) cause every produced block
+        // to fail apply_block_validated and stall the chain.
+        all_txs.retain(|tx| {
+            let expected_nonce = self.state.accounts.get(&tx.from)
+                .map(|a| a.nonce)
+                .unwrap_or(0);
+            tx.nonce >= expected_nonce
+        });
         // Feature 6: Sort pending transactions by fee descending (priority).
         all_txs.sort_by(|a, b| b.fee.cmp(&a.fee));
         let txs: Vec<Transaction> = if all_txs.len() > commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK {

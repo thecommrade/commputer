@@ -156,6 +156,11 @@ pub const DUST_LIMIT: u64 = 10_000;
 /// Minimum balance required to register as a validator (0.1 COMME = 10_000_000 raw units).
 pub const MINIMUM_VALIDATOR_STAKE: u64 = 10_000_000;
 
+/// During the first BOOTSTRAP_REGISTRATION_BLOCKS, validator registration is
+/// exempt from the stake requirement so early joiners can register before
+/// they have any COMME. After this height, stake is enforced.
+pub const BOOTSTRAP_REGISTRATION_BLOCKS: u64 = 1000;
+
 /// Number of blocks a newly registered validator must wait before participating in consensus.
 pub const VALIDATOR_COOLDOWN_BLOCKS: u64 = 10;
 

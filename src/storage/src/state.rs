@@ -684,9 +684,12 @@ impl ChainState {
 
             TxKind::ValidatorRegister { .. } => {
                 // Feature 4: Check minimum validator stake.
-                // Exempt during bootstrap era (total emitted < stake threshold) so early
-                // validators can join before enough coins exist to meet the requirement.
-                if self.total_emitted >= commputer_core::transaction::MINIMUM_VALIDATOR_STAKE as u64
+                // Exempt during the first BOOTSTRAP_REGISTRATION_BLOCKS so early
+                // joiners can register before they have any COMME. The previous
+                // exemption used total_emitted, which was crossed by a single
+                // block reward (15.85 COMME >> 0.01 COMME stake), making the
+                // exemption window effectively zero.
+                if self.blocks.height() >= commputer_core::transaction::BOOTSTRAP_REGISTRATION_BLOCKS
                     && sender.balance.raw() < commputer_core::transaction::MINIMUM_VALIDATOR_STAKE
                 {
                     return Err(StateError::InvalidBlock(format!(

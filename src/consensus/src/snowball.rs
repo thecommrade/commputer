@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use commputer_core::block::BlockHash;
 use rand::seq::SliceRandom;
+use tracing::info;
 
 /// Snowball consensus parameters.
 /// These control how quickly the network converges on a decision.
@@ -116,6 +117,10 @@ impl SnowballVoter {
             .find(|&(_, &count)| count >= self.params.quorum)
             .map(|(hash, _)| *hash);
 
+        info!("[SNOWBALL_DBG] record_round responses={:?} quorum={} pref={:?} cc_before={} threshold={} quorum_choice={:?}",
+            responses, self.params.quorum, self.preference, self.consecutive_count,
+            self.params.decision_threshold, quorum_choice);
+
         match quorum_choice {
             Some(choice) => {
                 // Increment confidence for this choice.
@@ -138,6 +143,9 @@ impl SnowballVoter {
                     }
                 }
 
+                info!("[SNOWBALL_DBG] record_round AFTER pref={:?} cc_after={} confidence={:?}",
+                    self.preference, self.consecutive_count, self.confidence);
+
                 // Check if we've reached the decision threshold.
                 if self.consecutive_count >= self.params.decision_threshold {
                     self.finalized = true;
@@ -147,6 +155,7 @@ impl SnowballVoter {
             None => {
                 // No quorum reached — reset consecutive counter.
                 self.consecutive_count = 0;
+                info!("[SNOWBALL_DBG] record_round NO_QUORUM cc_reset_to_0");
             }
         }
 

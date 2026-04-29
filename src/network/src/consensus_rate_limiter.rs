@@ -1,21 +1,9 @@
 // consensus_rate_limiter.rs — Rate limit consensus messages per peer
 //
-// WHAT IT DOES:
-//   Rate limits consensus protocol messages to protect against spam:
-//   - Track votes per peer per height (reject duplicates)
-//   - Max 10 consensus requests per peer per second
-//   - Log but don't ban (could be legitimate retries)
-//   - Uses a token bucket per peer for rate limiting
-//
-// WHERE IT SHOULD GO: src/network/src/consensus_rate_limiter.rs
-//
-// WIRING REQUIRED:
-//   1. Add `pub mod consensus_rate_limiter;` to src/network/src/lib.rs
-//   2. Instantiate ConsensusRateLimiter in the consensus protocol handler
-//   3. Call limiter.check(peer, height) before processing any consensus message
-//   4. Import: use commputer_network::consensus_rate_limiter::ConsensusRateLimiter;
+// Token bucket per peer. Max 10 consensus requests per peer per second.
+// Log but don't ban (could be legitimate retries).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -49,7 +37,6 @@ impl PeerBucket {
 
     /// Try to consume a token. Returns true if request is allowed.
     fn try_consume(&mut self) -> bool {
-        // Refill if window has elapsed
         let now = Instant::now();
         if now.duration_since(self.last_refill) >= RATE_WINDOW {
             self.tokens = MAX_REQUESTS_PER_SECOND;
@@ -68,10 +55,6 @@ impl PeerBucket {
     }
 }
 
-/// Tracks which (peer, height) pairs have already voted.
-/// Prevents duplicate vote counting from the same peer at the same height.
-type PeerVoteKey = (u64, u64); // (peer_id_hash, height)
-
 /// Rate limiter for consensus messages.
 ///
 /// # Usage
@@ -86,12 +69,6 @@ type PeerVoteKey = (u64, u64); // (peer_id_hash, height)
 pub struct ConsensusRateLimiter {
     /// Token buckets per peer (keyed by peer id hash).
     buckets: HashMap<u64, PeerBucket>,
-    /// Set of (peer, height) pairs that have already voted.
-    seen_votes: HashSet<PeerVoteKey>,
-    /// Maximum number of heights to track in seen_votes before pruning.
-    max_tracked_heights: usize,
-    /// The highest height we've seen (for pruning old entries).
-    max_height: u64,
 }
 
 impl ConsensusRateLimiter {
@@ -99,27 +76,16 @@ impl ConsensusRateLimiter {
     pub fn new() -> Self {
         Self {
             buckets: HashMap::new(),
-            seen_votes: HashSet::new(),
-            max_tracked_heights: 200,
-            max_height: 0,
         }
     }
 
-    /// Check whether a consensus message from `peer` at `height` should be processed.
+    /// Check whether a consensus message from `peer` should be processed.
     ///
-    /// Check rate limit only (no vote dedup).
     /// Returns `true` if the peer has not exceeded the rate limit.
-    /// Vote deduplication should be handled on the response side
+    /// Vote deduplication is handled on the response side
     /// (in ConsensusManager::record_response), not here, because
     /// legitimate retries from the leader should not be blocked.
     pub fn check(&mut self, peer_hash: u64, height: u64) -> bool {
-        // Update max height for pruning
-        if height > self.max_height {
-            self.max_height = height;
-            self.maybe_prune(height);
-        }
-
-        // Check rate limit
         let bucket = self.buckets.entry(peer_hash).or_insert_with(PeerBucket::new);
         if !bucket.try_consume() {
             warn!(
@@ -140,26 +106,9 @@ impl ConsensusRateLimiter {
         self.buckets.get(&peer_hash).map(|b| (b.total_requests, b.rejected_requests))
     }
 
-    /// Returns the number of unique (peer, height) votes tracked.
-    pub fn tracked_votes(&self) -> usize {
-        self.seen_votes.len()
-    }
-
-    /// Prune vote records for heights below (max_height - window).
-    fn maybe_prune(&mut self, current_height: u64) {
-        if self.seen_votes.len() < self.max_tracked_heights {
-            return;
-        }
-        // Keep only votes from the last 100 heights
-        let cutoff = current_height.saturating_sub(100);
-        self.seen_votes.retain(|&(_, h)| h > cutoff);
-    }
-
     /// Clear all state (used when the node resets).
     pub fn reset(&mut self) {
         self.buckets.clear();
-        self.seen_votes.clear();
-        self.max_height = 0;
     }
 }
 
@@ -180,19 +129,18 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_vote_rejected() {
+    fn same_peer_same_height_allowed_within_budget() {
         let mut limiter = ConsensusRateLimiter::new();
-        // First vote: allowed
+        // Retries from same peer at same height are allowed (dedup is on response side)
         assert!(limiter.check(1, 100));
-        // Second vote from same peer at same height: rejected
-        assert!(!limiter.check(1, 100), "duplicate vote should be rejected");
+        assert!(limiter.check(1, 100));
     }
 
     #[test]
     fn different_heights_allowed() {
         let mut limiter = ConsensusRateLimiter::new();
         assert!(limiter.check(1, 100));
-        assert!(limiter.check(1, 101)); // different height, allowed
+        assert!(limiter.check(1, 101));
         assert!(limiter.check(1, 102));
     }
 
@@ -200,7 +148,7 @@ mod tests {
     fn different_peers_same_height_allowed() {
         let mut limiter = ConsensusRateLimiter::new();
         assert!(limiter.check(1, 100));
-        assert!(limiter.check(2, 100)); // different peer, same height
+        assert!(limiter.check(2, 100));
         assert!(limiter.check(3, 100));
     }
 
@@ -209,12 +157,10 @@ mod tests {
         let mut limiter = ConsensusRateLimiter::new();
         let peer = 42u64;
 
-        // MAX_REQUESTS_PER_SECOND requests at different heights: all allowed
         for h in 0..MAX_REQUESTS_PER_SECOND as u64 {
             assert!(limiter.check(peer, h), "request {} should be allowed", h);
         }
 
-        // Next request exceeds rate limit (but new height, so not duplicate)
         let over_limit = limiter.check(peer, MAX_REQUESTS_PER_SECOND as u64 + 100);
         assert!(!over_limit, "should be rate limited after {} requests", MAX_REQUESTS_PER_SECOND);
     }
@@ -234,26 +180,16 @@ mod tests {
     }
 
     #[test]
-    fn tracked_votes_count() {
-        let mut limiter = ConsensusRateLimiter::new();
-
-        for h in 0..5 {
-            limiter.check(1, h);
-            limiter.check(2, h);
-        }
-
-        assert_eq!(limiter.tracked_votes(), 10);
-    }
-
-    #[test]
     fn reset_clears_state() {
         let mut limiter = ConsensusRateLimiter::new();
         limiter.check(1, 100);
         limiter.check(2, 200);
         limiter.reset();
 
-        // After reset, same peer+height allowed again
-        assert!(limiter.check(1, 100), "should be allowed after reset");
-        assert_eq!(limiter.tracked_votes(), 1);
+        // After reset, peer stats are gone
+        assert!(limiter.peer_stats(1).is_none());
+        assert!(limiter.peer_stats(2).is_none());
+        // Requests still work
+        assert!(limiter.check(1, 100));
     }
 }
