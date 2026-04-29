@@ -2182,6 +2182,7 @@ impl EventLoop {
         }
 
         // Add to our own mempool so it gets included in the next block we produce.
+        self.mempool_added_at.insert(tx.hash(), std::time::Instant::now());
         self.pending_txs.push(tx);
 
         info!(
