@@ -49,3 +49,4 @@ docs/superpowers/
 
 # Wrangler / Cloudflare
 .wrangler/
+.worktrees/
