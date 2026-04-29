@@ -28,6 +28,23 @@ use commputer_validator::compliance_check::ComplianceChecker;
 use crate::consensus_manager::{ConsensusManager, ConsensusMessage};
 use crate::proof_manager::{ProofManager, ProofMessage};
 
+// ---------------------------------------------------------------------------
+// Peer exchange types (replaces PeerResponse in NetworkMessage)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of peer addresses to include in a single exchange message.
+const MAX_PEERS_PER_EXCHANGE: usize = 20;
+
+/// A peer exchange message — includes our address and addresses of known peers.
+/// Serialized as JSON and published on the TOPIC_PEER_ADDRS topic.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PeerExchangeMessage {
+    /// Per-peer addresses: key = peer_id.to_string() or "us", value = multiaddr strings.
+    peers: HashMap<String, Vec<String>>,
+    /// Sender's own listen addresses.
+    our_addresses: Vec<String>,
+}
+
 /// Feature 172: Minimum peers before we consider the network partitioned.
 /// Item 2: Lowered to 1 — a node with 1 peer should still produce blocks.
 const MINIMUM_PEERS: usize = 1;
@@ -1127,17 +1144,40 @@ impl EventLoop {
                     }
                 } else if topic == topics::TOPIC_PEER_ADDRS {
                     // Feature 6: Handle peer address gossip.
-                    if let Ok(msg) = serde_json::from_slice::<commputer_network::message::NetworkMessage>(&data)
-                        && let commputer_network::message::MessageKind::PeerResponse(peers) = msg.kind {
-                            for peer_info in peers {
-                                // Try to parse the address as a multiaddr and add to Kademlia.
-                                if let Ok(addr) = peer_info.address.parse::<libp2p::Multiaddr>() {
+                    // Updated: deserialize as PeerExchangeMessage (replaces NetworkMessage/PeerResponse).
+                    // The new format includes addresses of ALL known peers, not just the sender.
+                    if let Ok(msg) = serde_json::from_slice::<PeerExchangeMessage>(&data) {
+                        for (peer_str, addrs) in &msg.peers {
+                            // Skip our own entry.
+                            if peer_str == "us" {
+                                continue;
+                            }
+                            // Parse the peer ID.
+                            let peer_id = match peer_str.parse::<libp2p::PeerId>() {
+                                Ok(id) => id,
+                                Err(_) => continue,
+                            };
+                            // Skip already-connected and banned peers.
+                            if self.peer_ips.contains_key(&peer_id)
+                                || self.banned_peers.contains(&peer_id)
+                            {
+                                continue;
+                            }
+                            // Add each address to Kademlia so libp2p can dial them.
+                            for addr_str in addrs.iter().take(2) {
+                                if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
                                     self.network.swarm.behaviour_mut().kademlia.add_address(
-                                        &propagation_source, addr,
+                                        &peer_id, addr,
                                     );
                                 }
                             }
                         }
+                        debug!(
+                            "[peer_exchange] processed exchange from {}: {} peer entries",
+                            propagation_source,
+                            msg.peers.len()
+                        );
+                    }
                 }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -3076,49 +3116,48 @@ impl EventLoop {
     }
 
     /// Feature 169: Peer exchange — share known peer addresses periodically.
+    ///
+    /// Replaced by peer_exchange_fix logic: broadcasts ALL known peer addresses
+    /// (not just our own) so that nodes in a 3+ node network can discover each
+    /// other through a shared seed rather than only learning about the seed itself.
     fn handle_peer_exchange_tick(&mut self) {
-        if self.peer_ips.is_empty() {
-            return;
-        }
-
-        // Build a list of known peers with their addresses.
-        let peer_infos: Vec<commputer_network::message::PeerInfo> = self.peer_ips.values().map(|ip| {
-                commputer_network::message::PeerInfo {
-                    id: commputer_network::peer::PeerId([0u8; 32]), // Placeholder
-                    address: ip.clone(),
-                    port: 9000, // Default port
-                }
-            })
-            .take(20) // Limit to 20 peers per exchange
+        // Build our own listen addresses.
+        let our_addrs: Vec<String> = self.network.swarm.listeners()
+            .map(|a| a.to_string())
             .collect();
 
-        if peer_infos.is_empty() {
-            return;
+        // Build the peer map: "us" + each connected peer with their addresses.
+        let mut peers: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Add ourselves.
+        peers.insert("us".to_string(), our_addrs.clone());
+
+        // Add connected peers — this is the key fix: previously only self was announced.
+        for (peer_id, ip) in self.peer_ips.iter().take(MAX_PEERS_PER_EXCHANGE - 1) {
+            let addrs = vec![
+                format!("/ip4/{}/tcp/30303", ip),
+                format!("/ip4/{}/udp/30303/quic-v1", ip),
+            ];
+            peers.insert(peer_id.to_string(), addrs);
         }
 
-        let msg = commputer_network::message::NetworkMessage {
-            sender: commputer_network::peer::PeerId([0u8; 32]),
-            nonce: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            kind: commputer_network::message::MessageKind::PeerResponse(peer_infos),
+        debug!(
+            "[peer_exchange] building message: {} peer entries (including self)",
+            peers.len()
+        );
+
+        let msg = PeerExchangeMessage {
+            peers,
+            our_addresses: our_addrs,
         };
 
         if let Ok(data) = serde_json::to_vec(&msg) {
-            let compressed = commputer_network::compress(&data);
-            // Feature 6: Publish on dedicated peer_addrs topic.
             let topic = topics::peer_addrs_topic();
-            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed.clone()) {
-                debug!("Failed to publish peer addrs: {}", e);
-            }
-            // Also publish on consensus topic for backward compatibility.
-            let topic_compat = topics::consensus_topic();
-            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic_compat, compressed) {
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, data) {
                 debug!("Failed to publish peer exchange: {}", e);
             }
         }
-        debug!("Shared {} peer addresses via peer exchange", self.peer_ips.len().min(20));
+        debug!("Shared {} peer addresses via peer exchange", self.peer_ips.len().min(MAX_PEERS_PER_EXCHANGE));
     }
 
     /// Feature 171: Send ping to all connected peers for latency measurement.

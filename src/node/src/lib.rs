@@ -8,5 +8,4 @@ pub mod node_state;
 pub mod sync_machine;
 pub mod chain_health_monitor;
 pub mod config_validator;
-pub mod peer_exchange_fix;
 pub mod kademlia_bootstrap_fix;
