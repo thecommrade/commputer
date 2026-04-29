@@ -100,6 +100,8 @@ pub struct RpcState {
     pub cors_origins: String,
     /// Node start time for uptime calculation.
     pub start_time: Instant,
+    /// Chain health monitor snapshot (updated by event loop).
+    pub chain_health: Mutex<serde_json::Value>,
     /// Item 116: Network traffic statistics.
     pub traffic_stats: Mutex<serde_json::Value>,
     /// Item 150: Per-validator proof history for charting.
@@ -1129,13 +1131,14 @@ async fn get_capacity(
     }))
 }
 
-/// GET /health — enhanced health check with uptime and sync status.
+/// GET /health — enhanced health check with uptime, sync status, and chain health.
 async fn get_health_enhanced(
     State(state): State<Arc<RpcState>>,
 ) -> Json<serde_json::Value> {
     let status = state.status.lock().await;
     let peers = state.peers.lock().await;
     let uptime = state.start_time.elapsed().as_secs();
+    let chain_health = state.chain_health.lock().await.clone();
 
     Json(serde_json::json!({
         "healthy": true,
@@ -1146,6 +1149,7 @@ async fn get_health_enhanced(
         "uptime_secs": uptime,
         "synced": true,
         "chain_id": crate::config::DEFAULT_TESTNET_CHAIN_ID,
+        "chain_health": chain_health,
     }))
 }
 
@@ -1268,6 +1272,7 @@ mod tests {
             validator_performance: Mutex::new(HashMap::new()),
             cors_origins: "*".to_string(),
             start_time: Instant::now(),
+            chain_health: Mutex::new(serde_json::json!({})),
             traffic_stats: Mutex::new(serde_json::json!({})),
             proof_history: Mutex::new(HashMap::new()),
             proof_leaderboard: Mutex::new(HashMap::new()),

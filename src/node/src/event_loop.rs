@@ -25,6 +25,7 @@ use commputer_network::topics;
 use commputer_validator::lifecycle::{ValidatorState, ValidatorStatus};
 use commputer_validator::compliance_check::ComplianceChecker;
 
+use commputer::chain_health_monitor::{ChainHealthMonitor, FinalizeMethod};
 use crate::consensus_manager::{ConsensusManager, ConsensusMessage};
 use crate::proof_manager::{ProofManager, ProofMessage};
 
@@ -178,6 +179,8 @@ pub struct EventLoop {
     pub last_resync: Option<std::time::Instant>,
     /// Last time any message was received from each peer (for online/staleness checks).
     pub peer_last_seen: HashMap<libp2p::PeerId, std::time::Instant>,
+    /// Chain health monitor: block freshness, timeout rate, avg block time, active voters.
+    pub health_monitor: ChainHealthMonitor,
 }
 
 impl EventLoop {
@@ -243,6 +246,7 @@ impl EventLoop {
             stall_start: None,
             last_resync: None,
             peer_last_seen: HashMap::new(),
+            health_monitor: ChainHealthMonitor::new(),
         }
     }
 
@@ -488,6 +492,21 @@ impl EventLoop {
                         perf_guard.insert(addr_hex, json);
                     }
                 }
+            }
+
+            // Chain health monitor snapshot.
+            if let Ok(mut ch_guard) = rpc.chain_health.try_lock() {
+                let h = self.health_monitor.health();
+                *ch_guard = serde_json::json!({
+                    "is_healthy": h.is_healthy,
+                    "stuck_seconds": h.stuck_seconds,
+                    "timeout_rate": h.timeout_rate,
+                    "avg_block_time": h.avg_block_time,
+                    "active_voters": h.active_voters,
+                    "total_voters": h.total_voters,
+                    "height": h.height,
+                    "issues": h.issues,
+                });
             }
         }
     }
@@ -1567,6 +1586,8 @@ impl EventLoop {
                                         if accept {
                                             self.consensus.record_response(height, BlockHash(preference));
                                             self.voted_peers.insert(peer);
+                                            let peer_hash = peer.to_bytes()[..8].iter().fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64));
+                                            self.health_monitor.record_vote(peer_hash);
                                         }
                                     }
                                     ConsensusResponse::NotReady { height } => {
@@ -2867,6 +2888,7 @@ impl EventLoop {
                     info!("Finalized and applied block {} at height {}", hash, height);
                     self.fork_detector.record_success();
                     self.stall_start = None;
+                    self.health_monitor.record_block(height, block.header.timestamp, FinalizeMethod::Snowball);
                     self.last_block_seen_time = Some(std::time::Instant::now());
                     self.voted_peers.clear();
                     self.print_status();
