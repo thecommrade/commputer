@@ -37,10 +37,16 @@ body {
 a {
     color: var(--accent);
     text-decoration: none;
+    transition: color 0.2s;
 }
 
 a:hover {
     text-decoration: underline;
+}
+
+a:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }
 
 /* NAV */
@@ -84,11 +90,13 @@ a:hover {
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 1px;
+    transition: color 0.2s;
 }
 
-.nav-links a:hover {
+.nav-links a:hover, .nav-links a:focus {
     color: var(--accent);
     text-decoration: none;
+    outline: none;
 }
 
 /* HERO */
@@ -141,11 +149,17 @@ a:hover {
     cursor: pointer;
     text-transform: uppercase;
     letter-spacing: 1px;
+    transition: background-color 0.2s, transform 0.1s;
 }
 
-.btn-primary:hover {
+.btn-primary:hover, .btn-primary:focus {
     background: var(--accent-dim);
     text-decoration: none;
+    outline: none;
+}
+
+.btn-primary:active {
+    transform: scale(0.98);
 }
 
 .btn-secondary {
@@ -160,11 +174,17 @@ a:hover {
     cursor: pointer;
     text-transform: uppercase;
     letter-spacing: 1px;
+    transition: background-color 0.2s, color 0.2s, transform 0.1s;
 }
 
-.btn-secondary:hover {
+.btn-secondary:hover, .btn-secondary:focus {
     background: rgba(0, 255, 136, 0.1);
     text-decoration: none;
+    outline: none;
+}
+
+.btn-secondary:active {
+    transform: scale(0.98);
 }
 
 /* SECTIONS */
@@ -264,16 +284,24 @@ h3 {
 .principle {
     border: 1px solid var(--border);
     padding: 24px;
+    transition: border-color 0.2s, background-color 0.2s;
+}
+
+.principle:hover {
+    border-color: var(--accent);
+    background: var(--bg-hover);
 }
 
 .principle h3 {
     color: var(--accent);
     margin-bottom: 8px;
+    font-size: 15px;
 }
 
 .principle p {
     font-size: 13px;
     color: var(--text-dim);
+    line-height: 1.6;
 }
 
 /* WHITEPAPER */
@@ -570,9 +598,21 @@ footer {
 
 /* RESPONSIVE */
 @media (max-width: 768px) {
+    html {
+        font-size: 13px;
+    }
+
     .hero-text h1 {
         font-size: 36px;
         letter-spacing: 4px;
+    }
+
+    .tagline {
+        font-size: 16px;
+    }
+
+    .subtitle {
+        font-size: 13px;
     }
 
     .hamburger {
@@ -589,6 +629,11 @@ footer {
         flex-direction: column;
         padding: 16px 24px;
         border-bottom: 1px solid var(--border);
+        z-index: 99;
+    }
+
+    .nav-links a {
+        padding: 8px 0;
     }
 
     .nav-links.open {
@@ -611,12 +656,21 @@ footer {
     .code-block {
         overflow-x: auto;
         -webkit-overflow-scrolling: touch;
+        flex-direction: column;
+        align-items: flex-start;
     }
 
     .code-block code {
         white-space: pre-wrap;
         word-break: break-all;
         font-size: 11px;
+        margin-bottom: 8px;
+    }
+
+    .copy-btn {
+        align-self: flex-start;
+        margin-left: 0;
+        margin-top: 8px;
     }
 
     .steps .step {

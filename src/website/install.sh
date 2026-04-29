@@ -74,9 +74,10 @@ main() {
         LATEST_TAG=$($FETCH "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//' || true)
 
         if [ -z "$LATEST_TAG" ]; then
-            # Fallback to known version
+            # Fallback to known version (update this manually when new versions are released)
             LATEST_TAG="v0.1.0"
-            echo "  Could not fetch latest — using $LATEST_TAG"
+            echo "  WARNING: Could not fetch latest release info — using $LATEST_TAG (fallback)"
+            echo "  If this is an old version, check https://github.com/$REPO/releases"
         fi
         VERSION="$LATEST_TAG"
     fi
