@@ -25,6 +25,10 @@ pub struct PeerInfo {
     pub ip: Option<String>,
     pub validator_address: Option<String>,
     pub compliance_status: Option<String>,
+    /// Last time a message was received from this peer.
+    /// Not serialized — used only for online/staleness checks.
+    #[serde(skip)]
+    pub last_seen: Option<std::time::Instant>,
 }
 
 /// Account balance info returned by the balance endpoint.
@@ -964,6 +968,10 @@ async fn get_validators(
         .filter(|b| b.is_validator)
         .map(|b| {
             let peer = peers.iter().find(|p| p.validator_address.as_deref() == Some(&b.address));
+            let online = peer
+                .and_then(|p| p.last_seen)
+                .map(|last| last.elapsed().as_secs() < 300)
+                .unwrap_or(false);
             serde_json::json!({
                 "address": b.address,
                 "peer_id": peer.map(|p| p.peer_id.as_str()).unwrap_or("offline"),
@@ -971,7 +979,7 @@ async fn get_validators(
                 "balance": b.balance,
                 "total_mined": b.total_mined,
                 "tier": b.tier,
-                "online": peer.is_some(),
+                "online": online,
             })
         })
         .collect();

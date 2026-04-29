@@ -159,6 +159,8 @@ pub struct EventLoop {
     pub stall_start: Option<std::time::Instant>,
     /// Cooldown: when the last chain resync completed. Prevents resync loops from DoS.
     pub last_resync: Option<std::time::Instant>,
+    /// Last time any message was received from each peer (for online/staleness checks).
+    pub peer_last_seen: HashMap<libp2p::PeerId, std::time::Instant>,
 }
 
 impl EventLoop {
@@ -223,6 +225,7 @@ impl EventLoop {
             fork_detector: commputer::fork_detector::ForkDetector::new(),
             stall_start: None,
             last_resync: None,
+            peer_last_seen: HashMap::new(),
         }
     }
 
@@ -368,11 +371,13 @@ impl EventLoop {
                             format!("{:?}", self.compliance.check(addr))
                         })
                     });
+                    let last_seen = self.peer_last_seen.get(peer_id).copied();
                     peers.push(crate::rpc::PeerInfo {
                         peer_id: peer_id.to_string(),
                         ip: Some(ip.clone()),
                         validator_address,
                         compliance_status,
+                        last_seen,
                     });
                 }
                 *peers_guard = peers;
@@ -1073,6 +1078,9 @@ impl EventLoop {
                     .or_default()
                     .messages_received += 1;
 
+                // Refresh last-seen timestamp on every gossip message.
+                self.peer_last_seen.insert(propagation_source, std::time::Instant::now());
+
                 // Item 18: Application-level duplicate message suppression.
                 {
                     use sha2::{Sha256, Digest};
@@ -1190,6 +1198,9 @@ impl EventLoop {
 
                 // Feature 177: Initialize peer quality metrics.
                 self.peer_quality.entry(peer_id).or_default();
+
+                // Track connection as a peer activity timestamp.
+                self.peer_last_seen.insert(peer_id, std::time::Instant::now());
 
                 // Enforce connection limit: max 50 peers.
                 // Feature 170: Geographic diversity — if new peer has unique /16,
@@ -1834,6 +1845,9 @@ impl EventLoop {
         let height = block.height();
         let producer = block.header.producer;
 
+        // Refresh last-seen on block receipt.
+        self.peer_last_seen.insert(source, std::time::Instant::now());
+
         if self.state.blocks.contains(&hash) {
             return; // Already have this block.
         }
@@ -2035,6 +2049,7 @@ impl EventLoop {
             );
             self.peer_validators.insert(source, validator_addr);
             self.verified_peer_validators.insert(source, validator_addr);
+            self.peer_last_seen.insert(source, std::time::Instant::now());
 
             // If we already know this peer's IP, register with compliance checker.
             if let Some(ip) = self.peer_ips.get(&source) {
