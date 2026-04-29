@@ -2845,6 +2845,13 @@ impl EventLoop {
 
                     // Feature 127: Check for orphaned blocks that can now be processed.
                     self.process_orphans(hash);
+
+                    // Prune finalized txs from the local mempool.
+                    let block_tx_hashes: HashSet<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
+                    self.pending_txs.retain(|tx| !block_tx_hashes.contains(&tx.hash()));
+                    for h in &block_tx_hashes {
+                        self.mempool_added_at.remove(h);
+                    }
                 }
                 Err(e) => {
                     warn!("Rejected finalized block {}: {}", hash, e);
