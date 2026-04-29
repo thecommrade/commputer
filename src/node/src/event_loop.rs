@@ -2200,6 +2200,8 @@ impl EventLoop {
         if validator_count == 0 {
             debug!("Epoch {} tick — no validators", epoch);
             self.epoch_state = EpochState::new(epoch + 1, 0);
+            // Bound seen_tx_hashes memory: clear at epoch boundary (txs older than an epoch are either finalized or expired).
+            self.seen_tx_hashes.clear();
             return;
         }
 
@@ -2377,6 +2379,8 @@ impl EventLoop {
         self.epoch_state.difficulty_multiplier = next_difficulty;
         self.epoch_state.snapshot_validators(next_active_validators);
         self.epoch_state.record_summary(self_summary);
+        // Bound seen_tx_hashes memory: clear at epoch boundary (txs older than an epoch are either finalized or expired).
+        self.seen_tx_hashes.clear();
     }
 
     fn handle_block_tick(&mut self) {
