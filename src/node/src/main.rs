@@ -1134,6 +1134,7 @@ async fn run_node(
         validator_performance: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         cors_origins: cors_origins.clone(),
         start_time: std::time::Instant::now(),
+        chain_health: tokio::sync::Mutex::new(serde_json::json!({})),
         traffic_stats: tokio::sync::Mutex::new(serde_json::json!({})),
         proof_history: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         proof_leaderboard: tokio::sync::Mutex::new(std::collections::HashMap::new()),

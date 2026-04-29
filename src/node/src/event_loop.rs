@@ -25,8 +25,26 @@ use commputer_network::topics;
 use commputer_validator::lifecycle::{ValidatorState, ValidatorStatus};
 use commputer_validator::compliance_check::ComplianceChecker;
 
+use commputer::chain_health_monitor::{ChainHealthMonitor, FinalizeMethod};
 use crate::consensus_manager::{ConsensusManager, ConsensusMessage};
 use crate::proof_manager::{ProofManager, ProofMessage};
+
+// ---------------------------------------------------------------------------
+// Peer exchange types (replaces PeerResponse in NetworkMessage)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of peer addresses to include in a single exchange message.
+const MAX_PEERS_PER_EXCHANGE: usize = 20;
+
+/// A peer exchange message — includes our address and addresses of known peers.
+/// Serialized as JSON and published on the TOPIC_PEER_ADDRS topic.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PeerExchangeMessage {
+    /// Per-peer addresses: key = peer_id.to_string() or "us", value = multiaddr strings.
+    peers: HashMap<String, Vec<String>>,
+    /// Sender's own listen addresses.
+    our_addresses: Vec<String>,
+}
 
 /// Feature 172: Minimum peers before we consider the network partitioned.
 /// Item 2: Lowered to 1 — a node with 1 peer should still produce blocks.
@@ -159,6 +177,10 @@ pub struct EventLoop {
     pub stall_start: Option<std::time::Instant>,
     /// Cooldown: when the last chain resync completed. Prevents resync loops from DoS.
     pub last_resync: Option<std::time::Instant>,
+    /// Last time any message was received from each peer (for online/staleness checks).
+    pub peer_last_seen: HashMap<libp2p::PeerId, std::time::Instant>,
+    /// Chain health monitor: block freshness, timeout rate, avg block time, active voters.
+    pub health_monitor: ChainHealthMonitor,
 }
 
 impl EventLoop {
@@ -223,6 +245,8 @@ impl EventLoop {
             fork_detector: commputer::fork_detector::ForkDetector::new(),
             stall_start: None,
             last_resync: None,
+            peer_last_seen: HashMap::new(),
+            health_monitor: ChainHealthMonitor::new(),
         }
     }
 
@@ -368,11 +392,13 @@ impl EventLoop {
                             format!("{:?}", self.compliance.check(addr))
                         })
                     });
+                    let last_seen = self.peer_last_seen.get(peer_id).copied();
                     peers.push(crate::rpc::PeerInfo {
                         peer_id: peer_id.to_string(),
                         ip: Some(ip.clone()),
                         validator_address,
                         compliance_status,
+                        last_seen,
                     });
                 }
                 *peers_guard = peers;
@@ -466,6 +492,21 @@ impl EventLoop {
                         perf_guard.insert(addr_hex, json);
                     }
                 }
+            }
+
+            // Chain health monitor snapshot.
+            if let Ok(mut ch_guard) = rpc.chain_health.try_lock() {
+                let h = self.health_monitor.health();
+                *ch_guard = serde_json::json!({
+                    "is_healthy": h.is_healthy,
+                    "stuck_seconds": h.stuck_seconds,
+                    "timeout_rate": h.timeout_rate,
+                    "avg_block_time": h.avg_block_time,
+                    "active_voters": h.active_voters,
+                    "total_voters": h.total_voters,
+                    "height": h.height,
+                    "issues": h.issues,
+                });
             }
         }
     }
@@ -1073,6 +1114,9 @@ impl EventLoop {
                     .or_default()
                     .messages_received += 1;
 
+                // Refresh last-seen timestamp on every gossip message.
+                self.peer_last_seen.insert(propagation_source, std::time::Instant::now());
+
                 // Item 18: Application-level duplicate message suppression.
                 {
                     use sha2::{Sha256, Digest};
@@ -1119,17 +1163,40 @@ impl EventLoop {
                     }
                 } else if topic == topics::TOPIC_PEER_ADDRS {
                     // Feature 6: Handle peer address gossip.
-                    if let Ok(msg) = serde_json::from_slice::<commputer_network::message::NetworkMessage>(&data)
-                        && let commputer_network::message::MessageKind::PeerResponse(peers) = msg.kind {
-                            for peer_info in peers {
-                                // Try to parse the address as a multiaddr and add to Kademlia.
-                                if let Ok(addr) = peer_info.address.parse::<libp2p::Multiaddr>() {
+                    // Updated: deserialize as PeerExchangeMessage (replaces NetworkMessage/PeerResponse).
+                    // The new format includes addresses of ALL known peers, not just the sender.
+                    if let Ok(msg) = serde_json::from_slice::<PeerExchangeMessage>(&data) {
+                        for (peer_str, addrs) in &msg.peers {
+                            // Skip our own entry.
+                            if peer_str == "us" {
+                                continue;
+                            }
+                            // Parse the peer ID.
+                            let peer_id = match peer_str.parse::<libp2p::PeerId>() {
+                                Ok(id) => id,
+                                Err(_) => continue,
+                            };
+                            // Skip already-connected and banned peers.
+                            if self.peer_ips.contains_key(&peer_id)
+                                || self.banned_peers.contains(&peer_id)
+                            {
+                                continue;
+                            }
+                            // Add each address to Kademlia so libp2p can dial them.
+                            for addr_str in addrs.iter().take(2) {
+                                if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
                                     self.network.swarm.behaviour_mut().kademlia.add_address(
-                                        &propagation_source, addr,
+                                        &peer_id, addr,
                                     );
                                 }
                             }
                         }
+                        debug!(
+                            "[peer_exchange] processed exchange from {}: {} peer entries",
+                            propagation_source,
+                            msg.peers.len()
+                        );
+                    }
                 }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -1190,6 +1257,9 @@ impl EventLoop {
 
                 // Feature 177: Initialize peer quality metrics.
                 self.peer_quality.entry(peer_id).or_default();
+
+                // Track connection as a peer activity timestamp.
+                self.peer_last_seen.insert(peer_id, std::time::Instant::now());
 
                 // Enforce connection limit: max 50 peers.
                 // Feature 170: Geographic diversity — if new peer has unique /16,
@@ -1516,6 +1586,8 @@ impl EventLoop {
                                         if accept {
                                             self.consensus.record_response(height, BlockHash(preference));
                                             self.voted_peers.insert(peer);
+                                            let peer_hash = peer.to_bytes()[..8].iter().fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64));
+                                            self.health_monitor.record_vote(peer_hash);
                                         }
                                     }
                                     ConsensusResponse::NotReady { height } => {
@@ -1834,6 +1906,9 @@ impl EventLoop {
         let height = block.height();
         let producer = block.header.producer;
 
+        // Refresh last-seen on block receipt.
+        self.peer_last_seen.insert(source, std::time::Instant::now());
+
         if self.state.blocks.contains(&hash) {
             return; // Already have this block.
         }
@@ -2035,6 +2110,7 @@ impl EventLoop {
             );
             self.peer_validators.insert(source, validator_addr);
             self.verified_peer_validators.insert(source, validator_addr);
+            self.peer_last_seen.insert(source, std::time::Instant::now());
 
             // If we already know this peer's IP, register with compliance checker.
             if let Some(ip) = self.peer_ips.get(&source) {
@@ -2049,6 +2125,7 @@ impl EventLoop {
         // Item 18-20: Wire compute job transactions into job pool.
         self.process_job_tx(&tx);
 
+        self.mempool_added_at.insert(hash, std::time::Instant::now());
         self.pending_txs.push(tx);
         self.enforce_mempool_limit();
     }
@@ -2182,6 +2259,7 @@ impl EventLoop {
         }
 
         // Add to our own mempool so it gets included in the next block we produce.
+        self.mempool_added_at.insert(tx.hash(), std::time::Instant::now());
         self.pending_txs.push(tx);
 
         info!(
@@ -2198,6 +2276,8 @@ impl EventLoop {
         if validator_count == 0 {
             debug!("Epoch {} tick — no validators", epoch);
             self.epoch_state = EpochState::new(epoch + 1, 0);
+            // Bound seen_tx_hashes memory: clear at epoch boundary (txs older than an epoch are either finalized or expired).
+            self.seen_tx_hashes.clear();
             return;
         }
 
@@ -2375,6 +2455,8 @@ impl EventLoop {
         self.epoch_state.difficulty_multiplier = next_difficulty;
         self.epoch_state.snapshot_validators(next_active_validators);
         self.epoch_state.record_summary(self_summary);
+        // Bound seen_tx_hashes memory: clear at epoch boundary (txs older than an epoch are either finalized or expired).
+        self.seen_tx_hashes.clear();
     }
 
     fn handle_block_tick(&mut self) {
@@ -2517,26 +2599,41 @@ impl EventLoop {
             .unwrap_or(BlockHash::GENESIS);
 
         // Create a new block with pending transactions (capped to block size limit).
-        let mut all_txs = std::mem::take(&mut self.pending_txs);
-        // Drop txs whose nonce is below the sender's current chain nonce —
-        // they were already applied or are duplicates and would fail validation.
-        // Without this filter, stale ValidatorRegister txs (re-broadcast before
-        // the registrant's account is confirmed) cause every produced block
-        // to fail apply_block_validated and stall the chain.
-        all_txs.retain(|tx| {
+        // 3-bucket nonce filter:
+        //   1. strictly-stale  (tx.nonce <  expected): drop permanently — already applied or duplicate.
+        //   2. exact-match     (tx.nonce == expected): include as block candidate.
+        //   3. future-nonce    (tx.nonce >  expected): return to pending_txs for a later block.
+        //
+        // Using '>=' (the previous logic) let future-nonce txs into the candidate list.
+        // apply_transaction requires an exact nonce match and would reject them, causing block
+        // rejection.  Future-nonce txs were also permanently lost because std::mem::take already
+        // emptied pending_txs before the retain ran.
+        let all_txs = std::mem::take(&mut self.pending_txs);
+        let mut candidates: Vec<Transaction> = Vec::new();
+        let mut future_txs: Vec<Transaction> = Vec::new();
+        for tx in all_txs {
             let expected_nonce = self.state.accounts.get(&tx.from)
                 .map(|a| a.nonce)
                 .unwrap_or(0);
-            tx.nonce >= expected_nonce
-        });
-        // Feature 6: Sort pending transactions by fee descending (priority).
-        all_txs.sort_by(|a, b| b.fee.cmp(&a.fee));
-        let txs: Vec<Transaction> = if all_txs.len() > commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK {
-            let overflow = all_txs.split_off(commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK);
-            self.pending_txs = overflow; // Put excess back in mempool.
-            all_txs
+            match tx.nonce.cmp(&expected_nonce) {
+                std::cmp::Ordering::Less    => { /* strictly-stale: drop permanently */ }
+                std::cmp::Ordering::Equal   => candidates.push(tx),
+                std::cmp::Ordering::Greater => future_txs.push(tx),
+            }
+        }
+        // Return future-nonce txs to the mempool so they can be included once
+        // the intermediate nonces land in a confirmed block.
+        self.pending_txs = future_txs;
+        // Feature 6: Sort candidates by (fee desc, nonce asc) using a stable sort so
+        // that within the same sender higher-fee txs sort first but lower nonces always
+        // precede higher nonces for the same fee, preventing N+1-before-N reordering.
+        candidates.sort_by_key(|tx| (std::cmp::Reverse(tx.fee), tx.nonce));
+        let txs: Vec<Transaction> = if candidates.len() > commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK {
+            let overflow = candidates.split_off(commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK);
+            self.pending_txs.extend(overflow); // Put excess back in mempool.
+            candidates
         } else {
-            all_txs
+            candidates
         };
         let mut block = Block {
             header: BlockHeader {
@@ -2791,6 +2888,7 @@ impl EventLoop {
                     info!("Finalized and applied block {} at height {}", hash, height);
                     self.fork_detector.record_success();
                     self.stall_start = None;
+                    self.health_monitor.record_block(height, block.header.timestamp, FinalizeMethod::Snowball);
                     self.last_block_seen_time = Some(std::time::Instant::now());
                     self.voted_peers.clear();
                     self.print_status();
@@ -2828,6 +2926,13 @@ impl EventLoop {
 
                     // Feature 127: Check for orphaned blocks that can now be processed.
                     self.process_orphans(hash);
+
+                    // Prune finalized txs from the local mempool.
+                    let block_tx_hashes: HashSet<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
+                    self.pending_txs.retain(|tx| !block_tx_hashes.contains(&tx.hash()));
+                    for h in &block_tx_hashes {
+                        self.mempool_added_at.remove(h);
+                    }
                 }
                 Err(e) => {
                     warn!("Rejected finalized block {}: {}", hash, e);
@@ -3033,49 +3138,48 @@ impl EventLoop {
     }
 
     /// Feature 169: Peer exchange — share known peer addresses periodically.
+    ///
+    /// Replaced by peer_exchange_fix logic: broadcasts ALL known peer addresses
+    /// (not just our own) so that nodes in a 3+ node network can discover each
+    /// other through a shared seed rather than only learning about the seed itself.
     fn handle_peer_exchange_tick(&mut self) {
-        if self.peer_ips.is_empty() {
-            return;
-        }
-
-        // Build a list of known peers with their addresses.
-        let peer_infos: Vec<commputer_network::message::PeerInfo> = self.peer_ips.values().map(|ip| {
-                commputer_network::message::PeerInfo {
-                    id: commputer_network::peer::PeerId([0u8; 32]), // Placeholder
-                    address: ip.clone(),
-                    port: 9000, // Default port
-                }
-            })
-            .take(20) // Limit to 20 peers per exchange
+        // Build our own listen addresses.
+        let our_addrs: Vec<String> = self.network.swarm.listeners()
+            .map(|a| a.to_string())
             .collect();
 
-        if peer_infos.is_empty() {
-            return;
+        // Build the peer map: "us" + each connected peer with their addresses.
+        let mut peers: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Add ourselves.
+        peers.insert("us".to_string(), our_addrs.clone());
+
+        // Add connected peers — this is the key fix: previously only self was announced.
+        for (peer_id, ip) in self.peer_ips.iter().take(MAX_PEERS_PER_EXCHANGE - 1) {
+            let addrs = vec![
+                format!("/ip4/{}/tcp/30303", ip),
+                format!("/ip4/{}/udp/30303/quic-v1", ip),
+            ];
+            peers.insert(peer_id.to_string(), addrs);
         }
 
-        let msg = commputer_network::message::NetworkMessage {
-            sender: commputer_network::peer::PeerId([0u8; 32]),
-            nonce: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            kind: commputer_network::message::MessageKind::PeerResponse(peer_infos),
+        debug!(
+            "[peer_exchange] building message: {} peer entries (including self)",
+            peers.len()
+        );
+
+        let msg = PeerExchangeMessage {
+            peers,
+            our_addresses: our_addrs,
         };
 
         if let Ok(data) = serde_json::to_vec(&msg) {
-            let compressed = commputer_network::compress(&data);
-            // Feature 6: Publish on dedicated peer_addrs topic.
             let topic = topics::peer_addrs_topic();
-            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, compressed.clone()) {
-                debug!("Failed to publish peer addrs: {}", e);
-            }
-            // Also publish on consensus topic for backward compatibility.
-            let topic_compat = topics::consensus_topic();
-            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic_compat, compressed) {
+            if let Err(e) = self.network.swarm.behaviour_mut().gossipsub.publish(topic, data) {
                 debug!("Failed to publish peer exchange: {}", e);
             }
         }
-        debug!("Shared {} peer addresses via peer exchange", self.peer_ips.len().min(20));
+        debug!("Shared {} peer addresses via peer exchange", self.peer_ips.len().min(MAX_PEERS_PER_EXCHANGE));
     }
 
     /// Feature 171: Send ping to all connected peers for latency measurement.
