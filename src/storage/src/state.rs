@@ -2526,22 +2526,42 @@ mod tests {
 
     #[test]
     fn validator_register_requires_minimum_stake() {
+        // The bootstrap exemption allows registration at height < BOOTSTRAP_REGISTRATION_BLOCKS
+        // regardless of balance. This test verifies the stake check fires AFTER that window.
+
         let mut state = ChainState::new();
         state.apply_block(&genesis_block()).unwrap();
 
-        // Fund sender with less than MINIMUM_VALIDATOR_STAKE.
-        // Also set total_emitted above the threshold so the bootstrap exemption doesn't fire.
         let sender_addr = addr(1);
-        state.total_emitted = commputer_core::transaction::MINIMUM_VALIDATOR_STAKE as u64;
+        let bootstrap_end = commputer_core::transaction::BOOTSTRAP_REGISTRATION_BLOCKS;
+
+        // Advance chain height to past the bootstrap window by inserting a stub block.
+        // This sets blocks.height() >= BOOTSTRAP_REGISTRATION_BLOCKS so the stake check fires.
+        let stub_block = Block {
+            header: BlockHeader {
+                protocol_version: 1, height: bootstrap_end,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
+                timestamp: 9999, producer: addr(0), epoch: 0,
+                producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
+                chain_id: String::new(),
+            },
+            transactions: vec![],
+            proof_summaries: vec![],
+            compliance_summary: None, epoch_summary: None,
+        };
+        state.blocks.put(stub_block);
+
+        // Fund sender with less than MINIMUM_VALIDATOR_STAKE.
         let acct = state.accounts.get_or_create(sender_addr);
         acct.balance = Amount::from_raw(commputer_core::transaction::MINIMUM_VALIDATOR_STAKE - 1);
 
         let block = Block {
             header: BlockHeader {
-                protocol_version: 1, height: 1,
+                protocol_version: 1, height: bootstrap_end + 1,
                 parent_hash: state.blocks.latest().unwrap().hash(),
                 tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
-                timestamp: 2000, producer: addr(0), epoch: 0,
+                timestamp: 10000, producer: addr(0), epoch: 0,
                 producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
                 chain_id: String::new(),
             },
@@ -2559,18 +2579,18 @@ mod tests {
             compliance_summary: None, epoch_summary: None,
         };
         let result = state.apply_block(&block);
-        assert!(result.is_err(), "Validator register with insufficient stake should fail");
+        assert!(result.is_err(), "Validator register with insufficient stake should fail after bootstrap window");
 
-        // Now fund with enough and try again.
+        // Fund with enough and verify registration succeeds.
         let acct = state.accounts.get_or_create(sender_addr);
         acct.balance = Amount::from_raw(commputer_core::transaction::MINIMUM_VALIDATOR_STAKE);
 
         let block2 = Block {
             header: BlockHeader {
-                protocol_version: 1, height: 1,
+                protocol_version: 1, height: bootstrap_end + 1,
                 parent_hash: state.blocks.latest().unwrap().hash(),
                 tx_root: [0u8; 32], proof_root: [0u8; 32], state_root: [0u8; 32],
-                timestamp: 3000, producer: addr(0), epoch: 0,
+                timestamp: 10001, producer: addr(0), epoch: 0,
                 producer_public_key: vec![], signature: vec![], checkpoint_hash: None,
                 chain_id: String::new(),
             },
