@@ -418,7 +418,7 @@ impl ChainState {
         let mut diff = StateDiff::default();
         let mut before_states: HashMap<Address, (u64, u64)> = HashMap::new();
 
-        // Capture producer before-state BEFORE reward is credited.
+        // Capture producer before-state (before reward or any tx).
         if block.height() > 0 {
             let producer = block.header.producer;
             let (bal, nonce) = self.accounts.get(&producer)
@@ -427,9 +427,7 @@ impl ChainState {
             before_states.insert(producer, (bal, nonce));
         }
 
-        // Credit per-block reward to producer before transactions.
-        self.credit_block_reward(block);
-
+        // Capture sender/recipient before-states for all transactions.
         for tx in &block.transactions {
             // Record sender before-state.
             if let std::collections::hash_map::Entry::Vacant(e) = before_states.entry(tx.from) {
@@ -448,10 +446,15 @@ impl ChainState {
                 }
         }
 
-        // Process transactions.
+        // Process transactions — if any fail, no state has been mutated yet.
         for tx in &block.transactions {
             self.apply_transaction(tx)?;
         }
+
+        // Credit per-block reward AFTER all transactions succeed (atomicity).
+        // Moving this here ensures that if any transaction fails, the producer
+        // balance and total_emitted are never mutated for this block.
+        self.credit_block_reward(block);
 
         // Feature 181: Capture after-state and build diff.
         for (addr, (old_bal, old_nonce)) in &before_states {
@@ -541,10 +544,10 @@ impl ChainState {
             }
         }
 
-        // Credit per-block reward to producer before transactions.
-        self.credit_block_reward(block);
-
         // Process transactions and generate receipts.
+        // NOTE: credit_block_reward is intentionally called AFTER this loop so
+        // that if any transaction fails, total_emitted and producer balance are
+        // never mutated (atomicity guarantee).
         let block_hash = block.hash();
         for (i, tx) in block.transactions.iter().enumerate() {
             self.apply_transaction(tx)?;
@@ -562,6 +565,11 @@ impl ChainState {
                 self.history.record(*to, tx_hash);
             }
         }
+
+        // Credit per-block reward AFTER all transactions succeed (atomicity).
+        // If any transaction above failed, we returned Err already — the producer
+        // balance and total_emitted are not mutated for a failed block.
+        self.credit_block_reward(block);
 
         // Store block.
         self.blocks.put(block.clone());
