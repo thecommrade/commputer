@@ -2049,6 +2049,7 @@ impl EventLoop {
         // Item 18-20: Wire compute job transactions into job pool.
         self.process_job_tx(&tx);
 
+        self.mempool_added_at.insert(hash, std::time::Instant::now());
         self.pending_txs.push(tx);
         self.enforce_mempool_limit();
     }
@@ -2518,26 +2519,41 @@ impl EventLoop {
             .unwrap_or(BlockHash::GENESIS);
 
         // Create a new block with pending transactions (capped to block size limit).
-        let mut all_txs = std::mem::take(&mut self.pending_txs);
-        // Drop txs whose nonce is below the sender's current chain nonce —
-        // they were already applied or are duplicates and would fail validation.
-        // Without this filter, stale ValidatorRegister txs (re-broadcast before
-        // the registrant's account is confirmed) cause every produced block
-        // to fail apply_block_validated and stall the chain.
-        all_txs.retain(|tx| {
+        // 3-bucket nonce filter:
+        //   1. strictly-stale  (tx.nonce <  expected): drop permanently — already applied or duplicate.
+        //   2. exact-match     (tx.nonce == expected): include as block candidate.
+        //   3. future-nonce    (tx.nonce >  expected): return to pending_txs for a later block.
+        //
+        // Using '>=' (the previous logic) let future-nonce txs into the candidate list.
+        // apply_transaction requires an exact nonce match and would reject them, causing block
+        // rejection.  Future-nonce txs were also permanently lost because std::mem::take already
+        // emptied pending_txs before the retain ran.
+        let all_txs = std::mem::take(&mut self.pending_txs);
+        let mut candidates: Vec<Transaction> = Vec::new();
+        let mut future_txs: Vec<Transaction> = Vec::new();
+        for tx in all_txs {
             let expected_nonce = self.state.accounts.get(&tx.from)
                 .map(|a| a.nonce)
                 .unwrap_or(0);
-            tx.nonce >= expected_nonce
-        });
-        // Feature 6: Sort pending transactions by fee descending (priority).
-        all_txs.sort_by(|a, b| b.fee.cmp(&a.fee));
-        let txs: Vec<Transaction> = if all_txs.len() > commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK {
-            let overflow = all_txs.split_off(commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK);
-            self.pending_txs = overflow; // Put excess back in mempool.
-            all_txs
+            match tx.nonce.cmp(&expected_nonce) {
+                std::cmp::Ordering::Less    => { /* strictly-stale: drop permanently */ }
+                std::cmp::Ordering::Equal   => candidates.push(tx),
+                std::cmp::Ordering::Greater => future_txs.push(tx),
+            }
+        }
+        // Return future-nonce txs to the mempool so they can be included once
+        // the intermediate nonces land in a confirmed block.
+        self.pending_txs = future_txs;
+        // Feature 6: Sort candidates by (fee desc, nonce asc) using a stable sort so
+        // that within the same sender higher-fee txs sort first but lower nonces always
+        // precede higher nonces for the same fee, preventing N+1-before-N reordering.
+        candidates.sort_by_key(|tx| (std::cmp::Reverse(tx.fee), tx.nonce));
+        let txs: Vec<Transaction> = if candidates.len() > commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK {
+            let overflow = candidates.split_off(commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK);
+            self.pending_txs.extend(overflow); // Put excess back in mempool.
+            candidates
         } else {
-            all_txs
+            candidates
         };
         let mut block = Block {
             header: BlockHeader {
