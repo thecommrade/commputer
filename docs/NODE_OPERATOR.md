@@ -1,5 +1,38 @@
 # Commputer Node Operator Guide
 
+## Quick Start (5 Minutes)
+
+Get a node running and mining $COMME immediately:
+
+```bash
+# 1. Build the node
+cd ~/Coin/src
+cargo build --release -p commputer-node
+cd ../..
+
+# 2. Create a wallet (saves to ~/.commputer/keystore.json)
+./target/release/commputer-node wallet create
+# You will be prompted for a password. Save your 24-word seed phrase securely.
+
+# 3. Start the node (runs testnet by default)
+./target/release/commputer-node run --port 9000 --rpc-port 9944 --contribution-percent 100
+```
+
+**That's it.** Your node is now:
+- Generating and validating blocks
+- Running proof challenges across all five channels
+- Accumulating $COMME in your wallet
+- Visible on the network
+
+Check your balance anytime:
+```bash
+curl -s http://127.0.0.1:9944/health | jq .
+```
+
+To stop, press `Ctrl+C`. Your wallet and chain data persist.
+
+---
+
 ## Hardware Requirements
 
 ### Minimum (Reference Node)

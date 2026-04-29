@@ -1,5 +1,13 @@
 # Commputer Glossary
 
+## Core Roles
+
+**Validator** — A node operator registered with the protocol to produce blocks, earn rewards, and validate proofs. Validators run the `commputer-node` software and submit `ValidatorRegister` transactions. A single person can run only one compliant validator; additional nodes face exponential reward decay (see Exponential Decay).
+
+**Contributor** — A node operator actively running proof challenges across one or more of the five proof channels (CPU, GPU, storage, RAM, bandwidth). All validators are contributors, but the term emphasizes the resource-submission role. Contributions are measured and rewarded each epoch.
+
+**Holder** — Anyone who owns $COMME tokens, regardless of whether they run a node. Holders vote on charitable donations, access features based on their tier, and can submit compute jobs. A holder may or may not be a validator.
+
 ## Protocol Terms
 
 **Commputer** — A Layer 1 blockchain that coordinates a distributed supercomputer built from small contributions by regular people.

@@ -244,3 +244,99 @@ curl -s http://127.0.0.1:9944/storage/metrics | jq .
   "avg_write_us": 85
 }
 ```
+
+## Validators List
+
+```bash
+curl -s http://127.0.0.1:9944/validators | jq .
+```
+```json
+{
+  "epoch": 34,
+  "total_validators": 50,
+  "validators": [
+    {
+      "address": "comme:a1b2c3d4",
+      "composite_score": 98500,
+      "proof_channel_scores": {
+        "processing": 25000,
+        "gpu": 30000,
+        "storage": 20000,
+        "ram": 15000,
+        "bandwidth": 8500
+      },
+      "compliance_status": "Compliant",
+      "nerfed": false,
+      "contribution_percent": 100
+    }
+  ]
+}
+```
+
+## Grace Balance (for "Earn It" Contributors)
+
+```bash
+curl -s http://127.0.0.1:9944/grace-balance/a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 | jq .
+```
+```json
+{
+  "address": "a1b2c3d4...",
+  "grace_balance_days": 365,
+  "max_grace_days": 3650,
+  "grace_drain_rate": 1.0,
+  "grace_refill_rate": 2.0,
+  "contribution_history_days": 365,
+  "offline_since": null
+}
+```
+
+## Will Function Configuration
+
+```bash
+curl -s http://127.0.0.1:9944/will/a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2 | jq .
+```
+```json
+{
+  "address": "a1b2c3d4...",
+  "emergency_contacts": [
+    {
+      "email": "contact@example.com",
+      "phone": "+1-555-0123"
+    }
+  ],
+  "storage_grace_period_days": 730,
+  "will_configured": true,
+  "last_updated_block": 1200
+}
+```
+
+## Register as Validator
+
+```bash
+# This is a high-level description. Actual tx submission requires signing.
+# See CONFIGURATION.md for CLI command: commputer-node wallet create
+
+# Transaction payload structure:
+curl -s -X POST http://127.0.0.1:9944/tx \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+    "nonce": 0,
+    "kind": {
+      "ValidatorRegister": {
+        "hardware_fingerprint_hash": "abcd1234...",
+        "contribution_percent": 100
+      }
+    },
+    "fee": 100000,
+    "signature": [/* 64 bytes Ed25519 */],
+    "public_key": [/* 32 bytes Ed25519 */]
+  }' | jq .
+```
+```json
+{
+  "accepted": true,
+  "tx_hash": "f1e2d3c4b5a6...",
+  "message": "Validator registration submitted. Will be active next epoch."
+}
+```

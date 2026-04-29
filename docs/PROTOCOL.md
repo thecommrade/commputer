@@ -119,3 +119,69 @@ Challenge seeds are deterministic: `SHA-256(block_hash || epoch || validator_add
 - Per-channel: score^0.7 (sub-linear, penalizes over-investment)
 - Diversity bonus: up to 25% for contributing across all 5 channels
 - Formula: `sum(channel_score^0.7) * (1 + diversity_bonus/200) * 100`
+
+## Wire Format
+
+### Gossipsub Topics
+
+All messages are published on gossipsub topics prefixed by `/commputer/0.1.0/`:
+
+| Topic | Direction | Message Type | Encoding |
+|---|---|---|---|
+| `blocks` | Broadcast | Block | Borsh |
+| `transactions` | Broadcast | Transaction | Borsh |
+| `proofs` | Broadcast | ProofResult | Borsh |
+| `compliance-updates` | Broadcast | ComplianceSummary | Borsh |
+| `consensus-votes` | Broadcast | SnowballVote | Borsh |
+
+### Transaction Encoding (Borsh)
+
+Binary transaction format as sent over the wire:
+
+1. **from** (32 bytes): Ed25519 address (fixed array)
+2. **nonce** (8 bytes): u64, little-endian
+3. **kind** (variable): TxKind enum tag + payload
+   - Tag 0: Transfer (8 + 8 = 16 bytes: `to_addr || amount`)
+   - Tag 1: ValidatorRegister (32 + 1 = 33 bytes: `fingerprint_hash || contribution_percent`)
+   - Tag 2: ValidatorUpdate (1 byte: `contribution_percent`)
+   - Tag 3: ValidatorExit (0 bytes)
+   - Tag 4: BurstCompute (1 + 8 + 32 = 41 bytes: `channel_tag || burn_amount || job_hash`)
+   - Tag 5: StorageWill (variable: `num_contacts || contact_emails || contact_phones`)
+   - Tag 6-8: Other transaction types
+4. **fee** (8 bytes): u64, little-endian
+5. **signature** (64 bytes): Ed25519 signature
+6. **public_key** (32 bytes): Ed25519 public key
+
+**Total minimum size**: 32 + 8 + 1 + 8 + 64 + 32 = 145 bytes
+
+### Block Encoding (Borsh)
+
+Header + Body structure:
+
+**Header (196 bytes minimum):**
+- protocol_version: u32 (4 bytes)
+- height: u64 (8 bytes)
+- parent_hash: [u8; 32] (32 bytes)
+- tx_root: [u8; 32] (32 bytes)
+- proof_root: [u8; 32] (32 bytes)
+- state_root: [u8; 32] (32 bytes)
+- timestamp: u64 (8 bytes)
+- producer: [u8; 32] (32 bytes)
+- epoch: u64 (8 bytes)
+- producer_public_key: Vec\<u8\> (4 bytes length + 32 bytes data)
+- signature: Vec\<u8\> (4 bytes length + 64 bytes data)
+
+**Body (variable):**
+- transactions: Vec\<Transaction\> (serialized as above)
+- proof_summaries: Vec\<EpochProofSummary\> (per-validator proof scores)
+- compliance_summary: Option\<ComplianceSummary\>
+
+### Serialization Library
+
+All messages use **Borsh** (Binary Object Representation Serializer for Hashing):
+- Deterministic binary encoding
+- No version markers
+- Big-endian for multi-byte integers
+- Length-prefixed variable-length data
+
+Example: A 100-byte transaction serializes to exactly 100 bytes with no framing overhead.

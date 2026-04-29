@@ -46,25 +46,27 @@ Three rules are enshrined in this whitepaper and will never change:
 
 Commputer launches as a working L1 blockchain. A Rust CLI node. Here is what it does differently.
 
+**Feature Status Legend:** ✅ = Live in Phase 1 | 🔧 = In Flight (Phase 2) | 📋 = Planned (Phase 3+)
+
 ### The Coin: $COMME
 
-A Layer 1 token with a fixed supply of 2,000,000,000 earned by contributing idle computer resources. Five proof channels verified from day one: CPU, GPU, storage, RAM, and bandwidth. Burn mechanics active at launch. Full anti-scale protections enforced from block one.
+✅ A Layer 1 token with a fixed supply of 2,000,000,000 earned by contributing idle computer resources. Five proof channels verified from day one: CPU, GPU, storage, RAM, and bandwidth. Burn mechanics active at launch. Full anti-scale protections enforced from block one.
 
 ### Multi-Dimensional Proof of Work
 
-Every other PoW chain mines on a single axis. Commputer validates across five parallel channels — CPU, GPU, storage, RAM, and bandwidth — running asynchronously. A well-rounded home desktop contributing across all five channels earns a diversity bonus. Specialized farms earn less per unit than balanced machines. The protocol rewards the kind of computer real people actually own.
+✅ Every other PoW chain mines on a single axis. Commputer validates across five parallel channels — CPU, GPU, storage, RAM, and bandwidth — running asynchronously. A well-rounded home desktop contributing across all five channels earns a diversity bonus. Specialized farms earn less per unit than balanced machines. The protocol rewards the kind of computer real people actually own.
 
 ### Demand-Weighted Emission
 
-Total emission per epoch is split across the five proof channels based on what the network actually needs, with guaranteed minimum floors so no channel ever goes to zero. If the network needs more storage, storage proofs pay more. If GPUs are scarce, GPU contributors earn more. The network self-balances its own resource composition without governance votes or manual intervention.
+✅ Total emission per epoch is split across the five proof channels based on what the network actually needs, with guaranteed minimum floors so no channel ever goes to zero. If the network needs more storage, storage proofs pay more. If GPUs are scarce, GPU contributors earn more. The network self-balances its own resource composition without governance votes or manual intervention.
 
 ### Anti-Scale Enforcement
 
-The ideal Commputer validator is a regular person running one desktop at home. That is who the economics favor. A second node from the same operator earns 25% per unit. A third earns 6%. A fifth earns effectively zero. Datacenter patterns are detected and penalized. The adaptive nerf starts at 80% and can only increase, never decrease. The long-term target is 100% — zero rewards for cheaters. Details in Section 6.
+🔧 The ideal Commputer validator is a regular person running one desktop at home. That is who the economics favor. A second node from the same operator earns 25% per unit. A third earns 6%. A fifth earns effectively zero. Datacenter patterns are detected and penalized. The adaptive nerf starts at 80% and can only increase, never decrease. The long-term target is 100% — zero rewards for cheaters. Details in Section 6.
 
 ### Dual Burn Mechanics
 
-Supply only goes down. Milestone burns trigger automatically when the network hits capacity thresholds. Burst compute burns let holders spend $COMME on temporary compute beyond their tier — permanently burned. Transaction fees are burned. Details in Section 7.
+✅ Supply only goes down. Milestone burns trigger automatically when the network hits capacity thresholds. 🔧 Burst compute burns let holders spend $COMME on temporary compute beyond their tier — permanently burned. ✅ Transaction fees are burned. Details in Section 7.
 
 ### P2P Networking
 
@@ -92,7 +94,7 @@ The anonymous founder has no special treatment. No premine. No dev tax. No hidde
 
 ### Desktop App (Tauri GUI)
 
-Commputer launches as a CLI node for people comfortable with a terminal. The desktop app comes next — single download, cross-platform, install it like any other application. Resource slider from 1% to 100%. Auto-throttles when you are using your machine. Clear dashboard showing contributions, earnings, compliance status, and grace balance. Dead simple.
+📋 Commputer launches as a CLI node for people comfortable with a terminal. The desktop app comes next — single download, cross-platform, install it like any other application. Resource slider from 1% to 100%. Auto-throttles when you are using your machine. Clear dashboard showing contributions, earnings, compliance status, and 🔧 grace balance. Dead simple.
 
 ### Communication Layer
 - Personal email server
@@ -268,11 +270,11 @@ Floors are protocol-enforced. The remaining 60% floats to where demand is highes
 
 **2. Usage Burns** — Holders can spend $COMME on burst compute beyond their tier allocation. This is permanently burned. The price of burst compute in $COMME is tied to the gold standard benchmark scores described above for one year of usage. Pricing scales with network demand: cheap when the network has surplus, prohibitively expensive near capacity. Near capacity, the message is clear: stop buying, start recruiting validators. Enforced when compute jobs go live.
 
-**Storage protections:** Burst storage comes with a 2-year grace period to retrieve data should someone fall on hard times. All storage includes the ability to register email addresses and phone numbers that the blockchain will contact if the grace period is triggered. Enforced when storage allocations go live.
+**Storage protections:** 🔧 Burst storage comes with a 2-year grace period to retrieve data should someone fall on hard times. All storage includes the ability to register email addresses and phone numbers that the blockchain will contact if the grace period is triggered. Enforced when storage allocations go live.
 
 **Local-first storage:** Your data lives on your own machine first. Always. The network only stores what doesn't fit locally. If you contribute a full desktop with 2TB of storage, nearly all your files stay on your hardware — at local disk speed, under your control. Only the overflow goes to the communal pool. This is not cloud storage where everything is remote. It is local storage with a network safety net. Contributors with powerful machines barely depend on the network for their own data. Those with smaller machines rely on the pool more — and that is what the pool is for. If your machine goes offline, the network holds your backup. If it comes back, your data is still right where you left it.
 
-**The Will Function:** In the event of a holder's death, the protocol provides customizable execution options for their stored data. Every attempt will be made to contact listed persons throughout the grace period. For those listed contacts, no payment is required to download photos, videos, media, or any personal data. This is infrastructure designed for life, not a project interested in profiting from misfortune. Enforced when storage allocations go live. The transaction type exists in the protocol today; the execution logic activates when the network has storage capacity to protect.
+**The Will Function:** 🔧 In the event of a holder's death, the protocol provides customizable execution options for their stored data. Every attempt will be made to contact listed persons throughout the grace period. For those listed contacts, no payment is required to download photos, videos, media, or any personal data. This is infrastructure designed for life, not a project interested in profiting from misfortune. Enforced when storage allocations go live. The transaction type exists in the protocol today; the execution logic activates when the network has storage capacity to protect.
 
 **3. Transaction Fee Burns** — 100% of transaction fees are burned. No treasury split, no automatic allocation. The protocol is neutral. Supply only goes down.
 
@@ -289,7 +291,7 @@ Floors are protocol-enforced. The remaining 60% floats to where demand is highes
 
 ### Grace Period
 
-Life happens. For contributors on the "Earn It" path, the protocol provides a grace period proportional to their contribution history:
+🔧 Life happens. For contributors on the "Earn It" path, the protocol provides a grace period proportional to their contribution history:
 
 - 15 days contributing = 15 days grace
 - 1 year = 1 year
@@ -319,7 +321,7 @@ The node software is written in Rust — the language the most battle-tested mod
 
 ### Compute Jobs
 
-The pooled resources are not theoretical. They are usable. Here is how:
+📋 The pooled resources are not theoretical. They are usable. Here is how:
 
 **Submitting a job:** A holder spends $COMME to submit a compute job — train a model, process a dataset, run inference, render video, anything that requires compute. The spent $COMME is permanently burned. The job specification describes resource requirements (CPU, GPU, RAM, storage, bandwidth), maximum duration, and the work to be done.
 
