@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Commputer — Network Stats</title>
+    <meta name="description" content="Real-time Commputer network statistics: block height, validators, circulating supply, burned coins, peer count.">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <nav id="nav" aria-label="Main navigation">
+        <div class="nav-inner">
+            <a href="index.html" class="nav-logo">COMMPUTER</a>
+            <button class="hamburger" id="hamburger" aria-label="Toggle menu">
+                <span></span><span></span><span></span>
+            </button>
+            <div class="nav-links" id="nav-links">
+                <a href="index.html#dashboard">Dashboard</a>
+                <a href="index.html#whitepaper">Whitepaper</a>
+                <a href="index.html#download">Download</a>
+                <a href="stats.html" style="color: var(--accent);">Network Stats</a>
+                <a href="operator.html">Run a Node</a>
+            </div>
+        </div>
+    </nav>
+
+    <main>
+        <section style="min-height: 80vh; display: flex; align-items: center; justify-content: center; text-align: center; padding: 120px 24px 80px;">
+            <div style="max-width: 1000px; width: 100%;">
+                <h1 style="font-size: 48px; font-weight: 700; color: var(--accent); letter-spacing: 6px; margin-bottom: 24px;">Network Status</h1>
+
+                <div class="status-badge" id="status-badge" style="justify-content: center; margin-bottom: 48px;">
+                    <span class="status-dot offline"></span>
+                    <span id="status-text">Connecting...</span>
+                </div>
+
+                <div class="stats-grid" style="margin-bottom: 48px;">
+                    <div class="stat">
+                        <span class="stat-label">BLOCK HEIGHT</span>
+                        <span class="stat-value" id="stat-height">—</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">VALIDATORS</span>
+                        <span class="stat-value" id="stat-validators">—</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">EPOCH</span>
+                        <span class="stat-value" id="stat-epoch">—</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">CIRCULATING</span>
+                        <span class="stat-value" id="stat-circulating">—</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">TOTAL BURNED</span>
+                        <span class="stat-value" id="stat-burned">—</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">REMAINING SUPPLY</span>
+                        <span class="stat-value" id="stat-remaining">—</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">PENDING TXS</span>
+                        <span class="stat-value" id="stat-pending">—</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">ACCOUNTS</span>
+                        <span class="stat-value" id="stat-accounts">—</span>
+                    </div>
+                </div>
+
+                <p class="stat-note" id="stat-note" style="text-align: center;">Last updated: never</p>
+
+                <div style="margin-top: 48px;">
+                    <div id="recent-blocks" style="text-align: left; max-width: 100%; overflow-x: auto;">
+                        <h2 style="font-size: 14px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 2px; margin-bottom: 24px; text-align: center;">// Recent Blocks</h2>
+                        <table class="blocks-table" id="blocks-table">
+                            <thead>
+                                <tr><th>Height</th><th>Hash</th><th>Time</th><th>Txs</th></tr>
+                            </thead>
+                            <tbody id="blocks-tbody">
+                                <tr><td colspan="4" class="empty">Connecting to network...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div style="margin-top: 48px; text-align: center;">
+                    <a href="index.html" class="btn-secondary">Back to Home</a>
+                </div>
+            </div>
+        </section>
+
+        <footer>
+            <div class="footer-inner">
+                <p class="footer-motto">A communal supercomputer for the people, by the people.</p>
+                <p class="footer-motto-sub">The wine of technology. Patience will reward you.</p>
+                <div class="footer-links">
+                    <a href="https://github.com/thecommrade/commputer">GitHub</a>
+                    <a href="index.html#whitepaper">Whitepaper</a>
+                    <a href="#">Twitter</a>
+                </div>
+                <p class="footer-copy">$COMME &middot; 2B supply &middot; burn-heavy &middot; scale hurts</p>
+            </div>
+        </footer>
+    </main>
+
+    <script src="app.js"></script>
+    <script>
+    // Override the refresh behavior to also update footer height
+    const statsPage = true;
+
+    // Hamburger menu toggle
+    (function() {
+        var hamburger = document.getElementById('hamburger');
+        var navLinks = document.getElementById('nav-links');
+        if (hamburger && navLinks) {
+            hamburger.addEventListener('click', function() {
+                navLinks.classList.toggle('open');
+                hamburger.classList.toggle('active');
+            });
+        }
+    })();
+
+    // Keyboard navigation
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+            document.activeElement.blur();
+            var navLinks = document.getElementById('nav-links');
+            if (navLinks) navLinks.classList.remove('open');
+            var hamburger = document.getElementById('hamburger');
+            if (hamburger) hamburger.classList.remove('active');
+        }
+    });
+    </script>
+</body>
+</html>

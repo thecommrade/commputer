@@ -20,18 +20,18 @@
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <nav id="nav">
+    <nav id="nav" aria-label="Main navigation">
         <div class="nav-inner">
-            <a href="#" class="nav-logo">COMMPUTER</a>
+            <a href="index.html" class="nav-logo">COMMPUTER</a>
             <button class="hamburger" id="hamburger" aria-label="Toggle menu">
                 <span></span><span></span><span></span>
             </button>
             <div class="nav-links" id="nav-links">
                 <a href="#dashboard">Dashboard</a>
+                <a href="stats.html">Stats</a>
                 <a href="#whitepaper">Whitepaper</a>
                 <a href="#download">Download</a>
-                <a href="#explorer">Explorer</a>
-                <a href="#start">Get Started</a>
+                <a href="operator.html">Run a Node</a>
             </div>
         </div>
     </nav>
@@ -44,8 +44,8 @@
                 <p class="tagline">A communal supercomputer for the people, by the people.</p>
                 <p class="subtitle">Give a little of your computer. Earn $COMME. Own a piece of a machine that grows forever.</p>
                 <div class="hero-actions">
-                    <a href="#download" class="btn-primary">Download Node</a>
-                    <a href="#start" class="btn-secondary">Get Started</a>
+                    <a href="operator.html" class="btn-primary">Run a Node (5 min)</a>
+                    <a href="#download" class="btn-secondary">Download</a>
                 </div>
             </div>
         </section>
@@ -101,7 +101,27 @@
                 <p>Commputer is a Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources.</p>
                 <p>No datacenters. No mining farms. No e-waste. Your existing computer is enough.</p>
                 <p>Contribute a small slice of your machine's idle resources. Earn $COMME. The more people join, the more powerful everyone's share becomes.</p>
-                <p>Today, the network is the product. The chain runs, coins are mined, supply burns. The products built on top — storage, communication, AI — come as the pooled resources grow large enough to support them. We don't promise what doesn't exist yet. We show you a dashboard with real numbers and let you decide if the direction is worth your idle CPU cycles.</p>
+            </div>
+            <div style="background: var(--bg-card); border: 1px solid var(--border); padding: 24px; margin-bottom: 32px;">
+                <h3 style="color: var(--accent); margin-bottom: 12px;">What's Live Right Now</h3>
+                <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px;"><strong style="color: var(--text);">Phase 1: Consensus Stability (Live)</strong></p>
+                <ul style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px; padding-left: 24px;">
+                    <li>Testnet running: consensus works, blocks finalize, coins are mined and burned</li>
+                    <li>Real network stats: peer count, block height, circulating supply, epoch number</li>
+                    <li>Validator registration: run a node, stake 0.01 COMME, earn block rewards</li>
+                    <li>Block explorer: search blocks by height, view transactions, trace accounts</li>
+                </ul>
+                <p style="font-size: 13px; color: var(--text-dim);"><strong style="color: var(--text);">Phase 2: In Flight</strong></p>
+                <ul style="font-size: 13px; color: var(--text-dim); padding-left: 24px;">
+                    <li>Proof-of-work scoring (weighted by machine capacity)</li>
+                    <li>Anti-scale enforcement (single desktop max, warehouse penalty)</li>
+                    <li>Grace periods (offline uptime tolerance)</li>
+                    <li>Burn events (transaction fees, milestones, incentive burns)</li>
+                    <li>Tier system (resource access levels)</li>
+                    <li>Will-function (persistent backup state)</li>
+                </ul>
+                <p style="font-size: 13px; color: var(--text-dim); margin-top: 12px;"><strong style="color: var(--text);">Products (Storage, Communication, AI) — Launching as Network Capacity Grows</strong></p>
+                <p style="font-size: 13px; color: var(--text-dim);">Products are built only when the network's pooled resources are large and stable enough to support them reliably. We don't promise what doesn't exist yet. The dashboard shows real-time capacity so you can see exactly how close we are. Check back as the network grows.</p>
             </div>
             <div class="principles">
                 <div class="principle">
@@ -190,42 +210,10 @@
         <!-- GET STARTED -->
         <section id="start">
             <h2>// Get Started</h2>
-            <div class="steps">
-                <div class="step">
-                    <span class="step-num">01</span>
-                    <h3>Download</h3>
-                    <p>Get the node binary for your platform. One file, no dependencies.</p>
-                    <div class="code-block">
-                        <code>curl -sSf https://commputer.xyz/install.sh | sh</code>
-                        <button class="copy-btn" onclick="copyText('curl -sSf https://commputer.xyz/install.sh | sh')">copy</button>
-                    </div>
-                </div>
-                <div class="step">
-                    <span class="step-num">02</span>
-                    <h3>Start Mining</h3>
-                    <p>Run the node. A wallet is created automatically on first run. Write down your seed phrase.</p>
-                    <div class="code-block">
-                        <code>commputer run --testnet</code>
-                        <button class="copy-btn" onclick="copyText('commputer run --testnet')">copy</button>
-                    </div>
-                </div>
-                <div class="step">
-                    <span class="step-num">03</span>
-                    <h3>Wait for Rewards</h3>
-                    <p>Your node connects, syncs, registers as a validator, and starts solving proof challenges. First reward comes at the next epoch boundary.</p>
-                    <div class="code-block">
-                        <code>commputer status --testnet</code>
-                        <button class="copy-btn" onclick="copyText('commputer status --testnet')">copy</button>
-                    </div>
-                </div>
-                <div class="step">
-                    <span class="step-num">04</span>
-                    <h3>Earn $COMME</h3>
-                    <p>Your idle resources contribute to the communal supercomputer. You earn $COMME for every proof you complete. Check your balance anytime.</p>
-                    <div class="code-block">
-                        <code>commputer wallet show</code>
-                        <button class="copy-btn" onclick="copyText('commputer wallet show')">copy</button>
-                    </div>
+            <div class="content-block">
+                <p>Running a Commputer node takes 5 minutes. We've written a detailed operator guide that walks you through each step — installation, syncing, registration, and claiming rewards.</p>
+                <div style="margin-top: 24px;">
+                    <a href="operator.html" class="btn-primary">Read the Operator Guide</a>
                 </div>
             </div>
 
