@@ -322,7 +322,6 @@ impl ConsensusManager {
             && !state.voter.is_finalized() {
                 let entry = state.round_responses.entry(preference).or_insert(0);
                 *entry += 1;
-                info!("[SNOWBALL_DBG] record_response h={} pref={} count={}", height, preference, *entry);
             }
     }
 
@@ -337,15 +336,8 @@ impl ConsensusManager {
 
             // Try to finalize from accumulated peer votes FIRST.
             if !state.round_responses.is_empty() {
-                let pref_before = state.voter.preference();
                 let responses = std::mem::take(&mut state.round_responses);
-                info!("[SNOWBALL_DBG] try_finalize h={} responses={:?} pref_before={:?} params(sample={},quorum={},threshold={})",
-                    height, responses, pref_before,
-                    self.params.sample_size, self.params.quorum, self.params.decision_threshold);
                 let finalized = state.voter.record_round(&responses);
-                let pref_after = state.voter.preference();
-                info!("[SNOWBALL_DBG] after_record h={} pref_after={:?} finalized={}",
-                    height, pref_after, finalized);
                 if finalized {
                     info!(
                         "Snowball finalized at height {}: {:?}",
