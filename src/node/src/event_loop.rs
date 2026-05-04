@@ -3067,12 +3067,21 @@ impl EventLoop {
             let msg = ProofMessage::Challenge(challenge.clone());
             self.publish_proof_message(&msg);
 
-            // Solve if it's for us
+            // Solve off the event-loop task to keep the libp2p swarm poll responsive.
+            // The result is sent back via solver_response_tx and handled in the
+            // dedicated select! arm below.
             if challenge.target == *self.wallet.address() {
-                let response = self.proof_manager.solve_challenge(challenge);
-                self.proof_manager.record_response(response.clone());
-                let resp_msg = ProofMessage::Response(response);
-                self.publish_proof_message(&resp_msg);
+                let challenge_clone = challenge.clone();
+                let storage_data = self.proof_manager.storage_data_clone();
+                let our_address = *self.wallet.address();
+                let tx = self.solver_response_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let response = ProofManager::solve_challenge_pure(
+                        &challenge_clone, &storage_data, our_address,
+                    );
+                    // Receiver drop is the only failure mode; ignore it.
+                    let _ = tx.send(response);
+                });
             }
         }
 
