@@ -17,9 +17,16 @@
 //   4. Call monitor.health() for RPC /health endpoint
 //   5. Pass to event_loop.rs for periodic health checks
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+/// Minimum interval between repeated `chain_health: stuck for ...` warnings.
+/// Without this, every snapshot of `health()` (called from the RPC status
+/// update path on each tick) would emit an identical warning, producing
+/// a log flood once the chain entered a stuck state.
+const STUCK_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Block has been stuck for more than this long → unhealthy.
 pub const STUCK_THRESHOLD: Duration = Duration::from_secs(30);
@@ -79,6 +86,9 @@ pub struct ChainHealthMonitor {
     last_height: u64,
     /// voter_address_hash → last time they voted
     voter_activity: HashMap<u64, Instant>,
+    /// Last time we emitted a `chain_health: stuck for ...` warning. `Cell` so
+    /// `health()` can throttle through `&self` without mutating the public API.
+    last_stuck_warn: Cell<Option<Instant>>,
 }
 
 impl ChainHealthMonitor {
@@ -88,6 +98,7 @@ impl ChainHealthMonitor {
             last_block_time: Instant::now(),
             last_height: 0,
             voter_activity: HashMap::new(),
+            last_stuck_warn: Cell::new(None),
         }
     }
 
@@ -126,7 +137,22 @@ impl ChainHealthMonitor {
                 "chain stuck: no new block for {}s (threshold: {}s)",
                 stuck_seconds, STUCK_THRESHOLD.as_secs()
             ));
-            warn!("chain_health: stuck for {}s", stuck_seconds);
+            // Throttle: only emit a stuck warning once per STUCK_WARN_INTERVAL.
+            // The previous unconditional warn produced a flood because health()
+            // is invoked once per RPC status update (multiple times per second).
+            let now = Instant::now();
+            let should_warn = match self.last_stuck_warn.get() {
+                None => true,
+                Some(prev) => now.duration_since(prev) >= STUCK_WARN_INTERVAL,
+            };
+            if should_warn {
+                warn!("chain_health: stuck for {}s", stuck_seconds);
+                self.last_stuck_warn.set(Some(now));
+            }
+        } else {
+            // Chain has recovered — reset the throttle so the next stuck
+            // episode warns immediately rather than waiting out the interval.
+            self.last_stuck_warn.set(None);
         }
 
         // Timeout rate check
