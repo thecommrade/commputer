@@ -2312,21 +2312,23 @@ impl EventLoop {
             info!("  Compliant validators: {}, Nerfed: {}", compliant, nerfed);
         }
 
-        // Feature 114: Finalize proof results with difficulty weighting.
-        // Wrapped in tokio::task::block_in_place because the inner verification
-        // loop calls ProofVerifier::verify per (validator × channel) and each
-        // verifier re-runs the full prover work (CpuProver::verify_full does the
-        // iterative_hash again; same shape across gpu/ram/bandwidth/storage).
-        // At ~50 validators × 5 channels × 8s/proof, an epoch transition would
-        // otherwise pin the swarm-driving worker thread for ~30 minutes. With
-        // block_in_place tokio migrates the swarm task to a fresh worker for
-        // the duration. Multi-threaded runtime required (we have it via
-        // #[tokio::main] in main.rs).
-        let proof_summaries = tokio::task::block_in_place(|| {
-            self.proof_manager.finalize_epoch_with_difficulty(
-                &self.epoch_state.difficulty_multiplier,
-            )
+        // Feature 114 + Item 152: Finalize proof results with difficulty
+        // weighting. Two-stage:
+        //   1. Heavy stage: compute verdicts in parallel via rayon, wrapped
+        //      in tokio::task::block_in_place so the swarm-driving task
+        //      migrates to another worker for the duration. ProofVerifier
+        //      ::verify per (validator × channel) re-runs the full prover
+        //      work; sequential cost would be ~30 min at 50 validators.
+        //      Rayon brings it down to ~30/cores.
+        //   2. Cheap stage: apply the precomputed verdicts and update
+        //      ProofManager state. Runs on the main task.
+        let verdicts = tokio::task::block_in_place(|| {
+            self.proof_manager.compute_current_epoch_verdicts()
         });
+        let proof_summaries = self.proof_manager.finalize_epoch_with_precomputed_verdicts(
+            &verdicts,
+            &self.epoch_state.difficulty_multiplier,
+        );
         for (_addr, summary) in &proof_summaries {
             self.epoch_state.record_summary(summary.clone());
         }

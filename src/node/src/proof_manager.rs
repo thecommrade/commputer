@@ -286,6 +286,20 @@ impl ProofManager {
             .collect()
     }
 
+    /// Convenience wrapper: snapshot current state and compute verdicts.
+    /// Returned map is suitable for passing to
+    /// `finalize_epoch_with_precomputed_verdicts`. Designed to be wrapped in
+    /// `tokio::task::block_in_place` at the event-loop call site so the
+    /// parallel verification (rayon) runs without pinning the swarm task.
+    pub fn compute_current_epoch_verdicts(&self) -> HashMap<[u8; 32], ProofVerdict> {
+        Self::compute_epoch_verdicts(
+            &self.pending_challenges,
+            &self.responses,
+            &self.expired_challenges,
+            self.current_height,
+        )
+    }
+
     /// Finalize the epoch using a precomputed verdict map. Same body as
     /// `finalize_epoch_with_difficulty` but skips the inner
     /// `ProofVerifier::verify` calls — verdicts are looked up from the map
