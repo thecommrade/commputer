@@ -142,25 +142,31 @@ impl ProofManager {
         challenges
     }
 
+    /// Static solver — usable from `tokio::task::spawn_blocking` without `&self`.
+    /// Dispatches to the appropriate prover based on the challenge's `ResourceChannel`.
+    pub fn solve_challenge_pure(
+        challenge: &ProofChallenge,
+        storage_data: &[u8],
+        our_address: Address,
+    ) -> ProofResponse {
+        match challenge.channel {
+            ResourceChannel::Processing => CpuProver::solve(challenge, our_address),
+            ResourceChannel::Gpu => GpuProver::solve(challenge, our_address),
+            ResourceChannel::Ram => RamProver::solve(challenge, our_address),
+            ResourceChannel::Bandwidth => BandwidthProver::solve(challenge, our_address),
+            ResourceChannel::Storage => StorageProver::solve(challenge, storage_data, our_address),
+        }
+    }
+
     /// Solve a challenge directed at us, dispatching to the appropriate prover.
     pub fn solve_challenge(&self, challenge: &ProofChallenge) -> ProofResponse {
-        match challenge.channel {
-            ResourceChannel::Processing => {
-                CpuProver::solve(challenge, self.our_address)
-            }
-            ResourceChannel::Gpu => {
-                GpuProver::solve(challenge, self.our_address)
-            }
-            ResourceChannel::Ram => {
-                RamProver::solve(challenge, self.our_address)
-            }
-            ResourceChannel::Bandwidth => {
-                BandwidthProver::solve(challenge, self.our_address)
-            }
-            ResourceChannel::Storage => {
-                StorageProver::solve(challenge, &self.storage_data, self.our_address)
-            }
-        }
+        Self::solve_challenge_pure(challenge, &self.storage_data, self.our_address)
+    }
+
+    /// Clone of the per-validator storage data (1 MB). Used by spawn_blocking workers
+    /// that need to solve `ResourceChannel::Storage` challenges off the runtime.
+    pub fn storage_data_clone(&self) -> Vec<u8> {
+        self.storage_data.clone()
     }
 
     /// Record a proof response for later verification at epoch end.
@@ -606,5 +612,38 @@ mod tests {
 
         let summaries = pm.finalize_epoch();
         assert_eq!(summaries.len(), 10);
+    }
+
+    #[test]
+    fn solve_challenge_pure_works_for_all_channels() {
+        // Verifies the new static helper dispatches correctly for each ResourceChannel
+        // and propagates challenge_id + validator. Result bytes are not asserted equal
+        // across calls because some provers (PoW-style) use random nonces and are
+        // non-deterministic between invocations.
+        let our_address = test_addr(7);
+        let mut pm = ProofManager::new(our_address);
+        let epoch_seed = [42u8; 32];
+        let challenges = pm.generate_challenges(0, &epoch_seed, our_address, 100);
+        let storage_data = pm.storage_data_clone();
+
+        assert_eq!(challenges.len(), 5, "expected 5 challenges (one per ResourceChannel)");
+
+        for challenge in &challenges {
+            let via_static = ProofManager::solve_challenge_pure(
+                challenge, &storage_data, our_address,
+            );
+            assert_eq!(
+                via_static.challenge_id, challenge.challenge_id,
+                "challenge_id mismatch on channel {:?}", challenge.channel,
+            );
+            assert_eq!(
+                via_static.validator, our_address,
+                "validator mismatch on channel {:?}", challenge.channel,
+            );
+            assert!(
+                !via_static.result.is_empty(),
+                "empty result on channel {:?}", challenge.channel,
+            );
+        }
     }
 }
