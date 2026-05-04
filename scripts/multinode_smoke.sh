@@ -45,7 +45,7 @@ set -o pipefail
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 # src/staging/ -> repo root is two levels up
-REPO_ROOT="$( cd "${SCRIPT_DIR}/../.." && pwd )"
+REPO_ROOT="$( cd "${SCRIPT_DIR}/.." && pwd )"
 SRC_DIR="${REPO_ROOT}/src"
 
 SMOKE_NODES="${SMOKE_NODES:-3}"
