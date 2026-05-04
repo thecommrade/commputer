@@ -697,6 +697,12 @@ impl EventLoop {
                 _ = proof_interval.tick() => {
                     self.handle_proof_tick();
                 }
+                Some(response) = self.solver_response_rx.recv() => {
+                    // Proof solved off-runtime in spawn_blocking — record + publish on main task.
+                    self.proof_manager.record_response(response.clone());
+                    let resp_msg = ProofMessage::Response(response);
+                    self.publish_proof_message(&resp_msg);
+                }
                 _ = peer_exchange_interval.tick() => {
                     self.handle_peer_exchange_tick();
                 }
