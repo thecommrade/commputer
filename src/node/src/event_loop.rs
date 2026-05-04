@@ -91,6 +91,12 @@ pub struct EventLoop {
     pub pending_txs: Vec<Transaction>,
     pub consensus: ConsensusManager,
     pub proof_manager: ProofManager,
+    /// Sender for proof responses produced by spawn_blocking solver workers.
+    /// Cloned into each spawned worker; the worker sends back a finished `ProofResponse`.
+    pub solver_response_tx: tokio::sync::mpsc::UnboundedSender<commputer_core::proof::ProofResponse>,
+    /// Receiver for proof responses; polled in the main `tokio::select!` loop and
+    /// turned into a published `ProofMessage::Response` on the event-loop task.
+    pub solver_response_rx: tokio::sync::mpsc::UnboundedReceiver<commputer_core::proof::ProofResponse>,
     /// Detected hardware fingerprint for this node.
     pub hardware: HardwareFingerprint,
     /// Maps libp2p PeerIds to their observed IP addresses.
@@ -192,6 +198,7 @@ impl EventLoop {
     ) -> Self {
         let epoch_state = EpochState::new(0, 0);
         let our_address = *wallet.address();
+        let (solver_response_tx, solver_response_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             state,
             wallet,
@@ -203,6 +210,8 @@ impl EventLoop {
             pending_txs: Vec::new(),
             consensus: ConsensusManager::new(),
             proof_manager: ProofManager::new(our_address),
+            solver_response_tx,
+            solver_response_rx,
             hardware,
             peer_ips: HashMap::new(),
             peer_validators: HashMap::new(),
