@@ -243,11 +243,74 @@ impl ProofManager {
         self.finalize_epoch_with_difficulty(&HashMap::new())
     }
 
+    /// Pure verdict computation: for each response, decide whether the
+    /// corresponding challenge passed/failed/timed-out. This is the only
+    /// expensive part of epoch finalization — `ProofVerifier::verify` re-runs
+    /// the full prover work for each response (CpuProver does the iterative
+    /// hash again, GPU/RAM/Bandwidth do the same per-channel) so verification
+    /// cost is approximately equal to proving cost.
+    ///
+    /// Static so it's callable from `tokio::task::spawn_blocking` without
+    /// holding `&self`. The event loop calls this off-runtime in
+    /// `handle_epoch_tick` to keep the libp2p swarm poll responsive during
+    /// the verification window.
+    pub fn compute_epoch_verdicts(
+        pending_challenges: &HashMap<[u8; 32], ProofChallenge>,
+        responses: &[ProofResponse],
+        expired_challenges: &HashSet<[u8; 32]>,
+        current_height: u64,
+    ) -> HashMap<[u8; 32], ProofVerdict> {
+        let mut verdicts: HashMap<[u8; 32], ProofVerdict> = HashMap::new();
+        for resp in responses {
+            if let Some(challenge) = pending_challenges.get(&resp.challenge_id) {
+                let expired = expired_challenges.contains(&resp.challenge_id);
+                let timed_out = expired
+                    || (challenge.deadline_block > 0
+                        && current_height > challenge.deadline_block);
+                let verdict = if timed_out {
+                    ProofVerdict::TimedOut
+                } else {
+                    ProofVerifier::verify(challenge, resp)
+                };
+                verdicts.insert(resp.challenge_id, verdict);
+            }
+        }
+        verdicts
+    }
+
+    /// Finalize the epoch using a precomputed verdict map. Same body as
+    /// `finalize_epoch_with_difficulty` but skips the inner
+    /// `ProofVerifier::verify` calls — verdicts are looked up from the map
+    /// instead. The map is typically produced by
+    /// `compute_epoch_verdicts` running in `spawn_blocking`.
+    ///
+    /// Falls back to `ProofVerdict::Invalid` for any challenge_id not present
+    /// in the map (defensive — should not happen if the map was generated
+    /// from the same snapshot of `pending_challenges` / `responses`).
+    pub fn finalize_epoch_with_precomputed_verdicts(
+        &mut self,
+        verdicts: &HashMap<[u8; 32], ProofVerdict>,
+        difficulty_multipliers: &HashMap<ResourceChannel, f64>,
+    ) -> Vec<(Address, EpochProofSummary)> {
+        self.finalize_epoch_inner(Some(verdicts), difficulty_multipliers)
+    }
+
     /// Finalize with per-channel difficulty multipliers for weighted scoring.
     /// Item 148: Enhanced — weights proof scores by difficulty level.
     /// Item 152: Uses parallel verification via iterators (rayon would be used in production).
     pub fn finalize_epoch_with_difficulty(
         &mut self,
+        difficulty_multipliers: &HashMap<ResourceChannel, f64>,
+    ) -> Vec<(Address, EpochProofSummary)> {
+        self.finalize_epoch_inner(None, difficulty_multipliers)
+    }
+
+    /// Shared implementation. If `precomputed_verdicts` is `Some`, the inner
+    /// loop skips `ProofVerifier::verify` and looks up verdicts there.
+    /// If `None`, computes verdicts inline (legacy synchronous path).
+    fn finalize_epoch_inner(
+        &mut self,
+        precomputed_verdicts: Option<&HashMap<[u8; 32], ProofVerdict>>,
         difficulty_multipliers: &HashMap<ResourceChannel, f64>,
     ) -> Vec<(Address, EpochProofSummary)> {
         // Item 159: Mark expired challenges before finalization.
@@ -298,6 +361,10 @@ impl ProofManager {
 
                     let verdict = if timed_out {
                         ProofVerdict::TimedOut
+                    } else if let Some(map) = precomputed_verdicts {
+                        // Use precomputed verdict (came from spawn_blocking).
+                        // Defensive fallback: unknown challenge_ids treated as Invalid.
+                        map.get(&resp.challenge_id).copied().unwrap_or(ProofVerdict::Invalid)
                     } else {
                         ProofVerifier::verify(challenge, resp)
                     };
@@ -612,6 +679,68 @@ mod tests {
 
         let summaries = pm.finalize_epoch();
         assert_eq!(summaries.len(), 10);
+    }
+
+    #[test]
+    fn precomputed_verdicts_match_inline_path() {
+        // Two parallel ProofManagers: A finalizes via the legacy inline-verify
+        // path; B does it via compute_epoch_verdicts (the spawn_blocking-friendly
+        // pure path) followed by finalize_epoch_with_precomputed_verdicts.
+        // Their summaries should match on the deterministic fields.
+        let our_addr = test_addr(7);
+        let target = test_addr(8);
+
+        let mut pm_a = ProofManager::new(our_addr);
+        let mut pm_b = ProofManager::new(our_addr);
+
+        // Generate identical challenges in both managers.
+        let challenges_a = pm_a.generate_challenges(0, &[42u8; 32], target, 100);
+        let challenges_b = pm_b.generate_challenges(0, &[42u8; 32], target, 100);
+        assert_eq!(challenges_a.len(), challenges_b.len());
+
+        // Solve all channels and record in both managers.
+        let storage = pm_a.storage_data_clone();
+        for (ca, cb) in challenges_a.iter().zip(challenges_b.iter()) {
+            let resp_a = ProofManager::solve_challenge_pure(ca, &storage, target);
+            let resp_b = ProofManager::solve_challenge_pure(cb, &storage, target);
+            pm_a.record_response(resp_a);
+            pm_b.record_response(resp_b);
+        }
+
+        // Path A: legacy inline verification.
+        let multipliers = HashMap::new();
+        let summaries_a = pm_a.finalize_epoch_with_difficulty(&multipliers);
+
+        // Path B: precompute verdicts (spawn_blocking-friendly), then apply.
+        let verdicts = ProofManager::compute_epoch_verdicts(
+            &pm_b.pending_challenges,
+            &pm_b.responses,
+            &pm_b.expired_challenges,
+            pm_b.current_height,
+        );
+        let summaries_b = pm_b.finalize_epoch_with_precomputed_verdicts(&verdicts, &multipliers);
+
+        assert_eq!(summaries_a.len(), summaries_b.len(), "summary count mismatch");
+        // Summaries are sorted by HashMap iteration order which is randomised, so
+        // sort both by validator addr for stable comparison.
+        let mut sa: Vec<_> = summaries_a.into_iter().collect();
+        let mut sb: Vec<_> = summaries_b.into_iter().collect();
+        sa.sort_by_key(|(a, _)| a.0);
+        sb.sort_by_key(|(a, _)| a.0);
+        for ((addr_a, sum_a), (addr_b, sum_b)) in sa.iter().zip(sb.iter()) {
+            assert_eq!(addr_a, addr_b, "validator address mismatch");
+            assert_eq!(sum_a.epoch, sum_b.epoch);
+            assert_eq!(sum_a.processing_score, sum_b.processing_score, "processing_score mismatch");
+            assert_eq!(sum_a.gpu_score, sum_b.gpu_score);
+            assert_eq!(sum_a.storage_score, sum_b.storage_score);
+            assert_eq!(sum_a.ram_score, sum_b.ram_score);
+            assert_eq!(sum_a.bandwidth_score, sum_b.bandwidth_score);
+            assert_eq!(sum_a.diversity_bonus, sum_b.diversity_bonus);
+        }
+
+        // Both paths should clear per-epoch state.
+        assert!(pm_a.pending_challenges.is_empty());
+        assert!(pm_b.pending_challenges.is_empty());
     }
 
     #[test]
