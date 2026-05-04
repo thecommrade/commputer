@@ -3099,10 +3099,20 @@ impl EventLoop {
             ProofMessage::Challenge(challenge) => {
                 if challenge.target == *self.wallet.address() {
                     debug!("Received proof challenge for {:?}", challenge.channel);
-                    let response = self.proof_manager.solve_challenge(&challenge);
-                    self.proof_manager.record_response(response.clone());
-                    let resp_msg = ProofMessage::Response(response);
-                    self.publish_proof_message(&resp_msg);
+                    // Same off-runtime pattern as handle_proof_tick: spawn_blocking the
+                    // PoW work so the swarm-arm of the select! stays responsive.
+                    // Result returns via solver_response_tx and is recorded + published
+                    // by the dedicated select! arm.
+                    let challenge_clone = challenge.clone();
+                    let storage_data = self.proof_manager.storage_data_clone();
+                    let our_address = *self.wallet.address();
+                    let tx = self.solver_response_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let response = ProofManager::solve_challenge_pure(
+                            &challenge_clone, &storage_data, our_address,
+                        );
+                        let _ = tx.send(response);
+                    });
                 }
             }
             ProofMessage::Response(response) => {
