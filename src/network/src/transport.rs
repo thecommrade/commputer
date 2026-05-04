@@ -318,6 +318,27 @@ pub const SEED_NODES: &[&str] = &[
     // Or QUIC: /ip4/<IP>/udp/<PORT>/quic-v1/p2p/<PEER_ID>
 ];
 
+/// Convert a TCP multiaddr into its QUIC-v1 equivalent.
+///
+/// Two cases:
+///   - `/ip4/X/tcp/N/p2p/<id>`  →  `/ip4/X/udp/N/quic-v1/p2p/<id>`
+///     (`/quic-v1` inserted before the embedded peer ID)
+///   - `/ip4/X/tcp/N`           →  `/ip4/X/udp/N/quic-v1`
+///     (`/quic-v1` appended at the end since there's no embedded peer ID)
+///
+/// The previous one-liner used `/p2p/` as the insertion anchor and silently
+/// emitted a bare `/ip4/X/udp/N` (no codec) for seeds without a peer ID,
+/// which libp2p rejected as `MultiaddrNotSupported`.
+fn tcp_to_quic_v1(addr_str: &str) -> String {
+    if addr_str.contains("/p2p/") {
+        addr_str
+            .replace("/tcp/", "/udp/")
+            .replace("/p2p/", "/quic-v1/p2p/")
+    } else {
+        format!("{}/quic-v1", addr_str.replace("/tcp/", "/udp/"))
+    }
+}
+
 impl CommpNetwork {
     /// Dial all built-in seed nodes. Returns the number successfully dialed.
     pub fn connect_to_seeds(&mut self) -> usize {
@@ -349,11 +370,9 @@ impl CommpNetwork {
                         }
                     }
 
-                    // If the given address is TCP, also try QUIC variant
+                    // If the given address is TCP, also try QUIC variant.
                     if addr_str.contains("/tcp/") {
-                        let quic_addr = addr_str
-                            .replace("/tcp/", "/udp/")
-                            .replace("/p2p/", "/quic-v1/p2p/");
+                        let quic_addr = tcp_to_quic_v1(&addr_str);
                         if let Ok(addr) = quic_addr.parse::<Multiaddr>() {
                             match self.dial(addr) {
                                 Ok(()) => {
@@ -805,5 +824,26 @@ mod tests {
     fn upnp_status_display() {
         let status = UpnpStatus::Mapped("1.2.3.4:9000".to_string());
         assert!(matches!(status, UpnpStatus::Mapped(_)));
+    }
+
+    #[test]
+    fn tcp_to_quic_v1_with_embedded_peer_id() {
+        // Use a real PeerId so the transformed string round-trips through parse().
+        let peer_id = libp2p::PeerId::random();
+        let tcp = format!("/ip4/127.0.0.1/tcp/19001/p2p/{}", peer_id);
+        let quic = tcp_to_quic_v1(&tcp);
+        assert_eq!(quic, format!("/ip4/127.0.0.1/udp/19001/quic-v1/p2p/{}", peer_id));
+        assert!(quic.parse::<Multiaddr>().is_ok(), "expected valid multiaddr, got {}", quic);
+    }
+
+    #[test]
+    fn tcp_to_quic_v1_without_peer_id() {
+        // Regression: seeds without an embedded peer ID (common for local
+        // bootstrap or DNS-resolved seeds) used to produce /ip4/X/udp/N
+        // with no codec, which libp2p rejected.
+        let tcp = "/ip4/127.0.0.1/tcp/19001";
+        let quic = tcp_to_quic_v1(tcp);
+        assert_eq!(quic, "/ip4/127.0.0.1/udp/19001/quic-v1");
+        assert!(quic.parse::<Multiaddr>().is_ok(), "expected valid multiaddr, got {}", quic);
     }
 }
