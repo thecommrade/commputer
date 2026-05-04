@@ -8,6 +8,16 @@ use futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
 use std::time::Duration;
 
+/// Pick an unused TCP port from the OS so concurrent runs (or a stress
+/// harness using fixed ports like 19001-19006) can't collide. Small TOCTOU
+/// window between dropping the listener and CommpNetwork::new rebinding, but
+/// in practice the OS doesn't recycle ports that fast.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind 127.0.0.1:0 should succeed");
+    listener.local_addr().expect("local_addr").port()
+}
+
 /// Build a minimal test block for gossip propagation.
 fn test_block() -> Block {
     Block {
@@ -33,8 +43,8 @@ fn test_block() -> Block {
 /// Two nodes start, connect, and exchange a block via gossipsub.
 #[tokio::test]
 async fn two_nodes_gossip_block() {
-    let mut node_a = CommpNetwork::new(19001).expect("node A should start");
-    let mut node_b = CommpNetwork::new(19002).expect("node B should start");
+    let mut node_a = CommpNetwork::new(free_port()).expect("node A should start");
+    let mut node_b = CommpNetwork::new(free_port()).expect("node B should start");
 
     // Poll node B briefly to pick up its listen address.
     let b_addr = loop {
@@ -151,8 +161,8 @@ async fn two_nodes_gossip_block() {
 /// via gossipsub. Both nodes should see both candidates.
 #[tokio::test]
 async fn fork_competing_blocks_propagate() {
-    let mut node_a = CommpNetwork::new(19005).expect("node A should start");
-    let mut node_b = CommpNetwork::new(19006).expect("node B should start");
+    let mut node_a = CommpNetwork::new(free_port()).expect("node A should start");
+    let mut node_b = CommpNetwork::new(free_port()).expect("node B should start");
 
     let block_a = Block {
         header: BlockHeader {
@@ -310,8 +320,8 @@ async fn fork_competing_blocks_propagate() {
 /// Simpler test: two nodes can discover each other and establish a connection.
 #[tokio::test]
 async fn two_nodes_connect() {
-    let mut node_a = CommpNetwork::new(19003).expect("node A should start");
-    let mut node_b = CommpNetwork::new(19004).expect("node B should start");
+    let mut node_a = CommpNetwork::new(free_port()).expect("node A should start");
+    let mut node_b = CommpNetwork::new(free_port()).expect("node B should start");
 
     // Get node B's listen address.
     let b_addr = loop {
