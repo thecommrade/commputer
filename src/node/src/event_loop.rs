@@ -78,6 +78,33 @@ impl Default for PeerQuality {
     }
 }
 
+/// Snapshot of an epoch finalization, produced off-task by spawn_blocking
+/// verdict computation and consumed by a dedicated `tokio::select!` arm.
+///
+/// Why: the previous design ran the verifier loop inline inside the
+/// `epoch_interval` arm body, which blocks all other arms of the same
+/// `tokio::select!` (block_interval, swarm, etc.) until it returns. Even
+/// `tokio::task::block_in_place` can't help — block_in_place migrates the
+/// calling tokio task to another worker, but a select! arm body is part of
+/// that task; the select itself can't fire other arms until the body
+/// completes. Empirical evidence: stress runs showed block production
+/// stalled for ~110s during epoch transitions.
+///
+/// New design: `handle_epoch_tick` does only the cheap setup work (early-gate
+/// + transition logging), then dispatches the heavy verifier work to
+/// `spawn_blocking`. The blocking task computes verdicts via rayon, packages
+/// the result into an `EpochFinalizeData`, and sends it back via mpsc. A
+/// dedicated select arm receives the message and runs `handle_epoch_tick_post`
+/// — applying verdicts, EpochState reset, account scans, etc.
+pub struct EpochFinalizeData {
+    pub verdicts: std::collections::HashMap<[u8; 32], commputer_core::proof::ProofVerdict>,
+    pub multipliers: HashMap<commputer_core::proof::ResourceChannel, f64>,
+    /// The epoch number this finalization is for (sanity check at apply time).
+    pub epoch_being_finalized: u64,
+    /// Validator count at the time the epoch tick fired.
+    pub validator_count: u64,
+}
+
 #[allow(dead_code)]
 /// Main event loop for a Commputer node. Coordinates network, consensus, proofs, and chain state.
 pub struct EventLoop {
@@ -97,6 +124,12 @@ pub struct EventLoop {
     /// Receiver for proof responses; polled in the main `tokio::select!` loop and
     /// turned into a published `ProofMessage::Response` on the event-loop task.
     pub solver_response_rx: tokio::sync::mpsc::UnboundedReceiver<commputer_core::proof::ProofResponse>,
+    /// Sender for completed epoch finalization data (verdicts + meta) from the
+    /// spawn_blocking verdict-computation worker. The receive arm of the main
+    /// select! applies the verdicts and runs the rest of the epoch transition.
+    pub epoch_finalize_tx: tokio::sync::mpsc::UnboundedSender<EpochFinalizeData>,
+    /// Receiver for completed epoch finalization data.
+    pub epoch_finalize_rx: tokio::sync::mpsc::UnboundedReceiver<EpochFinalizeData>,
     /// Detected hardware fingerprint for this node.
     pub hardware: HardwareFingerprint,
     /// Maps libp2p PeerIds to their observed IP addresses.
@@ -199,6 +232,7 @@ impl EventLoop {
         let epoch_state = EpochState::new(0, 0);
         let our_address = *wallet.address();
         let (solver_response_tx, solver_response_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (epoch_finalize_tx, epoch_finalize_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             state,
             wallet,
@@ -212,6 +246,8 @@ impl EventLoop {
             proof_manager: ProofManager::new(our_address),
             solver_response_tx,
             solver_response_rx,
+            epoch_finalize_tx,
+            epoch_finalize_rx,
             hardware,
             peer_ips: HashMap::new(),
             peer_validators: HashMap::new(),
@@ -702,6 +738,14 @@ impl EventLoop {
                     self.proof_manager.record_response(response.clone());
                     let resp_msg = ProofMessage::Response(response);
                     self.publish_proof_message(&resp_msg);
+                }
+                Some(epoch_data) = self.epoch_finalize_rx.recv() => {
+                    // Verdicts arrived from the spawn_blocking verifier worker.
+                    // Apply them and run the rest of the epoch transition. This
+                    // arm body still runs on the event-loop task, but each call
+                    // is the cheap apply phase (HashMap inserts + state mutation),
+                    // not the heavy verify phase.
+                    self.handle_epoch_tick_post(epoch_data);
                 }
                 _ = peer_exchange_interval.tick() => {
                     self.handle_peer_exchange_tick();
@@ -2312,22 +2356,46 @@ impl EventLoop {
             info!("  Compliant validators: {}, Nerfed: {}", compliant, nerfed);
         }
 
-        // Feature 114 + Item 152: Finalize proof results with difficulty
-        // weighting. Two-stage:
-        //   1. Heavy stage: compute verdicts in parallel via rayon, wrapped
-        //      in tokio::task::block_in_place so the swarm-driving task
-        //      migrates to another worker for the duration. ProofVerifier
-        //      ::verify per (validator × channel) re-runs the full prover
-        //      work; sequential cost would be ~30 min at 50 validators.
-        //      Rayon brings it down to ~30/cores.
-        //   2. Cheap stage: apply the precomputed verdicts and update
-        //      ProofManager state. Runs on the main task.
-        let verdicts = tokio::task::block_in_place(|| {
-            self.proof_manager.compute_current_epoch_verdicts()
+        // Feature 114 + Item 152: Dispatch verdict computation off-task.
+        // Empirical evidence (stress runs of 2026-05-04): running the verifier
+        // loop inline in this select! arm body blocks all other arms (including
+        // block_interval) for the duration — chain stalled ~110s at every epoch
+        // transition with 3 validators. block_in_place doesn't help inside a
+        // select arm body; only deferring to another task does. See doc comment
+        // on EpochFinalizeData for the design.
+        let pending = self.proof_manager.pending_challenges_clone();
+        let responses = self.proof_manager.responses_clone();
+        let expired = self.proof_manager.expired_challenges_clone();
+        let height = self.proof_manager.current_height;
+        let multipliers = self.epoch_state.difficulty_multiplier.clone();
+        let tx = self.epoch_finalize_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let verdicts = ProofManager::compute_epoch_verdicts(
+                &pending, &responses, &expired, height,
+            );
+            let _ = tx.send(EpochFinalizeData {
+                verdicts,
+                multipliers,
+                epoch_being_finalized: epoch,
+                validator_count,
+            });
         });
+        // The remainder of the epoch transition (record summaries, account
+        // scans, will processing, EpochState reset, next-epoch difficulty)
+        // runs in handle_epoch_tick_post when the verdicts arrive.
+    }
+
+    /// Post-verdict half of the epoch transition. Called from the dedicated
+    /// `epoch_finalize_rx` arm of the main `tokio::select!` once the
+    /// spawn_blocking verdict computation completes. Splitting this off keeps
+    /// the swarm/block_interval/etc. arms responsive during the verify window.
+    fn handle_epoch_tick_post(&mut self, data: EpochFinalizeData) {
+        let EpochFinalizeData { verdicts, multipliers, epoch_being_finalized, validator_count } = data;
+        let epoch = epoch_being_finalized;
+
         let proof_summaries = self.proof_manager.finalize_epoch_with_precomputed_verdicts(
             &verdicts,
-            &self.epoch_state.difficulty_multiplier,
+            &multipliers,
         );
         for (_addr, summary) in &proof_summaries {
             self.epoch_state.record_summary(summary.clone());

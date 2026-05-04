@@ -300,6 +300,21 @@ impl ProofManager {
         )
     }
 
+    /// Owned clones of the inputs needed by `compute_epoch_verdicts`. Used
+    /// when the caller needs to move the data into `tokio::task::spawn_blocking`,
+    /// which requires a `'static` closure.
+    pub fn pending_challenges_clone(&self) -> HashMap<[u8; 32], ProofChallenge> {
+        self.pending_challenges.clone()
+    }
+
+    pub fn responses_clone(&self) -> Vec<ProofResponse> {
+        self.responses.clone()
+    }
+
+    pub fn expired_challenges_clone(&self) -> HashSet<[u8; 32]> {
+        self.expired_challenges.clone()
+    }
+
     /// Finalize the epoch using a precomputed verdict map. Same body as
     /// `finalize_epoch_with_difficulty` but skips the inner
     /// `ProofVerifier::verify` calls — verdicts are looked up from the map
