@@ -260,22 +260,30 @@ impl ProofManager {
         expired_challenges: &HashSet<[u8; 32]>,
         current_height: u64,
     ) -> HashMap<[u8; 32], ProofVerdict> {
-        let mut verdicts: HashMap<[u8; 32], ProofVerdict> = HashMap::new();
-        for resp in responses {
-            if let Some(challenge) = pending_challenges.get(&resp.challenge_id) {
-                let expired = expired_challenges.contains(&resp.challenge_id);
-                let timed_out = expired
-                    || (challenge.deadline_block > 0
-                        && current_height > challenge.deadline_block);
-                let verdict = if timed_out {
-                    ProofVerdict::TimedOut
-                } else {
-                    ProofVerifier::verify(challenge, resp)
-                };
-                verdicts.insert(resp.challenge_id, verdict);
-            }
-        }
-        verdicts
+        // Item 152: rayon::par_iter for parallel verification — each
+        // ProofVerifier::verify call is CPU-bound and independent, so this
+        // gets near-linear speedup with core count. With block_in_place
+        // wrapping at the call site (event_loop.rs handle_epoch_tick) the
+        // entire parallel verification runs on tokio's worker pool without
+        // blocking the swarm task.
+        use rayon::prelude::*;
+        responses
+            .par_iter()
+            .filter_map(|resp| {
+                pending_challenges.get(&resp.challenge_id).map(|challenge| {
+                    let expired = expired_challenges.contains(&resp.challenge_id);
+                    let timed_out = expired
+                        || (challenge.deadline_block > 0
+                            && current_height > challenge.deadline_block);
+                    let verdict = if timed_out {
+                        ProofVerdict::TimedOut
+                    } else {
+                        ProofVerifier::verify(challenge, resp)
+                    };
+                    (resp.challenge_id, verdict)
+                })
+            })
+            .collect()
     }
 
     /// Finalize the epoch using a precomputed verdict map. Same body as
