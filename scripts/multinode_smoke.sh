@@ -30,6 +30,11 @@
 #   SMOKE_TMPROOT      where to put per-node home dirs (default /tmp/multinode-smoke)
 #   SMOKE_LOG_DIR      where to write logs (default <repo>/scripts/multinode_smoke_logs/)
 #   SMOKE_LOG_LEVEL    RUST_LOG level (default info; debug is noisy)
+#   SMOKE_LATE_NODES   number of nodes to start LATE (default 0). The last N
+#                      of SMOKE_NODES are held back for SMOKE_LATE_DELAY
+#                      seconds so they have to sync from peers.
+#   SMOKE_LATE_DELAY   seconds to wait between early-node boot and late-node
+#                      boot (default 0; ignored unless SMOKE_LATE_NODES > 0).
 #   FORCE_BUILD        if set, force a `cargo build` even if the binary exists
 #
 # Per-node HOME is overridden so each node gets its own ~/.commputer/ data dir
@@ -55,9 +60,20 @@ SMOKE_BASE_RPC="${SMOKE_BASE_RPC:-19944}"
 SMOKE_TMPROOT="${SMOKE_TMPROOT:-/tmp/multinode-smoke}"
 SMOKE_LOG_DIR="${SMOKE_LOG_DIR:-${SCRIPT_DIR}/multinode_smoke_logs}"
 SMOKE_LOG_LEVEL="${SMOKE_LOG_LEVEL:-info}"
+# Lazy-join knobs: start the LAST `SMOKE_LATE_NODES` nodes after a delay so
+# they have to sync from a running chain instead of bootstrapping with the
+# others. Useful for validating sync-from-peers code paths.
+SMOKE_LATE_NODES="${SMOKE_LATE_NODES:-0}"
+SMOKE_LATE_DELAY="${SMOKE_LATE_DELAY:-0}"
 
 if [[ "${SMOKE_NODES}" -lt 2 || "${SMOKE_NODES}" -gt 5 ]]; then
     echo "[smoke] SMOKE_NODES must be in [2, 5], got ${SMOKE_NODES}" >&2
+    exit 1
+fi
+
+if [[ "${SMOKE_LATE_NODES}" -ge "${SMOKE_NODES}" ]]; then
+    echo "[smoke] SMOKE_LATE_NODES (${SMOKE_LATE_NODES}) must be < SMOKE_NODES (${SMOKE_NODES})" >&2
+    echo "[smoke] (need at least one early node to bootstrap the chain)" >&2
     exit 1
 fi
 
@@ -189,11 +205,28 @@ start_node() {
     NODE_NAMES+=("${name}")
 }
 
-for ((n = 1; n <= SMOKE_NODES; n++)); do
+EARLY_NODES=$((SMOKE_NODES - SMOKE_LATE_NODES))
+
+for ((n = 1; n <= EARLY_NODES; n++)); do
     start_node "${n}"
     # Stagger boots a bit so seeds in earlier-started nodes are reachable.
     sleep 1
 done
+
+# Lazy-join: hold off on the late nodes so the early nodes can produce blocks.
+# When the late nodes come up, they should sync from peers rather than
+# bootstrap as fresh validators.
+if (( SMOKE_LATE_NODES > 0 )); then
+    if (( SMOKE_LATE_DELAY > 0 )); then
+        echo "[smoke] Started ${EARLY_NODES} early node(s); waiting ${SMOKE_LATE_DELAY}s before starting ${SMOKE_LATE_NODES} late node(s)..."
+        sleep "${SMOKE_LATE_DELAY}"
+    fi
+    echo "[smoke] Starting ${SMOKE_LATE_NODES} late node(s) — these must sync from peers"
+    for ((n = EARLY_NODES + 1; n <= SMOKE_NODES; n++)); do
+        start_node "${n}"
+        sleep 1
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # Wait for each RPC to come up
