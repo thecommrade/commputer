@@ -3283,15 +3283,40 @@ impl EventLoop {
         info!("No peers connected — attempting seed reconnection");
         let seeds = self.custom_seeds.clone();
         let mut reconnected = 0;
+        let mut parse_failures = 0;
+        let mut dial_failures = 0;
         for addr_str in &seeds {
-            if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
-                if let Ok(()) = self.network.dial(addr) {
-                    reconnected += 1;
+            match addr_str.parse::<libp2p::Multiaddr>() {
+                Ok(addr) => match self.network.dial(addr) {
+                    Ok(()) => {
+                        reconnected += 1;
+                    }
+                    Err(e) => {
+                        // Common transient: DialError::DialPeerConditionFalse
+                        // (libp2p already has a pending dial for this peer).
+                        // Visible as debug so the periodic retry doesn't spam
+                        // the log, but no longer fully silent.
+                        debug!("Reconnect dial to {} failed: {}", addr_str, e);
+                        dial_failures += 1;
+                    }
+                },
+                Err(e) => {
+                    // Parse failures are likely config issues — warn so
+                    // they're surfaced at default log level.
+                    warn!("Reconnect skipped malformed seed '{}': {}", addr_str, e);
+                    parse_failures += 1;
                 }
             }
         }
         if reconnected > 0 {
             info!("Dialed {} seed nodes for reconnection", reconnected);
+        } else if dial_failures > 0 || parse_failures > 0 {
+            // Surface the all-failed case so operators don't assume a silent
+            // success when no peers ever come back.
+            info!(
+                "Seed reconnection: 0 succeeded, {} dial errors, {} parse errors (out of {} seeds)",
+                dial_failures, parse_failures, seeds.len()
+            );
         }
     }
 
