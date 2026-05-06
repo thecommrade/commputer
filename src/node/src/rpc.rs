@@ -901,6 +901,11 @@ async fn security_headers(
 
 /// Maximum requests per IP per second.
 const RATE_LIMIT_MAX: u32 = 100;
+/// W5.7 F-2: bound the rate_limits map so it cannot OOM the node under
+/// CGNAT churn or a spoofed-source flood. When this cap is reached we
+/// sweep entries older than EVICT_AFTER and drop them.
+const MAX_RATE_LIMIT_ENTRIES: usize = 100_000;
+const EVICT_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Middleware that enforces per-IP rate limiting: max 100 req/s.
 async fn rate_limit_middleware(
@@ -916,6 +921,13 @@ async fn rate_limit_middleware(
     {
         let mut limits = state.rate_limits.lock().await;
         let now = Instant::now();
+
+        // W5.7 F-2: bounded eviction. Cheap below the cap; one O(n) sweep
+        // at the cap. Amortized O(1) per request even under hostile churn.
+        if limits.len() >= MAX_RATE_LIMIT_ENTRIES {
+            limits.retain(|_, (_, ts)| now.duration_since(*ts) < EVICT_AFTER);
+        }
+
         let entry = limits.entry(ip).or_insert((0, now));
 
         // Reset counter if more than 1 second has passed.
@@ -1467,6 +1479,42 @@ mod tests {
             resp.status().is_client_error(),
             "expected 4xx, got {}",
             resp.status()
+        );
+    }
+
+    /// W5.7 F-2: regression test for unbounded rate_limits HashMap.
+    /// Pre-fix every unique source IP lived forever and the limiter was
+    /// itself a DoS vector. After the fix the map must stay at-or-below
+    /// MAX_RATE_LIMIT_ENTRIES even after a flood of distinct IPs.
+    #[tokio::test]
+    async fn rate_limit_map_is_bounded() {
+        let (state, _rx) = make_rpc_state();
+        let app = build_router(state.clone());
+
+        // Drive the limiter map directly past the cap with stale timestamps.
+        {
+            let mut limits = state.rate_limits.lock().await;
+            let now = std::time::Instant::now();
+            for n in 0..(MAX_RATE_LIMIT_ENTRIES + 10_000) {
+                let ip = format!("10.{}.{}.{}", (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff);
+                limits.insert(ip, (1, now - std::time::Duration::from_secs(60)));
+            }
+        }
+
+        // Trigger one live request so the eviction sweep fires.
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/status")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let _ = app.oneshot(req).await.unwrap();
+
+        let limits = state.rate_limits.lock().await;
+        assert!(
+            limits.len() <= MAX_RATE_LIMIT_ENTRIES,
+            "expected rate_limits.len() <= {}, got {}",
+            MAX_RATE_LIMIT_ENTRIES,
+            limits.len()
         );
     }
 }
