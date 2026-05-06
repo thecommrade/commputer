@@ -430,6 +430,27 @@ Concretely:
 Compliance is restored automatically once the offending peer deregisters or
 moves IP (`compliance_check.rs:597-604`).
 
+### Seed nodes vs validator nodes — cloud is fine for seeds
+
+The cloud-IP nerf above applies to **validators** — nodes that contribute
+compute, register on-chain, and earn $COMME rewards. A **seed node** (a
+long-lived public-facing node whose only job is to bootstrap peer
+connectivity for new joiners) is functionally fine on AWS / GCP / Azure /
+Hetzner / OVH / DigitalOcean. The seed will be flagged `NerfedIncidental`
+and its $COMME earnings will be near-zero — but its value to the network
+is connectivity, not consensus weight. That is by design and consistent
+with the whitepaper's anti-scale principle.
+
+If you are running a **dedicated seed** (no expectation of validator
+rewards), a public-IP cloud host is the correct choice — it has the
+static IP, uptime, and inbound reachability seeds need.
+
+If you are running a **validator** that you expect to earn from, run it
+on bare-metal home / colo hardware. Anything inside a cloud provider's
+IPv4 or IPv6 range (see `compliance_check.rs::is_datacenter_ip` for the
+current list, including the IPv6 ranges added in commit 44c3f50) gets
+the nerf.
+
 > Compliance status appears on `/compliance` (RPC) and via `commputer
 > compliance-check`.
 
