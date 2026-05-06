@@ -191,28 +191,26 @@ impl ConsensusManager {
     }
 
     /// Scale Snowball parameters to current network size.
-    /// On small networks, sample_size and quorum shrink so voting can converge.
-    /// On large networks, use the full params for Byzantine fault tolerance.
+    /// Stepped curve from solo-bootstrap (1,1,1) up to full production
+    /// (20,14,20) at peer_count >= 21. Each rung satisfies the validate()
+    /// invariant `quorum > sample_size / 2`. The (3,2,5) rung at
+    /// peer_count in [3,5] preserves the bbbed4f-validated 3-node stress
+    /// behaviour. See ADR-0002 (docs/adrs/0002_snowball_consensus.md) and
+    /// `src/consensus/src/config.rs` for the parameter envelope.
     pub fn update_params_for_network_size(&mut self, peer_count: usize) {
-        let base_sample = 3usize;
-        let effective_sample = if peer_count == 0 {
-            1
-        } else {
-            base_sample.min(peer_count)
+        let (sample, quorum, threshold): (usize, usize, u32) = match peer_count {
+            0 => (1, 1, 1),
+            1 => (1, 1, 3),
+            2 => (2, 2, 3),
+            3..=5 => (3, 2, 5),
+            6..=10 => (5, 4, 8),
+            11..=20 => (10, 7, 14),
+            _ => (20, 14, 20),
         };
-        let effective_quorum = if effective_sample <= 1 {
-            1
-        } else {
-            (effective_sample * 2 + 2) / 3 // ceil(2/3)
-        };
-        // Scale decision_threshold: fewer rounds needed on small networks.
-        // Large network (3+ peers): 5 rounds for BFT confidence.
-        // Small network (1-2 peers): 3 rounds (faster finalization).
-        let effective_threshold = if peer_count <= 2 { 3 } else { 5 };
 
-        self.params.sample_size = effective_sample;
-        self.params.quorum = effective_quorum;
-        self.params.decision_threshold = effective_threshold;
+        self.params.sample_size = sample;
+        self.params.quorum = quorum;
+        self.params.decision_threshold = threshold;
 
         // Propagate to all existing voters so they use current network params.
         // Without this, voters created at startup keep stale default params
@@ -1350,5 +1348,121 @@ mod tests {
         assert!(!cm.has_height(1));
         assert!(!cm.has_height(2));
         assert!(cm.active_heights().is_empty());
+    }
+
+    // ---- update_params_for_network_size: scaling curve ----
+    // Whitepaper goal Step B: SnowballParams::production() (20/14/20) was
+    // dead code; the scaler now climbs there at peer_count >= 21 instead
+    // of hard-capping at sample=3. ADR-0002 documents the design.
+
+    fn assert_curve(peer_count: usize, expect_k: usize, expect_alpha: usize, expect_beta: u32) {
+        let mut cm = ConsensusManager::new();
+        cm.update_params_for_network_size(peer_count);
+        assert_eq!(
+            cm.params.sample_size, expect_k,
+            "sample_size mismatch at peer_count={peer_count}"
+        );
+        assert_eq!(
+            cm.params.quorum, expect_alpha,
+            "quorum mismatch at peer_count={peer_count}"
+        );
+        assert_eq!(
+            cm.params.decision_threshold, expect_beta,
+            "decision_threshold mismatch at peer_count={peer_count}"
+        );
+    }
+
+    #[test]
+    fn scaling_curve_solo_bootstrap() {
+        assert_curve(0, 1, 1, 1);
+    }
+
+    #[test]
+    fn scaling_curve_one_peer() {
+        assert_curve(1, 1, 1, 3);
+    }
+
+    #[test]
+    fn scaling_curve_two_peers() {
+        assert_curve(2, 2, 2, 3);
+    }
+
+    #[test]
+    fn scaling_curve_three_peers_matches_testing_profile() {
+        // bbbed4f-validated 3-node stress rung — must stay (3,2,5).
+        assert_curve(3, 3, 2, 5);
+    }
+
+    #[test]
+    fn scaling_curve_five_peers_still_testing_profile() {
+        assert_curve(5, 3, 2, 5);
+    }
+
+    #[test]
+    fn scaling_curve_ten_peers_first_intermediate_rung() {
+        assert_curve(10, 5, 4, 8);
+    }
+
+    #[test]
+    fn scaling_curve_twenty_peers_second_intermediate_rung() {
+        assert_curve(20, 10, 7, 14);
+    }
+
+    #[test]
+    fn scaling_curve_twentyone_peers_full_production() {
+        assert_curve(21, 20, 14, 20);
+    }
+
+    #[test]
+    fn scaling_curve_hundred_peers_full_production() {
+        assert_curve(100, 20, 14, 20);
+    }
+
+    #[test]
+    fn scaling_curve_validate_invariant_every_rung() {
+        // For every rung where sample > 1, quorum must be > sample/2 (liveness).
+        // For sample == 1 (peer_count 0 and 1), validate() requires α >= 1
+        // since k/2 == 0.
+        let cases = [0usize, 1, 2, 3, 5, 10, 20, 21, 100];
+        for &pc in &cases {
+            let mut cm = ConsensusManager::new();
+            cm.update_params_for_network_size(pc);
+            let k = cm.params.sample_size;
+            let alpha = cm.params.quorum;
+            assert!(alpha >= 1, "alpha must be >= 1 at peer_count={pc}");
+            assert!(alpha <= k, "alpha must be <= k at peer_count={pc}");
+            if k > 1 {
+                assert!(
+                    alpha > k / 2,
+                    "alpha ({alpha}) must be > k/2 ({}) at peer_count={pc}",
+                    k / 2
+                );
+            }
+            assert!(cm.params.decision_threshold >= 1);
+        }
+    }
+
+    #[test]
+    fn scaling_curve_propagates_to_existing_voters() {
+        // Regression: the propagation loop must keep stale voters in sync.
+        // Adding a candidate creates a voter at (3,2,5) defaults; bumping
+        // peer_count to 100 should re-parameterise that voter to production
+        // (20,14,20) — proven by 5 unanimous rounds NOT being enough to
+        // finalize at the larger β.
+        let mut cm = ConsensusManager::new();
+        let block = make_test_block(1);
+        cm.add_candidate(block);
+        cm.update_params_for_network_size(100);
+        let hash = cm.heights.get(&1).unwrap().voter.preference().unwrap();
+        for _ in 0..5 {
+            for _ in 0..14 {
+                cm.record_response(1, hash);
+            }
+            cm.try_finalize_round(1, 100);
+        }
+        assert!(
+            cm.finalized_at_height(1).is_none(),
+            "5 rounds should not be enough at production beta=20"
+        );
     }
 }
