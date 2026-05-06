@@ -24,6 +24,27 @@ fn subnet_16(ip: &str) -> Option<String> {
     }
 }
 
+/// W5.3 / whitepaper anti-scale: returns true iff `addr` falls inside `prefix/len`.
+/// `prefix` is a textual IPv6 string parseable by `Ipv6Addr::from_str`.
+/// `len` is in bits, 0..=128. Out-of-range len returns false.
+fn ipv6_in_prefix(addr: std::net::Ipv6Addr, prefix: &str, len: u8) -> bool {
+    use std::net::Ipv6Addr;
+    if len > 128 {
+        return false;
+    }
+    let net: Ipv6Addr = match prefix.parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let addr_bits = u128::from_be_bytes(addr.octets());
+    let net_bits = u128::from_be_bytes(net.octets());
+    if len == 0 {
+        return true;
+    }
+    let mask: u128 = (!0u128) << (128 - len);
+    (addr_bits & mask) == (net_bits & mask)
+}
+
 /// Feature 137: Behavioral analysis profile for a validator.
 #[derive(Debug, Clone)]
 pub struct BehaviorProfile {
@@ -288,37 +309,43 @@ impl ComplianceChecker {
     }
 
     /// Feature 148: Check if an IP belongs to a known datacenter provider.
-    /// Checks common CIDR ranges for AWS, GCP, Azure, Hetzner, OVH.
+    ///
+    /// Accepts both IPv4 dotted-quad and IPv6 colon-hex strings. IPv4 hits
+    /// the legacy octet-prefix table; IPv6 hits the `IPV6_DC_PREFIXES`
+    /// aggregate table in `is_datacenter_ipv6`. Anything that doesn't parse
+    /// as either returns false (preserves existing malformed-input behaviour).
+    /// Closes the IPv6 anti-scale bypass that previously let every cloud
+    /// provider's v6 ranges silently evade detection.
     pub fn is_datacenter_ip(ip: &str) -> bool {
-        let parts: Vec<&str> = ip.split('.').collect();
-        if parts.len() != 4 {
-            return false;
+        use std::net::IpAddr;
+        match ip.parse::<IpAddr>() {
+            Ok(IpAddr::V4(v4)) => Self::is_datacenter_ipv4(v4),
+            Ok(IpAddr::V6(v6)) => Self::is_datacenter_ipv6(v6),
+            Err(_) => false,
         }
-        let octets: Vec<u8> = parts.iter()
-            .filter_map(|p| p.parse().ok())
-            .collect();
-        if octets.len() != 4 {
-            return false;
-        }
+    }
 
-        // AWS EC2: 3.x.x.x, 13.x.x.x, 18.x.x.x, 34.x.x.x, 35.x.x.x, 52.x.x.x, 54.x.x.x
+    /// IPv4 datacenter detection — legacy octet-prefix table.
+    fn is_datacenter_ipv4(addr: std::net::Ipv4Addr) -> bool {
+        let octets = addr.octets();
+
+        // AWS EC2: 3.x, 13.x, 18.x, 34.x, 35.x, 52.x, 54.x.
         let aws_prefixes: &[u8] = &[3, 13, 18, 34, 35, 52, 54];
         if aws_prefixes.contains(&octets[0]) {
             return true;
         }
 
-        // GCP: 34.x.x.x, 35.x.x.x (overlap with AWS — already covered)
-        // Additional GCP: 104.196.x.x, 104.199.x.x
+        // GCP: 104.196.x, 104.199.x (34.x/35.x covered above).
         if octets[0] == 104 && (octets[1] == 196 || octets[1] == 199) {
             return true;
         }
 
-        // Azure: 13.x.x.x (overlap), 20.x.x.x, 40.x.x.x, 52.x.x.x (overlap)
+        // Azure: 20.x, 40.x (13.x/52.x overlap AWS).
         if octets[0] == 20 || octets[0] == 40 {
             return true;
         }
 
-        // Hetzner: 88.198.x.x, 78.46.x.x, 148.251.x.x, 176.9.x.x, 46.4.x.x, 5.9.x.x
+        // Hetzner: 88.198, 78.46, 148.251, 176.9, 46.4, 5.9.
         if (octets[0] == 88 && octets[1] == 198)
             || (octets[0] == 78 && octets[1] == 46)
             || (octets[0] == 148 && octets[1] == 251)
@@ -329,7 +356,7 @@ impl ComplianceChecker {
             return true;
         }
 
-        // OVH: 51.x.x.x, 54.36.x.x, 87.98.x.x, 91.121.x.x, 149.202.x.x
+        // OVH: 51.x, 54.36, 87.98, 91.121, 149.202.
         if octets[0] == 51
             || (octets[0] == 54 && octets[1] == 36)
             || (octets[0] == 87 && octets[1] == 98)
@@ -339,7 +366,7 @@ impl ComplianceChecker {
             return true;
         }
 
-        // DigitalOcean: 64.225.x.x, 104.131.x.x, 128.199.x.x, 167.71.x.x, 167.172.x.x
+        // DigitalOcean: 64.225, 104.131, 128.199, 167.71, 167.172.
         if (octets[0] == 64 && octets[1] == 225)
             || (octets[0] == 104 && octets[1] == 131)
             || (octets[0] == 128 && octets[1] == 199)
@@ -348,6 +375,33 @@ impl ComplianceChecker {
             return true;
         }
 
+        false
+    }
+
+    /// IPv6 datacenter detection — aggregate prefix table.
+    /// Citations: AWS ip-ranges.json, Microsoft ServiceTags_Public.json,
+    /// Google goog.json, RIPE/ARIN BGP route objects (AS24940, AS16276,
+    /// AS14061). Aggregates intentionally cover provider-owned IANA
+    /// allocations; residential ISPs do not announce inside these ranges.
+    fn is_datacenter_ipv6(addr: std::net::Ipv6Addr) -> bool {
+        const IPV6_DC_PREFIXES: &[(&str, u8)] = &[
+            ("2600:1f00::", 24),   // AWS global EC2
+            ("2406:da00::", 24),   // AWS APAC EC2
+            ("2603:1000::", 24),   // Azure
+            ("2620:1ec::",  36),   // Azure edge / front-door
+            ("2600:1900::", 28),   // GCP primary
+            ("2620:0:1c00::", 40), // Google misc / corp edge
+            ("2a01:4f8::",  29),   // Hetzner AS24940
+            ("2a01:4f9::",  32),   // Hetzner secondary
+            ("2001:41d0::", 32),   // OVH AS16276
+            ("2604:a880::", 32),   // DigitalOcean AS14061 (US)
+            ("2a03:b0c0::", 32),   // DigitalOcean AS14061 (EU)
+        ];
+        for (prefix, len) in IPV6_DC_PREFIXES {
+            if ipv6_in_prefix(addr, prefix, *len) {
+                return true;
+            }
+        }
         false
     }
 
@@ -832,5 +886,97 @@ mod tests {
         // Deregister the second -> first should be restored to compliant
         checker.deregister_node(&addr(2));
         assert_eq!(checker.check(&addr(1)), ComplianceStatus::Compliant);
+    }
+
+    // -------------------------------------------------------------------
+    // IPv6 anti-scale — closes the cloud-IP bypass. The whitepaper
+    // promises "anti-scale enforcement from block one" and "datacenter
+    // mining economically suicidal" — the v6 path now matches the v4 path.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn ipv6_aws_is_datacenter() {
+        // 2600:1f00::/24 — AWS global EC2.
+        assert!(ComplianceChecker::is_datacenter_ip("2600:1f00:1000:1::1"));
+        // 2406:da00::/24 — AWS APAC.
+        assert!(ComplianceChecker::is_datacenter_ip("2406:da00::1"));
+    }
+
+    #[test]
+    fn ipv6_azure_is_datacenter() {
+        assert!(ComplianceChecker::is_datacenter_ip("2603:1000::1"));
+        assert!(ComplianceChecker::is_datacenter_ip("2603:10ff:ffff::1"));
+    }
+
+    #[test]
+    fn ipv6_gcp_is_datacenter() {
+        assert!(ComplianceChecker::is_datacenter_ip("2600:1900::1"));
+        assert!(ComplianceChecker::is_datacenter_ip("2620:0:1c00::1"));
+    }
+
+    #[test]
+    fn ipv6_hetzner_is_datacenter() {
+        assert!(ComplianceChecker::is_datacenter_ip("2a01:4f8::1"));
+        assert!(ComplianceChecker::is_datacenter_ip("2a01:4f9:c010::1"));
+    }
+
+    #[test]
+    fn ipv6_ovh_is_datacenter() {
+        assert!(ComplianceChecker::is_datacenter_ip("2001:41d0:1:abcd::1"));
+    }
+
+    #[test]
+    fn ipv6_digitalocean_is_datacenter() {
+        assert!(ComplianceChecker::is_datacenter_ip("2604:a880::1"));
+        assert!(ComplianceChecker::is_datacenter_ip("2a03:b0c0:3::1"));
+    }
+
+    #[test]
+    fn ipv6_residential_not_datacenter() {
+        // ISP allocations outside any cloud aggregate.
+        assert!(!ComplianceChecker::is_datacenter_ip("2600::1"));      // sparse
+        assert!(!ComplianceChecker::is_datacenter_ip("2001:db8::1"));  // RFC 3849 doc
+        assert!(!ComplianceChecker::is_datacenter_ip("2607:f8b0::1")); // legacy edge
+    }
+
+    #[test]
+    fn ipv6_link_local_and_loopback_not_datacenter() {
+        assert!(!ComplianceChecker::is_datacenter_ip("::1"));     // loopback
+        assert!(!ComplianceChecker::is_datacenter_ip("fe80::1")); // link-local
+        assert!(!ComplianceChecker::is_datacenter_ip("ff02::1")); // multicast
+    }
+
+    #[test]
+    fn ipv6_unparseable_returns_false() {
+        // Same contract as v4 for malformed input.
+        assert!(!ComplianceChecker::is_datacenter_ip("not.an.ip"));
+        assert!(!ComplianceChecker::is_datacenter_ip(""));
+        assert!(!ComplianceChecker::is_datacenter_ip("zzzz::1"));
+        assert!(!ComplianceChecker::is_datacenter_ip("2600:1f00::g"));
+    }
+
+    #[test]
+    fn ipv6_boundary_first_address_of_aws_prefix() {
+        // First address of 2600:1f00::/24 is 2600:1f00:: itself.
+        assert!(ComplianceChecker::is_datacenter_ip("2600:1f00::"));
+    }
+
+    #[test]
+    fn ipv6_boundary_last_address_of_aws_prefix() {
+        // Last address of 2600:1f00::/24 — host bits all 1.
+        assert!(ComplianceChecker::is_datacenter_ip(
+            "2600:1fff:ffff:ffff:ffff:ffff:ffff:ffff"
+        ));
+        // One address past the prefix (2600:2000::) must NOT be flagged.
+        assert!(!ComplianceChecker::is_datacenter_ip("2600:2000::"));
+    }
+
+    #[test]
+    fn ipv4_string_still_works_through_new_parser() {
+        // Regression: dotted-quad asserts must still pass after the
+        // IpAddr-based rewrite.
+        assert!(ComplianceChecker::is_datacenter_ip("3.5.10.20"));
+        assert!(ComplianceChecker::is_datacenter_ip("88.198.1.1"));
+        assert!(!ComplianceChecker::is_datacenter_ip("192.168.1.1"));
     }
 }
