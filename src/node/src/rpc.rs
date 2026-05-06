@@ -190,11 +190,18 @@ async fn get_status(
 }
 
 /// GET /peers — return connected peer information.
+/// W5.7 F-5: the `ip` field is redacted on this public route to prevent
+/// validator-topology enumeration. Operators with a legitimate need read
+/// IPs from node logs. A future /peers/full behind --rpc-key is out of scope.
 async fn get_peers(
     State(state): State<Arc<RpcState>>,
 ) -> Json<Vec<PeerInfo>> {
     let peers = state.peers.lock().await.clone();
-    Json(peers)
+    let redacted: Vec<PeerInfo> = peers
+        .into_iter()
+        .map(|p| PeerInfo { ip: None, ..p })
+        .collect();
+    Json(redacted)
 }
 
 /// Feature 17: Validate hex address format (64 hex chars = 32 bytes).
@@ -1480,6 +1487,48 @@ mod tests {
             "expected 4xx, got {}",
             resp.status()
         );
+    }
+
+    /// W5.7 F-5: regression test for /peers IP-leak.
+    /// Pre-fix the public /peers route returned the full Vec<PeerInfo>
+    /// including each peer's IP. After the fix the ip field must be None
+    /// regardless of internal state.
+    #[tokio::test]
+    async fn get_peers_redacts_ip() {
+        let (state, _rx) = make_rpc_state();
+
+        // Populate internal state with a real IP so we can prove the route strips it.
+        {
+            let mut peers = state.peers.lock().await;
+            peers.push(PeerInfo {
+                peer_id: "12D3KooWTestPeerForRedaction".into(),
+                ip: Some("203.0.113.42".into()),
+                validator_address: Some("ab".repeat(32)),
+                compliance_status: Some("Compliant".into()),
+                last_seen: None,
+            });
+        }
+
+        let app = build_router(state);
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/peers")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let returned: Vec<PeerInfo> = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(returned.len(), 1, "expected one peer in response");
+        assert!(
+            returned[0].ip.is_none(),
+            "ip MUST be redacted on /peers; got {:?}",
+            returned[0].ip
+        );
+        // Non-IP fields still pass through.
+        assert_eq!(returned[0].peer_id, "12D3KooWTestPeerForRedaction");
+        assert_eq!(returned[0].compliance_status.as_deref(), Some("Compliant"));
     }
 
     /// W5.7 F-2: regression test for unbounded rate_limits HashMap.
