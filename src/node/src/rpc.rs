@@ -4,7 +4,7 @@ use std::time::Instant;
 use axum::{
     Router,
     Json,
-    extract::{Path, State, ConnectInfo},
+    extract::{DefaultBodyLimit, Path, State, ConnectInfo},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     http::StatusCode,
     middleware::{self, Next},
@@ -126,38 +126,18 @@ async fn submit_tx(
     State(state): State<Arc<RpcState>>,
     Json(tx): Json<Transaction>,
 ) -> (StatusCode, Json<SubmitTxResponse>) {
-    // Feature 17: Structural validation before signature check.
-    if tx.public_key.len() != 32 {
+    // W5.7 F-1: structural validation BEFORE signature verify (cheap,
+    // catches body-bombs and malformed Batch / MultiSig shapes).
+    if let Err(reason) = tx.validate_shape() {
         return (
             StatusCode::BAD_REQUEST,
             Json(SubmitTxResponse {
                 accepted: false,
                 tx_hash: String::new(),
-                error: Some("public_key must be 32 bytes".into()),
+                error: Some(reason.into()),
             }),
         );
     }
-    if tx.signature.len() != 64 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(SubmitTxResponse {
-                accepted: false,
-                tx_hash: String::new(),
-                error: Some("signature must be 64 bytes".into()),
-            }),
-        );
-    }
-    if let Some(ref memo) = tx.memo
-        && memo.len() > commputer_core::transaction::Transaction::MAX_MEMO_LENGTH {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(SubmitTxResponse {
-                    accepted: false,
-                    tx_hash: String::new(),
-                    error: Some(format!("memo exceeds max length of {} bytes", commputer_core::transaction::Transaction::MAX_MEMO_LENGTH)),
-                }),
-            );
-        }
 
     // Basic validation before forwarding to event loop.
     if !tx.verify() {
@@ -1157,7 +1137,10 @@ async fn get_health_enhanced(
 pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
     Router::new()
         .route("/", get(block_explorer))
-        .route("/tx", post(submit_tx))
+        .route(
+            "/tx",
+            post(submit_tx).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/status", get(get_status))
         .route("/peers", get(get_peers))
         .route("/balance/{address}", get(get_balance))
@@ -1418,5 +1401,72 @@ mod tests {
         assert_eq!(status.height, 42);
         assert_eq!(status.epoch, 1);
         assert_eq!(status.accounts, 3);
+    }
+
+    /// W5.7 F-1: oversized Batch should be rejected by validate_shape
+    /// before signature verify, returning 400 BAD_REQUEST.
+    #[tokio::test]
+    async fn submit_tx_with_oversized_batch_rejected() {
+        let (state, _rx) = make_rpc_state();
+        let app = build_router(state);
+
+        let wallet = Wallet::generate();
+        let inner = TxKind::Transfer {
+            to: Address([1u8; 32]),
+            amount: Amount::from_comme(1),
+        };
+        let ops: Vec<TxKind> = (0..(Transaction::MAX_BATCH_SIZE + 1))
+            .map(|_| inner.clone()).collect();
+        let mut tx = Transaction {
+            from: *wallet.address(),
+            nonce: 0,
+            kind: TxKind::Batch { operations: ops },
+            fee: 100_000,
+            signature: vec![],
+            public_key: vec![],
+            memo: None,
+            timelock: None,
+        };
+        sign_transaction(&mut tx, &wallet);
+        let body = serde_json::to_vec(&tx).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tx")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let result: SubmitTxResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(!result.accepted);
+        assert_eq!(result.error.as_deref(), Some("batch exceeds MAX_BATCH_SIZE"));
+    }
+
+    /// W5.7 F-1: a 200 KB junk body on /tx must be rejected by the
+    /// DefaultBodyLimit layer BEFORE serde_json::Json deserialization,
+    /// so the server doesn't burn CPU/RAM on a malformed payload.
+    #[tokio::test]
+    async fn submit_tx_body_bomb_rejected_by_layer() {
+        let (state, _rx) = make_rpc_state();
+        let app = build_router(state);
+
+        let body = vec![b'x'; 200 * 1024];
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tx")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "expected 4xx, got {}",
+            resp.status()
+        );
     }
 }

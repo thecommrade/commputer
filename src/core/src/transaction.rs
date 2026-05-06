@@ -273,4 +273,210 @@ impl Transaction {
 
     /// Feature 246: Maximum batch size.
     pub const MAX_BATCH_SIZE: usize = 10;
+
+    /// W5.7 F-1: Maximum number of signers in a MultiSig tx.
+    /// Picked so a worst-case Batch of 10 MultiSigs fits inside the 64 KiB
+    /// body limit on /tx: 16 * (32 pubkey + 64 sig) = 1536 bytes payload,
+    /// plus borsh framing < 2 KiB → 10 × 2 KiB = 20 KiB. Comfortable margin.
+    pub const MAX_MULTISIG_SIGNERS: usize = 16;
+
+    /// W5.7 F-1: Validate the structural invariants of this transaction
+    /// BEFORE any expensive cryptographic work. Cheap, allocation-free,
+    /// safe to call from RPC entry, mempool admission, or block apply.
+    ///
+    /// Rejects:
+    ///   - public_key not 32 bytes / signature not 64 bytes
+    ///   - memo > MAX_MEMO_LENGTH
+    ///   - Batch.operations.len() > MAX_BATCH_SIZE
+    ///   - any element of Batch.operations that is itself a Batch
+    ///     (nested Batch is banned outright; clients must flatten)
+    ///   - MultiSig with threshold == 0, threshold > signers.len(),
+    ///     signers.len() > MAX_MULTISIG_SIGNERS, or
+    ///     signatures.len() != threshold
+    ///   - MultiSig with any signer != 32 bytes or any signature != 64 bytes
+    ///   - KeyRotation with new_public_key.len() != 32
+    pub fn validate_shape(&self) -> Result<(), &'static str> {
+        if self.public_key.len() != 32 {
+            return Err("public_key must be 32 bytes");
+        }
+        if self.signature.len() != 64 {
+            return Err("signature must be 64 bytes");
+        }
+        if let Some(ref memo) = self.memo {
+            if memo.len() > Self::MAX_MEMO_LENGTH {
+                return Err("memo exceeds MAX_MEMO_LENGTH");
+            }
+        }
+        Self::validate_kind_shape(&self.kind)
+    }
+
+    /// Inner helper: structural check on a TxKind. Used by validate_shape
+    /// at the outer level and by Batch elements at depth 1 (depth 1 is
+    /// the only legal depth — nested Batch is rejected).
+    fn validate_kind_shape(kind: &TxKind) -> Result<(), &'static str> {
+        match kind {
+            TxKind::Batch { operations } => {
+                if operations.len() > Self::MAX_BATCH_SIZE {
+                    return Err("batch exceeds MAX_BATCH_SIZE");
+                }
+                for op in operations {
+                    if matches!(op, TxKind::Batch { .. }) {
+                        return Err("nested Batch is not allowed");
+                    }
+                    Self::validate_kind_shape(op)?;
+                }
+            }
+            TxKind::MultiSig { threshold, signers, signatures } => {
+                if *threshold == 0 {
+                    return Err("multisig threshold must be > 0");
+                }
+                if signers.len() > Self::MAX_MULTISIG_SIGNERS {
+                    return Err("multisig signers exceeds MAX_MULTISIG_SIGNERS");
+                }
+                if (*threshold as usize) > signers.len() {
+                    return Err("multisig threshold > signers.len()");
+                }
+                if signatures.len() != *threshold as usize {
+                    return Err("multisig signatures.len() != threshold");
+                }
+                for s in signers.iter() {
+                    if s.len() != 32 {
+                        return Err("multisig signer must be 32 bytes");
+                    }
+                }
+                for s in signatures.iter() {
+                    if s.len() != 64 {
+                        return Err("multisig signature must be 64 bytes");
+                    }
+                }
+            }
+            TxKind::KeyRotation { new_public_key } => {
+                if new_public_key.len() != 32 {
+                    return Err("new_public_key must be 32 bytes");
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimally-valid Transaction shell for shape testing.
+    /// Signature is wrong on purpose — validate_shape() does NOT verify
+    /// signatures, only structural invariants.
+    fn shell_tx(kind: TxKind) -> Transaction {
+        Transaction {
+            from: Address([0u8; 32]),
+            nonce: 0,
+            kind,
+            fee: 100_000,
+            signature: vec![0u8; 64],
+            public_key: vec![0u8; 32],
+            memo: None,
+            timelock: None,
+        }
+    }
+
+    #[test]
+    fn validate_shape_accepts_simple_transfer() {
+        let tx = shell_tx(TxKind::Transfer {
+            to: Address([1u8; 32]),
+            amount: Amount::from_comme(1),
+        });
+        assert!(tx.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn validate_shape_rejects_oversized_batch() {
+        let inner = TxKind::Transfer { to: Address([1u8; 32]), amount: Amount::from_comme(1) };
+        let ops: Vec<TxKind> = (0..(Transaction::MAX_BATCH_SIZE + 1))
+            .map(|_| inner.clone()).collect();
+        let tx = shell_tx(TxKind::Batch { operations: ops });
+        assert_eq!(tx.validate_shape(), Err("batch exceeds MAX_BATCH_SIZE"));
+    }
+
+    #[test]
+    fn validate_shape_accepts_max_size_batch() {
+        let inner = TxKind::Transfer { to: Address([1u8; 32]), amount: Amount::from_comme(1) };
+        let ops: Vec<TxKind> = (0..Transaction::MAX_BATCH_SIZE).map(|_| inner.clone()).collect();
+        let tx = shell_tx(TxKind::Batch { operations: ops });
+        assert!(tx.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn validate_shape_rejects_nested_batch() {
+        let inner = TxKind::Batch { operations: vec![] };
+        let outer = TxKind::Batch { operations: vec![inner] };
+        let tx = shell_tx(outer);
+        assert_eq!(tx.validate_shape(), Err("nested Batch is not allowed"));
+    }
+
+    #[test]
+    fn validate_shape_rejects_oversized_multisig_signers() {
+        let signers = vec![vec![0u8; 32]; Transaction::MAX_MULTISIG_SIGNERS + 1];
+        let signatures = vec![vec![0u8; 64]; 1];
+        let tx = shell_tx(TxKind::MultiSig { threshold: 1, signers, signatures });
+        assert_eq!(tx.validate_shape(),
+                   Err("multisig signers exceeds MAX_MULTISIG_SIGNERS"));
+    }
+
+    #[test]
+    fn validate_shape_rejects_zero_threshold() {
+        let tx = shell_tx(TxKind::MultiSig {
+            threshold: 0,
+            signers: vec![vec![0u8; 32]],
+            signatures: vec![],
+        });
+        assert_eq!(tx.validate_shape(), Err("multisig threshold must be > 0"));
+    }
+
+    #[test]
+    fn validate_shape_rejects_threshold_exceeds_signers() {
+        let tx = shell_tx(TxKind::MultiSig {
+            threshold: 5,
+            signers: vec![vec![0u8; 32]; 2],
+            signatures: vec![vec![0u8; 64]; 5],
+        });
+        assert_eq!(tx.validate_shape(), Err("multisig threshold > signers.len()"));
+    }
+
+    #[test]
+    fn validate_shape_rejects_signature_count_mismatch() {
+        let tx = shell_tx(TxKind::MultiSig {
+            threshold: 2,
+            signers: vec![vec![0u8; 32]; 3],
+            signatures: vec![vec![0u8; 64]; 1],
+        });
+        assert_eq!(tx.validate_shape(), Err("multisig signatures.len() != threshold"));
+    }
+
+    #[test]
+    fn validate_shape_rejects_bad_multisig_signer_len() {
+        let tx = shell_tx(TxKind::MultiSig {
+            threshold: 1,
+            signers: vec![vec![0u8; 31]],
+            signatures: vec![vec![0u8; 64]],
+        });
+        assert_eq!(tx.validate_shape(), Err("multisig signer must be 32 bytes"));
+    }
+
+    #[test]
+    fn validate_shape_rejects_bad_keyrotation_pubkey_len() {
+        let tx = shell_tx(TxKind::KeyRotation { new_public_key: vec![0u8; 33] });
+        assert_eq!(tx.validate_shape(), Err("new_public_key must be 32 bytes"));
+    }
+
+    #[test]
+    fn validate_shape_rejects_oversized_memo() {
+        let mut tx = shell_tx(TxKind::Transfer {
+            to: Address([1u8; 32]),
+            amount: Amount::from_comme(1),
+        });
+        tx.memo = Some(vec![0u8; Transaction::MAX_MEMO_LENGTH + 1]);
+        assert_eq!(tx.validate_shape(), Err("memo exceeds MAX_MEMO_LENGTH"));
+    }
 }
