@@ -745,6 +745,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "commputer-seed-node-kit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libp2p",
+ "libp2p-identity",
+ "tokio",
+]
+
+[[package]]
 name = "commputer-sim"
 version = "0.1.0"
 dependencies = [

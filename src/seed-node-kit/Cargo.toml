@@ -1,0 +1,27 @@
+[package]
+name = "commputer-seed-node-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Operator toolkit for generating + verifying seed-node keys + multiaddrs"
+
+[[bin]]
+name = "commputer-keygen"
+path = "src/bin/keygen.rs"
+
+[[bin]]
+name = "commputer-multiaddr-builder"
+path = "src/bin/multiaddr_builder.rs"
+
+[[bin]]
+name = "commputer-verify-multiaddr"
+path = "src/bin/verify_multiaddr.rs"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
+libp2p = { workspace = true }
+# verify_multiaddr uses tokio for timeout-bounded DNS resolution + TCP connect.
+tokio = { workspace = true }
