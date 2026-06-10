@@ -124,53 +124,137 @@ fn http_text_get(host_port: &str, request: &str) -> Result<String, String> {
 // IPv4 prefix matching — mirrors compliance_check.rs::is_datacenter_ipv4
 // ---------------------------------------------------------------------------
 
+/// A5-cidr-tighten: CIDR matcher, mirror of compliance_check.rs::ipv4_in_prefix.
+fn ipv4_in_prefix(addr: [u8; 4], net: &str, len: u8) -> bool {
+    use std::net::Ipv4Addr;
+    if len > 32 {
+        return false;
+    }
+    let net_addr: Ipv4Addr = match net.parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let addr_bits = u32::from_be_bytes(addr);
+    let net_bits = u32::from_be_bytes(net_addr.octets());
+    if len == 0 {
+        return true;
+    }
+    let mask: u32 = (!0u32) << (32 - len);
+    (addr_bits & mask) == (net_bits & mask)
+}
+
+/// A5-cidr-tighten: CIDR-precise datacenter/cloud IPv4 prefix table.
+/// LOCKSTEP COPY of compliance_check.rs::DATACENTER_V4_PREFIXES — if you change
+/// one, change the other, or the operator doctor disagrees with the on-chain
+/// verdict. BGP-grounded (RIPEstat AS24940 Hetzner / AS16276 OVH / AS14061 DO;
+/// Google cloud.json). Replaces the legacy octet table that wrongly flagged the
+/// whole 51/8 as OVH and missed modern Hetzner /16s.
+const DATACENTER_V4_PREFIXES: &[(&str, u8, &str)] = &[
+    // ----- AWS (AS16509 / AS14618) — coarse /8 heuristic, preserved ----
+    ("3.0.0.0", 8, "AWS"),
+    ("13.0.0.0", 8, "AWS"),
+    ("18.0.0.0", 8, "AWS"),
+    ("34.0.0.0", 8, "AWS"),  // also GCP
+    ("35.0.0.0", 8, "AWS"),  // also GCP
+    ("52.0.0.0", 8, "AWS"),
+    ("54.0.0.0", 8, "AWS"),  // OVH 54.36/14 sits inside
+
+    // ----- Azure (AS8075) — coarse /8 heuristic, preserved -------------
+    ("20.0.0.0", 8, "Azure"),
+    ("40.0.0.0", 8, "Azure"),
+
+    // ----- GCP (AS15169 / AS396982) — confirmed cloud.json aggregates --
+    ("104.196.0.0", 14, "GCP"),
+    ("104.154.0.0", 15, "GCP"),
+    ("104.197.0.0", 16, "GCP"),
+    ("130.211.0.0", 16, "GCP"),
+    ("35.184.0.0", 13, "GCP"),
+
+    // ----- Hetzner (AS24940) — BROADENED to real announced /15-/17 -----
+    ("88.198.0.0", 16, "Hetzner"),
+    ("88.99.0.0", 16, "Hetzner"),
+    ("49.12.0.0", 16, "Hetzner"),
+    ("49.13.0.0", 16, "Hetzner"),
+    ("65.21.0.0", 16, "Hetzner"),
+    ("65.108.0.0", 16, "Hetzner"),
+    ("65.109.0.0", 16, "Hetzner"),
+    ("95.216.0.0", 16, "Hetzner"),
+    ("95.217.0.0", 16, "Hetzner"),
+    ("116.202.0.0", 16, "Hetzner"),
+    ("116.203.0.0", 16, "Hetzner"),
+    ("167.233.0.0", 16, "Hetzner"),
+    ("167.235.0.0", 16, "Hetzner"),
+    ("168.119.0.0", 16, "Hetzner"),
+    ("78.46.0.0", 15, "Hetzner"),
+    ("148.251.0.0", 16, "Hetzner"),
+    ("176.9.0.0", 16, "Hetzner"),
+    ("5.9.0.0", 16, "Hetzner"),
+    ("46.4.0.0", 16, "Hetzner"),
+    ("46.224.0.0", 15, "Hetzner"),
+    ("5.75.128.0", 17, "Hetzner"),
+
+    // ----- OVH (AS16276) — TIGHTENED from whole-51/8 to 18 real blocks -
+    ("51.38.0.0", 16, "OVH"),
+    ("51.68.0.0", 16, "OVH"),
+    ("51.75.0.0", 16, "OVH"),
+    ("51.77.0.0", 16, "OVH"),
+    ("51.79.0.0", 16, "OVH"),
+    ("51.81.0.0", 16, "OVH"),
+    ("51.83.0.0", 16, "OVH"),
+    ("51.89.0.0", 16, "OVH"),
+    ("51.91.0.0", 16, "OVH"),
+    ("51.161.0.0", 16, "OVH"),
+    ("51.178.0.0", 16, "OVH"),
+    ("51.195.0.0", 16, "OVH"),
+    ("51.210.0.0", 16, "OVH"),
+    ("51.222.0.0", 16, "OVH"),
+    ("51.254.0.0", 15, "OVH"),
+    ("54.36.0.0", 14, "OVH"),
+    ("87.98.0.0", 16, "OVH"),
+    ("91.121.0.0", 16, "OVH"),
+    ("149.202.0.0", 16, "OVH"),
+    ("145.239.0.0", 16, "OVH"),
+    ("137.74.0.0", 16, "OVH"),
+    ("141.94.0.0", 16, "OVH"),
+    ("141.95.0.0", 16, "OVH"),
+    ("178.32.0.0", 15, "OVH"),
+    ("188.165.0.0", 16, "OVH"),
+    ("5.135.0.0", 16, "OVH"),
+    ("5.196.0.0", 16, "OVH"),
+    ("92.222.0.0", 16, "OVH"),
+    ("94.23.0.0", 16, "OVH"),
+    ("213.32.0.0", 17, "OVH"),
+    ("5.39.0.0", 17, "OVH"),
+
+    // ----- DigitalOcean (AS14061) — fully-covered /16s -----------------
+    ("64.225.0.0", 16, "DigitalOcean"),
+    ("104.131.0.0", 16, "DigitalOcean"),
+    ("128.199.0.0", 16, "DigitalOcean"),
+    ("167.71.0.0", 16, "DigitalOcean"),
+    ("167.172.0.0", 16, "DigitalOcean"),
+    ("134.122.0.0", 16, "DigitalOcean"),
+    ("137.184.0.0", 16, "DigitalOcean"),
+    ("138.197.0.0", 16, "DigitalOcean"),
+    ("138.68.0.0", 16, "DigitalOcean"),
+    ("142.93.0.0", 16, "DigitalOcean"),
+    ("143.198.0.0", 16, "DigitalOcean"),
+    ("146.190.0.0", 16, "DigitalOcean"),
+    ("157.230.0.0", 16, "DigitalOcean"),
+    ("159.65.0.0", 16, "DigitalOcean"),
+    ("159.89.0.0", 16, "DigitalOcean"),
+    ("161.35.0.0", 16, "DigitalOcean"),
+    ("165.22.0.0", 16, "DigitalOcean"),
+    ("165.227.0.0", 16, "DigitalOcean"),
+    ("206.189.0.0", 16, "DigitalOcean"),
+    ("64.227.0.0", 16, "DigitalOcean"),
+];
+
 fn match_datacenter_ipv4(o: [u8; 4]) -> Option<&'static str> {
-    // AWS EC2: 3.x, 13.x, 18.x, 34.x, 35.x, 52.x, 54.x.
-    const AWS_PREFIXES: &[u8] = &[3, 13, 18, 34, 35, 52, 54];
-    if AWS_PREFIXES.contains(&o[0]) {
-        return Some("AWS");
+    for (net, len, label) in DATACENTER_V4_PREFIXES {
+        if ipv4_in_prefix(o, net, *len) {
+            return Some(label);
+        }
     }
-
-    // GCP additional: 104.196.x, 104.199.x.
-    if o[0] == 104 && (o[1] == 196 || o[1] == 199) {
-        return Some("GCP");
-    }
-
-    // Azure: 20.x, 40.x.
-    if o[0] == 20 || o[0] == 40 {
-        return Some("Azure");
-    }
-
-    // Hetzner.
-    if (o[0] == 88 && o[1] == 198)
-        || (o[0] == 78 && o[1] == 46)
-        || (o[0] == 148 && o[1] == 251)
-        || (o[0] == 176 && o[1] == 9)
-        || (o[0] == 46 && o[1] == 4)
-        || (o[0] == 5 && o[1] == 9)
-    {
-        return Some("Hetzner");
-    }
-
-    // OVH.
-    if o[0] == 51
-        || (o[0] == 54 && o[1] == 36)
-        || (o[0] == 87 && o[1] == 98)
-        || (o[0] == 91 && o[1] == 121)
-        || (o[0] == 149 && o[1] == 202)
-    {
-        return Some("OVH");
-    }
-
-    // DigitalOcean.
-    if (o[0] == 64 && o[1] == 225)
-        || (o[0] == 104 && o[1] == 131)
-        || (o[0] == 128 && o[1] == 199)
-        || (o[0] == 167 && (o[1] == 71 || o[1] == 172))
-    {
-        return Some("DigitalOcean");
-    }
-
     None
 }
 
@@ -247,7 +331,12 @@ mod tests {
 
     #[test]
     fn ovh_v4_flagged() {
-        assert_eq!(match_datacenter_ipv4([51, 1, 2, 3]), Some("OVH"));
+        // A5-cidr-tighten: 51.68/16 is a real announced OVH block. The old code
+        // wrongly flagged the WHOLE 51/8 (incl. 51.1.x and Scaleway 51.15.x);
+        // those are NOT OVH and must now be None.
+        assert_eq!(match_datacenter_ipv4([51, 68, 1, 1]), Some("OVH"));
+        assert_eq!(match_datacenter_ipv4([51, 1, 2, 3]), None);
+        assert_eq!(match_datacenter_ipv4([51, 100, 1, 1]), None);
     }
 
     #[test]
