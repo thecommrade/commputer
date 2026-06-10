@@ -71,8 +71,9 @@ src/staging/pouw/
     escalation.rs     // NoQuorum/challenge -> larger re-execution quorum (wires dispute.rs logic)
     settlement.rs     // escrow, 85/10/5, slashing, refunds, the incentive accounting
     engine.rs         // drives one job through the whole game (orchestrator)
-    params.rs         // GameParams (K, sample_rate, p_trap, quorum, bonds, split,
-                      //             dispute_bounty_bps, challenge_window, K_escalate)
+    params.rs         // GameParams: K, K_escalate, sample_rate, p_trap, quorum, split (85/10/5),
+                      //   executor_bond, verifier_bond, challenger_bond, challenge_window,
+                      //   dispute_bounty_bps, challenger_reward_bps, escalation_reward_bps, trap_jackpot_bps
   sim/                // the proof harness (separate bin or tests/)
     agents.rs         // honest/lazy/cheating executor; honest/rubber-stamp/colluding verifier
     tournament.rs     // Monte-Carlo driver + metrics
@@ -100,8 +101,9 @@ pub struct Job {
 
 pub struct ExecutorClaim { pub executor: ParticipantId, pub result_hash: [u8; 32], pub bond: u64 }
 
-pub struct Commitment { pub verifier: ParticipantId, pub commit: [u8; 32] } // H(result_hash ‖ salt ‖ verifier)
+pub struct Commitment { pub verifier: ParticipantId, pub commit: [u8; 32], pub bond: u64 } // H(result_hash ‖ salt ‖ verifier); bond posted on commit
 pub struct Reveal     { pub verifier: ParticipantId, pub result_hash: [u8; 32], pub salt: [u8; 32] }
+pub struct Challenge  { pub challenger: ParticipantId, pub bond: u64 } // staked dispute of an (unsampled / NoQuorum) result
 
 pub enum Verdict {
     Confirmed { result_hash: [u8; 32] },         // committee agrees WITH the executor
@@ -112,7 +114,10 @@ pub enum Verdict {
 pub struct SettlementOutcome {
     pub worker_paid: u64, pub verifiers_paid: u64, pub burned: u64,
     pub submitter_refunded: u64,
-    pub slashed: Vec<(ParticipantId, u64)>,      // executor and/or dishonest verifiers
+    pub challenger_paid: u64,                    // successful-challenger reward (Disputed-via-escalation)
+    pub panel_paid: u64,                         // escalation re-executor compensation
+    pub bonds_returned: u64,                     // all honest participants' bonds returned intact
+    pub slashed: Vec<(ParticipantId, u64)>,      // executor / challenger / dishonest verifiers (a log; the amounts land in `burned`/`challenger_paid`/`panel_paid`)
 }
 ```
 
@@ -144,6 +149,14 @@ Phases, driven by `engine.rs`:
    - All slashed stake is **burned** except the explicit `Disputed` catch bounty (preserves the deflationary thesis).
 
    *Worked example (`Disputed`, `B`=100, `Be`=100, bounty 20%):* submitter refunded **100**; honest verifiers split **20** from the slashed bond; **80** burned; the cheating executor nets **−100**. Conservation: inflow `100 (budget) + 100 (bond) = 200` = `100 refund + 20 verifiers + 80 burn`. ✓
+
+   **Escalation & challenge outcomes (loser-pays).** A `Challenge` (on an unsampled or `NoQuorum` job) posts bond `Bc` and draws a `K_escalate` re-execution panel (default 7) of stake-weighted re-executors, each posting a verifier bond, that returns a binding ⅔ verdict:
+   - **Executor guilty (`Disputed`-via-escalation):** loser = executor. Submitter refunded full `B`; the **challenger** gets `Bc` back **+** reward `challenger_reward_bps · Be`; the honest **panel** splits `escalation_reward_bps · Be`; the remainder of `Be` is burned. (Requires `challenger_reward_bps + escalation_reward_bps ≤ 1`.)
+   - **Executor innocent (`Confirmed`-via-escalation / false challenge):** loser = challenger. The job settles `Confirmed` for the worker (85/10/5 — the 10% to honest original verifiers if the job was sampled, else burned); the honest **panel** splits `escalation_reward_bps · Bc`; the remainder of `Bc` is burned; the executor's bond is returned.
+   - Dishonest / no-show panel members forfeit their verifier bonds (burned).
+   Every escalation flow is funded by the **loser's slashed bond** (`Be` or `Bc`) plus the escrow `B` — nothing is minted — so the §9 identity holds with `Bc` added as an inflow.
+
+   **Trap jobs (synthetic; conservation-clean).** A trap is a *synthetic* verification challenge with **no real budget `B`**: the protocol presents a known-wrong claim to a committee. Rubber-stampers (revealed the planted wrong answer) have their **verifier bonds slashed**; honest verifiers split a **jackpot = `trap_jackpot_bps · (slashed rubber-stamper bonds)`**, remainder burned. The jackpot is funded **only from slashed bonds — never minted** — so traps strictly shrink supply. If no one rubber-stamps, there is no slash and no jackpot (honest verifiers are paid on *real* jobs via the 10% slice; traps exist only to punish cheats).
 
 ## 7. Economics — the one inequality everything serves
 
@@ -192,8 +205,12 @@ The deterministic `EquivalenceOracle` impl is literally `a == b`. That is the en
 - Rubber-stamp verifier ⇒ trap-slashed; net EV < 0.
 - Collusion of `f` verifiers ⇒ fails below the stake fraction implied by K/quorum; succeeds only above it (documents the bound).
 - `NoQuorum` ⇒ escalation produces a binding verdict and slashes the loser.
-- Settlement conserves value: `budget + Σ bonds_in = worker_paid + verifiers_paid + burned + submitter_refunded + bonds_returned`. No mint (bonds are an inflow alongside the escrowed budget).
+- Settlement conserves value on **every** terminal branch:
+  `budget + Σ bonds_in (executor + verifiers + challenger) = worker_paid + verifiers_paid + challenger_paid + panel_paid + burned + submitter_refunded + bonds_returned`. No mint — bonds are inflows alongside the escrowed budget, and every payout/burn is sourced from those inflows.
 - Unsampled & unchallenged job ⇒ settles **85% worker / 15% burn**; the verifier slice is burned, never paid to a non-verifier.
+- `Disputed`-via-escalation ⇒ submitter refunded full `B`; challenger reward + panel reward come **only** from the slashed executor bond `Be`; remainder burned; conservation holds.
+- `Confirmed`-via-escalation (false challenge) ⇒ challenger bond `Bc` fully consumed (panel reward + burn); worker still paid 85/10/5; executor bond returned.
+- Trap job ⇒ jackpot to honest verifiers is sourced **only** from slashed rubber-stamper bonds (never minted); remainder burned; supply strictly shrinks.
 - No-show / commitment-mismatch verifier ⇒ its bond is slashed (burned) and appears in `SettlementOutcome.slashed` and the conservation ledger.
 
 **Monte-Carlo tournament (`sim/`):** many jobs, a mix of agent strategies, seeded RNG. Reports: % cheats caught, honest-vs-cheat average profit (cheat must be ≤ 0), and a **best-response check** that "honest" is the Nash strategy under the chosen params. Output is a short table the founder can read.
