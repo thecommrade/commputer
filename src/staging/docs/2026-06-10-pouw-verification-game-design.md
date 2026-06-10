@@ -71,7 +71,8 @@ src/staging/pouw/
     escalation.rs     // NoQuorum/challenge -> larger re-execution quorum (wires dispute.rs logic)
     settlement.rs     // escrow, 85/10/5, slashing, refunds, the incentive accounting
     engine.rs         // drives one job through the whole game (orchestrator)
-    params.rs         // GameParams (K, sample_rate, p_trap, quorum, bonds, split)
+    params.rs         // GameParams (K, sample_rate, p_trap, quorum, bonds, split,
+                      //             dispute_bounty_bps, challenge_window, K_escalate)
   sim/                // the proof harness (separate bin or tests/)
     agents.rs         // honest/lazy/cheating executor; honest/rubber-stamp/colluding verifier
     tournament.rs     // Monte-Carlo driver + metrics
@@ -121,7 +122,11 @@ Phases, driven by `engine.rs`:
 
 1. **Submit.** `budget` is escrowed via `ChainHooks::escrow`. Executor claims and posts `bond ≥ budget` (so a slash ≥ the cheating gain). 
 2. **Execute.** Executor runs `ExecutionOracle::run(spec, input)`; posts `ExecutorClaim{ result_hash }`. The claim is fixed before verifiers are known (binds the executor; enables unpredictable selection).
-3. **Sample.** A `seed` (modeled VRF; later a block hash / anchor VRF, *unknowable before step 2*) draws **K** verifiers, **stake-weighted**, excluding the executor (`committee.rs`). Only a `sample_rate` fraction of jobs get a full committee; **trap jobs cover the unsampled population probabilistically**.
+3. **Sample.** A `seed` (modeled VRF; later a block hash / anchor VRF), **unknowable before step 2**, decides per job — with probability `sample_rate` — whether the job is *proactively* verified:
+   - **Sampled** (`p = sample_rate`): the seed draws **K** **stake-weighted** verifiers, excluding the executor (`committee.rs`); proceed to commit-reveal (steps 4–6).
+   - **Unsampled** (`p = 1 − sample_rate`): the claim is **optimistically accepted** but enters a **challenge window** in which any staked actor may force an escalation (step 8). Trap jobs (§7) cover this population probabilistically, so a lazy executor still expects to be caught.
+
+   Because the executor fixed its claim in step 2 *before* learning whether the job is sampled, it cannot selectively cheat only on unsampled jobs.
 4. **Commit.** Each selected verifier independently runs the job and submits `Commitment = H(result_hash ‖ salt ‖ id)`. Hiding ⇒ no verifier can copy another's or the executor's answer.
 5. **Reveal.** After all commit (or a timeout), verifiers reveal `(result_hash, salt)`. A reveal that doesn't match its commitment is discarded and the verifier penalized (no-show).
 6. **Verdict** (`verdict.rs`, quorum = `ceil(2/3·K)` agreeing under `EquivalenceOracle`):
@@ -130,10 +135,15 @@ Phases, driven by `engine.rs`:
    - no value reaches quorum → `NoQuorum` → **escalate**.
 7. **Traps** (`trap.rs`, probability `p_trap`). The protocol injects a job whose **true** answer it knows but presents the executor-result as a **deliberately wrong** hash. Any verifier who reveals the *wrong* answer (i.e., rubber-stamped, or computed-and-lied) is **slashed**; verifiers who reveal the *true* answer get a **jackpot**. This makes "skip the work and echo the executor" strictly EV-negative.
 8. **Escalation** (`escalation.rs`). `NoQuorum` or a staked **challenge** triggers a larger re-execution quorum (K′ > K, e.g. 7), ⅔-majority binding. This is precisely the logic the dead `consensus/dispute.rs` `resolve_dispute` already encodes (3 re-executors, ⅔, 50% slash) — generalized and finally given a caller. The loser (executor or a false challenger) is slashed.
-9. **Settle** (`settlement.rs`). On the final verdict:
-   - `Confirmed`: release escrow **85% worker / 10% to revealing-honest verifiers / 5% burn**; bonds returned.
-   - `Disputed`: executor **bond slashed (burned)**; **submitter refunded** the budget (minus the verifier reward funded from the slash); honest verifiers paid from the slash.
-   - All slashed stake is **burned** (preserves the deflationary thesis).
+9. **Settle** (`settlement.rs`). Let `B` = budget, `Be` = executor bond (`≥ B`). Inflows into settlement are `B` (escrow) **plus all posted bonds**; settlement only ever redistributes or burns these — it never mints.
+   - **`Confirmed`** — sampled committee agrees with the executor, *or* an unsampled job survives its challenge window:
+     - *Sampled:* release `B` as **85% worker / 10% revealing-honest verifiers / 5% burn**; all bonds returned.
+     - *Unsampled (no committee):* the 10% verifier slice has **no recipient**, so it is **burned** — settlement is **85% worker / 15% burn**. No one is paid for verification that did not happen; all bonds returned.
+   - **`Disputed`** — committee or escalation proves the executor wrong: the **submitter is refunded the full `B`** (they received no useful work). The executor bond `Be` is slashed and split — honest verifiers (who revealed the correct answer) share a **catch bounty** of `dispute_bounty_bps · Be` (default **2000 bps = 20%**); the remainder `Be · (1 − dispute_bounty_bps)` is **burned**. Honest verifiers' own bonds are returned.
+   - **Dishonest / no-show verifiers** — revealed the wrong answer, failed to reveal, or a commitment mismatch (steps 5/7): their **verifier bond is slashed and burned**, recorded in `SettlementOutcome.slashed`.
+   - All slashed stake is **burned** except the explicit `Disputed` catch bounty (preserves the deflationary thesis).
+
+   *Worked example (`Disputed`, `B`=100, `Be`=100, bounty 20%):* submitter refunded **100**; honest verifiers split **20** from the slashed bond; **80** burned; the cheating executor nets **−100**. Conservation: inflow `100 (budget) + 100 (bond) = 200` = `100 refund + 20 verifiers + 80 burn`. ✓
 
 ## 7. Economics — the one inequality everything serves
 
@@ -143,7 +153,7 @@ For honesty to be the dominant strategy:
 E[gain from cheating]  <  P(caught) · slash
 ```
 
-- **Lazy/cheating executor:** gain ≈ saved compute `C_exec`. `P(caught) = P(sampled) + P(trap) − overlap`. Require `(P(sampled)+P(trap)) · bond > C_exec` for all jobs ⇒ pick `bond ≥ budget` and tune `sample_rate`, `p_trap`.
+- **Lazy/cheating executor:** gain ≈ saved compute `C_exec`. True `P(caught) = P(sampled) + P(trap) − overlap`; we use the **conservative lower bound** `P(caught) ≥ max(P(sampled), P(trap))` (dropping the `overlap` term *understates* safety, so the design holds a fortiori). Require `max(P(sampled), P(trap)) · Be > C_exec` for all jobs ⇒ pick executor bond `Be ≥ budget` and tune `sample_rate`, `p_trap`.
 - **Rubber-stamp verifier:** gain ≈ saved verify cost `C_ver`. Require `p_trap · verifier_bond > C_ver`.
 - **Collusion:** executor + `f` colluding committee members win only if they reach quorum; `f ≥ ceil(2/3·K)` of a *stake-weighted, post-commit-unpredictable* committee is required — the sim reports the stake fraction at which this becomes feasible, and escalation raises the bar further.
 
@@ -182,7 +192,9 @@ The deterministic `EquivalenceOracle` impl is literally `a == b`. That is the en
 - Rubber-stamp verifier ⇒ trap-slashed; net EV < 0.
 - Collusion of `f` verifiers ⇒ fails below the stake fraction implied by K/quorum; succeeds only above it (documents the bound).
 - `NoQuorum` ⇒ escalation produces a binding verdict and slashes the loser.
-- Settlement conserves value (escrow in = paid + burned + refunded; no mint).
+- Settlement conserves value: `budget + Σ bonds_in = worker_paid + verifiers_paid + burned + submitter_refunded + bonds_returned`. No mint (bonds are an inflow alongside the escrowed budget).
+- Unsampled & unchallenged job ⇒ settles **85% worker / 15% burn**; the verifier slice is burned, never paid to a non-verifier.
+- No-show / commitment-mismatch verifier ⇒ its bond is slashed (burned) and appears in `SettlementOutcome.slashed` and the conservation ledger.
 
 **Monte-Carlo tournament (`sim/`):** many jobs, a mix of agent strategies, seeded RNG. Reports: % cheats caught, honest-vs-cheat average profit (cheat must be ≤ 0), and a **best-response check** that "honest" is the Nash strategy under the chosen params. Output is a short table the founder can read.
 
