@@ -3,6 +3,7 @@
 
 pub mod commit_reveal;
 pub mod committee;
+pub mod engine;
 pub mod escalation;
 pub mod ids;
 pub mod job;
