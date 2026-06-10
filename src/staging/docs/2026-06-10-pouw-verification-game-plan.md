@@ -749,7 +749,7 @@ mod tests {
 pub fn bps(amount: u64, bps: u32) -> u64 { (amount as u128 * bps as u128 / 10_000) as u64 }
 
 pub fn settle_confirmed_sampled(l: &mut dyn ChainHooks, p: &GameParams, budget: u64,
-    worker: ParticipantId, verifiers: &[ParticipantId]) -> SettlementOutcome { /* 85/10/5; split the 10% evenly, remainder of the even split burned */ }
+    worker: ParticipantId, verifiers: &[ParticipantId]) -> SettlementOutcome { /* 85/10/5; burn the 85/10/5 rounding remainder too (not just the even-split-among-verifiers remainder), per the global rule */ }
 
 pub fn settle_confirmed_unsampled(l: &mut dyn ChainHooks, p: &GameParams, budget: u64,
     worker: ParticipantId) -> SettlementOutcome { /* worker 85%, burn the rest (15%) */ }
@@ -775,7 +775,7 @@ pub fn settle_committee_disputed(l: &mut dyn ChainHooks, p: &GameParams, budget:
 
 Implement the four escalation outcomes from spec §6.9: `Disputed`-via-challenge, false-challenge (`Confirmed`-via-challenge), `NoQuorum`→`Confirmed`, `NoQuorum`→`Disputed`. `escalation.rs` runs the panel (reuse `compute_verdict` with `k_escalate`) and calls the matching settlement function.
 
-- [ ] **Step 1: Failing tests** — one per branch, asserting exact splits + `total_supply` invariance. Mirror Task 8's style. Key assertions:
+- [ ] **Step 1: Failing tests** — one per branch, asserting exact splits + `total_supply` invariance. Mirror Task 8's style. **Test-setup reminder:** each panel member posts a `verifier_bond`, so the test must `escrow` those panel bonds up front (like the executor bond in Task 8 Step 1) or the conservation assertion will look unbalanced. Key assertions:
   - `Disputed`-via-challenge (`Be`=100, challenger_reward 10%, escalation_reward 10%): submitter refunded 100; challenger gets bond back + 10; panel gets 10; burn 80.
   - false-challenge (`Bc`=50): challenger loses 50; panel gets `bps(50, escalation_reward_bps)=5`; burn 45; worker still 85/burn-the-10/5.
   - `NoQuorum`→`Confirmed`: worker 85/10/5; wrong-side committee bonds slashed → panel reward + burn; no `Bc`.
