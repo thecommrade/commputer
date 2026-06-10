@@ -161,7 +161,9 @@ The node creates `~/.commputer/` automatically on first run
 ```
 ~/.commputer/
 ├── config.toml          # optional — overrides CLI defaults
-├── peer_id              # libp2p peer identity (auto-generated, persistent)
+├── peer_id              # libp2p peer identity (auto-generated if absent;
+│                        #   SEED operators MUST pre-place their keygen output
+│                        #   here so their node's peer id matches SEED_NODES)
 ├── wallet/
 │   └── wallet-testnet.json   # encrypted keystore (BIP39-derived)
 └── testnet/             # RocksDB chain data (or mainnet/ on mainnet)

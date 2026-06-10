@@ -77,15 +77,22 @@ fn main() -> Result<()> {
     println!("  bytes   : {}", bytes.len());
     println!();
     println!("NEXT STEPS");
-    println!("  1. Run your node with this key file as the persistent identity.");
-    println!("     The node loader is at src/network/src/transport.rs:169 ");
-    println!("     (`new_with_keypair_path`).");
+    println!("  1. Install this key as your node's persistent identity.");
+    println!("     The node reads its libp2p identity from ONE fixed path:");
+    println!("       ~/.commputer/peer_id");
+    println!("     Put this key there BEFORE the first node start:");
+    println!("       mkdir -p ~/.commputer && cp {} ~/.commputer/peer_id", args.out.display());
+    println!("       chmod 600 ~/.commputer/peer_id");
+    println!("     (Or generate straight there: commputer-keygen --out ~/.commputer/peer_id --force)");
+    println!("     If you skip this, the node generates a DIFFERENT random identity");
+    println!("     on first boot and the peer id above will NOT match your node.");
     println!("  2. Build the multiaddr with:");
     println!("       commputer-multiaddr-builder \\");
     println!("         --peer-id {peer_id} \\");
     println!("         --ip <PUBLIC_IP> --port <PORT>");
     println!("  3. Send that multiaddr to the founder for inclusion in");
-    println!("     SEED_NODES (src/network/src/transport.rs:316).");
+    println!("     SEED_NODES (src/network/src/transport.rs:316). It must carry the");
+    println!("     peer id of the key installed at ~/.commputer/peer_id.");
 
     Ok(())
 }

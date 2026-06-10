@@ -45,11 +45,20 @@ analysis knows why rewards are zero.
    sudo install -m 0755 target/release/commputer /usr/local/bin/commputer
    commputer version    # confirm same git hash as the other two operators
    ```
-2. **Generate node keypair using T3.1's tooling:**
+2. **Generate node keypair, writing it to the path the node actually reads
+   (`~/.commputer/peer_id`):**
    ```bash
-   commputer-keygen --out /etc/commputer/node_key.bin
+   commputer-keygen --out ~/.commputer/peer_id
    # records the peer ID; you'll need it again at step 4.
    ```
+   **CRITICAL:** the node loads its libp2p identity ONLY from
+   `~/.commputer/peer_id`. If you generate the key anywhere else and don't
+   copy it there before the first start, the node boots with a DIFFERENT
+   random peer ID and the multiaddr you compute in step 4 will point at a
+   peer that does not exist — every follower's seed dial to you will fail.
+   Verified end-to-end: a node with this file pre-placed logs "Loaded
+   persistent peer identity"; without it, "Generated and saved new peer
+   identity" (a fresh random key).
 3. **Open firewall:** TCP 9000 + UDP 9000 inbound (libp2p TCP + QUIC).
 4. **Compute your multiaddr:**
    ```bash

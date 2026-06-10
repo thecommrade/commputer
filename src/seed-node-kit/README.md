@@ -30,7 +30,7 @@ You are an operator who has volunteered to host a seed node. You will:
    *is* the identity.
 
    ```bash
-   commputer-keygen --out /etc/commputer/seed_key.bin
+   commputer-keygen --out ~/.commputer/peer_id
    ```
 
    Output:
@@ -38,17 +38,27 @@ You are an operator who has volunteered to host a seed node. You will:
    ```
    Generated libp2p Ed25519 keypair
      peer id : 12D3KooWExample...
-     key file: /etc/commputer/seed_key.bin
-     bytes   : 39
+     key file: ~/.commputer/peer_id
+     bytes   : 68
    ```
 
    The `--out` file is `chmod 0600` immediately. Do not run as root unless
-   you also chown it to the user that will run the node.
+   you also chown it to the user that will run the node. `keygen` creates
+   the parent directory if it does not exist.
 
-2. **Run your node with that key file as the persistent identity.** The
-   node loads it via `new_with_keypair_path` in
-   `src/network/src/transport.rs:169`. Wire the path through whatever
-   config / CLI flag your build exposes.
+2. **The node loads its identity ONLY from `~/.commputer/peer_id`** (a fixed
+   path; see `new_with_keypair_path` in `src/network/src/transport.rs:169`,
+   reading the path from `config::peer_key_path()`). That is why step 1
+   writes the key straight there. If you generated the key elsewhere, copy
+   it into place BEFORE the first node start:
+
+   ```bash
+   mkdir -p ~/.commputer && cp <your-key> ~/.commputer/peer_id && chmod 600 ~/.commputer/peer_id
+   ```
+
+   If you skip this, the node generates a DIFFERENT random identity on first
+   boot (transport.rs:177) and the peer ID you registered with the founder
+   will not match your running node — seed connections to you will fail.
 
 3. **Build your multiaddr** using the peer ID printed above plus the
    public IP/DNS and port you intend to expose:
