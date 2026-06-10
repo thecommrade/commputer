@@ -846,21 +846,52 @@ h1 {{ color: #e94560; }}
 
 // ── Feature 15: RPC API key authentication middleware ──
 
+/// A4-auth-loopback: code-level opt-out for the legacy loopback auth bypass.
+///
+/// `false` (default, secure) — when an API key is configured the key is
+/// required for EVERY caller, including loopback (127.0.0.1 / ::1) and callers
+/// whose source IP cannot be determined. This is the correct default: a
+/// configured key is an explicit decision to require auth, and "trusted
+/// because it came from loopback" is unsafe on multi-tenant / containerized
+/// hosts where many unrelated processes share 127.0.0.1.
+///
+/// `true` — restores the old convenience: loopback callers skip the key check.
+/// Only flip this if you fully control every process on the host AND accept
+/// that any of them can drive the RPC unauthenticated. There is intentionally
+/// no CLI flag for this (src/node/src/main.rs is protected); the opt-out is a
+/// single auditable source line that ships closed.
+const ALLOW_LOOPBACK_BYPASS: bool = false;
+
 /// Middleware that checks `X-API-Key` header against the configured key.
-/// Localhost (127.0.0.1) requests bypass auth. If no key is configured, all requests pass.
+///
+/// If no key is configured, all requests pass (unchanged default).
+///
+/// A4-auth-loopback: if a key IS configured, the key is required for every
+/// caller. Loopback no longer bypasses auth unless `ALLOW_LOOPBACK_BYPASS` is
+/// set to `true` at build time. When the bypass is disabled (default) a caller
+/// with no determinable source IP is treated as untrusted and must present the
+/// key (fail-closed).
 async fn auth_middleware(
     State(state): State<Arc<RpcState>>,
     req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     if let Some(ref expected_key) = state.api_key {
-        // Bypass auth for localhost.
-        let is_localhost = req.extensions()
-            .get::<ConnectInfo<std::net::SocketAddr>>()
-            .map(|ci| ci.0.ip().is_loopback())
-            .unwrap_or(true); // Default to allowing if we can't determine IP
+        // A4-auth-loopback: by default, enforce for everyone. Only when the
+        // build-time opt-out is enabled do we exempt loopback callers.
+        let exempt = if ALLOW_LOOPBACK_BYPASS {
+            req.extensions()
+                .get::<ConnectInfo<std::net::SocketAddr>>()
+                .map(|ci| ci.0.ip().is_loopback())
+                // Cannot determine the source IP -> fail closed (NOT exempt),
+                // even under the opt-out. The old code defaulted this to `true`
+                // (exempt), which is exactly the hole this patch closes.
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
-        if !is_localhost {
+        if !exempt {
             let provided = req.headers()
                 .get("X-API-Key")
                 .and_then(|v| v.to_str().ok());
@@ -1659,5 +1690,176 @@ mod tests {
 
         // No transfer should have been queued to the event loop.
         assert!(rx.try_recv().is_err(), "faucet must not queue a tx when unprovisioned");
+    }
+
+    // ── A4-auth-loopback regression tests ──
+    //
+    // The bug: when an api_key was set, loopback callers (and callers with no
+    // determinable IP) skipped the X-API-Key check. These tests pin the new
+    // policy: a configured key is required for loopback callers too, while the
+    // no-key default remains a pure pass-through.
+
+    use std::net::SocketAddr;
+
+    /// Helper: a request to GET /status carrying an explicit loopback
+    /// ConnectInfo in its extensions (what the real TCP accept path injects).
+    /// `key`: Some(..) sets the X-API-Key header; None omits it entirely.
+    fn loopback_status_request(key: Option<&str>) -> Request<Body> {
+        let loopback: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let mut builder = Request::builder().method("GET").uri("/status");
+        if let Some(k) = key {
+            builder = builder.header("X-API-Key", k);
+        }
+        let mut req = builder.body(Body::empty()).unwrap();
+        // Inject the source address exactly as into_make_service_with_connect_info
+        // would at runtime, so auth_middleware's is_loopback() path is exercised.
+        req.extensions_mut().insert(ConnectInfo(loopback));
+        req
+    }
+
+    /// With a key configured, a LOOPBACK request that omits X-API-Key MUST be
+    /// rejected (401). This is the bypass the patch closes.
+    #[tokio::test]
+    async fn loopback_without_key_is_rejected_when_key_set() {
+        let (mut state, _rx) = make_rpc_state();
+        // Configure an API key. State Arc is unique here (refcount 1), so
+        // get_mut succeeds before build_router clones it into the router.
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(loopback_status_request(None))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "loopback caller with no X-API-Key MUST be rejected when a key is configured \
+             (this is the A4 loopback bypass)"
+        );
+    }
+
+    /// With a key configured, a LOOPBACK request that presents the WRONG key
+    /// MUST be rejected (401). Guards against any "present-but-unchecked" path.
+    #[tokio::test]
+    async fn loopback_with_wrong_key_is_rejected_when_key_set() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(loopback_status_request(Some("wrong-key")))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "loopback caller with a wrong key MUST be rejected when a key is configured"
+        );
+    }
+
+    /// With a key configured, a LOOPBACK request that presents the CORRECT key
+    /// MUST be accepted (200) and reach the handler.
+    #[tokio::test]
+    async fn loopback_with_correct_key_is_accepted_when_key_set() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(loopback_status_request(Some("s3cret-key")))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "loopback caller presenting the correct key MUST be accepted"
+        );
+    }
+
+    /// Default path (no key configured): the middleware is a pass-through.
+    /// A loopback request with NO X-API-Key MUST still be accepted (200).
+    /// This pins that the patch does not regress the unauthenticated default.
+    #[tokio::test]
+    async fn loopback_passes_through_when_no_key_set() {
+        // make_rpc_state() defaults api_key = None.
+        let (state, _rx) = make_rpc_state();
+        assert!(state.api_key.is_none(), "helper default must be no-key");
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(loopback_status_request(None))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "with no key configured, loopback requests pass through unchanged"
+        );
+    }
+
+    /// Runtime-path guard: with a key configured and NO ConnectInfo present at
+    /// all (the actual condition under the current `axum::serve` wiring, which
+    /// does not inject ConnectInfo), the request MUST still be rejected (401).
+    /// Pins the fail-closed "no determinable IP" behavior.
+    #[tokio::test]
+    async fn no_connect_info_is_rejected_when_key_set() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        let app = build_router(state);
+
+        // No ConnectInfo inserted — mirrors the live runtime path.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "request with no determinable source IP MUST be rejected when a key is configured"
+        );
+    }
+
+    /// Cross-check: a non-loopback caller with no key is ALSO rejected when a
+    /// key is configured. This isn't new behavior (it worked before), but it
+    /// pins that the refactor didn't accidentally narrow enforcement to the
+    /// loopback branch only.
+    #[tokio::test]
+    async fn remote_without_key_is_rejected_when_key_set() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        let app = build_router(state);
+
+        let remote: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(remote));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "non-loopback caller with no key MUST be rejected when a key is configured"
+        );
     }
 }
