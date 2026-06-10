@@ -2,4 +2,5 @@
 //! See src/staging/docs/2026-06-10-pouw-verification-game-design.md.
 
 pub mod ids;
+pub mod job;
 pub mod params;
