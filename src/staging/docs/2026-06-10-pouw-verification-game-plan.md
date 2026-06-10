@@ -68,10 +68,10 @@ description = "Proof-of-useful-work verification & settlement game (deterministi
 
 [dependencies]
 sha2 = { workspace = true }
+rand = { workspace = true }    # used by engine.rs (seeded RNG param) AND the pouw-sim binary — must be a normal dep, not dev-only
 
 [dev-dependencies]
 proptest = "1.4"
-rand = { workspace = true }
 
 [[bin]]
 name = "pouw-sim"
@@ -445,7 +445,9 @@ impl ChainHooks for Ledger {
 }
 ```
 
-> Note for the implementer: model **bonds** as escrow too — when a participant posts a bond, `escrow` it; on return, `pay` it back to them; on slash, `burn` it. This keeps every bond inside `total_supply` until it is explicitly burned, which is what makes the conservation test (Task 11) exact.
+> **Note for the implementer (read before Task 8):** model **bonds as escrow** — when a participant posts a bond, `escrow` it; on return, `pay` it back; to slash it, `burn` it **from escrow**. This keeps every bond inside `total_supply` until explicitly burned, which is what makes the conservation test (Task 11) exact.
+>
+> Consequence: **`ChainHooks::slash` (which debits un-escrowed *balance*) is NOT used in the settlement money path.** A bond is already in escrow, so settlement moves it with `pay`/`burn`, and `SettlementOutcome.slashed` is only a **log** of who lost what — never a call to `ChainHooks::slash`. `slash` exists in the trait to match the spec's chain-ops surface and applies only to un-escrowed stake; add a doc-comment on it saying exactly that so a later reader doesn't wire it into settlement by mistake.
 
 - [ ] **Step 4: Run, verify pass.**
 - [ ] **Step 5: Commit** — `git commit -am "feat(pouw): execution/equivalence/chain oracle seams + deterministic impls"`
@@ -741,7 +743,7 @@ mod tests {
 
 - [ ] **Step 2: Run, verify fail.**
 
-- [ ] **Step 3: Implement** the three functions. Each: pull the named amounts out of escrow via `ChainHooks`, split with `bps`, route the remainder to `burn`, and record into a `SettlementOutcome`. Signatures:
+- [ ] **Step 3: Implement** the three functions. **Bonds and budget are already in escrow** (the caller `escrow`'d them); settlement moves them with `pay`/`burn` only and **records** slashed amounts in `SettlementOutcome.slashed` — it never calls `ChainHooks::slash` on an escrowed bond (see the Task 4 note). Each fn: pull the named amounts from escrow, split with `bps`, route the remainder to `burn`, and record into a `SettlementOutcome`. Signatures:
 
 ```rust
 pub fn bps(amount: u64, bps: u32) -> u64 { (amount as u128 * bps as u128 / 10_000) as u64 }
@@ -780,7 +782,7 @@ Implement the four escalation outcomes from spec §6.9: `Disputed`-via-challenge
   - `NoQuorum`→`Disputed`: submitter refunded; `Be` split `(challenger_reward+escalation_reward)` to honest verifiers+panel, rest burned.
 
 - [ ] **Step 2: Run, verify fail.**
-- [ ] **Step 3: Implement** the four settlement fns + `escalation::resolve(...)` which: selects the panel (`select_committee` with `k_escalate`), runs `compute_verdict`, then dispatches to the correct settlement fn. Keep all arithmetic in `bps`; route remainders to burn.
+- [ ] **Step 3: Implement** the four settlement fns + `escalation::resolve(...)` which: selects the panel (`select_committee` with `k_escalate`), runs `compute_verdict`, then dispatches to the correct settlement fn. Keep all arithmetic in `bps`; route remainders to burn. **On the `NoQuorum`→`Disputed` branch there is no challenger, so the `challenger_reward_bps` share is paid to the honest original verifiers (who surfaced the split), not dropped** — otherwise that slice strands value and the conservation test fails.
 - [ ] **Step 4: Run, verify pass.**
 - [ ] **Step 5: Commit** — `git commit -am "feat(pouw): settlement + escalation (challenge & NoQuorum paths)"`
 
