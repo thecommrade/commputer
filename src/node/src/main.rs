@@ -850,6 +850,7 @@ async fn run_node(
     port: u16,
     rpc_port: u16,
     rpc_bind: String,
+    rpc_key: Option<String>,
     contribution_percent: u8,
     relay: bool,
     seeds: Vec<String>,
@@ -1129,7 +1130,7 @@ async fn run_node(
         ws_broadcast: tokio::sync::broadcast::channel(256).0,
         is_testnet: testnet,
         faucet_claims: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        api_key: None,
+        api_key: rpc_key,
         rate_limits: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         validator_performance: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         cors_origins: cors_origins.clone(),
@@ -1232,13 +1233,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { testnet, mainnet, log_level, port, rpc_port, rpc_bind, contribution_percent, relay, seeds, dns_seeds, password, wallet: _, dashboard: _, rpc_key: _, json_log, cors_origins } => {
+        Commands::Run { testnet, mainnet, log_level, port, rpc_port, rpc_bind, contribution_percent, relay, seeds, dns_seeds, password, wallet: _, dashboard: _, rpc_key, json_log, cors_origins } => {
             // --mainnet overrides --testnet
             let is_testnet = if mainnet { false } else { testnet };
-            run_node(is_testnet, log_level, port, rpc_port, rpc_bind, contribution_percent, relay, seeds, dns_seeds, password, json_log, cors_origins).await?;
+            run_node(is_testnet, log_level, port, rpc_port, rpc_bind, rpc_key, contribution_percent, relay, seeds, dns_seeds, password, json_log, cors_origins).await?;
         }
         Commands::Mine { port, rpc_port, password } => {
-            run_node(true, "info".to_string(), port, rpc_port, "127.0.0.1".to_string(), 100, false, vec![], vec![], password, false, "*".to_string()).await?;
+            run_node(true, "info".to_string(), port, rpc_port, "127.0.0.1".to_string(), None, 100, false, vec![], vec![], password, false, "*".to_string()).await?;
         }
         Commands::Update => {
             cmd_update().await?;
