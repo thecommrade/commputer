@@ -188,3 +188,25 @@ sim/
 
 `engine.rs` is the only module that knows the full sequence; `settlement.rs` is the only
 place money moves.
+
+## Final-review notes (for the on-chain wiring cycle)
+
+An independent holistic review (2026-06-10) **approved** the crate: conservation correct on
+all branches, the engine a genuine thin orchestrator, and the EV deliverable measured through
+the *real* settlement code (non-tautological). Three notes, all in `engine.rs`, all bearing on
+adversary behaviours the spec explicitly defers — **none is a conservation hole or
+economic-soundness break.** Glance at these when wiring this onto the real chain:
+
+1. **(fixed, `a48d91b`)** On a sampled `Disputed` verdict the catch bounty now pays verifiers
+   who revealed the quorum-vindicated `correct_hash`, not merely anyone who disagreed with the
+   executor.
+2. **Wrong-side committee verifiers are not slashed on a real-job `Disputed` path** — their
+   bonds are returned. Rubber-stamp deterrence rests entirely on **trap jobs** (the sim
+   confirms they catch rubber-stampers ~40% of the time, making them EV-negative). Spec §6.9's
+   "slash rejected-value committee verifiers" sub-rule is therefore realised via traps, not on
+   the Disputed real-job path. A faithful on-chain version should slash them there too — it
+   would only strengthen the incentives (and require re-checking the EV regime).
+3. **Commit-reveal is built and unit-tested (`commit_reveal.rs`) but the engine does not call
+   `reveal_matches`** during orchestration — harmless in this deterministic prototype (no
+   equivocating adversary), but the on-chain version must enforce it (spec §6.5: discard a
+   non-matching reveal and penalise) once verifiers can commit one value and reveal another.
