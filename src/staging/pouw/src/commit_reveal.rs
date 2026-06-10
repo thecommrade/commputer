@@ -18,7 +18,7 @@ pub fn reveal_matches(c: &Commitment, r: &Reveal) -> bool {
 mod tests {
     use super::*;
     use crate::ids::ParticipantId;
-    use crate::job::{Commitment, Reveal};
+    use crate::job::Reveal;
     fn pid(n: u8) -> ParticipantId { ParticipantId([n; 32]) }
 
     #[test]
