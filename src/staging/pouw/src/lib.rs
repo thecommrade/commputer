@@ -7,3 +7,4 @@ pub mod ids;
 pub mod job;
 pub mod oracle;
 pub mod params;
+pub mod verdict;
