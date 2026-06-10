@@ -103,7 +103,7 @@ pub struct ExecutorClaim { pub executor: ParticipantId, pub result_hash: [u8; 32
 
 pub struct Commitment { pub verifier: ParticipantId, pub commit: [u8; 32], pub bond: u64 } // H(result_hash ‖ salt ‖ verifier); bond posted on commit
 pub struct Reveal     { pub verifier: ParticipantId, pub result_hash: [u8; 32], pub salt: [u8; 32] }
-pub struct Challenge  { pub challenger: ParticipantId, pub bond: u64 } // staked dispute of an (unsampled / NoQuorum) result
+pub struct Challenge  { pub challenger: ParticipantId, pub bond: u64 } // staked dispute of an OPTIMISTICALLY-ACCEPTED (unsampled) result; a NoQuorum committee auto-escalates with no challenger
 
 pub enum Verdict {
     Confirmed { result_hash: [u8; 32] },         // committee agrees WITH the executor
@@ -139,7 +139,11 @@ Phases, driven by `engine.rs`:
    - committee value **!=** executor claim → `Disputed` (executor was wrong).
    - no value reaches quorum → `NoQuorum` → **escalate**.
 7. **Traps** (`trap.rs`, probability `p_trap`). The protocol injects a job whose **true** answer it knows but presents the executor-result as a **deliberately wrong** hash. Any verifier who reveals the *wrong* answer (i.e., rubber-stamped, or computed-and-lied) is **slashed**; verifiers who reveal the *true* answer get a **jackpot**. This makes "skip the work and echo the executor" strictly EV-negative.
-8. **Escalation** (`escalation.rs`). `NoQuorum` or a staked **challenge** triggers a larger re-execution quorum (K′ > K, e.g. 7), ⅔-majority binding. This is precisely the logic the dead `consensus/dispute.rs` `resolve_dispute` already encodes (3 re-executors, ⅔, 50% slash) — generalized and finally given a caller. The loser (executor or a false challenger) is slashed.
+8. **Escalation** (`escalation.rs`). Two distinct triggers, both resolved by a `K_escalate` re-execution panel (default 7, stake-weighted, each posting a `verifier_bond`), ⅔-majority binding — the logic the dead `consensus/dispute.rs` `resolve_dispute` already encodes (3 re-executors, ⅔, slash), generalized and finally given a caller:
+   - **`NoQuorum`** (a *sampled* committee that split): **protocol-initiated — no challenger, no `Bc`.** Funded internally by slashing the original committee members who revealed the value the panel ultimately rejects (plus the executor bond if the panel rules the executor wrong).
+   - **`Challenge`** (a staked dispute of an *unsampled, optimistically-accepted* result): the challenger posts `Bc`; loser-pays.
+
+   Settlement for both is in §6.9. The loser (executor, a wrong-side verifier, or a false challenger) is slashed; honest re-executors are paid from the slash.
 9. **Settle** (`settlement.rs`). Let `B` = budget, `Be` = executor bond (`≥ B`). Inflows into settlement are `B` (escrow) **plus all posted bonds**; settlement only ever redistributes or burns these — it never mints.
    - **`Confirmed`** — sampled committee agrees with the executor, *or* an unsampled job survives its challenge window:
      - *Sampled:* release `B` as **85% worker / 10% revealing-honest verifiers / 5% burn**; all bonds returned.
@@ -150,11 +154,18 @@ Phases, driven by `engine.rs`:
 
    *Worked example (`Disputed`, `B`=100, `Be`=100, bounty 20%):* submitter refunded **100**; honest verifiers split **20** from the slashed bond; **80** burned; the cheating executor nets **−100**. Conservation: inflow `100 (budget) + 100 (bond) = 200` = `100 refund + 20 verifiers + 80 burn`. ✓
 
-   **Escalation & challenge outcomes (loser-pays).** A `Challenge` (on an unsampled or `NoQuorum` job) posts bond `Bc` and draws a `K_escalate` re-execution panel (default 7) of stake-weighted re-executors, each posting a verifier bond, that returns a binding ⅔ verdict:
-   - **Executor guilty (`Disputed`-via-escalation):** loser = executor. Submitter refunded full `B`; the **challenger** gets `Bc` back **+** reward `challenger_reward_bps · Be`; the honest **panel** splits `escalation_reward_bps · Be`; the remainder of `Be` is burned. (Requires `challenger_reward_bps + escalation_reward_bps ≤ 1`.)
-   - **Executor innocent (`Confirmed`-via-escalation / false challenge):** loser = challenger. The job settles `Confirmed` for the worker (85/10/5 — the 10% to honest original verifiers if the job was sampled, else burned); the honest **panel** splits `escalation_reward_bps · Bc`; the remainder of `Bc` is burned; the executor's bond is returned.
-   - Dishonest / no-show panel members forfeit their verifier bonds (burned).
-   Every escalation flow is funded by the **loser's slashed bond** (`Be` or `Bc`) plus the escrow `B` — nothing is minted — so the §9 identity holds with `Bc` added as an inflow.
+   **Escalation outcomes (loser-pays).** A `K_escalate` re-execution panel (default 7) of stake-weighted re-executors, each posting a `verifier_bond`, returns a binding ⅔ verdict. Inflows on these paths: `B`, executor bond `Be`, the original-committee verifier bonds (if the job was sampled), the panel verifier bonds, and — on the *challenge* path only — the challenger bond `Bc`. Two entry triggers:
+
+   *(i) Challenge path* — a challenger disputes an **unsampled, optimistically-accepted** result, posting `Bc`:
+   - **Executor guilty (`Disputed`-via-challenge):** submitter refunded full `B`; the **challenger** gets `Bc` back **+** reward `challenger_reward_bps · Be`; the honest **panel** splits `escalation_reward_bps · Be`; remainder of `Be` burned. (Requires `challenger_reward_bps + escalation_reward_bps ≤ 1`.)
+   - **Executor innocent (false challenge):** loser = challenger. Worker settles 85/10/5 (the 10% **burned** — no committee existed on an unsampled job); the honest **panel** splits `escalation_reward_bps · Bc`; remainder of `Bc` burned; the executor bond is returned.
+
+   *(ii) NoQuorum path* — a **sampled committee split** (no challenger, no `Bc`); the panel resolves it:
+   - **Panel agrees with the executor (`Confirmed`):** worker settles 85/10/5. Original verifiers who revealed the **panel-vindicated** value get their bonds back and split the 10%; original verifiers who revealed a **rejected** value are slashed → their bonds fund `escalation_reward_bps · slashed` to the panel, remainder burned. Executor bond returned.
+   - **Panel rejects the executor (`Disputed`):** submitter refunded full `B`; executor bond `Be` slashed → honest original verifiers + the panel split `(challenger_reward_bps + escalation_reward_bps) · Be` (with no challenger, the challenger-reward share also accrues to the honest verifiers who surfaced the split), remainder of `Be` burned; rejected-value original verifiers are also slashed (burned).
+
+   - Dishonest / no-show panel members forfeit their `verifier_bond` (burned).
+   Every escalation flow is funded by a **slashed loser bond** (`Be`, `Bc`, or a wrong-side verifier bond) plus the escrow `B` — nothing is minted.
 
    **Trap jobs (synthetic; conservation-clean).** A trap is a *synthetic* verification challenge with **no real budget `B`**: the protocol presents a known-wrong claim to a committee. Rubber-stampers (revealed the planted wrong answer) have their **verifier bonds slashed**; honest verifiers split a **jackpot = `trap_jackpot_bps · (slashed rubber-stamper bonds)`**, remainder burned. The jackpot is funded **only from slashed bonds — never minted** — so traps strictly shrink supply. If no one rubber-stamps, there is no slash and no jackpot (honest verifiers are paid on *real* jobs via the 10% slice; traps exist only to punish cheats).
 
@@ -206,12 +217,13 @@ The deterministic `EquivalenceOracle` impl is literally `a == b`. That is the en
 - Collusion of `f` verifiers ⇒ fails below the stake fraction implied by K/quorum; succeeds only above it (documents the bound).
 - `NoQuorum` ⇒ escalation produces a binding verdict and slashes the loser.
 - Settlement conserves value on **every** terminal branch:
-  `budget + Σ bonds_in (executor + verifiers + challenger) = worker_paid + verifiers_paid + challenger_paid + panel_paid + burned + submitter_refunded + bonds_returned`. No mint — bonds are inflows alongside the escrowed budget, and every payout/burn is sourced from those inflows.
+  `budget + Σ all bonds_in (executor + original-committee verifiers + escalation-panel re-executors + challenger where present) = worker_paid + verifiers_paid + challenger_paid + panel_paid + burned + submitter_refunded + bonds_returned`. No mint — bonds are inflows alongside the escrowed budget, and every payout/burn is sourced from those inflows.
 - Unsampled & unchallenged job ⇒ settles **85% worker / 15% burn**; the verifier slice is burned, never paid to a non-verifier.
-- `Disputed`-via-escalation ⇒ submitter refunded full `B`; challenger reward + panel reward come **only** from the slashed executor bond `Be`; remainder burned; conservation holds.
-- `Confirmed`-via-escalation (false challenge) ⇒ challenger bond `Bc` fully consumed (panel reward + burn); worker still paid 85/10/5; executor bond returned.
+- `Disputed`-via-challenge ⇒ submitter refunded full `B`; challenger reward + panel reward come **only** from the slashed executor bond `Be`; remainder burned.
+- `Confirmed`-via-challenge (false challenge) ⇒ challenger bond `Bc` fully consumed (panel reward + burn); worker still paid 85/10/5 (the 10% burned, no committee); executor bond returned.
+- `NoQuorum`-via-escalation (no challenger, no `Bc`) ⇒ panel + honest-verifier rewards come **only** from slashed wrong-side original-committee bonds (and `Be` if the executor is rejected); remainder burned; balances with no `Bc`.
 - Trap job ⇒ jackpot to honest verifiers is sourced **only** from slashed rubber-stamper bonds (never minted); remainder burned; supply strictly shrinks.
-- No-show / commitment-mismatch verifier ⇒ its bond is slashed (burned) and appears in `SettlementOutcome.slashed` and the conservation ledger.
+- No-show / commitment-mismatch verifier (committee or panel) ⇒ its bond is slashed (burned) and appears in `SettlementOutcome.slashed` and the conservation ledger.
 
 **Monte-Carlo tournament (`sim/`):** many jobs, a mix of agent strategies, seeded RNG. Reports: % cheats caught, honest-vs-cheat average profit (cheat must be ≤ 0), and a **best-response check** that "honest" is the Nash strategy under the chosen params. Output is a short table the founder can read.
 
