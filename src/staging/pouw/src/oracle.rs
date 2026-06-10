@@ -47,6 +47,10 @@ impl Ledger {
     pub fn new() -> Self { Self { balances: HashMap::new(), escrowed: 0, burned: 0 } }
     pub fn credit(&mut self, who: ParticipantId, amount: u64) { *self.balances.entry(who).or_insert(0) += amount; }
     pub fn balance_of(&self, who: &ParticipantId) -> u64 { *self.balances.get(who).unwrap_or(&0) }
+    /// Value currently held in escrow (still in supply, not yet paid out or burned).
+    /// After a complete settlement this must be 0 — any non-zero remainder is value
+    /// stranded in escrow, the exact failure mode burning the rounding remainder prevents.
+    pub fn escrowed(&self) -> u64 { self.escrowed }
     pub fn total_supply(&self) -> u64 {
         self.balances.values().sum::<u64>() + self.escrowed + self.burned
     }

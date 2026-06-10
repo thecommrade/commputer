@@ -143,12 +143,19 @@ mod tests {
         // submitter funded the escrow; here we just escrow 100 directly for the test.
         l.credit(pid(0), 100); l.escrow(pid(0), 100);
         let total0 = l.total_supply();
+        let burned0 = l.burned;
         let out = settle_confirmed_sampled(&mut l, &p, 100, worker, &[v1, v2]);
         assert_eq!(out.worker_paid, 85);
         assert_eq!(out.verifiers_paid, 10);
         assert_eq!(out.burned, 5);
         assert_eq!(l.balance_of(&worker), 85);
         assert_eq!(l.total_supply(), total0); // no mint
+        // Conservation, the non-vacuous way: the burn actually happened (the ledger's
+        // burned counter moved by 5), and the escrow is fully drained — no value is
+        // stranded in escrow. total_supply alone cannot catch a stranded escrow because
+        // escrow is already inside total_supply; these two assertions can.
+        assert_eq!(l.burned - burned0, 5);   // 5 units truly left circulation
+        assert_eq!(l.escrowed(), 0);         // nothing stranded in escrow
     }
 
     #[test]
@@ -156,10 +163,15 @@ mod tests {
         let p = GameParams::default();
         let mut l = Ledger::new();
         l.credit(pid(0), 100); l.escrow(pid(0), 100);
+        let total0 = l.total_supply();
+        let burned0 = l.burned;
         let out = settle_confirmed_unsampled(&mut l, &p, 100, pid(1));
         assert_eq!(out.worker_paid, 85);
         assert_eq!(out.burned, 15); // 5% protocol + 10% unclaimed verifier slice
         assert_eq!(out.verifiers_paid, 0);
+        assert_eq!(l.total_supply(), total0); // no mint
+        assert_eq!(l.burned - burned0, 15);   // 15 units truly left circulation
+        assert_eq!(l.escrowed(), 0);          // nothing stranded in escrow
     }
 
     #[test]
@@ -170,11 +182,17 @@ mod tests {
         l.credit(submitter, 100); l.escrow(submitter, 100);  // budget escrowed
         l.credit(exec, 100); l.escrow(exec, 100);            // executor bond escrowed
         let total0 = l.total_supply();
+        let burned0 = l.burned;
         let out = settle_committee_disputed(&mut l, &p, 100, submitter, exec, 100, &[v1]);
         assert_eq!(out.submitter_refunded, 100);
         assert_eq!(out.verifiers_paid, 20);   // 20% of the 100 bond
         assert_eq!(out.burned, 80);           // remaining bond burned
         assert_eq!(l.balance_of(&submitter), 100);
         assert_eq!(l.total_supply(), total0);
+        // Both escrow pots (budget + executor bond) must end fully drained: 100 budget
+        // refunded, bond split 20 bounty / 80 burned. Assert the burn truly happened and
+        // no unit is stranded in either pot.
+        assert_eq!(l.burned - burned0, 80);   // 80 units truly left circulation
+        assert_eq!(l.escrowed(), 0);          // neither pot leaves stranded value
     }
 }
