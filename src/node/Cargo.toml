@@ -40,3 +40,5 @@ chrono = "0.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# Tier B test harnesses — property-based testing.
+proptest = "1.4"
