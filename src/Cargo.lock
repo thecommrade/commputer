@@ -752,6 +752,7 @@ dependencies = [
  "blake3",
  "borsh",
  "commputer-core",
+ "proptest",
  "rand 0.8.5",
  "serde",
  "serde_json",
