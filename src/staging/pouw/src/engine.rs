@@ -32,6 +32,15 @@ pub type ClaimFn<'a> = dyn Fn(&[u8; 32]) -> [u8; 32] + 'a;
 /// the executor's claimed hash.
 pub type RevealFn<'a> = dyn Fn(&ParticipantId, &[u8; 32], &[u8; 32]) -> [u8; 32] + 'a;
 
+/// The challenge strategy for an *unsampled, optimistically-accepted* result (spec §6.9
+/// challenge path). Given `(true result hash, executor's claimed hash)`, return
+/// `Some(challenger)` if a staked actor steps forward to dispute the claim during the
+/// challenge window, or `None` if the claim is left to settle optimistically. A rational
+/// challenger disputes exactly when it can see the executor's claim is wrong; an absent
+/// or apathetic challenger returns `None`. Supplied as data so the engine never decides
+/// *whether* to challenge — only wires the consequence.
+pub type ChallengeFn<'a> = dyn Fn(&[u8; 32], &[u8; 32]) -> Option<ParticipantId> + 'a;
+
 /// Everything `run_job` needs that is not the chain/oracle wiring or the params.
 ///
 /// The behavioural model is supplied as data, so a test (or the simulation) controls
@@ -57,6 +66,13 @@ pub struct JobInputs<'a> {
     /// The hash a given verifier *reveals*, as a function of (verifier, true result hash,
     /// executor's claimed hash). Honest ⇒ true hash; rubber-stamp ⇒ executor's claim.
     pub verifier_reveal: &'a RevealFn<'a>,
+    /// Whether a challenger disputes an *unsampled* (optimistically-accepted) result, and
+    /// who. `Some(challenger)` forces the challenge-escalation path; `None` lets the claim
+    /// settle optimistically (Confirmed-unsampled). The challenger posts `challenger_bond`.
+    pub challenge: &'a ChallengeFn<'a>,
+    /// The bond a challenger posts to dispute an unsampled result (uniform in the
+    /// prototype; `params::challenger_bond`). Only escrowed when `challenge` returns `Some`.
+    pub challenger_bond: u64,
 }
 
 /// Hash a 32-byte result into the 32-byte `result_hash` the game compares on. The toy
@@ -97,11 +113,108 @@ pub fn run_job(
     let sampled = rng.gen_range(0..10_000u32) < p.sample_rate_bps;
 
     if !sampled {
-        // --- Unsampled: optimistically accepted; in this prototype no challenge is
-        // raised, so it settles as Confirmed-unsampled (85% worker / 15% burn). ---
-        let outcome = settle_confirmed_unsampled(l, p, job.budget, inputs.executor);
-        return (Verdict::Confirmed { result_hash: executor_hash }, outcome);
+        // --- Unsampled: optimistically accepted, but it enters a challenge window in
+        // which any staked actor may force an escalation (spec §6.9 challenge path). Ask
+        // the challenge strategy whether a challenger steps forward. ---
+        match (inputs.challenge)(&true_hash, &executor_hash) {
+            None => {
+                // No challenge: the claim survives its window and settles as
+                // Confirmed-unsampled (85% worker / 15% burn — no committee existed).
+                let outcome = settle_confirmed_unsampled(l, p, job.budget, inputs.executor);
+                (Verdict::Confirmed { result_hash: executor_hash }, outcome)
+            }
+            Some(challenger) => {
+                // A challenger disputes the optimistic acceptance. Escrow its bond, then
+                // resolve on the re-execution panel via the challenge trigger. The panel
+                // re-executes honestly (it is the protocol's own re-execution), so its
+                // reveals are the true hash; the panel verdict decides loser-pays.
+                resolve_challenge(l, p, inputs, challenger, true_hash, executor_hash, stake_of, eq, rng)
+            }
+        }
+    } else {
+        run_sampled(l, p, inputs, eq, stake_of, rng, true_hash, executor_hash)
     }
+}
+
+/// Wire the challenge-escalation phase for an unsampled, optimistically-accepted result
+/// (spec §6.9 challenge path). Escrows the challenger bond, selects the re-execution
+/// panel (which re-executes honestly ⇒ reveals the true hash), and dispatches through
+/// [`resolve_escalation`] with [`Trigger::Challenge`]. The panel verdict decides:
+/// `Disputed` ⇒ the challenger was right; `Confirmed` ⇒ a false challenge. Holds no money
+/// logic itself — every unit moves through [`crate::settlement`] via the escalation call.
+#[allow(clippy::too_many_arguments)]
+fn resolve_challenge(
+    l: &mut dyn ChainHooks,
+    p: &GameParams,
+    inputs: &JobInputs,
+    challenger: ParticipantId,
+    true_hash: [u8; 32],
+    executor_hash: [u8; 32],
+    stake_of: &dyn Fn(&ParticipantId) -> u64,
+    eq: &dyn EquivalenceOracle,
+    rng: &mut dyn rand::RngCore,
+) -> (Verdict, SettlementOutcome) {
+    let job = &inputs.job;
+    // The challenger stakes its bond to dispute the optimistic acceptance.
+    l.escrow(challenger, inputs.challenger_bond);
+
+    // Pre-select the panel so its bonds are escrowed before resolving.
+    let panel_seed = draw_seed(rng);
+    let panel = select_committee(
+        &panel_seed,
+        inputs.candidates,
+        &inputs.executor,
+        p.k_escalate,
+        stake_of,
+    );
+    for m in &panel {
+        l.escrow(*m, inputs.verifier_bond);
+    }
+    // The panel re-executes honestly: every panelist reveals the true hash.
+    let panel_reveals: Vec<Reveal> = panel
+        .iter()
+        .map(|m| Reveal { verifier: *m, result_hash: true_hash, salt: [0; 32] })
+        .collect();
+
+    let esc = Escalation {
+        seed: panel_seed,
+        candidates: inputs.candidates,
+        budget: job.budget,
+        executor: inputs.executor,
+        executor_hash,
+        executor_bond: inputs.executor_bond,
+        panel_reveals: &panel_reveals,
+        panel_bond: inputs.verifier_bond,
+    };
+    resolve_escalation(
+        l,
+        p,
+        &esc,
+        Trigger::Challenge {
+            submitter: job.submitter,
+            challenger,
+            challenger_bond: inputs.challenger_bond,
+        },
+        eq,
+        stake_of,
+    )
+}
+
+/// Wire the sampled path: select the committee, run commit-reveal, take the verdict, and
+/// settle or escalate (on NoQuorum). Holds no money logic — every unit moves through
+/// [`crate::settlement`] / [`crate::escalation`].
+#[allow(clippy::too_many_arguments)]
+fn run_sampled(
+    l: &mut dyn ChainHooks,
+    p: &GameParams,
+    inputs: &JobInputs,
+    eq: &dyn EquivalenceOracle,
+    stake_of: &dyn Fn(&ParticipantId) -> u64,
+    rng: &mut dyn rand::RngCore,
+    true_hash: [u8; 32],
+    executor_hash: [u8; 32],
+) -> (Verdict, SettlementOutcome) {
+    let job = &inputs.job;
 
     // --- Sampled: select the committee, run commit-reveal, take the verdict. ---
     let committee = select_committee(
@@ -286,6 +399,8 @@ mod tests {
         let honest_claim = |true_hash: &[u8; 32]| *true_hash;
         let honest_reveal =
             |_v: &ParticipantId, true_hash: &[u8; 32], _exec: &[u8; 32]| *true_hash;
+        // Sampled job ⇒ the challenge strategy is never consulted; supply a no-op.
+        let no_challenge = |_true: &[u8; 32], _exec: &[u8; 32]| None;
         let inputs = JobInputs {
             job,
             input: b"in",
@@ -295,6 +410,8 @@ mod tests {
             candidates: &candidates,
             verifier_bond: p.verifier_bond,
             verifier_reveal: &honest_reveal,
+            challenge: &no_challenge,
+            challenger_bond: p.challenger_bond,
         };
 
         let vm = IteratedHashVm { rounds: 1000 };
@@ -320,6 +437,97 @@ mod tests {
         // The executor was paid the worker share and got its bond back.
         assert_eq!(l.balance_of(&executor), 85 + p.executor_bond);
         // Conservation: no mint, and every escrow pot fully drained.
+        assert_eq!(l.total_supply(), total0);
+        assert_eq!(l.escrowed(), 0);
+    }
+
+    /// An UNSAMPLED job whose executor cheated (claims a wrong hash) is challenged by a
+    /// rational challenger during the challenge window (spec §6.9 challenge path). The
+    /// engine must wire the challenge: select the re-execution panel (re-executes honestly
+    /// ⇒ the true hash), and `escalation::resolve` with `Trigger::Challenge` returns
+    /// `Disputed`-via-challenge. The submitter is refunded, the challenger is rewarded
+    /// from the slashed executor bond, the panel is paid, the remainder is burned, and
+    /// supply is invariant with no escrow stranded. This exercises the phase the prior
+    /// engine declined to wire.
+    #[test]
+    fn unsampled_cheating_executor_challenged_routes_to_disputed_and_conserves() {
+        // Never sample, so every job goes through the challenge window.
+        let mut p = GameParams::default();
+        p.sample_rate_bps = 0;
+        let mut l = Ledger::new();
+
+        let submitter = pid(0);
+        let executor = pid(9);
+        let challenger = pid(8);
+        // Pool large enough for a k_escalate = 7 panel, excluding the executor.
+        let candidates: Vec<ParticipantId> = (10u8..30).map(pid).collect();
+
+        l.credit(submitter, 100); // budget
+        l.credit(executor, p.executor_bond); // executor bond
+        l.credit(challenger, p.challenger_bond); // challenger bond
+        for c in &candidates {
+            l.credit(*c, p.verifier_bond); // each potential panelist's bond
+        }
+        let total0 = l.total_supply();
+
+        let spec = JobSpec { program_hash: [7; 32], input_hash: [9; 32] };
+        let job = Job {
+            id: JobId::derive(&[7; 32], &[9; 32], &submitter, 0),
+            submitter,
+            spec,
+            budget: 100,
+        };
+
+        // Cheating executor: claims a hash that is NOT the true one.
+        let cheat_claim = |_true_hash: &[u8; 32]| [0xAB; 32];
+        let honest_reveal =
+            |_v: &ParticipantId, true_hash: &[u8; 32], _exec: &[u8; 32]| *true_hash;
+        // Rational challenger: disputes exactly when the executor's claim differs from
+        // the true hash (i.e. when it can see the executor cheated).
+        let rational_challenge = |true_hash: &[u8; 32], exec: &[u8; 32]| {
+            if true_hash != exec { Some(challenger) } else { None }
+        };
+        let inputs = JobInputs {
+            job,
+            input: b"in",
+            executor,
+            executor_bond: p.executor_bond,
+            executor_claim: &cheat_claim,
+            candidates: &candidates,
+            verifier_bond: p.verifier_bond,
+            verifier_reveal: &honest_reveal,
+            challenge: &rational_challenge,
+            challenger_bond: p.challenger_bond,
+        };
+
+        let vm = IteratedHashVm { rounds: 1000 };
+        let stake = |_: &ParticipantId| 1u64;
+        let mut rng = StdRng::seed_from_u64(7);
+
+        let (verdict, out) =
+            run_job(&mut l, &p, &inputs, &vm, &ByteEq, &stake, &mut rng);
+
+        // The panel re-executed honestly and found the executor wrong.
+        match verdict {
+            Verdict::Disputed { .. } => {}
+            other => panic!("expected Disputed, got {other:?}"),
+        }
+        // Submitter refunded the full budget (no useful work).
+        assert_eq!(out.submitter_refunded, 100);
+        // Challenger rewarded challenger_reward_bps (10%) of the 100 executor bond = 10.
+        assert_eq!(out.challenger_paid, 10);
+        // Panel splits escalation_reward_bps (10%) of 100 = 10 across 7 panelists:
+        // 10/7 = 1 each ⇒ 7 paid; the executor bond is the only thing slashed.
+        assert_eq!(out.panel_paid, 7);
+        assert_eq!(out.slashed, vec![(executor, p.executor_bond)]);
+        // Burn = executor bond - challenger reward - panel paid = 100 - 10 - 7 = 83.
+        assert_eq!(out.burned, 83);
+        // Submitter got the refund back; challenger got bond + reward.
+        assert_eq!(l.balance_of(&submitter), 100);
+        assert_eq!(l.balance_of(&challenger), p.challenger_bond + 10);
+        // The cheating executor's bond was consumed (challenged successfully).
+        assert_eq!(l.balance_of(&executor), 0);
+        // Conservation: no mint, every escrow pot drained.
         assert_eq!(l.total_supply(), total0);
         assert_eq!(l.escrowed(), 0);
     }
