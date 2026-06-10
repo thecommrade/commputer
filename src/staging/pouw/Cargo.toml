@@ -1,0 +1,17 @@
+[package]
+name = "commputer-pouw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Proof-of-useful-work verification & settlement game (deterministic prototype + simulation)"
+
+[dependencies]
+sha2 = { workspace = true }
+rand = { workspace = true }    # used by engine.rs (seeded RNG param) AND the pouw-sim binary — must be a normal dep, not dev-only
+
+[dev-dependencies]
+proptest = "1.4"
+
+[[bin]]
+name = "pouw-sim"
+path = "sim/main.rs"
