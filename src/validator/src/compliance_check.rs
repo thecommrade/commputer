@@ -24,6 +24,27 @@ fn subnet_16(ip: &str) -> Option<String> {
     }
 }
 
+/// Testnet-realism: true iff `ip` is a loopback address (127.0.0.0/8 or ::1).
+///
+/// A loopback address can ONLY occur in single-host testing — a remote peer can
+/// never observe another validator at 127.0.0.1. So loopback nodes are exempt
+/// from the datacenter/colocation/fingerprint nerfs, letting a local multi-node
+/// testnet (all nodes on 127.0.0.1) exercise the Compliant reward/emission path
+/// instead of being flagged `NerfedIncidental` for sharing one IP.
+///
+/// Deliberately **loopback-only**: RFC1918 / LAN ranges are NOT exempt, because
+/// (a) the anti-scale suite uses them as colocation fixtures, and (b) a LAN
+/// warehouse is a real anti-scale target — on a real network its nodes are
+/// observed at one shared *public* IP and nerfed via the same-IP path. Exempting
+/// LAN ranges would be a separate founder decision (and need a config flag).
+fn is_loopback_ip(ip: &str) -> bool {
+    use std::net::IpAddr;
+    match ip.parse::<IpAddr>() {
+        Ok(addr) => addr.is_loopback(), // 127.0.0.0/8 and ::1
+        Err(_) => false,
+    }
+}
+
 /// W5.3 / whitepaper anti-scale: returns true iff `addr` falls inside `prefix/len`.
 /// `prefix` is a textual IPv6 string parseable by `Ipv6Addr::from_str`.
 /// `len` is in bits, 0..=128. Out-of-range len returns false.
@@ -602,6 +623,18 @@ impl ComplianceChecker {
         let Some(ip) = self.node_to_ip.get(addr) else {
             return ComplianceStatus::Compliant;
         };
+
+        // Testnet-realism: a loopback address (127.0.0.1 / ::1) only occurs in
+        // single-host testing — never as a peer's observed address on a real
+        // network — so the datacenter/colocation/fingerprint nerfs do not apply.
+        // Without this, every node on a local multi-node testnet shares 127.0.0.1
+        // and is flagged NerfedIncidental, making the reward/emission path
+        // impossible to validate locally. LAN/RFC1918 is intentionally NOT
+        // exempt (see is_loopback_ip). Mainnet-safe: no remote peer is observed
+        // at a loopback address.
+        if is_loopback_ip(ip) {
+            return ComplianceStatus::Compliant;
+        }
 
         // Feature 136: Check for duplicate fingerprints.
         if let Some(hash) = self.fingerprints.get(addr) {
@@ -1330,6 +1363,62 @@ mod tests {
             assert!(dc("3.5.10.20"));      // AWS — still true
             assert!(dc("88.198.1.1"));     // Hetzner — still true
             assert!(!dc("192.168.1.1"));   // private — still false
+        }
+    }
+
+    // ── Testnet-realism: loopback-only compliance exemption ──
+    mod local_ip_exemption_tests {
+        use super::super::*;
+
+        fn a(n: u8) -> Address {
+            Address([n; 32])
+        }
+
+        #[test]
+        fn loopback_nodes_compliant_even_when_colocated() {
+            // Two validators on the same host (127.0.0.1) — the exact local
+            // multi-node testnet case. Without the exemption both are
+            // NerfedIncidental (same exact IP); with it both are Compliant.
+            let mut checker = ComplianceChecker::new();
+            checker.register_node(a(1), "127.0.0.1".into());
+            checker.register_node(a(2), "127.0.0.1".into());
+            assert_eq!(checker.check(&a(1)), ComplianceStatus::Compliant);
+            assert_eq!(checker.check(&a(2)), ComplianceStatus::Compliant);
+        }
+
+        #[test]
+        fn private_lan_nodes_still_nerfed() {
+            // LAN/RFC1918 is intentionally NOT exempt (only loopback is): two
+            // nodes on the same /24 are still NerfedIncidental, preserving the
+            // anti-scale behavior the existing suite relies on.
+            let mut checker = ComplianceChecker::new();
+            checker.register_node(a(1), "192.168.1.10".into());
+            checker.register_node(a(2), "192.168.1.11".into());
+            assert_eq!(checker.check(&a(1)), ComplianceStatus::NerfedIncidental);
+            assert_eq!(checker.check(&a(2)), ComplianceStatus::NerfedIncidental);
+        }
+
+        #[test]
+        fn public_datacenter_ip_still_nerfed() {
+            // The exemption must NOT leak to public addresses: an AWS IP is
+            // still flagged NerfedIncidental.
+            let mut checker = ComplianceChecker::new();
+            checker.register_node(a(1), "3.5.10.20".into());
+            assert_eq!(checker.check(&a(1)), ComplianceStatus::NerfedIncidental);
+        }
+
+        #[test]
+        fn is_loopback_ip_classifies_correctly() {
+            for ip in ["127.0.0.1", "127.1.2.3", "::1"] {
+                assert!(is_loopback_ip(ip), "{} should be loopback", ip);
+            }
+            // NOT loopback — incl. LAN/RFC1918, which stay subject to nerfs.
+            for ip in [
+                "10.0.0.5", "172.16.3.4", "192.168.1.1", "169.254.1.1",
+                "100.64.0.1", "3.5.10.20", "8.8.8.8", "fe80::1", "not-an-ip",
+            ] {
+                assert!(!is_loopback_ip(ip), "{} should NOT be loopback", ip);
+            }
         }
     }
 }
