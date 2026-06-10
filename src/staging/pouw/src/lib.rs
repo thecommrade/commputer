@@ -9,4 +9,5 @@ pub mod job;
 pub mod oracle;
 pub mod params;
 pub mod settlement;
+pub mod trap;
 pub mod verdict;
