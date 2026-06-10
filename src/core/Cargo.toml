@@ -22,3 +22,7 @@ argon2 = "0.5"
 serde_json = { workspace = true }
 sysinfo = "0.32"
 zeroize = "1"
+
+[dev-dependencies]
+# Tier B test harnesses — property-based testing (first proptest dep in the workspace).
+proptest = "1.4"
