@@ -81,6 +81,17 @@ pub enum Verifier {
     /// Colludes with a *named* executor: rubber-stamps (echoes the claim) when that
     /// executor is the one under review, but verifies honestly for everyone else (so it
     /// is not trivially caught on unrelated jobs/traps).
+    ///
+    /// `allow(dead_code)`: this variant is part of the strategy API (spec §4) and is fully
+    /// exercised by this module's unit tests, but the Task-14 tournament's deliverable
+    /// inequalities name only the executor and rubber-stamp strategies, so its fixed
+    /// committee does not *construct* a colluder. A faithful collusion measurement needs
+    /// the multi-executor, stake-weighted **collusion-bound** model the spec defers to a
+    /// follow-up cycle (§7: "the sim reports the stake fraction at which this becomes
+    /// feasible"; §10 out-of-scope) — modeling it with a single reused executor id would
+    /// conflate a colluder with a plain rubber-stamper on traps and mislead. The attribute
+    /// is scoped to this one variant so the rest of the enum still warns on real dead code.
+    #[allow(dead_code)]
     Collude(ParticipantId),
 }
 

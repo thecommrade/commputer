@@ -1,18 +1,34 @@
-//! pouw-sim — Monte-Carlo tournament entry point.
-//! Placeholder until Task 14 wires the tournament; the `[[bin]]` target declared
-//! in Cargo.toml needs a source file so the crate builds from the skeleton on.
+//! `pouw-sim` — the Monte-Carlo tournament entry point (plan Task 14).
+//!
+//! WHAT THIS DOES: runs the default tournament at the tuned `safe_regime` and prints a
+//! small, founder-readable metrics table (strategy, plays, caught %, net EV/play) plus a
+//! one-line verdict. The table is the human-facing deliverable: it shows, on real money
+//! moved through the production settlement branches, that honest play dominates — every
+//! modeled cheating strategy is EV-negative — at the documented safe parameter regime.
+//!
+//! HOW TO RUN: `cargo run -p commputer-pouw --bin pouw-sim`.
+//! HOW TO READ: see `src/staging/pouw/README.md` (Task 15).
+//!
+//! The machine-checked version of the same claim is the unit test
+//! `tournament::tests::honest_play_dominates_at_safe_regime`, run by
+//! `cargo test -p commputer-pouw`.
 
-/// Adversarial agent strategies (Task 13). Declared here so the module compiles into the
-/// `pouw-sim` binary and its unit tests run under `cargo test -p commputer-pouw`. Task 14
-/// adds `mod tournament;` and replaces `main` with the tournament driver.
-///
-/// `allow(dead_code)`: the strategies are consumed by the tournament driver that lands in
-/// Task 14; until then they are exercised only by their own unit tests, so the public API
-/// reads as unused. The attribute is scoped to this module and removed once Task 14 wires
-/// the consumers.
-#[allow(dead_code)]
+/// Adversarial agent strategies (Task 13): the executor/verifier strategies the
+/// tournament pits against each other.
 mod agents;
+/// Monte-Carlo tournament + the per-strategy EV proof (Task 14).
+mod tournament;
+
+use tournament::{run_tournament, safe_regime};
+
+/// Number of seeded jobs the default tournament plays. Large enough that the per-strategy
+/// EV averages are stable across seeds (the unit test uses the same scale).
+const DEFAULT_JOBS: u64 = 50_000;
+/// Fixed seed so `pouw-sim` prints the same table on every run (reproducible deliverable).
+const DEFAULT_SEED: u64 = 0xC0FFEE;
 
 fn main() {
-    println!("pouw-sim: not yet implemented (see Task 14)");
+    let (params, costs) = safe_regime();
+    let report = run_tournament(DEFAULT_JOBS, &params, &costs, DEFAULT_SEED);
+    print!("{}", report.table());
 }
