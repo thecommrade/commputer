@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Commputer — Run a Node</title>
+    <meta name="description" content="5-minute operator guide: how to run a Commputer node, register as a validator, and earn block rewards.">
+    <meta property="og:title" content="Commputer — Run a Node">
+    <meta property="og:description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources.">
+    <meta property="og:image" content="https://commputer.xyz/og-image.png">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <nav id="nav">
+        <div class="nav-inner">
+            <a href="index.html" class="nav-logo">COMMPUTER</a>
+            <button class="hamburger" id="hamburger" aria-label="Toggle menu">
+                <span></span><span></span><span></span>
+            </button>
+            <div class="nav-links" id="nav-links">
+                <a href="index.html#dashboard">Dashboard</a>
+                <a href="index.html#whitepaper">Whitepaper</a>
+                <a href="index.html#download">Download</a>
+                <a href="index.html#start">Get Started</a>
+                <a href="operator.html" style="color: var(--accent);">Run a Node</a>
+            </div>
+        </div>
+    </nav>
+
+    <main>
+        <section id="hero" style="padding: 120px 24px 80px;">
+            <div class="hero-text">
+                <h1>Run a Node</h1>
+                <p class="tagline">Become a validator. Earn $COMME.</p>
+                <p class="subtitle">Turn your idle desktop into part of a distributed supercomputer. This guide takes 5 minutes.</p>
+            </div>
+        </section>
+
+        <section id="operator-guide">
+            <h2>// Operator Walkthrough</h2>
+
+            <div class="steps">
+                <div class="step">
+                    <span class="step-num">01</span>
+                    <h3>Install the Binary</h3>
+                    <p>Download the Commputer node for your platform. One file, no dependencies.</p>
+                    <div class="code-block">
+                        <code>curl -sSf https://commputer.xyz/install.sh | sh</code>
+                        <button class="copy-btn" onclick="copyText('curl -sSf https://commputer.xyz/install.sh | sh')">copy</button>
+                    </div>
+                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">This downloads the latest binary and places it in <code style="color: var(--accent);">~/.local/bin/commputer</code>. If that directory isn't in your PATH, the installer will tell you how to add it.</p>
+                </div>
+
+                <div class="step">
+                    <span class="step-num">02</span>
+                    <h3>Start the Node</h3>
+                    <p>Run the node. A wallet is created automatically on first run. Keep your seed phrase safe.</p>
+                    <div class="code-block">
+                        <code>commputer run --testnet</code>
+                        <button class="copy-btn" onclick="copyText('commputer run --testnet')">copy</button>
+                    </div>
+                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">The node will:</p>
+                    <ul style="font-size: 12px; color: var(--text-dim); margin-top: 8px; padding-left: 24px;">
+                        <li>Generate a wallet (keypair) and save it locally</li>
+                        <li>Print your address (where coins will be sent)</li>
+                        <li>Print your seed phrase (write it down — you'll need it if your machine fails)</li>
+                        <li>Connect to the network and sync the blockchain</li>
+                    </ul>
+                </div>
+
+                <div class="step">
+                    <span class="step-num">03</span>
+                    <h3>Check Sync Status</h3>
+                    <p>Monitor your node's progress. Syncing takes a few minutes depending on chain height.</p>
+                    <div class="code-block">
+                        <code>commputer status --testnet</code>
+                        <button class="copy-btn" onclick="copyText('commputer status --testnet')">copy</button>
+                    </div>
+                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">Watch for:</p>
+                    <ul style="font-size: 12px; color: var(--text-dim); margin-top: 8px; padding-left: 24px;">
+                        <li><strong>Syncing...</strong> → Node is catching up to the tip. Normal on first run.</li>
+                        <li><strong>Synced</strong> → Node is current with the network. Ready to register.</li>
+                        <li><strong>Block height</strong> → Your node's position on the chain.</li>
+                        <li><strong>Peers connected</strong> → How many other nodes you're talking to.</li>
+                    </ul>
+                </div>
+
+                <div class="step">
+                    <span class="step-num">04</span>
+                    <h3>Register as a Validator</h3>
+                    <p>Once synced, register your node to start earning rewards. You'll automatically be registered after one epoch, or you can register explicitly.</p>
+                    <div class="code-block">
+                        <code>commputer wallet validate-register --testnet</code>
+                        <button class="copy-btn" onclick="copyText('commputer wallet validate-register --testnet')">copy</button>
+                    </div>
+                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">Your node will:</p>
+                    <ul style="font-size: 12px; color: var(--text-dim); margin-top: 8px; padding-left: 24px;">
+                        <li>Broadcast a ValidatorRegister transaction to the network</li>
+                        <li>Wait for the transaction to be included in a block</li>
+                        <li>Start solving proof challenges in the next epoch</li>
+                        <li>Earn block rewards automatically (check in ~2 minutes)</li>
+                    </ul>
+                </div>
+
+                <div class="step">
+                    <span class="step-num">05</span>
+                    <h3>Claim Your Rewards</h3>
+                    <p>Your balance is updated on-chain automatically. Check it anytime.</p>
+                    <div class="code-block">
+                        <code>commputer wallet show --testnet</code>
+                        <button class="copy-btn" onclick="copyText('commputer wallet show --testnet')">copy</button>
+                    </div>
+                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">You'll see:</p>
+                    <ul style="font-size: 12px; color: var(--text-dim); margin-top: 8px; padding-left: 24px;">
+                        <li><strong>Address:</strong> Your wallet's public identifier</li>
+                        <li><strong>Balance:</strong> Total $COMME you own</li>
+                        <li><strong>Validator status:</strong> Whether you're registered</li>
+                        <li><strong>Total mined:</strong> Cumulative rewards earned so far</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="faq">
+                <h3 style="margin-bottom: 16px;">FAQ</h3>
+
+                <details>
+                    <summary>What does my computer need to run a node?</summary>
+                    <p>A modern desktop or laptop with 4+ GB RAM, 50GB disk, and a stable internet connection. M-series Mac, Intel/AMD x86_64, or ARM64 (Raspberry Pi). The binary is small (~50MB) and uses moderate CPU/memory during normal operation.</p>
+                </details>
+
+                <details>
+                    <summary>How much of my computer's resources will Commputer use?</summary>
+                    <p>By default, 20% of idle CPU (once the blockchain is synced). You control this with <code style="color: var(--accent);">--cpu-percent</code>. The node runs in user space with no root access. It only uses resources you allocate.</p>
+                </details>
+
+                <details>
+                    <summary>What's the minimum stake to become a validator?</summary>
+                    <p>0.01 $COMME during bootstrap (first ~33 minutes). After that, you need 0.01 $COMME in your account to register. You can get coins by mining, trading, or receiving transfers from other validators.</p>
+                </details>
+
+                <details>
+                    <summary>How often do I earn rewards?</summary>
+                    <p>Block rewards are awarded per block (~every 2 seconds) and credited to your account automatically. The first reward comes at the next epoch boundary (which occurs roughly every 1800 blocks, or ~1 hour). All rewards are final and can't be taken away.</p>
+                </details>
+
+                <details>
+                    <summary>What if I need to turn off my node?</summary>
+                    <p>Your balance is always safe on-chain, regardless of uptime. You simply stop earning new coins while offline. If you want to become a validator again, just run <code style="color: var(--accent);">commputer run</code> again — your wallet loads automatically and you can re-register.</p>
+                </details>
+
+                <details>
+                    <summary>Can I run multiple nodes?</summary>
+                    <p>Yes, but only one per machine. The protocol detects and penalizes validators who contribute from datacenters or warehouses. "Scale hurts" is a core principle — the system rewards regular people, not corporations.</p>
+                </details>
+
+                <details>
+                    <summary>How do I back up my wallet?</summary>
+                    <p>Your seed phrase is the master key. Write it down and store it safely (paper is fine). The seed regenerates your keypair on any machine. Private keys are stored in <code style="color: var(--accent);">~/.commputer/wallet.json</code> — keep that file safe too.</p>
+                </details>
+
+                <details>
+                    <summary>What's the testnet vs mainnet difference?</summary>
+                    <p>Testnet will be the public proving ground for Commputer — consensus is currently verified in local multi-node testing, with a wider public testnet as the next milestone. Run a node to learn how the system works. Mainnet launches May 2027 or sooner, with real economic value. Testnet coins are worthless. Plan to migrate your validator to mainnet when it launches.</p>
+                </details>
+
+                <details>
+                    <summary>Where do I report bugs or ask for help?</summary>
+                    <p><a href="https://github.com/thecommrade/commputer" style="color: var(--accent);">GitHub Issues</a> for technical bugs, or email <a href="mailto:bugreport@commputer.xyz" style="color: var(--accent);">bugreport@commputer.xyz</a>. <a href="https://t.me/CommradeProject" style="color: var(--accent);">Telegram</a> for community questions.</p>
+                </details>
+            </div>
+
+            <div style="margin-top: 48px; padding: 24px; background: var(--bg-card); border: 1px solid var(--border);">
+                <h3 style="margin-bottom: 12px;">Need Help?</h3>
+                <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 8px;"><strong style="color: var(--text);">Stuck on installation?</strong> Make sure you have <code style="color: var(--accent);">curl</code> installed. On Linux: <code style="color: var(--accent);">sudo apt install curl</code>. On Mac: <code style="color: var(--accent);">brew install curl</code>.</p>
+                <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 8px;"><strong style="color: var(--text);">Node won't sync?</strong> Check your internet connection. The node needs to reach other nodes via TCP/QUIC. If you're behind a strict firewall, you might need to open ports.</p>
+                <p style="font-size: 13px; color: var(--text-dim);"><strong style="color: var(--text);">Lost your seed phrase?</strong> Your coins are still in your account on-chain. If you lose the seed AND your wallet file, you can't recover the keypair. Write it down immediately.</p>
+                <p style="font-size: 13px; color: var(--text-dim); margin-top: 8px;"><strong style="color: var(--text);">Still stuck?</strong> Email <a href="mailto:bugreport@commputer.xyz" style="color: var(--accent);">bugreport@commputer.xyz</a> with your node logs.</p>
+            </div>
+
+            <div style="text-align: center; margin-top: 48px;">
+                <p style="color: var(--text-dim); margin-bottom: 16px;">Ready to run a node?</p>
+                <a href="index.html#download" class="btn-primary">Download Commputer</a>
+                <a href="https://github.com/thecommrade/commputer" class="btn-secondary" style="margin-left: 12px;">View Source Code</a>
+            </div>
+        </section>
+
+        <footer>
+            <div class="footer-inner">
+                <p class="footer-motto">A communal supercomputer for the people, by the people.</p>
+                <p class="footer-motto-sub">The wine of technology. Patience will reward you.</p>
+                <div class="footer-links">
+                    <a href="https://github.com/thecommrade/commputer">GitHub</a>
+                    <a href="index.html#whitepaper">Whitepaper</a>
+                    <a href="#">Twitter</a>
+                    <a href="mailto:commrade@commputer.xyz">Contact</a>
+                </div>
+                <p class="footer-copy">$COMME &middot; 2B supply &middot; burn-heavy &middot; scale hurts</p>
+            </div>
+        </footer>
+    </main>
+
+    <script src="app.js"></script>
+    <script>
+    // Copy text to clipboard
+    function copyText(text) {
+        navigator.clipboard.writeText(text).then(() => {
+            event.target.textContent = 'copied';
+            setTimeout(() => { event.target.textContent = 'copy'; }, 1500);
+        });
+    }
+
+    // Hamburger menu toggle
+    (function() {
+        var hamburger = document.getElementById('hamburger');
+        var navLinks = document.getElementById('nav-links');
+        if (hamburger && navLinks) {
+            hamburger.addEventListener('click', function() {
+                navLinks.classList.toggle('open');
+                hamburger.classList.toggle('active');
+            });
+        }
+    })();
+
+    // Keyboard navigation
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+            document.activeElement.blur();
+            var navLinks = document.getElementById('nav-links');
+            if (navLinks) navLinks.classList.remove('open');
+            var hamburger = document.getElementById('hamburger');
+            if (hamburger) hamburger.classList.remove('active');
+        }
+    });
+    </script>
+</body>
+</html>

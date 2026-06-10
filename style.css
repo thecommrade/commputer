@@ -19,6 +19,11 @@
 
 html {
     scroll-behavior: smooth;
+    overflow-x: hidden;
+}
+
+body {
+    overflow-x: hidden;
 }
 
 body {
@@ -32,10 +37,16 @@ body {
 a {
     color: var(--accent);
     text-decoration: none;
+    transition: color 0.2s;
 }
 
 a:hover {
     text-decoration: underline;
+}
+
+a:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }
 
 /* NAV */
@@ -79,11 +90,13 @@ a:hover {
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 1px;
+    transition: color 0.2s;
 }
 
-.nav-links a:hover {
+.nav-links a:hover, .nav-links a:focus {
     color: var(--accent);
     text-decoration: none;
+    outline: none;
 }
 
 /* HERO */
@@ -136,11 +149,17 @@ a:hover {
     cursor: pointer;
     text-transform: uppercase;
     letter-spacing: 1px;
+    transition: background-color 0.2s, transform 0.1s;
 }
 
-.btn-primary:hover {
+.btn-primary:hover, .btn-primary:focus {
     background: var(--accent-dim);
     text-decoration: none;
+    outline: none;
+}
+
+.btn-primary:active {
+    transform: scale(0.98);
 }
 
 .btn-secondary {
@@ -155,11 +174,17 @@ a:hover {
     cursor: pointer;
     text-transform: uppercase;
     letter-spacing: 1px;
+    transition: background-color 0.2s, color 0.2s, transform 0.1s;
 }
 
-.btn-secondary:hover {
+.btn-secondary:hover, .btn-secondary:focus {
     background: rgba(0, 255, 136, 0.1);
     text-decoration: none;
+    outline: none;
+}
+
+.btn-secondary:active {
+    transform: scale(0.98);
 }
 
 /* SECTIONS */
@@ -259,16 +284,24 @@ h3 {
 .principle {
     border: 1px solid var(--border);
     padding: 24px;
+    transition: border-color 0.2s, background-color 0.2s;
+}
+
+.principle:hover {
+    border-color: var(--accent);
+    background: var(--bg-hover);
 }
 
 .principle h3 {
     color: var(--accent);
     margin-bottom: 8px;
+    font-size: 15px;
 }
 
 .principle p {
     font-size: 13px;
     color: var(--text-dim);
+    line-height: 1.6;
 }
 
 /* WHITEPAPER */
@@ -490,15 +523,121 @@ footer {
     letter-spacing: 1px;
 }
 
+/* DARK SCROLLBAR */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+::-webkit-scrollbar-track {
+    background: var(--bg);
+}
+::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #333;
+}
+* {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) var(--bg);
+}
+
+/* HAMBURGER MENU */
+.hamburger {
+    display: none;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 4px;
+    flex-direction: column;
+    gap: 5px;
+}
+.hamburger span {
+    display: block;
+    width: 22px;
+    height: 2px;
+    background: var(--text);
+    transition: transform 0.2s, opacity 0.2s;
+}
+.hamburger.active span:nth-child(1) {
+    transform: rotate(45deg) translate(5px, 5px);
+}
+.hamburger.active span:nth-child(2) {
+    opacity: 0;
+}
+.hamburger.active span:nth-child(3) {
+    transform: rotate(-45deg) translate(5px, -5px);
+}
+
+/* NETWORK STATUS INDICATOR PULSE */
+.status-dot.online {
+    background: var(--accent);
+    animation: pulse-green 2s ease-in-out infinite;
+}
+.status-dot.fetching {
+    background: var(--accent);
+    animation: pulse-fetch 0.8s ease-in-out infinite;
+}
+.status-dot.cached {
+    background: #ffaa00;
+    animation: pulse-amber 3s ease-in-out infinite;
+}
+@keyframes pulse-green {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(0, 255, 136, 0.4); }
+    50% { box-shadow: 0 0 0 6px rgba(0, 255, 136, 0); }
+}
+@keyframes pulse-fetch {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+@keyframes pulse-amber {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255, 170, 0, 0.3); }
+    50% { box-shadow: 0 0 0 6px rgba(255, 170, 0, 0); }
+}
+
 /* RESPONSIVE */
 @media (max-width: 768px) {
+    html {
+        font-size: 13px;
+    }
+
     .hero-text h1 {
         font-size: 36px;
         letter-spacing: 4px;
     }
 
+    .tagline {
+        font-size: 16px;
+    }
+
+    .subtitle {
+        font-size: 13px;
+    }
+
+    .hamburger {
+        display: flex;
+    }
+
     .nav-links {
         display: none;
+        position: absolute;
+        top: 100%;
+        left: 0;
+        right: 0;
+        background: rgba(10, 10, 10, 0.98);
+        flex-direction: column;
+        padding: 16px 24px;
+        border-bottom: 1px solid var(--border);
+        z-index: 99;
+    }
+
+    .nav-links a {
+        padding: 8px 0;
+    }
+
+    .nav-links.open {
+        display: flex;
     }
 
     .stats-grid {
@@ -513,6 +652,34 @@ footer {
     .explorer-search {
         flex-direction: column;
     }
+
+    .code-block {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .code-block code {
+        white-space: pre-wrap;
+        word-break: break-all;
+        font-size: 11px;
+        margin-bottom: 8px;
+    }
+
+    .copy-btn {
+        align-self: flex-start;
+        margin-left: 0;
+        margin-top: 8px;
+    }
+
+    .steps .step {
+        padding-left: 16px;
+    }
+
+    section {
+        padding: 48px 16px;
+    }
 }
 
 @media (max-width: 480px) {
@@ -523,4 +690,60 @@ footer {
     .hero-text h1 {
         font-size: 28px;
     }
+}
+
+/* Item 48: Loading skeleton animation */
+.loading {
+    background: linear-gradient(90deg, var(--bg-card) 25%, var(--bg-hover) 50%, var(--bg-card) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    color: transparent !important;
+    border-radius: 4px;
+    min-width: 60px;
+    display: inline-block;
+}
+
+@keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+}
+
+/* Block explorer table */
+.block-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+}
+
+.block-table th {
+    text-align: left;
+    padding: 8px 12px;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    font-weight: 500;
+}
+
+.block-table td {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+}
+
+.block-table tr:hover td {
+    background: var(--bg-hover);
+}
+
+.block-table a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.block-table a:hover {
+    text-decoration: underline;
+}
+
+.mono {
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    color: var(--text-dim);
 }

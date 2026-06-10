@@ -5,20 +5,33 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Commputer — A Communal Supercomputer</title>
     <meta name="description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources. $COMME. Scale hurts. Patience rewards.">
+    <meta property="og:title" content="Commputer — A Communal Supercomputer">
+    <meta property="og:description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources. $COMME. Scale hurts. Patience rewards.">
+    <meta property="og:image" content="https://commputer.xyz/og-image.png">
+    <meta property="og:url" content="https://commputer.xyz/">
+    <meta property="og:type" content="website">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Commputer — A Communal Supercomputer">
+    <meta name="twitter:description" content="A Layer 1 blockchain built from regular people's idle desktop resources. $COMME.">
+    <meta name="twitter:image" content="https://commputer.xyz/og-image.png">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <nav id="nav">
+    <nav id="nav" aria-label="Main navigation">
         <div class="nav-inner">
-            <a href="#" class="nav-logo">COMMPUTER</a>
-            <div class="nav-links">
+            <a href="index.html" class="nav-logo">COMMPUTER</a>
+            <button class="hamburger" id="hamburger" aria-label="Toggle menu">
+                <span></span><span></span><span></span>
+            </button>
+            <div class="nav-links" id="nav-links">
                 <a href="#dashboard">Dashboard</a>
+                <a href="stats.html">Stats</a>
                 <a href="#whitepaper">Whitepaper</a>
                 <a href="#download">Download</a>
-                <a href="#explorer">Explorer</a>
-                <a href="#start">Get Started</a>
+                <a href="operator.html">Run a Node</a>
             </div>
         </div>
     </nav>
@@ -31,8 +44,8 @@
                 <p class="tagline">A communal supercomputer for the people, by the people.</p>
                 <p class="subtitle">Give a little of your computer. Earn $COMME. Own a piece of a machine that grows forever.</p>
                 <div class="hero-actions">
-                    <a href="#download" class="btn-primary">Download Node</a>
-                    <a href="#start" class="btn-secondary">Get Started</a>
+                    <a href="operator.html" class="btn-primary">Run a Node (5 min)</a>
+                    <a href="#download" class="btn-secondary">Download</a>
                 </div>
             </div>
         </section>
@@ -89,6 +102,28 @@
                 <p>No datacenters. No mining farms. No e-waste. Your existing computer is enough.</p>
                 <p>Contribute a small slice of your machine's idle resources. Earn $COMME. The more people join, the more powerful everyone's share becomes.</p>
             </div>
+            <div style="background: var(--bg-card); border: 1px solid var(--border); padding: 24px; margin-bottom: 32px;">
+                <h3 style="color: var(--accent); margin-bottom: 12px;">What's Live Right Now</h3>
+                <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px;"><strong style="color: var(--text);">Update — June 10, 2026:</strong> Multi-node consensus verified in local testing — independent node instances finalize blocks and stay in agreement on the same chain, with no crashes. Anti-scale detection (datacenter / colocation) tightened. Next: a wider public testnet.</p>
+                <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px;"><strong style="color: var(--text);">Phase 1: Consensus Stability (Live)</strong></p>
+                <ul style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px; padding-left: 24px;">
+                    <li>Local testnet running: consensus works, blocks finalize, coins are mined and burned</li>
+                    <li>Real network stats: peer count, block height, circulating supply, epoch number</li>
+                    <li>Validator registration: run a node, stake 0.01 COMME, earn block rewards</li>
+                    <li>Block explorer: search blocks by height, view transactions, trace accounts</li>
+                </ul>
+                <p style="font-size: 13px; color: var(--text-dim);"><strong style="color: var(--text);">Phase 2: In Flight</strong></p>
+                <ul style="font-size: 13px; color: var(--text-dim); padding-left: 24px;">
+                    <li>Proof-of-work scoring (weighted by machine capacity)</li>
+                    <li>Anti-scale enforcement (single desktop max, warehouse penalty)</li>
+                    <li>Grace periods (offline uptime tolerance)</li>
+                    <li>Burn events (transaction fees, milestones, incentive burns)</li>
+                    <li>Tier system (resource access levels)</li>
+                    <li>Will-function (persistent backup state)</li>
+                </ul>
+                <p style="font-size: 13px; color: var(--text-dim); margin-top: 12px;"><strong style="color: var(--text);">Products (Storage, Communication, AI) — Launching as Network Capacity Grows</strong></p>
+                <p style="font-size: 13px; color: var(--text-dim);">Products are built only when the network's pooled resources are large and stable enough to support them reliably. We don't promise what doesn't exist yet. The dashboard shows real-time capacity so you can see exactly how close we are. Check back as the network grows.</p>
+            </div>
             <div class="principles">
                 <div class="principle">
                     <h3>Scale Hurts</h3>
@@ -96,7 +131,7 @@
                 </div>
                 <div class="principle">
                     <h3>Burns Everything</h3>
-                    <p>2 billion $COMME. Fixed supply. Dual burn mechanism. Every transaction fee, every compute job, every milestone — burned. Supply only goes down.</p>
+                    <p>2 billion $COMME. Fixed supply. Transaction fees burned. Every compute job, every milestone -- burned. Supply only goes down.</p>
                 </div>
                 <div class="principle">
                     <h3>Patience Rewards</h3>
@@ -105,6 +140,10 @@
                 <div class="principle">
                     <h3>For Everyone</h3>
                     <p>No VCs. No influencer deals. Anonymous founder. Word of mouth only. The product is the marketing.</p>
+                </div>
+                <div class="principle">
+                    <h3>Built to Last</h3>
+                    <p>10% of all resources held in permanent reserve — absorbs validators joining and leaving without disruption. 51% builds products for users. 49% is yours. In an emergency, the 51% drops everything to protect your data first.</p>
                 </div>
             </div>
         </section>
@@ -139,10 +178,10 @@
                 <details class="other-platforms">
                     <summary>All platforms</summary>
                     <table class="download-table">
-                        <tr><td>Linux x86_64</td><td><a href="#">commputer-linux-x86_64</a></td><td class="hash">sha256: —</td></tr>
-                        <tr><td>Linux aarch64</td><td><a href="#">commputer-linux-aarch64</a></td><td class="hash">sha256: —</td></tr>
-                        <tr><td>macOS x86_64</td><td><a href="#">commputer-macos-x86_64</a></td><td class="hash">sha256: —</td></tr>
-                        <tr><td>macOS aarch64</td><td><a href="#">commputer-macos-aarch64</a></td><td class="hash">sha256: —</td></tr>
+                        <tr><td>Linux x86_64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-linux-x86_64">commputer-linux-x86_64</a></td><td class="hash">sha256: —</td></tr>
+                        <tr><td>Linux aarch64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-linux-aarch64">commputer-linux-aarch64</a></td><td class="hash">sha256: —</td></tr>
+                        <tr><td>macOS x86_64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-macos-x86_64">commputer-macos-x86_64</a></td><td class="hash">sha256: —</td></tr>
+                        <tr><td>macOS aarch64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-macos-aarch64">commputer-macos-aarch64</a></td><td class="hash">sha256: —</td></tr>
                     </table>
                 </details>
             </div>
@@ -172,43 +211,12 @@
         <!-- GET STARTED -->
         <section id="start">
             <h2>// Get Started</h2>
-            <div class="steps">
-                <div class="step">
-                    <span class="step-num">01</span>
-                    <h3>Download</h3>
-                    <p>Get the node binary for your platform. One file, no dependencies.</p>
-                    <div class="code-block">
-                        <code>curl -sSf https://commputer.xyz/install.sh | sh</code>
-                        <button class="copy-btn" onclick="copyText('curl -sSf https://commputer.xyz/install.sh | sh')">copy</button>
-                    </div>
+            <div class="content-block">
+                <p>Running a Commputer node takes 5 minutes. We've written a detailed operator guide that walks you through each step — installation, syncing, registration, and claiming rewards.</p>
+                <div style="margin-top: 24px;">
+                    <a href="operator.html" class="btn-primary">Read the Operator Guide</a>
                 </div>
-                <div class="step">
-                    <span class="step-num">02</span>
-                    <h3>Create Wallet</h3>
-                    <p>Generate your wallet. Write down the seed phrase. This is your identity.</p>
-                    <div class="code-block">
-                        <code>commputer wallet create</code>
-                        <button class="copy-btn" onclick="copyText('commputer wallet create')">copy</button>
-                    </div>
-                </div>
-                <div class="step">
-                    <span class="step-num">03</span>
-                    <h3>Start Contributing</h3>
-                    <p>Run the node. Choose how much of your computer to contribute. Start earning.</p>
-                    <div class="code-block">
-                        <code>commputer run --contribution 50</code>
-                        <button class="copy-btn" onclick="copyText('commputer run --contribution 50')">copy</button>
-                    </div>
-                </div>
-                <div class="step">
-                    <span class="step-num">04</span>
-                    <h3>Earn $COMME</h3>
-                    <p>Your idle resources contribute to the communal supercomputer. You earn $COMME for every proof you complete. Check your balance anytime.</p>
-                    <div class="code-block">
-                        <code>commputer wallet show</code>
-                        <button class="copy-btn" onclick="copyText('commputer wallet show')">copy</button>
-                    </div>
-                </div>
+                <p style="margin-top: 16px; font-size: 14px; color: var(--text-dim);">Questions, press, or partnership? <a href="mailto:commrade@commputer.xyz" style="color: var(--accent);">commrade@commputer.xyz</a></p>
             </div>
 
             <div class="faq">
@@ -219,7 +227,7 @@
                 </details>
                 <details>
                     <summary>How much will I earn?</summary>
-                    <p>Depends on network size and your hardware. At launch, a single desktop earns approximately 0.09 $COMME per day. As the network grows, the rate adjusts — but so does the value of what you earn.</p>
+                    <p>Depends on how many people are mining. Block rewards follow Bitcoin's halving model -- early miners earn the most. At launch with 25 nodes, a single desktop earns thousands of $COMME per day. As the network grows, the reward is shared among more people, but the coins are worth more. Show up early.</p>
                 </details>
                 <details>
                     <summary>Is it safe?</summary>
@@ -227,11 +235,19 @@
                 </details>
                 <details>
                     <summary>What happens if I turn off my computer?</summary>
-                    <p>You stop earning while offline. Your balance and wallet are safe. The network has a grace period system — long-time contributors have built-up tolerance for downtime.</p>
+                    <p>Your balance and wallet are always safe regardless of uptime. If you hold $COMME, your access to products never changes whether your machine is on or off. You simply stop earning new coins while offline. If you're contributing compute to earn access without holding coins, the network has a grace period system — long-time contributors can go offline for extended periods without losing access.</p>
+                </details>
+                <details>
+                    <summary>I have 33 $COMME — where is my supercomputer?</summary>
+                    <p>Holding 33 $COMME means you own a share of the communal computer that will grow over time. Right now, the network is young. Your share might be a calculator's worth of compute. That's honest. As more people contribute, the pool grows, and your share grows with it. The products built on this compute — storage, communication, AI — are developed as the network matures enough to support them. Check the dashboard to see current network capacity and your share. This is a lifetime project, not a launch-day promise.</p>
+                </details>
+                <details>
+                    <summary>When will the products (storage, email, AI) be available?</summary>
+                    <p>Products are built as the network's pooled resources grow large enough to support them reliably. We will not launch a product until it works. There are no timelines — only thresholds. When the network has enough storage, you get storage. When it has enough compute, you get compute. The dashboard shows real-time capacity so you can see exactly how close we are. We'd rather be honest about what doesn't exist yet than sell you a roadmap.</p>
                 </details>
                 <details>
                     <summary>Who built this?</summary>
-                    <p>An anonymous founder. No company. No investors. The code is the product. The community is the team.</p>
+                    <p>An anonymous founder. No company. No investors. The code is the product. The community is the team. So long as one person holds 1 $COMME, the founder is working toward the full vision.</p>
                 </details>
             </div>
         </section>
@@ -245,6 +261,7 @@
                     <a href="https://github.com/thecommrade/commputer">GitHub</a>
                     <a href="whitepaper.html">Whitepaper</a>
                     <a href="#">Twitter</a>
+                    <a href="mailto:commrade@commputer.xyz">Contact</a>
                 </div>
                 <p class="footer-copy">$COMME &middot; 2B supply &middot; burn-heavy &middot; scale hurts</p>
             </div>
@@ -252,5 +269,60 @@
     </main>
 
     <script src="app.js"></script>
+    <script>
+    // Item 6: Typing animation on first visit
+    (function() {
+        if (sessionStorage.getItem('commputer-typed')) return;
+        const h1 = document.querySelector('#hero .hero-text h1');
+        if (!h1) return;
+        const text = h1.textContent;
+        h1.textContent = '';
+        h1.style.borderRight = '2px solid var(--accent)';
+        let i = 0;
+        function type() {
+            if (i < text.length) {
+                h1.textContent += text[i++];
+                setTimeout(type, 80 + Math.random() * 40);
+            } else {
+                h1.style.borderRight = 'none';
+                sessionStorage.setItem('commputer-typed', '1');
+            }
+        }
+        type();
+    })();
+
+    // Item 15: Keyboard navigation — / to focus search, Escape to close
+    document.addEventListener('keydown', function(e) {
+        if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+            e.preventDefault();
+            var input = document.getElementById('explorer-input');
+            if (input) { input.focus(); input.scrollIntoView({behavior:'smooth',block:'center'}); }
+        }
+        if (e.key === 'Escape') {
+            document.activeElement.blur();
+            var navLinks = document.getElementById('nav-links');
+            if (navLinks) navLinks.classList.remove('open');
+            var hamburger = document.getElementById('hamburger');
+            if (hamburger) hamburger.classList.remove('active');
+        }
+    });
+
+    // Item 5: Hamburger menu toggle
+    (function() {
+        var hamburger = document.getElementById('hamburger');
+        var navLinks = document.getElementById('nav-links');
+        if (hamburger && navLinks) {
+            hamburger.addEventListener('click', function() {
+                navLinks.classList.toggle('open');
+                hamburger.classList.toggle('active');
+            });
+        }
+    })();
+    </script>
+    <footer style="text-align:center; padding: 2rem; color: var(--text-dim, #666); font-size: 0.85rem; border-top: 1px solid var(--border, #333);">
+        <span id="footer-height">Chain height: —</span> &middot;
+        <a href="https://github.com/thecommrade/commputer" style="color: var(--accent, #e94560);">GitHub</a> &middot;
+        Commputer &copy; 2026
+    </footer>
 </body>
 </html>
