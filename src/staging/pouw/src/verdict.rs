@@ -65,4 +65,42 @@ mod tests {
         let v = compute_verdict(&reveals, &[9; 32], p.quorum(3), &ByteEq);
         assert_eq!(v, Verdict::NoQuorum);
     }
+
+    /// Spec §8 / §12.3: prove the [`EquivalenceOracle`] is a real seam — a stub
+    /// "approximate" oracle compiles against and changes the behaviour of the *same*
+    /// `compute_verdict`, with no change to the game logic. This is the deterministic
+    /// `a == b` impl's future replacement (Cycle C: tolerance / semantic equivalence).
+    ///
+    /// Here "approximate" means: two result hashes are equivalent iff their first bytes
+    /// differ by at most 1. Under [`ByteEq`] the three reveals below are a three-way split
+    /// (`NoQuorum`); under the approximate oracle two of them collapse into one class that
+    /// reaches quorum — same engine, different (pluggable) equivalence.
+    struct ApproxFirstByte;
+    impl EquivalenceOracle for ApproxFirstByte {
+        fn equiv(&self, a: &[u8; 32], b: &[u8; 32]) -> bool {
+            a[0].abs_diff(b[0]) <= 1
+        }
+    }
+
+    #[test]
+    fn approximate_equivalence_oracle_swaps_in_against_the_same_engine() {
+        let p = GameParams::default();
+        // hashes 9, 10, 3: under ByteEq all distinct → NoQuorum; under ApproxFirstByte
+        // {9,10} are equivalent → a 2-of-3 quorum on that class.
+        let reveals = vec![rv(1, 9), rv(2, 10), rv(3, 3)];
+
+        // Deterministic seam: three-way split.
+        assert_eq!(
+            compute_verdict(&reveals, &[9; 32], p.quorum(3), &ByteEq),
+            Verdict::NoQuorum
+        );
+
+        // Approximate seam: the same call, same data, only the oracle swapped → a verdict.
+        // The class representative is the first-seen member (hash 9), which equals the
+        // executor's claim under the approximate oracle → Confirmed.
+        assert_eq!(
+            compute_verdict(&reveals, &[9; 32], p.quorum(3), &ApproxFirstByte),
+            Verdict::Confirmed { result_hash: [9; 32] }
+        );
+    }
 }
