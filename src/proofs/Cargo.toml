@@ -16,3 +16,7 @@ borsh = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Tier B test harnesses — property-based testing.
+proptest = "1.4"
