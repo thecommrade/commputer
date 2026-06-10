@@ -666,6 +666,7 @@ dependencies = [
  "borsh",
  "commputer-core",
  "commputer-storage",
+ "proptest",
  "rand 0.8.5",
  "serde",
  "sha2",
