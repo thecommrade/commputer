@@ -45,6 +45,150 @@ fn ipv6_in_prefix(addr: std::net::Ipv6Addr, prefix: &str, len: u8) -> bool {
     (addr_bits & mask) == (net_bits & mask)
 }
 
+/// A5-cidr-tighten: IPv4 analogue of `ipv6_in_prefix`. Returns true iff `addr`
+/// (the 4 octets of an IPv4 address) falls inside `net/len`. `net` is a dotted
+/// quad parseable by `Ipv4Addr::from_str` (network address, host bits zero).
+/// Out-of-range `len` or an unparseable `net` returns false; `len == 0` matches
+/// everything (guards the `<< 32` host-shift hazard, exactly as the v6 helper
+/// guards `<< 128`).
+fn ipv4_in_prefix(addr: [u8; 4], net: &str, len: u8) -> bool {
+    use std::net::Ipv4Addr;
+    if len > 32 {
+        return false;
+    }
+    let net_addr: Ipv4Addr = match net.parse() {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let addr_bits = u32::from_be_bytes(addr);
+    let net_bits = u32::from_be_bytes(net_addr.octets());
+    if len == 0 {
+        return true;
+    }
+    let mask: u32 = (!0u32) << (32 - len);
+    (addr_bits & mask) == (net_bits & mask)
+}
+
+/// A5-cidr-tighten: CIDR-precise datacenter/cloud IPv4 prefix table grounded in
+/// real BGP-announced ranges (RIPEstat AS24940 Hetzner / AS16276 OVH / AS14061
+/// DigitalOcean, verified 2026-06-10; Google cloud.json for GCP). Replaces the
+/// legacy coarse first-octet table. Each row is (network, prefix_len, label);
+/// first match wins. AWS/Azure/GCP keep the accepted coarse heuristic re-
+/// expressed as CIDRs; Hetzner is broadened to its real modern /16s and OVH is
+/// tightened from the wrong whole-51/8 to its 18 announced blocks.
+const DATACENTER_V4_PREFIXES: &[(&str, u8, &str)] = &[
+    // ----- AWS (AS16509 / AS14618) — coarse /8 heuristic, preserved ----
+    ("3.0.0.0", 8, "AWS"),
+    ("13.0.0.0", 8, "AWS"),
+    ("18.0.0.0", 8, "AWS"),
+    ("34.0.0.0", 8, "AWS"),  // also GCP
+    ("35.0.0.0", 8, "AWS"),  // also GCP
+    ("52.0.0.0", 8, "AWS"),
+    ("54.0.0.0", 8, "AWS"),  // OVH 54.36/14 sits inside; OVH rows below are
+                             // redundant for the bool but kept for labels.
+
+    // ----- Azure (AS8075) — coarse /8 heuristic, preserved -------------
+    ("20.0.0.0", 8, "Azure"),
+    ("40.0.0.0", 8, "Azure"),
+
+    // ----- GCP (AS15169 / AS396982) — confirmed cloud.json aggregates --
+    ("104.196.0.0", 14, "GCP"),
+    ("104.154.0.0", 15, "GCP"),
+    ("104.197.0.0", 16, "GCP"),
+    ("130.211.0.0", 16, "GCP"),
+    ("35.184.0.0", 13, "GCP"),   // also covered by 35/8 AWS row; label clarity
+
+    // ----- Hetzner (AS24940) — BROADENED to real announced /15-/17 -----
+    ("88.198.0.0", 16, "Hetzner"),   // kept (already correct)
+    ("88.99.0.0", 16, "Hetzner"),    // newly caught
+    ("49.12.0.0", 16, "Hetzner"),    // newly caught
+    ("49.13.0.0", 16, "Hetzner"),    // newly caught
+    ("65.21.0.0", 16, "Hetzner"),    // newly caught
+    ("65.108.0.0", 16, "Hetzner"),   // newly caught
+    ("65.109.0.0", 16, "Hetzner"),   // newly caught
+    ("95.216.0.0", 16, "Hetzner"),   // newly caught
+    ("95.217.0.0", 16, "Hetzner"),   // newly caught
+    ("116.202.0.0", 16, "Hetzner"),  // newly caught
+    ("116.203.0.0", 16, "Hetzner"),  // newly caught
+    ("167.233.0.0", 16, "Hetzner"),  // newly caught
+    ("167.235.0.0", 16, "Hetzner"),  // newly caught
+    ("168.119.0.0", 16, "Hetzner"),  // newly caught
+    ("78.46.0.0", 15, "Hetzner"),    // was 78.46/16 in old code; real is /15
+    ("148.251.0.0", 16, "Hetzner"),  // kept (correct)
+    ("176.9.0.0", 16, "Hetzner"),    // kept (correct)
+    ("5.9.0.0", 16, "Hetzner"),      // kept (correct)
+    ("46.4.0.0", 16, "Hetzner"),     // was 46.4/16 in old code (correct)
+    ("46.224.0.0", 15, "Hetzner"),   // newly caught aggregate
+    ("5.75.128.0", 17, "Hetzner"),   // newly caught (Hetzner cloud)
+
+    // ----- OVH (AS16276) — TIGHTENED from whole-51/8 to 18 real blocks -
+    ("51.38.0.0", 16, "OVH"),
+    ("51.68.0.0", 16, "OVH"),
+    ("51.75.0.0", 16, "OVH"),
+    ("51.77.0.0", 16, "OVH"),
+    ("51.79.0.0", 16, "OVH"),
+    ("51.81.0.0", 16, "OVH"),
+    ("51.83.0.0", 16, "OVH"),
+    ("51.89.0.0", 16, "OVH"),
+    ("51.91.0.0", 16, "OVH"),
+    ("51.161.0.0", 16, "OVH"),
+    ("51.178.0.0", 16, "OVH"),
+    ("51.195.0.0", 16, "OVH"),
+    ("51.210.0.0", 16, "OVH"),
+    ("51.222.0.0", 16, "OVH"),
+    ("51.254.0.0", 15, "OVH"),   // 51.254.0.0 - 51.255.255.255
+    ("54.36.0.0", 14, "OVH"),    // 54.36.0.0 - 54.39.255.255 (inside AWS 54/8)
+    ("87.98.0.0", 16, "OVH"),    // mild over-cover; RIPEstat confirmed
+                                 // 87.98.128.0/17 — TODO(cidr) tighten if strict
+    ("91.121.0.0", 16, "OVH"),
+    ("149.202.0.0", 16, "OVH"),
+    ("145.239.0.0", 16, "OVH"),  // newly caught
+    ("137.74.0.0", 16, "OVH"),   // newly caught
+    ("141.94.0.0", 16, "OVH"),   // newly caught
+    ("141.95.0.0", 16, "OVH"),   // newly caught
+    ("178.32.0.0", 15, "OVH"),   // newly caught aggregate
+    ("188.165.0.0", 16, "OVH"),  // newly caught
+    ("5.135.0.0", 16, "OVH"),    // newly caught
+    ("5.196.0.0", 16, "OVH"),    // newly caught
+    ("92.222.0.0", 16, "OVH"),   // newly caught
+    ("94.23.0.0", 16, "OVH"),    // newly caught
+    ("213.32.0.0", 17, "OVH"),   // newly caught
+    ("5.39.0.0", 17, "OVH"),     // newly caught
+
+    // ----- DigitalOcean (AS14061) — fully-covered /16s -----------------
+    ("64.225.0.0", 16, "DigitalOcean"),   // kept
+    ("104.131.0.0", 16, "DigitalOcean"),  // kept
+    ("128.199.0.0", 16, "DigitalOcean"),  // kept
+    ("167.71.0.0", 16, "DigitalOcean"),   // kept
+    ("167.172.0.0", 16, "DigitalOcean"),  // kept
+    ("134.122.0.0", 16, "DigitalOcean"),  // newly caught
+    ("137.184.0.0", 16, "DigitalOcean"),  // newly caught
+    ("138.197.0.0", 16, "DigitalOcean"),  // newly caught
+    ("138.68.0.0", 16, "DigitalOcean"),   // newly caught
+    ("142.93.0.0", 16, "DigitalOcean"),   // newly caught
+    ("143.198.0.0", 16, "DigitalOcean"),  // newly caught
+    ("146.190.0.0", 16, "DigitalOcean"),  // newly caught
+    ("157.230.0.0", 16, "DigitalOcean"),  // newly caught
+    ("159.65.0.0", 16, "DigitalOcean"),   // newly caught
+    ("159.89.0.0", 16, "DigitalOcean"),   // newly caught
+    ("161.35.0.0", 16, "DigitalOcean"),   // newly caught
+    ("165.22.0.0", 16, "DigitalOcean"),   // newly caught
+    ("165.227.0.0", 16, "DigitalOcean"),  // newly caught
+    ("206.189.0.0", 16, "DigitalOcean"),  // newly caught
+    ("64.227.0.0", 16, "DigitalOcean"),   // newly caught
+];
+
+/// A5-cidr-tighten: returns the matching provider label for an IPv4 address, or
+/// `None`. `is_datacenter_ipv4` only needs the bool; the label aids diagnostics.
+fn match_datacenter_ipv4(octets: [u8; 4]) -> Option<&'static str> {
+    for (net, len, label) in DATACENTER_V4_PREFIXES {
+        if ipv4_in_prefix(octets, net, *len) {
+            return Some(label);
+        }
+    }
+    None
+}
+
 /// Feature 137: Behavioral analysis profile for a validator.
 #[derive(Debug, Clone)]
 pub struct BehaviorProfile {
@@ -325,57 +469,13 @@ impl ComplianceChecker {
         }
     }
 
-    /// IPv4 datacenter detection — legacy octet-prefix table.
+    /// IPv4 datacenter detection — CIDR-precise prefix table (A5-cidr-tighten).
+    /// Delegates to the module-level `match_datacenter_ipv4` / `DATACENTER_V4_PREFIXES`
+    /// (BGP-grounded). Replaces the legacy coarse octet table that flagged the
+    /// whole 51/8 as OVH and missed modern Hetzner /16s. Signature and call site
+    /// at `is_datacenter_ip` are unchanged.
     fn is_datacenter_ipv4(addr: std::net::Ipv4Addr) -> bool {
-        let octets = addr.octets();
-
-        // AWS EC2: 3.x, 13.x, 18.x, 34.x, 35.x, 52.x, 54.x.
-        let aws_prefixes: &[u8] = &[3, 13, 18, 34, 35, 52, 54];
-        if aws_prefixes.contains(&octets[0]) {
-            return true;
-        }
-
-        // GCP: 104.196.x, 104.199.x (34.x/35.x covered above).
-        if octets[0] == 104 && (octets[1] == 196 || octets[1] == 199) {
-            return true;
-        }
-
-        // Azure: 20.x, 40.x (13.x/52.x overlap AWS).
-        if octets[0] == 20 || octets[0] == 40 {
-            return true;
-        }
-
-        // Hetzner: 88.198, 78.46, 148.251, 176.9, 46.4, 5.9.
-        if (octets[0] == 88 && octets[1] == 198)
-            || (octets[0] == 78 && octets[1] == 46)
-            || (octets[0] == 148 && octets[1] == 251)
-            || (octets[0] == 176 && octets[1] == 9)
-            || (octets[0] == 46 && octets[1] == 4)
-            || (octets[0] == 5 && octets[1] == 9)
-        {
-            return true;
-        }
-
-        // OVH: 51.x, 54.36, 87.98, 91.121, 149.202.
-        if octets[0] == 51
-            || (octets[0] == 54 && octets[1] == 36)
-            || (octets[0] == 87 && octets[1] == 98)
-            || (octets[0] == 91 && octets[1] == 121)
-            || (octets[0] == 149 && octets[1] == 202)
-        {
-            return true;
-        }
-
-        // DigitalOcean: 64.225, 104.131, 128.199, 167.71, 167.172.
-        if (octets[0] == 64 && octets[1] == 225)
-            || (octets[0] == 104 && octets[1] == 131)
-            || (octets[0] == 128 && octets[1] == 199)
-            || (octets[0] == 167 && (octets[1] == 71 || octets[1] == 172))
-        {
-            return true;
-        }
-
-        false
+        match_datacenter_ipv4(addr.octets()).is_some()
     }
 
     /// IPv6 datacenter detection — aggregate prefix table.
@@ -978,5 +1078,258 @@ mod tests {
         assert!(ComplianceChecker::is_datacenter_ip("3.5.10.20"));
         assert!(ComplianceChecker::is_datacenter_ip("88.198.1.1"));
         assert!(!ComplianceChecker::is_datacenter_ip("192.168.1.1"));
+    }
+
+    // ── A5-cidr-tighten: CIDR-precise IPv4 datacenter detector ──
+    // `dc` routes through the real public dispatcher (is_datacenter_ip ->
+    // is_datacenter_ipv4 -> match_datacenter_ipv4); `label` calls the table
+    // helper directly for provider-attribution assertions.
+    mod cidr_v4_tests {
+        use super::super::*;
+        use std::net::Ipv4Addr;
+        use std::str::FromStr;
+
+        fn dc(s: &str) -> bool {
+            ComplianceChecker::is_datacenter_ip(s)
+        }
+        fn label(s: &str) -> Option<&'static str> {
+            match_datacenter_ipv4(Ipv4Addr::from_str(s).unwrap().octets())
+        }
+
+        // ---- ipv4_in_prefix correctness (the matcher itself) ----
+
+        #[test]
+        fn prefix_len_out_of_range_is_false() {
+            assert!(!ipv4_in_prefix([10, 0, 0, 1], "10.0.0.0", 33));
+            assert!(!ipv4_in_prefix([10, 0, 0, 1], "10.0.0.0", 255));
+        }
+
+        #[test]
+        fn prefix_unparseable_net_is_false() {
+            assert!(!ipv4_in_prefix([10, 0, 0, 1], "not.an.ip", 16));
+            assert!(!ipv4_in_prefix([10, 0, 0, 1], "", 16));
+        }
+
+        #[test]
+        fn prefix_len_zero_matches_everything() {
+            assert!(ipv4_in_prefix([1, 2, 3, 4], "0.0.0.0", 0));
+            assert!(ipv4_in_prefix([255, 255, 255, 255], "0.0.0.0", 0));
+        }
+
+        #[test]
+        fn prefix_32_is_exact_host_match() {
+            assert!(ipv4_in_prefix([51, 68, 1, 1], "51.68.1.1", 32));
+            assert!(!ipv4_in_prefix([51, 68, 1, 2], "51.68.1.1", 32));
+        }
+
+        #[test]
+        fn prefix_16_membership_math() {
+            assert!(ipv4_in_prefix([88, 99, 0, 0], "88.99.0.0", 16));
+            assert!(ipv4_in_prefix([88, 99, 255, 255], "88.99.0.0", 16));
+            assert!(!ipv4_in_prefix([88, 100, 0, 0], "88.99.0.0", 16));
+            assert!(!ipv4_in_prefix([88, 98, 255, 255], "88.99.0.0", 16));
+        }
+
+        #[test]
+        fn prefix_15_spans_two_octet3_values() {
+            // 78.46.0.0/15 -> 78.46.0.0 .. 78.47.255.255
+            assert!(ipv4_in_prefix([78, 46, 0, 0], "78.46.0.0", 15));
+            assert!(ipv4_in_prefix([78, 47, 255, 255], "78.46.0.0", 15));
+            assert!(!ipv4_in_prefix([78, 48, 0, 0], "78.46.0.0", 15));
+            assert!(!ipv4_in_prefix([78, 45, 255, 255], "78.46.0.0", 15));
+        }
+
+        #[test]
+        fn prefix_14_spans_four_octet3_values() {
+            // 54.36.0.0/14 -> 54.36.0.0 .. 54.39.255.255 (OVH)
+            assert!(ipv4_in_prefix([54, 36, 0, 0], "54.36.0.0", 14));
+            assert!(ipv4_in_prefix([54, 39, 255, 255], "54.36.0.0", 14));
+            assert!(!ipv4_in_prefix([54, 40, 0, 0], "54.36.0.0", 14));
+            assert!(!ipv4_in_prefix([54, 35, 255, 255], "54.36.0.0", 14));
+        }
+
+        // ---- Each provider: positive hits ----
+
+        #[test]
+        fn aws_positive() {
+            assert_eq!(label("3.5.10.20"), Some("AWS"));
+            assert_eq!(label("18.200.1.1"), Some("AWS"));
+            assert_eq!(label("52.95.1.1"), Some("AWS"));
+            assert!(dc("54.240.1.1"));
+        }
+
+        #[test]
+        fn azure_positive() {
+            assert_eq!(label("20.1.2.3"), Some("Azure"));
+            assert_eq!(label("40.9.9.9"), Some("Azure"));
+        }
+
+        #[test]
+        fn gcp_positive() {
+            assert!(dc("104.196.1.1"));
+            assert!(dc("104.154.5.5"));
+            assert!(dc("130.211.1.1"));
+            assert!(dc("34.64.1.1"));
+            assert!(dc("35.184.1.1"));
+        }
+
+        #[test]
+        fn hetzner_positive_legacy_kept() {
+            assert_eq!(label("88.198.1.1"), Some("Hetzner"));
+            assert_eq!(label("5.9.1.1"), Some("Hetzner"));
+            assert_eq!(label("176.9.1.1"), Some("Hetzner"));
+            assert_eq!(label("148.251.1.1"), Some("Hetzner"));
+            assert_eq!(label("46.4.1.1"), Some("Hetzner"));
+        }
+
+        #[test]
+        fn ovh_positive_legacy_kept() {
+            assert_eq!(label("91.121.1.1"), Some("OVH"));
+            assert_eq!(label("149.202.1.1"), Some("OVH"));
+        }
+
+        #[test]
+        fn digitalocean_positive_legacy_kept() {
+            assert_eq!(label("64.225.1.1"), Some("DigitalOcean"));
+            assert_eq!(label("104.131.1.1"), Some("DigitalOcean"));
+            assert_eq!(label("128.199.1.1"), Some("DigitalOcean"));
+            assert_eq!(label("167.71.1.1"), Some("DigitalOcean"));
+            assert_eq!(label("167.172.1.1"), Some("DigitalOcean"));
+        }
+
+        // ---- BUG FIX 1: previously-missed Hetzner ranges now caught ----
+
+        #[test]
+        fn hetzner_previously_missed_now_caught() {
+            for ip in [
+                "88.99.1.1", "49.12.1.1", "49.13.1.1", "65.21.1.1", "65.108.1.1",
+                "65.109.1.1", "95.216.1.1", "95.217.1.1", "116.202.1.1",
+                "116.203.1.1", "167.233.1.1", "167.235.1.1", "168.119.1.1",
+            ] {
+                assert_eq!(label(ip), Some("Hetzner"), "{} should be Hetzner now", ip);
+                assert!(dc(ip), "{} should be datacenter now", ip);
+            }
+        }
+
+        #[test]
+        fn hetzner_78_46_now_full_slash15() {
+            assert!(dc("78.46.5.5"));
+            assert!(dc("78.47.5.5"));   // newly caught half of the /15
+            assert!(!dc("78.48.5.5"));  // just past the /15 — residential
+            assert!(!dc("78.45.5.5"));  // just before — residential
+        }
+
+        // ---- BUG FIX 2: OVH tightened, non-OVH 51.x NOT flagged ----
+
+        #[test]
+        fn ovh_real_blocks_flagged() {
+            for ip in [
+                "51.38.1.1", "51.68.1.1", "51.75.1.1", "51.77.1.1", "51.79.200.1",
+                "51.81.200.1", "51.83.1.1", "51.89.1.1", "51.91.1.1", "51.161.200.1",
+                "51.178.1.1", "51.195.1.1", "51.210.1.1", "51.222.1.1", "51.254.1.1",
+                "51.255.1.1",
+            ] {
+                assert_eq!(label(ip), Some("OVH"), "{} should be OVH", ip);
+            }
+        }
+
+        #[test]
+        fn non_ovh_51x_not_flagged() {
+            // THE headline regression: old `octets[0] == 51` flagged ALL of 51/8.
+            for ip in [
+                "51.100.5.5", "51.0.0.1", "51.1.2.3", "51.15.1.1", "51.158.1.1",
+                "51.69.1.1", "51.200.1.1", "51.253.1.1",
+            ] {
+                assert_eq!(label(ip), None, "{} must NOT be flagged (not OVH)", ip);
+                assert!(!dc(ip), "{} must NOT be datacenter", ip);
+            }
+        }
+
+        #[test]
+        fn ovh_51_254_slash15_boundary() {
+            assert!(dc("51.254.0.0"));
+            assert!(dc("51.255.255.255"));
+            assert!(!dc("51.253.255.255"));
+        }
+
+        #[test]
+        fn ovh_new_non51_blocks_flagged() {
+            for ip in [
+                "145.239.1.1", "137.74.1.1", "141.94.1.1", "141.95.200.1",
+                "178.32.5.5", "178.33.5.5", "188.165.1.1", "92.222.1.1", "94.23.1.1",
+            ] {
+                assert_eq!(label(ip), Some("OVH"), "{} should be OVH", ip);
+            }
+        }
+
+        // ---- DigitalOcean newly-caught /16s ----
+
+        #[test]
+        fn digitalocean_new_blocks_flagged() {
+            for ip in [
+                "134.122.1.1", "137.184.1.1", "138.197.1.1", "138.68.1.1",
+                "142.93.1.1", "146.190.1.1", "157.230.1.1", "159.65.1.1",
+                "159.89.1.1", "161.35.1.1", "165.22.1.1", "165.227.1.1",
+                "206.189.1.1", "64.227.1.1",
+            ] {
+                assert_eq!(label(ip), Some("DigitalOcean"), "{} should be DO", ip);
+            }
+        }
+
+        #[test]
+        fn digitalocean_unclaimed_partial_16s_not_overclaimed() {
+            // 143.110/16 and 64.23/16 are intentionally left out (only partially
+            // DO-owned). Documents current behavior so a future broadening is a
+            // conscious decision, not an accident.
+            assert_eq!(label("143.110.1.1"), None);
+            assert_eq!(label("64.23.1.1"), None);
+        }
+
+        // ---- Residential / private negatives ----
+
+        #[test]
+        fn residential_and_private_not_flagged() {
+            for ip in [
+                "192.168.1.1", "10.0.1.1", "172.16.1.1", "71.12.34.56", "24.1.1.1",
+                "86.1.2.3", "100.64.0.1", "127.0.0.1", "8.8.8.8",
+            ] {
+                assert!(!dc(ip), "{} must NOT be datacenter", ip);
+            }
+        }
+
+        // ---- CIDR boundary tests on representative provider blocks ----
+
+        #[test]
+        fn hetzner_88_99_slash16_boundaries() {
+            assert!(dc("88.99.0.0"));
+            assert!(dc("88.99.255.255"));
+            assert!(!dc("88.100.0.0"));
+            assert!(!dc("88.98.255.255"));
+        }
+
+        #[test]
+        fn ovh_51_68_slash16_boundaries() {
+            assert!(dc("51.68.0.0"));
+            assert!(dc("51.68.255.255"));
+            assert!(!dc("51.67.255.255"));
+            assert!(!dc("51.69.0.0"));
+        }
+
+        #[test]
+        fn aws_54_8_boundary_does_not_leak_to_55() {
+            assert!(dc("54.0.0.0"));
+            assert!(dc("54.255.255.255"));
+            assert!(!dc("55.0.0.0"));        // 55/8 is DoD, not AWS
+            assert!(!dc("53.255.255.255"));  // 53/8 not in table
+        }
+
+        // ---- Parity guard: the exact assertions the shipping tests rely on ----
+
+        #[test]
+        fn shipping_feature_148_assertions_still_hold() {
+            assert!(dc("3.5.10.20"));      // AWS — still true
+            assert!(dc("88.198.1.1"));     // Hetzner — still true
+            assert!(!dc("192.168.1.1"));   // private — still false
+        }
     }
 }
