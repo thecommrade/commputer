@@ -738,7 +738,7 @@ async fn faucet(
     let current_epoch = state.status.lock().await.epoch;
 
     // Rate limit: 1 request per address per epoch.
-    let mut claims = state.faucet_claims.lock().await;
+    let claims = state.faucet_claims.lock().await;
     if let Some(&last_epoch) = claims.get(&req.address)
         && last_epoch >= current_epoch {
             return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
@@ -747,17 +747,22 @@ async fn faucet(
             })));
         }
 
-    claims.insert(req.address.clone(), current_epoch);
+    // W5.7 F-6: HONESTY FIX. The faucet has no provisioned signing wallet:
+    // RpcState carries no faucet keypair, and no funded faucet/treasury
+    // account exists in genesis. Previously this handler inserted the
+    // rate-limit claim and returned {success:true, "1 COMME dispensed"}
+    // WITHOUT ever building, signing, or queueing a Transfer — it lied.
+    // Until a faucet wallet is wired (requires a protected-file change to
+    // main.rs RpcState construction + a funded faucet account in genesis),
+    // return 503 instead of a false success. Do NOT consume the per-epoch
+    // claim slot on a request we cannot fulfill.
+    drop(claims);
 
-    // Create a faucet transaction (1 COMME).
-    let faucet_amount = commputer_core::token::UNITS_PER_COMME; // 1 COMME
-
-    (StatusCode::OK, Json(serde_json::json!({
-        "success": true,
+    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+        "error": "faucet not provisioned",
+        "detail": "no faucet wallet is configured on this node; tokens cannot be dispensed",
         "address": req.address,
-        "amount": faucet_amount,
         "epoch": current_epoch,
-        "note": "1 COMME dispensed from faucet (testnet only)",
     })))
 }
 
@@ -1197,12 +1202,43 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .with_state(rpc_state)
 }
 
+/// W5.7 F-4: Deployment-safety gate. Returns `Err` when the RPC server
+/// would be exposed insecurely: bound to a non-loopback address while no
+/// API key is configured (auth disabled). Loopback binds, and any bind with
+/// an API key set, are allowed. An unparseable bind string is treated as
+/// non-loopback (fail-closed). The returned String is a human-readable reason
+/// suitable for logging.
+fn rpc_bind_guard(rpc_bind: &str, api_key_is_set: bool) -> Result<(), String> {
+    if api_key_is_set {
+        return Ok(());
+    }
+    match rpc_bind.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_loopback() => Ok(()),
+        Ok(ip) => Err(format!(
+            "refusing to start RPC server: bind address {} is not loopback and no API key is configured (auth disabled). Set an API key or bind to 127.0.0.1.",
+            ip
+        )),
+        Err(_) => Err(format!(
+            "refusing to start RPC server: bind address '{}' is not a valid IP and no API key is configured (auth disabled). Set an API key or bind to 127.0.0.1.",
+            rpc_bind
+        )),
+    }
+}
+
 /// Start the RPC server on the given port and bind address.
 pub async fn start_rpc_server(
     rpc_port: u16,
     rpc_bind: String,
     rpc_state: Arc<RpcState>,
 ) {
+    // W5.7 F-4: refuse to start if bound to a non-loopback address with auth
+    // disabled (no API key). This prevents an unauthenticated RPC surface from
+    // being silently exposed to the network.
+    if let Err(reason) = rpc_bind_guard(&rpc_bind, rpc_state.api_key.is_some()) {
+        tracing::error!("{}", reason);
+        return;
+    }
+
     let security_state = rpc_state.clone();
     let app = build_router(rpc_state)
         .layer(axum::middleware::from_fn_with_state(security_state, security_headers));
@@ -1565,5 +1601,63 @@ mod tests {
             MAX_RATE_LIMIT_ENTRIES,
             limits.len()
         );
+    }
+
+    #[test]
+    fn rpc_bind_guard_refuses_non_loopback_without_api_key() {
+        // W5.7 F-4: non-loopback bind + no API key => refuse to start.
+        assert!(rpc_bind_guard("0.0.0.0", false).is_err());
+        assert!(rpc_bind_guard("192.168.1.10", false).is_err());
+        assert!(rpc_bind_guard("::", false).is_err());
+        // Unparseable bind string is treated as non-loopback (fail-closed).
+        assert!(rpc_bind_guard("not-an-ip", false).is_err());
+
+        // Loopback binds are always allowed, even with auth disabled.
+        assert!(rpc_bind_guard("127.0.0.1", false).is_ok());
+        assert!(rpc_bind_guard("::1", false).is_ok());
+
+        // With an API key set, any bind address is permitted.
+        assert!(rpc_bind_guard("0.0.0.0", true).is_ok());
+        assert!(rpc_bind_guard("192.168.1.10", true).is_ok());
+        assert!(rpc_bind_guard("127.0.0.1", true).is_ok());
+
+        // Confirm the refusal reason mentions the offending address.
+        let err = rpc_bind_guard("0.0.0.0", false).unwrap_err();
+        assert!(err.contains("0.0.0.0"));
+        assert!(err.to_lowercase().contains("refusing"));
+    }
+
+    #[tokio::test]
+    async fn faucet_does_not_lie_when_unprovisioned() {
+        // W5.7 F-6: an unprovisioned faucet must NOT return a false success.
+        // make_rpc_state() builds an is_testnet=true state with no faucet
+        // wallet, so the request passes the testnet gate and hits the
+        // honesty path. It must return 503 and must NOT claim dispensal,
+        // and must NOT have queued any transfer on tx_sender.
+        let (state, mut rx) = make_rpc_state();
+        let app = build_router(state);
+
+        let addr_hex = hex::encode([7u8; 32]);
+        let body = serde_json::to_vec(&serde_json::json!({ "address": addr_hex })).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/faucet")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Must not claim success, and must surface the provisioning error.
+        assert!(v.get("success").is_none(), "unprovisioned faucet must not report success");
+        assert_eq!(v["error"], "faucet not provisioned");
+
+        // No transfer should have been queued to the event loop.
+        assert!(rx.try_recv().is_err(), "faucet must not queue a tx when unprovisioned");
     }
 }
