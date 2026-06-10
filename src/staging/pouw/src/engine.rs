@@ -257,11 +257,12 @@ fn run_sampled(
             return_committee_bonds(l, &committee, inputs.verifier_bond);
             out
         }
-        Verdict::Disputed { .. } => {
-            // The committee reached quorum AGAINST the executor: honest verifiers are
-            // those whose revealed value matches the committee value (= the verdict's
-            // correct_hash). Pay them the catch bounty; their own bonds are returned.
-            let honest: Vec<ParticipantId> = honest_against_executor(&reveals, &executor_hash, eq);
+        Verdict::Disputed { correct_hash } => {
+            // The committee reached quorum AGAINST the executor on `correct_hash`. The
+            // catch bounty goes to the verifiers who revealed that vindicated value —
+            // NOT merely anyone who disagreed with the executor (a third, also-wrong
+            // reveal earns no bounty). Their own bonds are returned below.
+            let honest: Vec<ParticipantId> = verifiers_revealing(&reveals, &correct_hash, eq);
             let out = settle_committee_disputed(
                 l,
                 p,
@@ -340,14 +341,18 @@ fn return_committee_bonds(l: &mut dyn ChainHooks, committee: &[ParticipantId], b
 /// The committee members who revealed the value the committee reached quorum on AGAINST
 /// the executor — i.e. a value NOT equivalent to the executor's claim. These are the
 /// honest verifiers eligible for the `Disputed` catch bounty.
-fn honest_against_executor(
+/// Verifiers whose revealed value equals `value` (e.g. the quorum-vindicated hash
+/// on a Disputed verdict). The catch bounty goes to those who actually produced the
+/// correct result — not merely anyone who disagreed with the executor (a third,
+/// also-wrong reveal earns no bounty).
+fn verifiers_revealing(
     reveals: &[Reveal],
-    executor_hash: &[u8; 32],
+    value: &[u8; 32],
     eq: &dyn EquivalenceOracle,
 ) -> Vec<ParticipantId> {
     reveals
         .iter()
-        .filter(|r| !eq.equiv(&r.result_hash, executor_hash))
+        .filter(|r| eq.equiv(&r.result_hash, value))
         .map(|r| r.verifier)
         .collect()
 }
