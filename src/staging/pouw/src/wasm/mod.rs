@@ -10,6 +10,7 @@ pub mod limits;
 pub use limits::WasmLimits;
 pub mod store;
 pub use store::ProgramStore;
+pub mod validation;
 
 #[cfg(test)]
 mod smoke {
