@@ -140,6 +140,14 @@ Existing split fields (`worker_bps` etc.) are unchanged *as code*; their **defau
 sweep outputs — if the sweep's recommended regime moves the split (e.g. a larger verifier
 slice), the new defaults are presented to the founder with the sweep table before adoption.
 
+**Zero-rate guard.** The bond formulas divide by `s_bps` (executor) and `t_bps` (verifier), and
+the game legally runs with either at 0 (existing tests set `sample_rate_bps = 0` to force the
+challenge path). Pricing therefore REFUSES rather than divides: `validate_economics` (and every
+`*_min` function) returns `EconViolation::BadParams` when `s_bps == 0` or `t_bps == 0` — a job
+cannot be *priced* in a regime with no proactive catching, even though the unpriced game can
+still simulate one. `GameParams::validate()` itself stays permissive (the game allows it); the
+restriction is enforcement-surface-only.
+
 ## 4. Module design
 
 New file **`src/staging/pouw/src/economics.rs`** (NOT feature-gated — pure integer math with no
