@@ -154,7 +154,7 @@ impl ExecutionOracle for WasmOracle {
 mod tests {
     use super::*;
     use crate::job::JobSpec;
-    use crate::wasm::error::ExecError;
+    use crate::wasm::error::{error_digest, ok_digest, ExecError};
     use crate::wasm::limits::WasmLimits;
     use crate::wasm::store::ProgramStore;
     use sha2::{Digest, Sha256};
@@ -226,7 +226,6 @@ mod tests {
 
     #[test]
     fn different_program_yields_different_digest() {
-        use crate::oracle::ExecutionOracle as _;
         let (a, spec_a, input) = oracle_with(DOUBLER);
         // A distinct program: triples instead of doubles (one-constant change).
         let tripler = DOUBLER.replace("(i32.const 2)", "(i32.const 3)");
@@ -263,5 +262,21 @@ mod tests {
             Err(ExecError::Rejected(why)) => assert!(why.contains("input")),
             other => panic!("expected Rejected(input...), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn trait_run_returns_ok_digest_for_success() {
+        let (oracle, spec, input) = oracle_with(DOUBLER);
+        let digest = oracle.run(&spec, &input);
+        let expected = ok_digest(&WasmLimits::default(), &[2u8, 4, 6, 80]);
+        assert_eq!(digest, expected.to_vec());
+    }
+
+    #[test]
+    fn trait_run_returns_the_single_error_sentinel_for_failures() {
+        let (oracle, mut spec, input) = oracle_with(DOUBLER);
+        spec.program_hash = [0xAB; 32]; // ProgramUnavailable
+        let digest = oracle.run(&spec, &input);
+        assert_eq!(digest, error_digest(&WasmLimits::default()).to_vec());
     }
 }
