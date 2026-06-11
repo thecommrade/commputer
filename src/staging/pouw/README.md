@@ -37,7 +37,7 @@ property test, below).
 
 ## How to run the sim
 
-From the workspace root (`/home/operator/Coin/src`):
+From the workspace root (`<repo-root>/src`):
 
 ```bash
 cargo run -p commputer-pouw --bin pouw-sim
@@ -218,7 +218,7 @@ economic-soundness break.** Glance at these when wiring this onto the real chain
 ### How to run
 
 ```bash
-# From /home/operator/Coin/src (workspace root):
+# From <repo-root>/src (the workspace root):
 cargo test -p commputer-pouw --features wasm-runtime
 ```
 
@@ -296,12 +296,13 @@ raw bits).
 | max stack height | 1 048 576 (1 << 20) |
 | max input / output | 10 MiB each |
 
-**These are consensus-critical.** The exact wasmi pin (`= 1.0.9` in `Cargo.toml`),
-`GATE_FEATURES`, and every limit above are folded into `WasmLimits::config_fingerprint()`.
+**These are consensus-critical.** The exact wasmi pin (`= 1.0.9` in `Cargo.toml`) and
+every limit above are folded directly into `WasmLimits::config_fingerprint()`. `GATE_FEATURES`
+is covered *indirectly* — any change to it MUST be accompanied by a `VALIDATION_VERSION` bump
+(see the coupling note in validation.rs), which then diverges the fingerprint.
 The fingerprint is embedded in every outcome digest (both ok and error). Two nodes that
 disagree on any single value diverge on every job — loudly, by design. Upgrading the engine
 version or changing any limit is a **coordinated protocol change**, not a silent bump.
-Changing `GATE_FEATURES` additionally requires bumping `VALIDATION_VERSION` in `limits.rs`.
 
 ### Canonical outcome digest
 

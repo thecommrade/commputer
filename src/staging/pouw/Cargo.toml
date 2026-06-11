@@ -9,7 +9,7 @@ description = "Proof-of-useful-work verification & settlement game (deterministi
 sha2 = { workspace = true }
 rand = { workspace = true }    # used by engine.rs (seeded RNG param) AND the pouw-sim binary — must be a normal dep, not dev-only
 wasmi = { version = "=1.0.9", optional = true }       # CONSENSUS-CRITICAL pin (spec §2)
-wasmparser = { version = "=0.228.0", optional = true } # same copy wasmi 1.0.9 pulls (one lockfile copy)
+wasmparser = { version = "=0.228.0", optional = true } # pinned to wasmi 1.0.9's own wasmparser major (consensus path shares one copy; dev-only wat pulls a second, harmless copy)
 
 [dev-dependencies]
 proptest = "1.4"

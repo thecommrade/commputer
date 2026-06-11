@@ -260,8 +260,8 @@ mod game_integration {
     /// through the UNCHANGED verification game and settles Confirmed 85/10/5.
     #[test]
     fn real_wasm_job_confirms_and_settles_85_10_5() {
-        let mut p = GameParams::default(); // sample_rate_bps = 10_000 => always sampled
-        p.p_trap_bps = 0; // defensive: traps are sim-layer only today; pinned off in case the engine wires the trap draw later
+        // defensive: traps are sim-layer only today; pinned off in case the engine wires the trap draw later
+        let p = GameParams { p_trap_bps: 0, ..GameParams::default() }; // sample_rate_bps = 10_000 => always sampled
         let mut l = Ledger::new();
 
         let (oracle, spec, input) = setup_game();
@@ -319,8 +319,8 @@ mod game_integration {
     /// independently re-executes the wasm and reveals the true digest.
     #[test]
     fn cheating_executor_against_real_wasm_is_disputed() {
-        let mut p = GameParams::default();
-        p.p_trap_bps = 0; // defensive: traps are sim-layer only today; pinned off in case the engine wires the trap draw later
+        // defensive: traps are sim-layer only today; pinned off in case the engine wires the trap draw later
+        let p = GameParams { p_trap_bps: 0, ..GameParams::default() };
         let mut l = Ledger::new();
 
         let (oracle, spec, input) = setup_game();

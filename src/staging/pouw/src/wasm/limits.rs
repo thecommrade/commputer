@@ -117,4 +117,18 @@ mod tests {
         assert_eq!(ENGINE_ID, "wasmi");
         assert_eq!(ENGINE_VERSION, "1.0.9");
     }
+
+    /// Guard: the hand-maintained ENGINE_VERSION const must equal the actual
+    /// Cargo.toml pin — bumping one without the other would silently keep the
+    /// consensus fingerprint unchanged while the real engine drifts.
+    #[test]
+    fn engine_version_matches_cargo_pin() {
+        let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        let pin = format!("wasmi = {{ version = \"={ENGINE_VERSION}\"");
+        assert!(
+            manifest.contains(&pin),
+            "Cargo.toml wasmi pin does not match ENGINE_VERSION {ENGINE_VERSION:?} — \
+             update both together (coordinated protocol change)"
+        );
+    }
 }
