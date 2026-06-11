@@ -26,6 +26,7 @@
   - `wasmparser::WasmFeatures::WASM1` **includes FLOATS** — it must be explicitly subtracted. Verified: `WasmFeatures::WASM1.union(BULK_MEMORY).union(SIGN_EXTENSION).difference(FLOATS)` const-evaluates; under it the validator rejects float, SIMD, and atomics modules and accepts bulk-memory + sign-ext integer modules; wasmi `floats(false)` independently rejects float modules at translation.
   - Payload walk: `Parser::new(0).parse_all(bytes)` yields `Payload::{ImportSection, MemorySection, TableSection, StartSection{..}, ExportSection, CodeSectionEntry}`; memory entries expose `.initial`/`.maximum` (pages); export entries expose `.name`/`.kind` (`ExternalKind::{Func, Memory}`); `body.get_operators_reader()` + match `Operator::MemoryGrow{..} | Operator::TableGrow{..}`.
 - **TDD:** every task = write failing test → see it fail → implement minimally → see it pass → commit. Run only the named test in the inner loop; run the full feature suite before each commit.
+- **Pre-flight (already done 2026-06-11, do not repeat):** the `wasm32-unknown-unknown` rustup target is installed on this machine, so Task 10's `build-guest.sh` needs no network. If you find it missing anyway, STOP and report BLOCKED before writing any Task 10 code.
 
 ### File map (what exists at the end)
 
@@ -836,6 +837,26 @@ mod tests {
     }
 
     #[test]
+    fn same_instance_is_deterministic_across_calls() {
+        // Spec §9.A row 1: one long-lived oracle (exactly how a verifier runs)
+        // must not accumulate state across executions.
+        let (oracle, spec, input) = oracle_with(DOUBLER);
+        let r1 = oracle.execute(&spec, &input);
+        let r2 = oracle.execute(&spec, &input);
+        assert_eq!(r1, r2, "same instance, same job => identical outcome + fuel");
+    }
+
+    #[test]
+    fn different_program_yields_different_digest() {
+        use crate::oracle::ExecutionOracle as _;
+        let (a, spec_a, input) = oracle_with(DOUBLER);
+        // A distinct program: triples instead of doubles (one-constant change).
+        let tripler = DOUBLER.replace("(i32.const 2)", "(i32.const 3)");
+        let (b, spec_b, _) = oracle_with(&tripler);
+        assert_ne!(a.run(&spec_a, &input), b.run(&spec_b, &input));
+    }
+
+    #[test]
     fn unknown_program_is_unavailable() {
         let (oracle, mut spec, input) = oracle_with(DOUBLER);
         spec.program_hash = [0xAB; 32];
@@ -870,7 +891,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — `cargo test -p commputer-pouw --features wasm-runtime oracle` → FAIL.
+- [ ] **Step 2: Run to verify failure** — `cargo test -p commputer-pouw --features wasm-runtime wasm::oracle` → FAIL. (Use the `wasm::oracle` filter, NOT bare `oracle` — the bare substring also matches 4 pre-existing tests in `oracle.rs`/`verdict.rs` and would distort the expected counts.)
 
 - [ ] **Step 3: Implement `abi.rs`:**
 
@@ -1074,7 +1095,7 @@ impl ExecutionOracle for WasmOracle {
 
 In `mod.rs` add: `pub mod abi;`, `pub mod oracle;`, `pub use oracle::WasmOracle;`.
 
-- [ ] **Step 5: Run to verify pass** — `cargo test -p commputer-pouw --features wasm-runtime oracle` → PASS (5 tests). Then full sweep: `cargo test -p commputer-pouw --features wasm-runtime` → all green.
+- [ ] **Step 5: Run to verify pass** — `cargo test -p commputer-pouw --features wasm-runtime wasm::oracle` → PASS (7 tests). Then full sweep: `cargo test -p commputer-pouw --features wasm-runtime` → all green.
 
 - [ ] **Step 6: Commit**
 
@@ -1229,6 +1250,24 @@ fn oversized_declared_output_is_abi_violation() {
 }
 
 #[test]
+fn wrong_export_signature_is_rejected_not_trapped() {
+    // Spec §9.C last row. This is the ONE gate rule enforced post-instantiation
+    // (abi.rs typed binding) rather than in validation.rs: the module passes
+    // validate_module (presence+kind are right) but `run` has the wrong type.
+    // It must fold to Rejected — never Trapped — and deterministically so.
+    let fixture = r#"(module
+        (memory (export "memory") 1 1)
+        (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "run") (param i32) (result i64) (i64.const 0)))"#;
+    let outcome = assert_consensus(fixture, b"in");
+    assert!(
+        matches!(outcome.result, Err(ExecError::Rejected(_))),
+        "wrong signature must be Rejected, got {:?}",
+        outcome.result
+    );
+}
+
+#[test]
 fn every_adversarial_failure_folds_to_the_same_sentinel() {
     use commputer_pouw::oracle::ExecutionOracle as _;
     let sentinel = error_digest(&WasmLimits::default()).to_vec();
@@ -1241,7 +1280,7 @@ fn every_adversarial_failure_folds_to_the_same_sentinel() {
 }
 ```
 
-- [ ] **Step 2: Run to verify** — `cargo test -p commputer-pouw --features wasm-runtime --test wasm_runtime` → PASS (7 tests). Any failure here is an implementation bug from Task 6 — fix `oracle.rs`/`abi.rs`, never weaken an assertion.
+- [ ] **Step 2: Run to verify** — `cargo test -p commputer-pouw --features wasm-runtime --test wasm_runtime` → PASS (8 tests). Any failure here is an implementation bug from Task 6 — fix `oracle.rs`/`abi.rs`, never weaken an assertion. (Timing note: the out-of-fuel tests each burn the full 100M-fuel budget in the interpreter, ~1.5s each in debug — a few seconds total is normal, not a hang.)
 
 - [ ] **Step 3: Commit**
 
@@ -1308,7 +1347,7 @@ mod determinism_properties {
 }
 ```
 
-- [ ] **Step 2: Run to verify** — `cargo test -p commputer-pouw --features wasm-runtime --test wasm_runtime determinism_properties` → PASS (256 proptest cases).
+- [ ] **Step 2: Run to verify** — `cargo test -p commputer-pouw --features wasm-runtime --test wasm_runtime determinism_properties` → PASS (1 test; proptest runs 256 cases internally).
 
 - [ ] **Step 3: Commit**
 
