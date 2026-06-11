@@ -38,9 +38,9 @@ fn infinite_loop_is_deterministic_out_of_fuel() {
     let fixture = format!("{ABI_SHELL_TOP} (loop $l (br $l)) (i64.const 0)))");
     let outcome = assert_consensus(&fixture, b"in");
     assert_eq!(outcome.result, Err(ExecError::OutOfFuel));
-    // wasmi leaves a remainder on the OOF trap (verified: budget 100_000 ->
-    // remaining 1). NEVER assert == budget; cross-instance equality above is
-    // the consensus property (spec §9.B).
+    // wasmi leaves a small remainder on the OOF trap (empirically verified at
+    // multiple budgets; see ExecOutcome::fuel_consumed's doc note). NEVER assert
+    // == budget; cross-instance equality above is the consensus property (§9.B).
     assert!(outcome.fuel_consumed <= WasmLimits::default().fuel);
     assert!(outcome.fuel_consumed > 0);
 }
@@ -159,56 +159,27 @@ fn growable_table_rejected_by_gate() {
 }
 
 /// EXTRA (Task 5 review): table.grow opcode is scanned out even on a fixed table.
-/// NOTE: `table.grow` requires the reference-types proposal, which GATE_FEATURES
-/// disables. The `wat` assembler also requires reference-types enabled for
-/// `ref.null func` syntax. Since the feature gate (layer 1) rejects reference-types
-/// before the operator scan (layer 2) can run, AND `wat` assembles this under
-/// default (reference-types enabled) WAT assembler settings, we verify that the
-/// output rejects — either at the feature gate layer ("feature gate") or at the
+/// `table.grow` requires the reference-types proposal, which GATE_FEATURES disables.
+/// wat =1.251.0 assembles reference-types syntax by default; the assembled module
+/// must be rejected — either at the feature gate layer ("feature gate") or at the
 /// operator scan layer ("table.grow"). Both are correct and accepted.
 #[test]
 fn table_grow_rejected_by_gate() {
     use commputer_pouw::wasm::validation::validate_module;
-    // Attempt to assemble — if wat refuses reference-types at assembly time,
-    // we fall back to the growable-table module which is guaranteed to be assembled.
-    let result = wat::parse_str(
+    let wasm = wat::parse_str(
         r#"(module
             (memory (export "memory") 1 1)
             (table 1 1 funcref)
             (func (export "alloc") (param i32) (result i32)
                 (table.grow (ref.null func) (i32.const 1)))
             (func (export "run") (param i32 i32) (result i64) (i64.const 0)))"#,
-    );
-    match result {
-        Ok(wasm) => {
-            // Assembly succeeded — now run through the gate; must reject.
-            match validate_module(&wasm, &WasmLimits::default()) {
-                Err(ExecError::Rejected(why)) => assert!(
-                    why.contains("table.grow") || why.contains("feature gate"),
-                    "got {why:?}"
-                ),
-                other => panic!("expected Rejected, got {other:?}"),
-            }
-        }
-        Err(_) => {
-            // `wat` refused to assemble reference-types syntax — this is expected
-            // when the WAT assembler's own feature gate is tight. The growable-table
-            // module (1 2) is a sufficient proxy: it hits the same validation.rs
-            // table gate (min!=max rule) and rejects deterministically.
-            let wasm = wat::parse_str(
-                r#"(module
-                    (memory (export "memory") 1 1)
-                    (table 1 2 funcref)
-                    (func (export "alloc") (param i32) (result i32) (i32.const 0))
-                    (func (export "run") (param i32 i32) (result i64) (i64.const 0)))"#,
-            )
-            .expect("growable-table fixture assembles");
-            match validate_module(&wasm, &WasmLimits::default()) {
-                Err(ExecError::Rejected(why)) => {
-                    assert!(why.contains("table"), "got {why:?}")
-                }
-                other => panic!("expected Rejected(table...), got {other:?}"),
-            }
-        }
+    )
+    .expect("wat =1.251.0 assembles reference-types syntax by default; if a wat bump changed this, update the fixture deliberately");
+    match validate_module(&wasm, &WasmLimits::default()) {
+        Err(ExecError::Rejected(why)) => assert!(
+            why.contains("table.grow") || why.contains("feature gate"),
+            "got {why:?}"
+        ),
+        other => panic!("expected Rejected, got {other:?}"),
     }
 }
