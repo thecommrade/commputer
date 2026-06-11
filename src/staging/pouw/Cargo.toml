@@ -8,9 +8,17 @@ description = "Proof-of-useful-work verification & settlement game (deterministi
 [dependencies]
 sha2 = { workspace = true }
 rand = { workspace = true }    # used by engine.rs (seeded RNG param) AND the pouw-sim binary — must be a normal dep, not dev-only
+wasmi = { version = "=1.0.9", optional = true }       # CONSENSUS-CRITICAL pin (spec §2)
+wasmparser = { version = "=0.228.0", optional = true } # same copy wasmi 1.0.9 pulls (one lockfile copy)
 
 [dev-dependencies]
 proptest = "1.4"
+wat = "=1.251.0"   # .wat -> .wasm fixture assembly; test-only (Cargo has no optional dev-deps; accepted, tiny)
+
+[features]
+# Real WASM execution runtime (spec: docs/2026-06-11-wasm-execution-runtime-design.md).
+# Default-OFF so the default build/lockfile graph of sibling crates is untouched.
+wasm-runtime = ["dep:wasmi", "dep:wasmparser"]
 
 [[bin]]
 name = "pouw-sim"

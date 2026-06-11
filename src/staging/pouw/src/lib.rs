@@ -12,3 +12,6 @@ pub mod params;
 pub mod settlement;
 pub mod trap;
 pub mod verdict;
+
+#[cfg(feature = "wasm-runtime")]
+pub mod wasm;
