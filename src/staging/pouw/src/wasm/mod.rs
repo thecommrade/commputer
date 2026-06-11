@@ -4,6 +4,8 @@
 //! Existing files changed: lib.rs (one line) + Cargo.toml (feature/deps) ONLY.
 //! Spec: src/staging/docs/2026-06-11-wasm-execution-runtime-design.md
 
+pub mod error;
+pub use error::{ExecError, ExecOutcome};
 pub mod limits;
 pub use limits::WasmLimits;
 
