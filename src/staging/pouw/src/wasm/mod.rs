@@ -4,6 +4,9 @@
 //! Existing files changed: lib.rs (one line) + Cargo.toml (feature/deps) ONLY.
 //! Spec: src/staging/docs/2026-06-11-wasm-execution-runtime-design.md
 
+pub mod limits;
+pub use limits::WasmLimits;
+
 #[cfg(test)]
 mod smoke {
     /// The pinned engine + parser + assembler link and run a trivial module.
