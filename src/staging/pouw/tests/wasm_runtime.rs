@@ -232,6 +232,145 @@ mod determinism_properties {
     }
 }
 
+mod game_integration {
+    use super::*;
+    use commputer_pouw::engine::{run_job, JobInputs};
+    use commputer_pouw::ids::{JobId, ParticipantId};
+    use commputer_pouw::job::{Job, Verdict};
+    use commputer_pouw::oracle::{ByteEq, Ledger};
+    use commputer_pouw::params::GameParams;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    const GUEST: &[u8] = include_bytes!("../src/wasm/fixtures/guest_example.wasm");
+
+    fn pid(n: u8) -> ParticipantId {
+        ParticipantId([n; 32])
+    }
+
+    fn setup_game() -> (WasmOracle, JobSpec, Vec<u8>) {
+        let input = b"useful work, verified".to_vec();
+        let mut store = ProgramStore::new();
+        let program_hash = store.insert(GUEST.to_vec());
+        let input_hash: [u8; 32] = Sha256::digest(&input).into();
+        (WasmOracle::new(store, WasmLimits::default()), JobSpec { program_hash, input_hash }, input)
+    }
+
+    /// Spec §9.E / success criterion §12.3: a real Rust-compiled program runs
+    /// through the UNCHANGED verification game and settles Confirmed 85/10/5.
+    #[test]
+    fn real_wasm_job_confirms_and_settles_85_10_5() {
+        let mut p = GameParams::default(); // sample_rate_bps = 10_000 => always sampled
+        p.p_trap_bps = 0; // keep the honest path deterministic
+        let mut l = Ledger::new();
+
+        let (oracle, spec, input) = setup_game();
+        let submitter = pid(0);
+        let executor = pid(9);
+        let candidates: Vec<ParticipantId> = (10u8..30).map(pid).collect();
+
+        l.credit(submitter, 100);
+        l.credit(executor, p.executor_bond);
+        for c in &candidates {
+            l.credit(*c, p.verifier_bond);
+        }
+        let total0 = l.total_supply();
+
+        let job = Job {
+            id: JobId::derive(&spec.program_hash, &spec.input_hash, &submitter, 0),
+            submitter,
+            spec,
+            budget: 100,
+        };
+
+        let honest_claim = |true_hash: &[u8; 32]| *true_hash;
+        let honest_reveal =
+            |_v: &ParticipantId, true_hash: &[u8; 32], _exec: &[u8; 32]| *true_hash;
+        let no_challenge = |_t: &[u8; 32], _e: &[u8; 32]| None;
+        let inputs = JobInputs {
+            job,
+            input: &input,
+            executor,
+            executor_bond: p.executor_bond,
+            executor_claim: &honest_claim,
+            candidates: &candidates,
+            verifier_bond: p.verifier_bond,
+            verifier_reveal: &honest_reveal,
+            challenge: &no_challenge,
+            challenger_bond: p.challenger_bond,
+        };
+
+        let stake = |_: &ParticipantId| 1u64;
+        let mut rng = StdRng::seed_from_u64(42);
+        let (verdict, out) = run_job(&mut l, &p, &inputs, &oracle, &ByteEq, &stake, &mut rng);
+
+        assert!(matches!(verdict, Verdict::Confirmed { .. }), "got {verdict:?}");
+        // Same arithmetic as the IteratedHashVm baseline test: 85 worker,
+        // 10/3=3 each to k=3 verifiers (9), remainder 1 + 5% slice burned (6).
+        assert_eq!(out.worker_paid, 85);
+        assert_eq!(out.verifiers_paid, 9);
+        assert_eq!(out.burned, 6);
+        assert_eq!(l.balance_of(&executor), 85 + p.executor_bond);
+        assert_eq!(l.total_supply(), total0, "conservation: no mint");
+        assert_eq!(l.escrowed(), 0, "no value stranded in escrow");
+    }
+
+    /// A cheating executor against the REAL oracle is caught: the committee
+    /// independently re-executes the wasm and reveals the true digest.
+    #[test]
+    fn cheating_executor_against_real_wasm_is_disputed() {
+        let mut p = GameParams::default();
+        p.p_trap_bps = 0;
+        let mut l = Ledger::new();
+
+        let (oracle, spec, input) = setup_game();
+        let submitter = pid(0);
+        let executor = pid(9);
+        let candidates: Vec<ParticipantId> = (10u8..30).map(pid).collect();
+
+        l.credit(submitter, 100);
+        l.credit(executor, p.executor_bond);
+        for c in &candidates {
+            l.credit(*c, p.verifier_bond);
+        }
+        let total0 = l.total_supply();
+
+        let job = Job {
+            id: JobId::derive(&spec.program_hash, &spec.input_hash, &submitter, 1),
+            submitter,
+            spec,
+            budget: 100,
+        };
+
+        let cheat_claim = |_true_hash: &[u8; 32]| [0xEE; 32]; // skipped the work
+        let honest_reveal =
+            |_v: &ParticipantId, true_hash: &[u8; 32], _exec: &[u8; 32]| *true_hash;
+        let no_challenge = |_t: &[u8; 32], _e: &[u8; 32]| None;
+        let inputs = JobInputs {
+            job,
+            input: &input,
+            executor,
+            executor_bond: p.executor_bond,
+            executor_claim: &cheat_claim,
+            candidates: &candidates,
+            verifier_bond: p.verifier_bond,
+            verifier_reveal: &honest_reveal,
+            challenge: &no_challenge,
+            challenger_bond: p.challenger_bond,
+        };
+
+        let stake = |_: &ParticipantId| 1u64;
+        let mut rng = StdRng::seed_from_u64(42);
+        let (verdict, out) = run_job(&mut l, &p, &inputs, &oracle, &ByteEq, &stake, &mut rng);
+
+        assert!(matches!(verdict, Verdict::Disputed { .. }), "got {verdict:?}");
+        assert_eq!(out.submitter_refunded, 100, "submitter made whole");
+        assert!(!out.slashed.is_empty(), "the cheater was slashed");
+        assert_eq!(l.total_supply(), total0, "conservation holds on the dispute path");
+        assert_eq!(l.escrowed(), 0);
+    }
+}
+
 mod guest_showcase {
     use super::*;
     use commputer_pouw::wasm::validation::validate_module;
