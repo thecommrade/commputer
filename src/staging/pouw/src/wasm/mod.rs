@@ -8,6 +8,8 @@ pub mod error;
 pub use error::{ExecError, ExecOutcome};
 pub mod limits;
 pub use limits::WasmLimits;
+pub mod store;
+pub use store::ProgramStore;
 
 #[cfg(test)]
 mod smoke {
