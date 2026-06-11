@@ -73,10 +73,36 @@ mod tests {
         let a = WasmLimits::default();
         let b = WasmLimits::default();
         assert_eq!(a.config_fingerprint(), b.config_fingerprint());
-        let mut c = WasmLimits::default();
-        c.fuel += 1;
-        assert_ne!(a.config_fingerprint(), c.config_fingerprint(),
-            "any limit change must change the consensus fingerprint");
+
+        // EVERY field must perturb the fingerprint — if a field is ever dropped
+        // from the hash, drift in it would no longer fail loud (spec §8).
+        let base = a.config_fingerprint();
+        let perturbations: [fn(&mut WasmLimits); 6] = [
+            |l| l.fuel += 1,
+            |l| l.max_memory_bytes += 1,
+            |l| l.max_call_depth += 1,
+            |l| l.max_stack_height += 1,
+            |l| l.max_input_bytes += 1,
+            |l| l.max_output_bytes += 1,
+        ];
+        for (i, perturb) in perturbations.iter().enumerate() {
+            let mut c = WasmLimits::default();
+            perturb(&mut c);
+            assert_ne!(base, c.config_fingerprint(), "field #{i} must be fingerprint-sensitive");
+        }
+    }
+
+    /// Known-answer pin: any change to the preimage serialization (field order,
+    /// endianness, separators, constants) shows up here as a loud diff.
+    #[test]
+    fn default_fingerprint_golden_vector() {
+        let hex: String = WasmLimits::default()
+            .config_fingerprint()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        // Computed from the spec'd serialization on 2026-06-11 (wasmi 1.0.9 identity).
+        assert_eq!(hex, "82230c7e1d031a9ff16a056510af9a3ed5e49aa11f04fa778777589f8e120cce");
     }
 
     #[test]
