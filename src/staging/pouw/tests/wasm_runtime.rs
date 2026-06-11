@@ -261,7 +261,7 @@ mod game_integration {
     #[test]
     fn real_wasm_job_confirms_and_settles_85_10_5() {
         let mut p = GameParams::default(); // sample_rate_bps = 10_000 => always sampled
-        p.p_trap_bps = 0; // keep the honest path deterministic
+        p.p_trap_bps = 0; // defensive: traps are sim-layer only today; pinned off in case the engine wires the trap draw later
         let mut l = Ledger::new();
 
         let (oracle, spec, input) = setup_game();
@@ -320,7 +320,7 @@ mod game_integration {
     #[test]
     fn cheating_executor_against_real_wasm_is_disputed() {
         let mut p = GameParams::default();
-        p.p_trap_bps = 0;
+        p.p_trap_bps = 0; // defensive: traps are sim-layer only today; pinned off in case the engine wires the trap draw later
         let mut l = Ledger::new();
 
         let (oracle, spec, input) = setup_game();
@@ -365,7 +365,8 @@ mod game_integration {
 
         assert!(matches!(verdict, Verdict::Disputed { .. }), "got {verdict:?}");
         assert_eq!(out.submitter_refunded, 100, "submitter made whole");
-        assert!(!out.slashed.is_empty(), "the cheater was slashed");
+        assert_eq!(out.slashed, vec![(executor, p.executor_bond)], "exactly the cheater's bond is slashed");
+        assert_eq!(l.balance_of(&executor), 0, "the cheater's bond was consumed");
         assert_eq!(l.total_supply(), total0, "conservation holds on the dispute path");
         assert_eq!(l.escrowed(), 0);
     }
