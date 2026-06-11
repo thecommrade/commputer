@@ -183,3 +183,52 @@ fn table_grow_rejected_by_gate() {
         other => panic!("expected Rejected, got {other:?}"),
     }
 }
+
+// ---- Task 9: property-based determinism testing ----
+
+mod determinism_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Same doubling transform as the oracle unit tests (kept in-sync by eye;
+    /// it is 12 lines of wat). Output[i] = 2*input[i] mod 256.
+    const DOUBLER: &str = r#"(module
+        (memory (export "memory") 1 1)
+        (global $next (mut i32) (i32.const 1024))
+        (func $alloc (export "alloc") (param $len i32) (result i32)
+            (local $ptr i32)
+            (local.set $ptr (global.get $next))
+            (global.set $next (i32.add (global.get $next) (local.get $len)))
+            (local.get $ptr))
+        (func (export "run") (param $ptr i32) (param $len i32) (result i64)
+            (local $out i32) (local $i i32)
+            (local.set $out (call $alloc (local.get $len)))
+            (block $done (loop $loop
+                (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+                (i32.store8
+                    (i32.add (local.get $out) (local.get $i))
+                    (i32.mul (i32.const 2)
+                        (i32.load8_u (i32.add (local.get $ptr) (local.get $i)))))
+                (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                (br $loop)))
+            (i64.or
+                (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+                (i64.extend_i32_u (local.get $len))))
+    )"#;
+
+    proptest! {
+        /// For arbitrary inputs: two independent oracles agree bit-for-bit on
+        /// output AND fuel; the output is the expected transform; different
+        /// inputs yield different digests.
+        #[test]
+        fn independent_oracles_always_agree(input in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let (a, spec) = setup(DOUBLER, &input);
+            let (b, _) = setup(DOUBLER, &input);
+            let (ra, rb) = (a.execute(&spec, &input), b.execute(&spec, &input));
+            prop_assert_eq!(&ra.result, &rb.result);
+            prop_assert_eq!(ra.fuel_consumed, rb.fuel_consumed);
+            let expected: Vec<u8> = input.iter().map(|b| b.wrapping_mul(2)).collect();
+            prop_assert_eq!(ra.result.unwrap(), expected);
+        }
+    }
+}
