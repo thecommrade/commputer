@@ -12,6 +12,9 @@ use wasmparser::{ExternalKind, Operator, Parser, Payload, Validator, WasmFeature
 /// it (verified empirically against wasmparser 0.228). Everything else (SIMD,
 /// relaxed-SIMD, threads, reference-types, multi-value, tail-call, GC,
 /// memory64, ...) is OFF and rejects in layer 1.
+/// CONSENSUS-COUPLING: any change to these bits is a validation-policy change —
+/// bump `VALIDATION_VERSION` in limits.rs in the same commit, or drift will not
+/// fail loud (the fingerprint folds the version, not these bits).
 pub const GATE_FEATURES: WasmFeatures = WasmFeatures::WASM1
     .union(WasmFeatures::BULK_MEMORY)
     .union(WasmFeatures::SIGN_EXTENSION)
@@ -54,7 +57,10 @@ pub fn validate_module(bytes: &[u8], limits: &WasmLimits) -> Result<(), ExecErro
                         _ => return reject("memory min==max required (growth impossible by construction)"),
                     }
                     if mem.initial.saturating_mul(WASM_PAGE_BYTES) > limits.max_memory_bytes {
-                        return reject("memory exceeds the shared cap");
+                        return reject(format!(
+                            "memory of {} pages exceeds the shared cap of {} bytes",
+                            mem.initial, limits.max_memory_bytes
+                        ));
                     }
                 }
             }
@@ -103,7 +109,11 @@ pub fn validate_module(bytes: &[u8], limits: &WasmLimits) -> Result<(), ExecErro
         return reject("module must define its own memory (export `memory` required)");
     }
     if !(export_memory && export_alloc && export_run) {
-        return reject("required exports missing: memory, alloc, run");
+        let mut missing = Vec::new();
+        if !export_memory { missing.push("memory"); }
+        if !export_alloc { missing.push("alloc"); }
+        if !export_run { missing.push("run"); }
+        return reject(format!("required exports missing: {}", missing.join(", ")));
     }
     Ok(())
 }
