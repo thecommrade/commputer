@@ -108,6 +108,14 @@ src/staging/pouw/guest-example/
   // so `cargo test` never requires the wasm32 toolchain.
 ```
 
+**Guest build constraints (required, or the §5 gate rejects our own showcase):** the default
+Rust wasm toolchain emits a memory with *no maximum* and its default allocator (dlmalloc) emits
+`memory.grow` — both §5 rejects. `build-guest.sh` must therefore (a) pin the memory with
+`-C link-arg=--initial-memory=N -C link-arg=--max-memory=N` (equal `N ≤ max_memory_bytes`, so
+min == max), (b) use a static bump allocator in the `#![no_std]` guest (no dlmalloc, no grow),
+and (c) the guest crate carries an empty `[workspace]` table in its Cargo.toml so cargo builds it
+standalone inside the workspace tree without workspace-inference errors.
+
 `src/staging/pouw/src/lib.rs` gains one line: `pub mod wasm;` (cfg-gated). `Cargo.toml` gains the
 optional deps + feature. Every new file carries the standard staging header comment (what it
 does, where it wires in, which existing file would need changes — for this cycle: none).
@@ -126,6 +134,11 @@ wasmparser = { version = "<pinned>", optional = true }
 wat = "<pinned>"   # .wat -> .wasm assembly for fixtures; test-only
 ```
 
+Two dependency notes, both deliberate: Cargo has no optional dev-dependencies, so `wat` builds
+for every `cargo test -p commputer-pouw` even with the feature off — accepted (it is tiny; the
+heavy deps stay gated). And wasmi 1.0 itself depends on `wasmparser`; pin our direct `wasmparser`
+to the same major wasmi pulls so the lockfile carries one copy, not duplicate majors.
+
 Default build (feature OFF) is exactly today's crate: `IteratedHashVm` remains the default
 oracle, sibling crates and existing CI are unaffected, and wasmi only enters the build graph when
 `--features wasm-runtime` is selected. All wasm-runtime tests are `#[cfg(feature =
@@ -138,7 +151,11 @@ A `wasmparser` scan over the raw module, run **before** instantiation, on both e
 verifier. The engine's own config disables what it can (no SIMD/threads features enabled; fixed
 stack limits), but **this scan is the authoritative gate** — determinism is enforced, not assumed.
 
-A module is **rejected** (deterministically, same verdict on every node) if it contains:
+**The scan is an allow-list:** only the core integer/control/fixed-memory instruction set and the
+required export shape are permitted; any construct outside it — including every row below and any
+unknown or future operator `wasmparser` surfaces — is rejected by the wildcard arm. The table is
+the *complement* of the allow-list, stated as reject rules for reviewability. A module is
+**rejected** (deterministically, same verdict on every node) if it contains:
 
 | # | Rejected construct | Why |
 |---|---|---|
@@ -150,10 +167,13 @@ A module is **rejected** (deterministically, same verdict on every node) if it c
 | 6 | Declared memory max exceeding `WasmLimits.max_memory_bytes` | the memory cap is a shared constant, not host RAM |
 | 7 | **Any import whatsoever** | the ABI imports nothing; clock/random/fs/net/env nondeterminism is structurally absent |
 | 8 | Missing/ill-typed required exports: `memory`, `alloc(i32)->i32`, `run(i32,i32)->i64` | the ABI contract (§7) |
+| 9 | A `start` section | a start function executes guest code at instantiation, outside the set-fuel→`alloc`→`run` flow; rejecting it makes the ABI calls the *only* execution path |
 
 Plus two runtime-configured bounds (identical constants everywhere): a **fixed call-depth /
-recursion cap** via wasmi's stack-limits config (deep recursion traps at the identical call on
-every node) and the **fuel budget** (§6). Validation failure is an `ExecError` and folds to the
+recursion cap** via wasmi's recursion/stack-height config (`Config::set_max_recursion_depth` /
+`set_max_stack_height` in the 1.0 API — deep recursion traps at the identical call on every node)
+and the **fuel budget** (§6). wasmi's `CompilationMode` is pinned to eager so any translation-time
+reject surfaces at module build, keeping error classification stable. Validation failure is an `ExecError` and folds to the
 canonical error sentinel (§8) — a node that receives an invalid program still produces the same
 claim as every other node.
 
@@ -201,7 +221,11 @@ The guest module exports exactly:
 - `memory` — the single linear memory (min == max).
 - `alloc(len: i32) -> i32` — returns a pointer to `len` writable bytes in linear memory.
 - `run(ptr: i32, len: i32) -> i64` — executes the job on `input = memory[ptr .. ptr+len]`,
-  returns `(out_ptr as i64) << 32 | (out_len as i64)` (both interpreted as u32).
+  returns out_ptr and out_len packed into one i64. The canonical guest formula is
+  `(((out_ptr as u64) << 32) | (out_len as u64)) as i64` — packing through *signed* types would
+  sign-extend an out_len with its high bit set and corrupt out_ptr. The host always decodes both
+  halves as u32 and bounds-checks, so a mis-packed value is a deterministic `AbiViolation`, never
+  a consensus hazard — the formula note is a guest-author footgun warning.
 
 The guest imports **nothing**. Host flow in `WasmOracle::execute`:
 
@@ -209,7 +233,8 @@ The guest imports **nothing**. Host flow in `WasmOracle::execute`:
    (defense-in-depth re-check) and `sha256(input) == spec.input_hash`; check
    `input.len() <= max_input_bytes`. Any failure → the matching `ExecError`.
 2. `validation::validate(bytes, &limits)` (§5) → `ExecError::Rejected(reason)` on failure.
-3. Build engine + store with fuel metering on and the stack/memory limits; instantiate;
+3. Build engine + store with fuel metering on and the stack/memory limits; instantiate
+   (instantiation executes no guest code — `start` sections are rejected at §5);
    **set the full fuel budget once** (it covers `alloc` + `run` together).
 4. `let ptr = alloc(input.len())`; bounds-check `[ptr, ptr+len)` against the fixed memory size;
    write input.
@@ -250,7 +275,10 @@ with `DOMAIN = "commputer-pouw-wasm-v1"`. Properties this buys:
 - **No false disputes among honest nodes:** every failure mode above is deterministic given
   identical (program, input, limits, engine version), so all honest nodes compute the same
   sentinel — a malformed or hostile program yields an *agreeing* committee, and the game
-  settles it like any other claim.
+  settles it like any other claim. **One scoped exception:** `ProgramUnavailable` depends on
+  *local* store state, not on (program, input) — it cannot cause an honest-vs-honest split in
+  this cycle only because tests/sim populate every node's store explicitly. The DA cycle must
+  resolve abstain-vs-sentinel before unavailability can occur in the wild (§10.2).
 - **No trap covert channel:** *which* error occurred is not distinguishable in the digest, so a
   malicious program cannot encode nondeterministic signal in its failure mode. The rich variant
   lives only in `ExecOutcome` for local logging/tests and the future cost cycle.
@@ -259,8 +287,8 @@ with `DOMAIN = "commputer-pouw-wasm-v1"`. Properties this buys:
 - **Config drift fails loud:** the fingerprint in the preimage makes *any* limit/version mismatch
   diverge on every job, immediately, rather than only on rare edge inputs.
 
-`engine.rs:79` already re-hashes whatever `run` returns into the fixed claim array; the digest
-slots in with zero engine changes.
+`engine.rs`'s `result_hash` helper already re-hashes whatever `run` returns into the fixed claim
+array; the digest slots in with zero engine changes.
 
 ## 9. Testing matrix
 
@@ -276,7 +304,13 @@ checked-in `guest_example.wasm`.
 - Proptest: random integer inputs through the example guest; two instances always agree.
 
 **B. Adversarial fixtures (caps + sandbox, each → deterministic sentinel)**
-- Infinite loop → `OutOfFuel`; identical sentinel from two instances; `fuel_consumed == budget`.
+- Infinite loop → `OutOfFuel`; identical sentinel from two instances; `fuel_consumed <= budget`
+  and **exactly equal across two independent oracle instances**. (Do NOT assert
+  `fuel_consumed == budget`: on an out-of-fuel trap wasmi 1.0 leaves the remaining-fuel counter
+  at the pre-trap remainder — load-bearing for its resumable-execution feature — so consumed
+  generally lands just under the budget. The consensus property is that the remainder is
+  *identical on every node*, not that it is zero. Classify out-of-fuel via `Error::kind()`
+  covering all OutOfFuel variants, not only `as_trap_code()`.)
 - `unreachable` → `Trapped`.
 - OOB memory access → `Trapped`.
 - Deep recursion → call-depth trap.
@@ -289,9 +323,12 @@ checked-in `guest_example.wasm`.
 - Plus `ProgramUnavailable` (hash not in store) and `HashMismatch` (tampered input bytes).
 
 **D. Realism showcase**
-- `guest_example.wasm` (real Rust→wasm32 integer transform, built by `build-guest.sh`, binary
+- `guest_example.wasm` (real Rust→wasm32 integer transform, built by `build-guest.sh` under the
+  §4 guest build constraints — pinned min==max memory, static bump allocator, no grow; binary
   checked in) runs end-to-end; output matches the natively-computed expected bytes; rebuild
   script documented but never required by `cargo test`.
+- The checked-in binary itself passes the §5 validation gate (regression that the build
+  constraints actually held).
 
 **E. Game integration (the point of the cycle)**
 - `engine::run_job` driven with `WasmOracle` + `ByteEq` + `Ledger`, honest executor + honest
@@ -313,9 +350,15 @@ gate makes it checked.
 
 1. **Fuel → economics:** replace `C_exec`/`C_ver` with measured fuel in the sim/settlement
    (needs a tokenomics decision on fuel as the work denomination, and possibly a weighted
-   per-operator cost table — frozen as a consensus constant).
+   per-operator cost table — frozen as a consensus constant). That cycle must also re-affirm or
+   change a deliberate v1 policy this design creates: a deterministically failing or
+   gate-rejected program settles `Confirmed` on the error sentinel, paying the executor 85% of
+   budget — defensible (work was done; the submitter supplied a bad program), but it must remain
+   a chosen policy, not an accident.
 2. **Data availability:** `ProgramStore` fetching/replication; verifiers retrieving program +
-   input by hash.
+   input by hash. Inherits a hard constraint from §8: it must decide abstain-vs-sentinel for
+   `ProgramUnavailable` — an infallible `run()` cannot express abstention, and a node genuinely
+   missing data must not assert the error sentinel as its honest claim.
 3. **On-chain wiring:** engine identity + limits fingerprint into consensus params; `ChainHooks`
    adapter; `event_loop`/`JobPool` (protected files; founder).
 4. **Floats / AI:** lifting reject-rule #1 is a protocol decision that almost certainly means the
