@@ -218,8 +218,7 @@ mod determinism_properties {
 
     proptest! {
         /// For arbitrary inputs: two independent oracles agree bit-for-bit on
-        /// output AND fuel; the output is the expected transform; different
-        /// inputs yield different digests.
+        /// output AND fuel, and the output is the expected transform.
         #[test]
         fn independent_oracles_always_agree(input in proptest::collection::vec(any::<u8>(), 0..512)) {
             let (a, spec) = setup(DOUBLER, &input);
@@ -228,7 +227,7 @@ mod determinism_properties {
             prop_assert_eq!(&ra.result, &rb.result);
             prop_assert_eq!(ra.fuel_consumed, rb.fuel_consumed);
             let expected: Vec<u8> = input.iter().map(|b| b.wrapping_mul(2)).collect();
-            prop_assert_eq!(ra.result.unwrap(), expected);
+            prop_assert_eq!(ra.result, Ok(expected));
         }
     }
 }
