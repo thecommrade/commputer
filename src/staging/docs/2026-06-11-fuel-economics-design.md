@@ -78,10 +78,30 @@ break even at the 10% verifier slice. This is not a bug; it is what replicated v
 costs. The sweep's job (§5) is to find parameter corners that price it honestly, and later
 cycles (sampling fewer verifiers, fraud proofs, SNARKs) attack the multiplier itself.
 
+**Why cap-pricing is not exploitable** (so sweep reviewers need not re-litigate it): any
+self-submission/wash-trade strategy loses at least the burn share of `B` per job plus the
+uncaptured verifier slice, and executors preferring tiny-measured-fuel jobs is market
+adverse-selection — the submitter overpays, no protocol-EV hole opens.
+
+**Event model (pinned).** The formulas below and the §5 real-fuel tournament both use the
+**additive** event model: per real job, a paid sampled verification occurs with probability
+`s` AND, independently, an unpaid synthetic trap round occurs with probability `t` (expected
+events per job per committee slot: `s + t`; a verifier's per-event trap probability:
+`t/(s+t)`). NOTE: the existing toy-mode tournament draws trap-with-precedence instead (trap
+`t`, else sampled `(1−t)·s`) — the toy mode and its regression line stay untouched, but the
+real-fuel mode's event generator MUST implement the additive model so the sweep measures the
+same world the formulas price. This divergence is deliberate and documented in the sim code.
+
 ## 3. The formulas (`economics.rs`)
 
-All formulas use ceiling division (never round value away in favor of a cheater) and saturating
-integer arithmetic; all are pure functions of `(F, &GameParams)`.
+All formulas are pure functions of `(F, &GameParams)` with ceiling division (never round value
+away in favor of a cheater). **Integer rule (consensus-destined, frozen):** every intermediate
+product is computed in `u128` (worst case ≈ 2^64·2^40, fits comfortably), with exactly ONE
+final saturation to `u64::MAX` at the end — over-strict, never lenient. Saturating-u64 chains
+are FORBIDDEN: a numerator that saturates before its division under-prices by orders of
+magnitude, violating the invariant "over-pricing is safe, under-pricing is not" (§8). A
+dedicated test pins no-underpricing at extremes (F=u64::MAX, huge `price_per_mfuel`): every
+`*_min` result must be ≥ `work_cost(F)`'s own saturated value.
 
 **Executor-profit constraint.** The honest executor receives `worker_bps·B/10_000` and pays at
 most `work_cost(F)`. Require profitability with margin:
@@ -90,19 +110,22 @@ most `work_cost(F)`. Require profitability with margin:
 B ≥ work_cost(F) · profit_margin_bps / worker_bps                       (Bx)
 ```
 
-**Verifier-profit constraint.** Per real job, a verification event occurs at rate `s` (paid:
-the committee splits `verifier_bps·B/10_000`) and a trap event at rate `t` (unpaid in the
-honest equilibrium — jackpots only fire when someone rubber-stamps). A candidate is selected
-into either event with the same probability, so per-verifier expected revenue and cost per real
-job are proportional to `s · (verifier_bps·B/10_000)/k` and `(s+t) · work_cost(F)` per selected
-slot. Requiring non-negative EV per slot with margin:
+**Verifier-profit constraint.** Per real job (additive event model, §2.1): a paid sampled
+event occurs at rate `s` — the committee splits `verifier_bps·B/10_000` — and an unpaid trap
+event at rate `t` (unpaid in the honest equilibrium — jackpots only fire when someone
+rubber-stamps). A candidate is selected into either event kind with the same probability, and
+the **cost of each selected event is one re-execution, `work_cost(F)`**; `(s+t)` is the
+per-job event rate, not a per-event cost factor. Per selected slot, expected revenue is
+`s·(verifier_bps·B/10_000)/k`-proportional and expected cost `(s+t)·work_cost(F)`-proportional
+(the selection probability cancels). Requiring non-negative EV with margin gives the exact
+closed form:
 
 ```
-B ≥ k · work_cost(F) · (s_bps + t_bps) · profit_margin_bps / (verifier_bps · s_bps) · ...     (Bv)
+Bv:  B ≥ k · work_cost(F) · (s_bps + t_bps) · profit_margin_bps / (verifier_bps · s_bps)
 ```
 
-(exact integer form in the module: `ceil_mul_div` chains; the spec's plan freezes the tested
-expression). **`budget_min(F) = max(Bx, Bv)`** — and Bv dominates by an order of magnitude at
+(dimensionally complete as written — the two 10_000 factors cancel; computed as one u128
+ceil-chain). **`budget_min(F) = max(Bx, Bv)`** — and Bv dominates by an order of magnitude at
 current defaults, which is the point of this cycle.
 
 **Executor bond.** A lazy executor saves at most `work_cost(F)` and is caught by proactive
@@ -116,6 +139,10 @@ executor_bond_min(F) = max( ceil(work_cost(F) · bond_safety_bps / s_bps),  budg
 ```
 
 The `max(…, budget)` term preserves the parent spec's `Be ≥ B` rule (slash ≥ value at stake).
+(Under the additive event model the executor's catch rate is exactly `s`; note also that for
+k ≥ 2 the formula term can never bind against the Bv-driven budget — `bond_safety ≈ 1.5×wc`
+vs budget ≥ ~26×wc at defaults — so in practice `executor_bond_min = budget`. Stated so the
+plan's tests assert the right branch.)
 
 **Verifier bond.** A rubber-stamper saves `work_cost(F)` per skipped re-execution and is caught
 exactly when the event is a trap — probability `t/(s+t)` per event:
@@ -133,20 +160,24 @@ the sweep explores that trade-off.
 | field | default | constraint (`validate()`) |
 |---|---|---|
 | `price_per_mfuel: u64` | 1 | ≥ 1 |
-| `profit_margin_bps: u32` | 12_000 | ≥ 10_000 (must be a real margin) |
+| `profit_margin_bps: u32` | 12_000 | **> 10_000** (strict — exact break-even would make an at-minimum honest role EV-zero and fail the sweep's strict EV-positive bar) |
 | `bond_safety_bps: u32` | 15_000 | ≥ 10_000 |
 
 Existing split fields (`worker_bps` etc.) are unchanged *as code*; their **default values** are
 sweep outputs — if the sweep's recommended regime moves the split (e.g. a larger verifier
 slice), the new defaults are presented to the founder with the sweep table before adoption.
 
-**Zero-rate guard.** The bond formulas divide by `s_bps` (executor) and `t_bps` (verifier), and
-the game legally runs with either at 0 (existing tests set `sample_rate_bps = 0` to force the
-challenge path). Pricing therefore REFUSES rather than divides: `validate_economics` (and every
-`*_min` function) returns `EconViolation::BadParams` when `s_bps == 0` or `t_bps == 0` — a job
-cannot be *priced* in a regime with no proactive catching, even though the unpriced game can
-still simulate one. `GameParams::validate()` itself stays permissive (the game allows it); the
-restriction is enforcement-surface-only.
+**Degenerate-params guard (complete list).** The formulas divide by `s_bps` (executor bond,
+Bv), `t_bps` (verifier bond), `worker_bps` (Bx), and `verifier_bps` (Bv) — and
+`GameParams::validate()` legally permits every one of them to be 0 (any split summing to
+10_000 passes; existing tests set `sample_rate_bps = 0` to force the challenge path; only
+`k_escalate > k` constrains `k`). Pricing therefore REFUSES rather than divides or panics:
+every `*_min` function and `validate_economics` returns `EconViolation::BadParams` when ANY of
+`s_bps`, `t_bps`, `worker_bps`, `verifier_bps`, or `k` is 0. A job cannot be *priced* in a
+regime with no proactive catching, no traps, no paid role, or no committee — even though the
+unpriced game can still simulate those. `GameParams::validate()` itself stays permissive (the
+game allows them); the restriction is enforcement-surface-only. Consequence for §4: the
+`*_min` functions are **fallible** — they return `Result<u64, EconViolation>`.
 
 ## 4. Module design
 
@@ -154,17 +185,20 @@ New file **`src/staging/pouw/src/economics.rs`** (NOT feature-gated — pure int
 wasmi dependency; usable by the default-build sim and tests):
 
 ```rust
-pub fn work_cost(fuel_cap: u64, price_per_mfuel: u64) -> u64;        // ceil(F/1M)·p, saturating
-pub fn budget_min(fuel_cap: u64, p: &GameParams) -> u64;             // max(Bx, Bv)
-pub fn executor_bond_min(fuel_cap: u64, budget: u64, p: &GameParams) -> u64;
-pub fn verifier_bond_min(fuel_cap: u64, p: &GameParams) -> u64;
+pub fn work_cost(fuel_cap: u64, price_per_mfuel: u64) -> u64;        // ceil(F/1M)·p, u128 then one saturation
+// Fallible (§3 degenerate-params guard): Err(BadParams) on any zero divisor / k == 0.
+pub fn budget_min(fuel_cap: u64, p: &GameParams) -> Result<u64, EconViolation>;      // max(Bx, Bv)
+pub fn executor_bond_min(fuel_cap: u64, budget: u64, p: &GameParams) -> Result<u64, EconViolation>;
+pub fn verifier_bond_min(fuel_cap: u64, p: &GameParams) -> Result<u64, EconViolation>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EconViolation {                  // values carried for log-quality messages
     BudgetBelowMin { budget: u64, min: u64 },
     ExecutorBondBelowMin { bond: u64, min: u64 },
     VerifierBondBelowMin { bond: u64, min: u64 },
-    BadParams(&'static str),              // GameParams::validate() failure
+    /// Degenerate pricing params (the §3 guard: zero s/t/worker/verifier bps or k==0)
+    /// — NOT merely a GameParams::validate() failure; validate() permits these.
+    BadParams(&'static str),
 }
 
 pub fn validate_economics(job: &JobInputs, fuel_cap: u64, p: &GameParams)
@@ -194,15 +228,36 @@ review exactly as last cycle (empty `git diff` over the game files).
 - **Real-fuel mode** (`#[cfg(feature = "wasm-runtime")]`, run via
   `cargo run -p commputer-pouw --features wasm-runtime --bin pouw-sim`):
   1. Measures fuel by executing real programs through `WasmOracle`: the checked-in
-     `guest_example.wasm` plus two wat fixtures spanning weight classes (a light ~10K-fuel
-     transform and a heavy ~10M-fuel loop), giving a 3-point fuel distribution.
-  2. Prices every agent's realized costs from **measured** fuel and all budgets/bonds from the
+     `guest_example.wasm` plus two **prebuilt .wasm fixtures checked in under `sim/`**
+     spanning weight classes (a light ~10K-fuel transform and a heavy ~10M-fuel loop), giving
+     a 3-point fuel distribution. (Prebuilt is mandatory: `wat` is a dev-dependency and cargo
+     bins cannot see dev-deps — assembling .wat at bin runtime would force an undeclared
+     Cargo.toml change. A tiny dev-gated test re-assembles the fixtures from committed .wat
+     sources and asserts byte-identity, keeping them auditable.)
+  2. Uses the **additive event model** (§2.1) for its event generator — pinned to match the
+     formulas; the toy mode's trap-precedence draw is untouched.
+  3. Prices every agent's realized costs from **measured** fuel and all budgets/bonds from the
      **cap** via `economics.rs` (the enforcement view and the realized view, both live).
-  3. Sweeps a small grid over `(sample_rate_bps, p_trap_bps, verifier_bps split, k)` with
-     budgets/bonds set AT the formula minimums, and reports per-corner: each strategy's EV
-     (honest executor, lazy executor, honest verifier, rubber-stamp verifier) and the verdict.
-  4. Prints the regime table; a corner passes iff **all cheats EV-negative AND all honest roles
-     EV-positive**. Output ends with a machine-greppable verdict line:
+  4. Sweeps a small grid over `(sample_rate_bps, p_trap_bps, verifier_bps, k)` with
+     budgets/bonds set AT the formula minimums. Sweep bookkeeping rules: a `verifier_bps`
+     change is absorbed by `worker_bps` (burn stays 500) so the split still sums to 10_000;
+     corners with k ≥ 7 set `k_escalate = 2k+1` to keep `validate()` green. The grid includes
+     a **tight-cap corner** (`F == measured fuel`, zero slack) — with the global 100M cap the
+     small fixtures otherwise pass every corner on cap-overpricing cushion alone, and
+     tight-cap is the stress that previews the deferred per-job-cap world.
+  5. Reports per-corner: each strategy's EV (honest executor, lazy executor, honest verifier,
+     rubber-stamp verifier) AND `verifier_bond_min` (the capital a verifier must stake — at
+     low t it explodes, e.g. ~151×wc at t=1%, and the founder must see that next to any
+     "safe" corner before adopting defaults).
+  6. **Honest-equilibrium scoring:** a corner's "honest roles EV-positive" bar is judged on an
+     all-honest-committee variant (or equivalently with jackpot/catch income excluded). The
+     mixed population (with cheaters present) measures the cheats' EVs only. Rationale: with
+     a permanent rubber-stamper seated, jackpot income (~2× the entire Bv margin at defaults)
+     would let under-priced corners pass on revenue that vanishes once cheaters are deterred —
+     the exact failure mode this cycle exists to rule out.
+  7. Prints the regime table; a corner passes iff **all cheats EV-negative (mixed run) AND all
+     honest roles EV-positive (honest-equilibrium run)**. Output ends with a machine-greppable
+     verdict line:
      `REAL-FUEL ECONOMICS: <n> safe corners — HONEST WORK PROFITABLE, CHEATING LOSES MONEY`
      (or a loud failure line if no corner passes — which is itself a publishable finding).
 - The recommended regime (the best corner) is written into the README and presented to the
@@ -214,20 +269,30 @@ review exactly as last cycle (empty `git diff` over the game files).
 One new game-level test (in the wasm integration suite): a deterministically-failing program
 (e.g. an `unreachable` guest) driven through `run_priced_job` with formula-minimum funding
 settles `Confirmed` with the executor paid the worker share — pinning the founder-locked
-anti-griefing policy at the enforcement surface. `economics.rs` carries the policy rationale as
-a doc comment; the README's WASM section gains three sentences (policy + rationale + the
-fuel-in-claim future that would refine it).
+anti-griefing policy at the enforcement surface. The doc comment in `economics.rs` states the
+policy **honestly, both ends**: the protective case (an out-of-fuel job burned *effectively*
+the full fuel budget — wasmi leaves a small remainder — so paying less would open
+executor-griefing via OOF-bombs) AND the generous case (an instant-error guest burns ~0 fuel
+yet collects the full worker share of the big Bv-driven budget; submitter-self-inflicted —
+no third party can inject errors into someone else's deterministic job, and wash-trading
+errors loses ≥ the burn share per job). The README's WASM section gains three sentences
+(policy + both-ends rationale + the fuel-in-claim future that would refine it).
 
 ## 7. Testing
 
 - **Unit (economics.rs):** `work_cost` ceil-division edges (0, 1, 1M−1, 1M, 1M+1, u64::MAX
   saturation); each formula at hand-computed values for the default params; `max(…, budget)`
-  binding in `executor_bond_min`; `validate_economics` accept/reject per violation variant;
-  `GameParams::validate()` rejecting bad new fields.
+  binding in `executor_bond_min` (and the documented k≥2 fact that the formula term never
+  binds at defaults); the **no-underpricing extremes test** (F=u64::MAX, huge
+  `price_per_mfuel`: every `*_min` ≥ the saturated `work_cost(F)` — pins the u128-intermediates
+  rule); the **degenerate-params guard** (each of s/t/worker/verifier bps and k at 0 →
+  `BadParams`, never a panic — unit test per divisor); `validate_economics` accept/reject per
+  violation variant; `GameParams::validate()` rejecting bad new fields (margin must be
+  strictly > 10_000).
 - **Property (proptest):** monotonicity — every formula non-decreasing in `F` and in
   `price_per_mfuel`; `budget_min ≥ Bx` and `≥ Bv` component bounds; a funded-at-minimum job
   always passes `validate_economics`, any single component one-below-minimum always fails with
-  the matching variant.
+  the matching variant; no input panics (degenerate params included — they error).
 - **Integration:** `run_priced_job` rejects an underfunded job *without any escrow side
   effects* (ledger snapshot unchanged — the check runs before money moves) and accepts +
   settles a formula-minimum honest job identically to bare `run_job` (same verdict, same
@@ -235,8 +300,9 @@ fuel-in-claim future that would refine it).
   fuel and asserting `budget_min` scales as the formulas demand.
 - **Sim:** toy-mode regression (default build, old verdict line); real-fuel mode smoke test +
   the sweep run documented in the README with its table.
-- **Regression:** default 39-test baseline untouched; feature suite (88 + new) green; game
-  files byte-identical.
+- **Regression:** default baseline untouched — exactly 39 (31 unit + 7 sim + 1 conservation,
+  verified live on this branch pre-cycle); feature suite grows from exactly 88
+  (63 + 7 + 1 + 17) plus this cycle's additions, all green; game files byte-identical.
 
 ## 8. Risks
 
