@@ -222,10 +222,12 @@ economic-soundness break.** Glance at these when wiring this onto the real chain
 cargo test -p commputer-pouw --features wasm-runtime
 ```
 
-The default `cargo test -p commputer-pouw` (no feature flag) builds 39 tests (31 unit + 7 sim
-+ 1 conservation property) and does not pull in wasmi at all. Adding `--features wasm-runtime`
-adds 17 more tests (adversarial + integration + guest showcase) for a total of 87, with wasmi
-entering the dependency graph only under that flag.
+The default `cargo test -p commputer-pouw` (no feature flag) builds **39 tests** (31 unit +
+7 sim + 1 conservation property) and does not pull in wasmi at all. Adding
+`--features wasm-runtime` brings the total to **87 tests** (62 unit + 7 sim + 1 conservation +
+17 integration): the 31 new in-crate wasm unit tests raise the unit count to 62, and the 17
+integration tests are added on top of the unchanged sim and conservation counts. Wasmi enters
+the dependency graph only under that flag.
 
 ### What it is
 
@@ -273,13 +275,11 @@ the host nondeterminism surface is structurally absent, not merely denied by con
 | 2 | SIMD / relaxed-SIMD | 1 — not in GATE_FEATURES |
 | 3 | threads / atomics (shared memory) | 1 — not in GATE_FEATURES |
 | 4 | `memory.grow` or `table.grow` opcode present anywhere | 2 — opcode scan |
-| 5 | memory min != max (unbounded or growable) | 2 — memory section scan |
-| 6 | table min != max | 2 — table section scan |
+| 5 | memory or table with `min != max` (unbounded or growable) | 2 — memory/table section scan |
+| 6 | memory max exceeding 64 MiB cap (1024 pages) | 2 — page count check |
 | 7 | any import section present | 2 — structural check |
-| 8 | start section present | 2 — structural check |
-| 9 | `memory`, `alloc`, or `run` export missing | 2 — export section scan |
-| 10 | ill-typed `alloc` or `run` signature | binding — `abi::bind` typed get |
-| 11 | memory over the 64 MiB cap (1024 pages) | 2 — page count check |
+| 8 | missing or ill-typed required exports: `memory`, `alloc(i32)->i32`, `run(i32,i32)->i64` (see `abi.rs`) | 2 — export section scan + `abi::bind` typed get |
+| 9 | `start` section present | 2 — structural check |
 
 CONSENSUS-COUPLING: `GATE_FEATURES` is a compile-time constant. Changing it is a
 validation-policy change — `VALIDATION_VERSION` in `limits.rs` must be bumped in the same
