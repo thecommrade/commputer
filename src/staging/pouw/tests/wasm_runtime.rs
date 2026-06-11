@@ -231,3 +231,65 @@ mod determinism_properties {
         }
     }
 }
+
+mod guest_showcase {
+    use super::*;
+    use commputer_pouw::wasm::validation::validate_module;
+
+    const GUEST: &[u8] = include_bytes!("../src/wasm/fixtures/guest_example.wasm");
+
+    /// Native mirror of guest-example/src/lib.rs `run` — keep in sync BY HAND.
+    fn native_reference(input: &[u8]) -> Vec<u8> {
+        let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in input {
+            seed ^= b as u64;
+            seed = seed.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        let mut state = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+        let mut out = vec![0u8; 32];
+        for lane in 0..4 {
+            for _ in 0..1000 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+            }
+            out[lane * 8..lane * 8 + 8].copy_from_slice(&state.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn checked_in_guest_passes_the_gate() {
+        // Regression that build-guest.sh's constraints actually held (spec §9.D).
+        validate_module(GUEST, &WasmLimits::default()).expect("compiled guest must pass the gate");
+    }
+
+    #[test]
+    fn compiled_rust_guest_matches_native_reference() {
+        let input = b"the people's compute".to_vec();
+        let mut store = ProgramStore::new();
+        let program_hash = store.insert(GUEST.to_vec());
+        let input_hash: [u8; 32] = Sha256::digest(&input).into();
+        let oracle = WasmOracle::new(store, WasmLimits::default());
+        let spec = JobSpec { program_hash, input_hash };
+        let outcome = oracle.execute(&spec, &input);
+        assert_eq!(outcome.result, Ok(native_reference(&input)));
+        assert!(outcome.fuel_consumed > 4_000, "4000 xorshift rounds must meter visibly");
+    }
+
+    #[test]
+    fn compiled_guest_is_deterministic_across_instances() {
+        let input = b"verify me twice".to_vec();
+        let input_hash: [u8; 32] = Sha256::digest(&input).into();
+        let mk = || {
+            let mut store = ProgramStore::new();
+            let program_hash = store.insert(GUEST.to_vec());
+            (WasmOracle::new(store, WasmLimits::default()), JobSpec { program_hash, input_hash })
+        };
+        let (a, spec) = mk();
+        let (b, _) = mk();
+        let (ra, rb) = (a.execute(&spec, &input), b.execute(&spec, &input));
+        assert_eq!(ra.result, rb.result);
+        assert_eq!(ra.fuel_consumed, rb.fuel_consumed);
+    }
+}
