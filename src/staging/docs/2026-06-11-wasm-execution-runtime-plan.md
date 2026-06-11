@@ -1480,8 +1480,9 @@ sha256sum ../src/wasm/fixtures/guest_example.wasm
 - [ ] **Step 4: Build and check in the artifact**
 
 Run: `bash src/staging/pouw/guest-example/build-guest.sh` (from `/home/operator/Coin`)
-Expected: prints `rebuilt:` + a sha256. (First run downloads the wasm32 target via rustup.)
-If `rustup target add` is unavailable offline, STOP and report BLOCKED — do not substitute a wat-built fake.
+Expected: prints `rebuilt:` + a sha256. (The wasm32 target is pre-installed — see the pre-flight
+note; the `rustup target add` in the script is an idempotent no-op here.)
+If the build fails for toolchain reasons, STOP and report BLOCKED — do not substitute a wat-built fake.
 
 - [ ] **Step 5: Append the showcase tests to `tests/wasm_runtime.rs`:**
 
