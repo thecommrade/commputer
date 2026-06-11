@@ -17,7 +17,7 @@ pub struct AbiHandles {
 pub fn bind<T>(store: &Store<T>, instance: &Instance) -> Result<AbiHandles, ExecError> {
     let memory = instance
         .get_memory(store, "memory")
-        .ok_or_else(|| ExecError::Rejected("export `memory` is not a memory".into()))?;
+        .ok_or_else(|| ExecError::Rejected("export `memory` missing or not a memory".into()))?;
     let alloc = instance
         .get_typed_func::<i32, i32>(store, "alloc")
         .map_err(|e| ExecError::Rejected(format!("export `alloc` signature: {e}")))?;
@@ -43,4 +43,27 @@ pub fn check_bounds(mem_len: usize, ptr: u32, len: u32, what: &str) -> Result<()
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the "decoded as u32 unconditionally" claim: a negative packed i64
+    /// must decode to large u32 halves (then fail bounds), never sign-extend.
+    #[test]
+    fn unpack_negative_packed_value_decodes_as_u32() {
+        assert_eq!(unpack(-1), (u32::MAX, u32::MAX));
+        assert_eq!(unpack(0), (0, 0));
+        assert_eq!(unpack(((7u64 << 32) | 9) as i64), (7, 9));
+    }
+
+    /// Pins exact-boundary acceptance: [ptr, ptr+len) ending exactly at
+    /// mem_len passes; one past fails. (The off-by-one a refactor could break.)
+    #[test]
+    fn check_bounds_accepts_exact_end_rejects_past_end() {
+        assert!(check_bounds(100, 90, 10, "x").is_ok());
+        assert!(check_bounds(100, 91, 10, "x").is_err());
+        assert!(check_bounds(100, 100, 0, "x").is_ok());
+    }
 }

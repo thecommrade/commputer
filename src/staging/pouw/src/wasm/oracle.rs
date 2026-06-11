@@ -68,7 +68,11 @@ impl WasmOracle {
             return Err(ExecError::HashMismatch);
         }
         if input.len() as u64 > self.limits.max_input_bytes {
-            return Err(ExecError::Rejected("input exceeds max_input_bytes".into()));
+            return Err(ExecError::Rejected(format!(
+                "input of {} bytes exceeds max_input_bytes {}",
+                input.len(),
+                self.limits.max_input_bytes
+            )));
         }
 
         // 2. The determinism gate (spec §5).
@@ -89,6 +93,8 @@ impl WasmOracle {
         store.set_fuel(self.limits.fuel).expect("consume_fuel is enabled in Config");
 
         // Track consumed fuel after every wasmi call so every exit path reports it.
+        // (macro, not closure: a closure capturing `&store` would conflict with the
+        // later `&mut store` calls — the macro re-borrows at each expansion site)
         macro_rules! track {
             () => {
                 *fuel_consumed =
@@ -121,7 +127,8 @@ impl WasmOracle {
         let (out_ptr, out_len) = abi::unpack(packed);
         if out_len as u64 > self.limits.max_output_bytes {
             return Err(ExecError::AbiViolation(format!(
-                "declared output {out_len} exceeds max_output_bytes"
+                "declared output {out_len} exceeds max_output_bytes {}",
+                self.limits.max_output_bytes
             )));
         }
         abi::check_bounds(mem_len, out_ptr, out_len, "run() output")?;
@@ -244,9 +251,7 @@ mod tests {
 
     #[test]
     fn oversized_input_rejected_before_running() {
-        let (_, _, _) = oracle_with(DOUBLER);
-        let mut limits = WasmLimits::default();
-        limits.max_input_bytes = 2;
+        let limits = WasmLimits { max_input_bytes: 2, ..WasmLimits::default() };
         let wasm = wat::parse_str(DOUBLER).unwrap();
         let mut store = ProgramStore::new();
         let program_hash = store.insert(wasm);
