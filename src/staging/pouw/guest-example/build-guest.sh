@@ -11,5 +11,6 @@ RUSTFLAGS="-C target-cpu=mvp -C link-arg=--initial-memory=1048576 -C link-arg=--
     cargo build --release --target wasm32-unknown-unknown
 mkdir -p ../src/wasm/fixtures
 cp target/wasm32-unknown-unknown/release/guest_example.wasm ../src/wasm/fixtures/guest_example.wasm
-echo "rebuilt:"
+rustc -V
+echo "rebuilt with $(rustc -V):"
 sha256sum ../src/wasm/fixtures/guest_example.wasm

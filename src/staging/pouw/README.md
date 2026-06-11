@@ -210,3 +210,168 @@ economic-soundness break.** Glance at these when wiring this onto the real chain
    `reveal_matches`** during orchestration — harmless in this deterministic prototype (no
    equivocating adversary), but the on-chain version must enforce it (spec §6.5: discard a
    non-matching reveal and penalise) once verifiers can commit one value and reveal another.
+
+---
+
+## WASM runtime (`wasm-runtime` feature)
+
+### How to run
+
+```bash
+# From /home/operator/Coin/src (workspace root):
+cargo test -p commputer-pouw --features wasm-runtime
+```
+
+The default `cargo test -p commputer-pouw` (no feature flag) builds 39 tests (31 unit + 7 sim
++ 1 conservation property) and does not pull in wasmi at all. Adding `--features wasm-runtime`
+adds 17 more tests (adversarial + integration + guest showcase) for a total of 87, with wasmi
+entering the dependency graph only under that flag.
+
+### What it is
+
+`WasmOracle` (`src/wasm/oracle.rs`) is the production `ExecutionOracle` that replaces the
+`IteratedHashVm` placeholder behind the **unchanged trait seam** in `src/oracle.rs`. Swapping
+the two is a one-line change at the call site; the verification game, settlement, and
+conservation property tests are untouched.
+
+Design doc: `src/staging/docs/2026-06-11-wasm-execution-runtime-design.md`
+Plan doc: `src/staging/docs/2026-06-11-wasm-execution-runtime-plan.md`
+
+### Guest ABI contract
+
+Every program submitted to the network must export exactly:
+
+| export | type | role |
+|---|---|---|
+| `memory` | memory, min == max | fixed linear memory; no growth |
+| `alloc(i32) -> i32` | func | host calls to allocate `len` bytes, returns ptr |
+| `run(i32, i32) -> i64` | func | host calls with `(in_ptr, in_len)`, returns packed i64 |
+
+**Packed return encoding:** `run` packs `(out_ptr, out_len)` as a single `i64`:
+
+```
+packed = (((out_ptr as u64) << 32) | (out_len as u64)) as i64
+```
+
+**Signed-shift footgun:** `i64` is a *signed* type in WASM. A guest that shifts a pointer
+value with `i64.shl` and then sign-extends the result will silently corrupt the upper half
+when the pointer has bit 31 set. The host decodes `packed` by casting to `u64` first (see
+`abi::unpack`), so a mis-packed value produces garbage pointers that the bounds check rejects
+deterministically — but the guest author must use unsigned arithmetic throughout.
+
+Zero host imports are allowed. Any import section causes an immediate gate rejection (rule 7);
+the host nondeterminism surface is structurally absent, not merely denied by config.
+
+### Determinism gate (reject rules)
+
+`src/wasm/validation.rs` applies two layers. Layer 1 validates under a locked
+`WasmFeatures` allow-list; layer 2 scans constructs the feature flags cannot express.
+
+| # | reject rule | layer |
+|---|---|---|
+| 1 | floats (f32/f64 instructions or types) | 1 — FLOATS subtracted from WASM1 |
+| 2 | SIMD / relaxed-SIMD | 1 — not in GATE_FEATURES |
+| 3 | threads / atomics (shared memory) | 1 — not in GATE_FEATURES |
+| 4 | `memory.grow` or `table.grow` opcode present anywhere | 2 — opcode scan |
+| 5 | memory min != max (unbounded or growable) | 2 — memory section scan |
+| 6 | table min != max | 2 — table section scan |
+| 7 | any import section present | 2 — structural check |
+| 8 | start section present | 2 — structural check |
+| 9 | `memory`, `alloc`, or `run` export missing | 2 — export section scan |
+| 10 | ill-typed `alloc` or `run` signature | binding — `abi::bind` typed get |
+| 11 | memory over the 64 MiB cap (1024 pages) | 2 — page count check |
+
+CONSENSUS-COUPLING: `GATE_FEATURES` is a compile-time constant. Changing it is a
+validation-policy change — `VALIDATION_VERSION` in `limits.rs` must be bumped in the same
+commit, or the policy drift will not fail loud (the fingerprint folds the version, not the
+raw bits).
+
+### Limits and consensus criticality
+
+| limit | default |
+|---|---|
+| fuel | 100 000 000 instructions |
+| max memory | 64 MiB |
+| max call depth | 1 024 frames |
+| max stack height | 1 048 576 (1 << 20) |
+| max input / output | 10 MiB each |
+
+**These are consensus-critical.** The exact wasmi pin (`= 1.0.9` in `Cargo.toml`),
+`GATE_FEATURES`, and every limit above are folded into `WasmLimits::config_fingerprint()`.
+The fingerprint is embedded in every outcome digest (both ok and error). Two nodes that
+disagree on any single value diverge on every job — loudly, by design. Upgrading the engine
+version or changing any limit is a **coordinated protocol change**, not a silent bump.
+Changing `GATE_FEATURES` additionally requires bumping `VALIDATION_VERSION` in `limits.rs`.
+
+### Canonical outcome digest
+
+The trait method `ExecutionOracle::run` always returns a 32-byte digest:
+
+- **Success:** `sha256(DOMAIN ‖ fingerprint ‖ 0x00 ‖ output)`
+- **Any error:** `sha256(DOMAIN ‖ fingerprint ‖ 0x01)`
+
+`DOMAIN = b"commputer-pouw-wasm-v1"`.
+
+One sentinel covers every error kind (gate rejection, hash mismatch, out-of-fuel, runtime
+trap, ABI violation). Which specific error occurred is local log data only — it is never
+exposed in the digest. This eliminates any covert trap channel between executor and verifier.
+
+`ProgramUnavailable` is the one error that is not inherently deterministic — it depends on
+whether the node's local store holds the program bytes. The current prototype populates every
+node's store before running, so this is safe. The production DA (data-availability) cycle
+decides whether an unavailable program causes abstain or sentinel; that decision is deferred.
+
+### Fuel metering
+
+Wasmi's built-in instruction fuel counter is the **only** consensus meter. Wall-clock time is
+explicitly forbidden as a meter — it is non-deterministic and would cause false disputes
+between nodes running on different hardware or under different load. On an out-of-fuel trap,
+wasmi leaves a small remainder (consumed < budget); the consensus property is that `fuel_consumed`
+is **equal** across nodes given identical (program, input, limits, engine version), not any
+particular absolute value. `fuel_consumed` is recorded in `ExecOutcome` and available for the
+future cost-coupling cycle but is **not yet wired into settlement** — in v1, a failing program
+settles `Confirmed` and the executor is paid 85% (the deliberate bootstrap policy; see deferred
+items below).
+
+### Guest rebuild
+
+`guest-example/build-guest.sh` rebuilds `src/wasm/fixtures/guest_example.wasm` from the Rust
+source in `guest-example/src/`. The flags satisfy all gate rules:
+`-C link-arg=--initial-memory=1048576 -C link-arg=--max-memory=1048576` (min==max memory,
+rule 5), `-C link-arg=-zstack-size=131072` (bounded stack), `-C target-cpu=mvp` (plain integer
+MVP, no post-MVP surprises). The bump arena allocator in the guest source uses no `memory.grow`
+(rule 4).
+
+Current checked-in artifact sha256:
+`32695999cdee9a0e31dc29024abcd3e7fbd37ab85ede1a93896b24bd2bbc55e5`
+Built with: `rustc 1.94.0 (4a4ef493e 2026-03-02)` (run `build-guest.sh` to confirm; it prints
+the toolchain beside the artifact hash).
+
+### FOUNDER CI NOTE (cross-arch gate — REQUIRED for testnet)
+
+Same-arch determinism (x86_64 → x86_64) is demonstrated by the `two_independent_oracles_agree_exactly`
+and `determinism_properties::independent_oracles_always_agree` tests, which assert byte-identical
+digests and identical `fuel_consumed` across fresh engine + store instances on this machine.
+
+**The cross-arch gate — the same corpus on x86_64 AND aarch64 runners asserting byte-identical
+digests and identical `fuel_consumed` — is a REQUIRED CI step for the testnet path and has NOT
+yet been run.** Interpreter-by-construction makes the risk low (wasmi evaluates the WASM
+instruction stream without generating native code), but the gate makes it checked. This must be
+wired into CI before the testnet launch gate.
+
+### Deferred items
+
+- **Fuel → economics:** The v1 policy that a failing program settles `Confirmed` and the
+  executor is paid 85% is deliberate bootstrap. The full fuel→settlement coupling (partial
+  payment, gas refund, executor cost amortisation) is a follow-up cycle.
+- **DA / fetching:** `ProgramUnavailable` resolution — whether a node abstains or emits the
+  error sentinel when it cannot fetch the program bytes — depends on the DA layer design.
+- **On-chain consensus params (founder):** `WasmLimits` and `VALIDATION_VERSION` live in
+  staging; moving them into the chain's consensus params is protected-file work.
+- **Floats / AI-equivalence:** The float ban is conservative. The approximate-equivalence
+  oracle seam (`EquivalenceOracle`) exists for a future cycle that relaxes this for AI tasks.
+- **Stack-height static analysis:** The `max_stack_height` wasmi config cap is dynamic (trap
+  at runtime); static analysis of the WASM operand stack at validate-time is not yet done.
+- **Compiled-module cache:** Wasmi compiles (`CompilationMode::Eager`) on every
+  `Module::new` call. A per-node module cache keyed by `program_hash` is a follow-up
+  performance optimisation; it does not affect consensus.
