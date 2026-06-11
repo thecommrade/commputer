@@ -31,7 +31,8 @@ the toy constants `C_exec=40 / C_ver=3`. This cycle:
   enforcement is a new pre-check, not a settlement change.
 - **Error policy: keep v1.** An error-sentinel job settles `Confirmed` with the executor paid
   the worker share. Rationale (now documented + test-pinned): the worst error case —
-  out-of-fuel — means the executor burned the *full* fuel budget; paying less would let
+  out-of-fuel — means the executor burned *effectively* the full fuel budget (wasmi leaves a
+  small remainder); paying less would let
   malicious submitters grief executors with designed-to-OOF jobs until executors stop accepting
   work. The gate-reject overpay is submitter-self-inflicted and bounded. Revisit only when fuel
   enters the claim format (deferred, §10).
@@ -141,8 +142,8 @@ executor_bond_min(F) = max( ceil(work_cost(F) · bond_safety_bps / s_bps),  budg
 The `max(…, budget)` term preserves the parent spec's `Be ≥ B` rule (slash ≥ value at stake).
 (Under the additive event model the executor's catch rate is exactly `s`; note also that for
 k ≥ 2 the formula term can never bind against the Bv-driven budget — `bond_safety ≈ 1.5×wc`
-vs budget ≥ ~26×wc at defaults — so in practice `executor_bond_min = budget`. Stated so the
-plan's tests assert the right branch.)
+vs budget ≥ ~26×wc for any k ≥ 2, ≈ 39.6×wc at the k=3 defaults — so in practice
+`executor_bond_min = budget`. Stated so the plan's tests assert the right branch.)
 
 **Verifier bond.** A rubber-stamper saves `work_cost(F)` per skipped re-execution and is caught
 exactly when the event is a trap — probability `t/(s+t)` per event:
