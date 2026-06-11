@@ -81,8 +81,9 @@ probabilistically on edge cases.
 
 `ExecutionOracle::run(&self, spec: &JobSpec, input: &[u8]) -> Vec<u8>` stays **exactly as it is**
 — infallible, unchanged. A new `WasmOracle` type (new files only) implements it. Zero edits to
-`oracle.rs`, `engine.rs`, or any existing file. (Honors the agent work method: new files only;
-and the scope decision: no cost coupling, so the game never needs to see fuel.)
+`oracle.rs`, `engine.rs`, or any existing file beyond the two integration points declared in §4
+(the `lib.rs` module line and the `Cargo.toml` feature/deps). (Honors the agent work method: new
+files only; and the scope decision: no cost coupling, so the game never needs to see fuel.)
 
 An infallible signature is reconciled with a fallible runtime by returning a **canonical outcome
 digest** (32 bytes) instead of raw output (§8). The rich, fallible interface —
@@ -337,8 +338,9 @@ checked-in `guest_example.wasm`.
   changes nothing about the game.
 
 **F. Regression**
-- Default-feature build: the existing 39 tests + conservation proptest still pass untouched;
-  `cargo run -p commputer-pouw --bin pouw-sim` still prints HONEST PLAY DOMINATES.
+- Default-feature build: the existing 39-test baseline (which includes the conservation
+  proptest) still passes untouched; `cargo run -p commputer-pouw --bin pouw-sim` still prints
+  HONEST PLAY DOMINATES.
 
 **Founder CI note (cannot be claimed from this machine):** the cross-arch gate — the same corpus
 on x86_64 *and* aarch64 runners asserting byte-identical digests and identical `fuel_consumed` —
