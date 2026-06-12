@@ -124,7 +124,7 @@ The regime is defined in code at `sim/tournament.rs::safe_regime()`.
 ## How to test
 
 ```bash
-cargo test -p commputer-pouw      # 31 unit + 7 sim + 1 conservation property — all green
+cargo test -p commputer-pouw      # all green — the suite grows with each cycle; at the fuel-economics cycle's close: 53 default (45 unit + 7 sim + 1 conservation)
 ```
 
 The most important test is the **conservation property** (`tests/conservation.rs`,
@@ -222,11 +222,9 @@ economic-soundness break.** Glance at these when wiring this onto the real chain
 cargo test -p commputer-pouw --features wasm-runtime
 ```
 
-The default `cargo test -p commputer-pouw` (no feature flag) builds **39 tests** (31 unit +
-7 sim + 1 conservation property) and does not pull in wasmi at all. Adding
-`--features wasm-runtime` brings the total to **87 tests** (62 unit + 7 sim + 1 conservation +
-17 integration): the 31 new in-crate wasm unit tests raise the unit count to 62, and the 17
-integration tests are added on top of the unchanged sim and conservation counts. Wasmi enters
+The default `cargo test -p commputer-pouw` (no feature flag) does not pull in wasmi at all.
+Adding `--features wasm-runtime` brings in the full matrix including the wasm and economics
+suites (108 at this cycle's close, one deliberately `#[ignore]`d regenerator). Wasmi enters
 the dependency graph only under that flag.
 
 ### What it is
@@ -440,7 +438,7 @@ Of the 72 corners, 48 are safe. The 24 safe tight-cap rows below are the operati
 10000/2500/4000/5/tight        18750      7500      9312.0       188.4    -18750.0    -18750.0     -1085.3    yes
 ```
 
-#### Why 100M-cap corners fail
+#### Why the s=2500 corners fail (and what cap slack adds)
 
 All 24 s=2500 (25% sampling) corners fail — 12 tight-cap and 12 100M-cap: at 25% sampling an unsampled cheat is too likely regardless of cap; the 100M-cap rows below additionally show how cap slack amplifies the loss. Representative failing rows:
 

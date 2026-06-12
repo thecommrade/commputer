@@ -262,9 +262,10 @@ pub fn run_sweep(grid: &[Corner], class: &FuelClass, jobs: u64, seed: u64) -> Ve
             lazy_executor_ev: le.mean_ev(),
             rubber_stamp_ev: rs.mean_ev(),
             mixed_honest_verifier_ev: hv_mixed.mean_ev(),
-            safe: ce.mean_ev() <= 0.0
-                && le.mean_ev() <= 0.0
-                && rs.mean_ev() < hv_mixed.mean_ev() // the cheat loses in ITS OWN population
+            safe: ce.mean_ev() < 0.0
+                && le.mean_ev() < 0.0
+                && rs.mean_ev() < 0.0                 // absolute: every cheat is EV-negative (spec §5.7)
+                && rs.mean_ev() < hv_mixed.mean_ev()  // and loses relative to honesty in ITS OWN population
                 && he.mean_ev() > 0.0                 // honest-equilibrium run
                 && hv.mean_ev() > 0.0,                // honest-equilibrium run
         });
