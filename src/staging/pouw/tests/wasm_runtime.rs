@@ -385,8 +385,8 @@ mod sim_fixtures {
     /// because `wat` is a dev-dependency; spec §5.1).
     #[test]
     fn fixtures_match_their_wat_sources() {
-        assert_eq!(wat::parse_str(LIGHT_WAT).unwrap(), LIGHT_WASM, "light.wasm stale — rerun the regenerate test");
-        assert_eq!(wat::parse_str(HEAVY_WAT).unwrap(), HEAVY_WASM, "heavy.wasm stale — rerun the regenerate test");
+        assert_eq!(wat::parse_str(LIGHT_WAT).unwrap(), LIGHT_WASM, "light.wasm stale — run: cargo test -p commputer-pouw --features wasm-runtime regenerate_sim_fixtures -- --ignored");
+        assert_eq!(wat::parse_str(HEAVY_WAT).unwrap(), HEAVY_WASM, "heavy.wasm stale — run: cargo test -p commputer-pouw --features wasm-runtime regenerate_sim_fixtures -- --ignored");
     }
 
     /// Regenerator: `cargo test -p commputer-pouw --features wasm-runtime \
@@ -423,6 +423,122 @@ mod sim_fixtures {
                 out.fuel_consumed
             );
         }
+    }
+}
+
+mod priced_game {
+    use super::*;
+    use commputer_pouw::economics::{budget_min, executor_bond_min, run_priced_job, verifier_bond_min};
+    use commputer_pouw::engine::JobInputs;
+    use commputer_pouw::ids::{JobId, ParticipantId};
+    use commputer_pouw::job::{Job, Verdict};
+    use commputer_pouw::oracle::{ByteEq, Ledger};
+    use commputer_pouw::params::GameParams;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    fn pid(n: u8) -> ParticipantId {
+        ParticipantId([n; 32])
+    }
+
+    /// Spec §6: the founder-locked error policy, pinned at the enforcement
+    /// surface. A deterministically-failing program (unreachable guest), funded
+    /// at the formula minimums, settles Confirmed with the executor paid the
+    /// worker share — both ends of the rationale documented in economics.rs.
+    #[test]
+    fn error_sentinel_job_settles_confirmed_at_formula_minimums() {
+        let p = GameParams { p_trap_bps: 1_000, ..GameParams::default() };
+        let fuel_cap = WasmLimits::default().fuel;
+        let budget = budget_min(fuel_cap, &p).unwrap();
+        let e_bond = executor_bond_min(fuel_cap, budget, &p).unwrap();
+        let v_bond = verifier_bond_min(fuel_cap, &p).unwrap();
+
+        // An always-trapping (error-sentinel) program through the REAL oracle.
+        let trap_wat = r#"(module
+            (memory (export "memory") 1 1)
+            (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "run") (param i32 i32) (result i64) (unreachable)))"#;
+        let wasm = wat::parse_str(trap_wat).unwrap();
+        let mut store = ProgramStore::new();
+        let program_hash = store.insert(wasm);
+        let input = b"will error".to_vec();
+        let input_hash: [u8; 32] = Sha256::digest(&input).into();
+        let oracle = WasmOracle::new(store, WasmLimits::default());
+        let spec = JobSpec { program_hash, input_hash };
+
+        let submitter = pid(0);
+        let executor = pid(9);
+        let candidates: Vec<ParticipantId> = (10u8..30).map(pid).collect();
+        let mut l = Ledger::new();
+        l.credit(submitter, budget);
+        l.credit(executor, e_bond);
+        for c in &candidates {
+            l.credit(*c, v_bond);
+        }
+        let total0 = l.total_supply();
+
+        let job = Job {
+            id: JobId::derive(&spec.program_hash, &spec.input_hash, &submitter, 0),
+            submitter,
+            spec,
+            budget,
+        };
+        let honest_claim = |h: &[u8; 32]| *h;
+        let honest_reveal = |_: &ParticipantId, h: &[u8; 32], _: &[u8; 32]| *h;
+        let no_challenge = |_: &[u8; 32], _: &[u8; 32]| None;
+        let inputs = JobInputs {
+            job,
+            input: &input,
+            executor,
+            executor_bond: e_bond,
+            executor_claim: &honest_claim,
+            candidates: &candidates,
+            verifier_bond: v_bond,
+            verifier_reveal: &honest_reveal,
+            challenge: &no_challenge,
+            challenger_bond: p.challenger_bond,
+        };
+        let stake = |_: &ParticipantId| 1u64;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let (verdict, out) =
+            run_priced_job(&mut l, &p, &inputs, fuel_cap, &oracle, &ByteEq, &stake, &mut rng)
+                .expect("formula-minimum funding must pass validation");
+
+        // The committee agrees on the SAME error sentinel ⇒ Confirmed, worker paid.
+        assert!(matches!(verdict, Verdict::Confirmed { .. }), "got {verdict:?}");
+        assert_eq!(out.worker_paid, budget * 8_500 / 10_000, "executor paid the worker share");
+        assert_eq!(l.total_supply(), total0, "conservation");
+        assert_eq!(l.escrowed(), 0);
+    }
+
+    /// budget_min scales with the measured fuel of a REAL program (spec §7).
+    #[test]
+    fn budget_min_scales_with_real_measured_fuel() {
+        const GUEST: &[u8] = include_bytes!("../src/wasm/fixtures/guest_example.wasm");
+        let mut store = ProgramStore::new();
+        let program_hash = store.insert(GUEST.to_vec());
+        let input = b"measure me".to_vec();
+        let input_hash: [u8; 32] = Sha256::digest(&input).into();
+        let oracle = WasmOracle::new(store, WasmLimits::default());
+        let out = oracle.execute(&JobSpec { program_hash, input_hash }, &input);
+        let measured = out.fuel_consumed;
+        assert!(out.result.is_ok());
+        assert!(measured > 0);
+
+        let p = GameParams::default();
+        let tight = budget_min(measured, &p).unwrap();
+        let slack = budget_min(WasmLimits::default().fuel, &p).unwrap();
+        // The guest is sub-1-Mfuel: tight-cap prices exactly 1 mfuel; the
+        // global 100M cap prices 100 mfuel. budget_min is linear in work_cost
+        // up to per-term ceilings, so slack lands within [99x, 100x] of tight.
+        assert!(measured < 1_000_000, "guest stays in the sub-mfuel class");
+        assert!(slack > tight, "cap-pricing must exceed tight-pricing");
+        assert!(
+            slack >= 99 * tight && slack <= 100 * tight,
+            "linear-in-wc up to ceilings: tight={tight}, slack={slack}"
+        );
+        assert_eq!(budget_min(1, &p).unwrap(), tight, "all sub-mfuel jobs price identically");
     }
 }
 
