@@ -372,6 +372,60 @@ mod game_integration {
     }
 }
 
+mod sim_fixtures {
+    use super::*;
+
+    const LIGHT_WAT: &str = include_str!("../sim/fixtures/light.wat");
+    const HEAVY_WAT: &str = include_str!("../sim/fixtures/heavy.wat");
+    const LIGHT_WASM: &[u8] = include_bytes!("../sim/fixtures/light.wasm");
+    const HEAVY_WASM: &[u8] = include_bytes!("../sim/fixtures/heavy.wasm");
+
+    /// The committed .wasm fixtures are exactly the committed .wat sources
+    /// (auditable provenance — the sim bin can't assemble wat at runtime
+    /// because `wat` is a dev-dependency; spec §5.1).
+    #[test]
+    fn fixtures_match_their_wat_sources() {
+        assert_eq!(wat::parse_str(LIGHT_WAT).unwrap(), LIGHT_WASM, "light.wasm stale — rerun the regenerate test");
+        assert_eq!(wat::parse_str(HEAVY_WAT).unwrap(), HEAVY_WASM, "heavy.wasm stale — rerun the regenerate test");
+    }
+
+    /// Regenerator: `cargo test -p commputer-pouw --features wasm-runtime \
+    ///   regenerate_sim_fixtures -- --ignored` rewrites the .wasm from the .wat.
+    #[test]
+    #[ignore]
+    fn regenerate_sim_fixtures() {
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/sim/fixtures/light.wasm"),
+            wat::parse_str(LIGHT_WAT).unwrap()).unwrap();
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/sim/fixtures/heavy.wasm"),
+            wat::parse_str(HEAVY_WAT).unwrap()).unwrap();
+    }
+
+    /// Weight classes straddle the 1-Mfuel pricing boundary (spec §5.1) and
+    /// pass the determinism gate.
+    #[test]
+    fn fixtures_pass_gate_and_meter_in_their_classes() {
+        use commputer_pouw::wasm::validation::validate_module;
+        for (bytes, lo, hi) in [
+            (LIGHT_WASM, 1_000_001u64, 5_000_000u64),
+            (HEAVY_WASM, 30_000_000, 100_000_000),
+        ] {
+            validate_module(bytes, &WasmLimits::default()).expect("fixture passes the gate");
+            let mut store = ProgramStore::new();
+            let program_hash = store.insert(bytes.to_vec());
+            let input = b"x".to_vec();
+            let input_hash: [u8; 32] = Sha256::digest(&input).into();
+            let oracle = WasmOracle::new(store, WasmLimits::default());
+            let out = oracle.execute(&JobSpec { program_hash, input_hash }, &input);
+            assert!(out.result.is_ok(), "fixture runs: {:?}", out.result);
+            assert!(
+                (lo..=hi).contains(&out.fuel_consumed),
+                "fuel {} outside class range [{lo}, {hi}] — adjust the .wat iteration count",
+                out.fuel_consumed
+            );
+        }
+    }
+}
+
 mod guest_showcase {
     use super::*;
     use commputer_pouw::wasm::validation::validate_module;
