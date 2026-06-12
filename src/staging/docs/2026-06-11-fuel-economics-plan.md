@@ -126,6 +126,7 @@ mod tests {
     fn work_cost_ceiling_edges() {
         assert_eq!(work_cost(0, 1), 0);
         assert_eq!(work_cost(1, 1), 1);                 // ceil(1/1M) = 1 mfuel
+        assert_eq!(work_cost(999_999, 1), 1);           // spec §7 lists the 1M−1 edge explicitly
         assert_eq!(work_cost(1_000_000, 1), 1);
         assert_eq!(work_cost(1_000_001, 1), 2);
         assert_eq!(work_cost(100_000_000, 1), 100);     // the default cap
@@ -405,13 +406,19 @@ mod prop_tests {
     }
 
     proptest! {
-        /// Monotone in fuel and price; minimums never panic on legal params.
+        /// Monotone in fuel AND in price (spec §7); minimums never panic on legal params.
         #[test]
         fn formulas_monotone_and_total(p in econ_params(), f1 in 0u64..=u64::MAX, f2 in 0u64..=u64::MAX) {
             let (lo, hi) = (f1.min(f2), f1.max(f2));
             prop_assert!(budget_min(lo, &p).unwrap() <= budget_min(hi, &p).unwrap());
             prop_assert!(verifier_bond_min(lo, &p).unwrap() <= verifier_bond_min(hi, &p).unwrap());
             prop_assert!(executor_bond_min(lo, 0, &p).unwrap() <= executor_bond_min(hi, 0, &p).unwrap());
+            // price-monotonicity: same fuel, cheaper price never prices higher.
+            let mut cheaper = p.clone();
+            cheaper.price_per_mfuel = p.price_per_mfuel.saturating_sub(1).max(1);
+            prop_assert!(budget_min(hi, &cheaper).unwrap() <= budget_min(hi, &p).unwrap());
+            prop_assert!(verifier_bond_min(hi, &cheaper).unwrap() <= verifier_bond_min(hi, &p).unwrap());
+            prop_assert!(executor_bond_min(hi, 0, &cheaper).unwrap() <= executor_bond_min(hi, 0, &p).unwrap());
         }
 
         /// budget_min dominates BOTH of its component constraints.
@@ -578,7 +585,7 @@ git commit -m "test(pouw): economics property harness — monotonicity, componen
     /// check: same seed ⇒ same verdict + same settlement outcome.
     #[test]
     fn priced_run_is_bare_run_after_the_check() {
-        let (p, l0, submitter, executor, candidates, budget, e_bond, v_bond) = priced_world();
+        let (p, _l0, submitter, executor, candidates, budget, e_bond, v_bond) = priced_world();
         let honest_claim = |h: &[u8; 32]| *h;
         let honest_reveal = |_: &ParticipantId, h: &[u8; 32], _: &[u8; 32]| *h;
         let no_challenge = |_: &[u8; 32], _: &[u8; 32]| None;
@@ -597,12 +604,14 @@ git commit -m "test(pouw): economics property harness — monotonicity, componen
         let vm = IteratedHashVm { rounds: 10 };
         let stake = |_: &ParticipantId| 1u64;
 
-        let mut l_priced = l0.clone();
+        // Ledger does NOT implement Clone (game file, untouchable): build two
+        // identical worlds from the deterministic helper instead.
+        let (_, mut l_priced, ..) = priced_world();
         let mut rng = StdRng::seed_from_u64(42);
         let (v1, o1) = run_priced_job(&mut l_priced, &p, &inputs, 100_000_000, &vm, &ByteEq, &stake, &mut rng)
             .expect("at-minimum funding must pass");
 
-        let mut l_bare = l0.clone();
+        let (_, mut l_bare, ..) = priced_world();
         let mut rng = StdRng::seed_from_u64(42);
         let (v2, o2) = run_job(&mut l_bare, &p, &inputs, &vm, &ByteEq, &stake, &mut rng);
 
@@ -612,7 +621,78 @@ git commit -m "test(pouw): economics property harness — monotonicity, componen
     }
 ```
 
-NOTE: this requires `Ledger: Clone`. Check `src/staging/pouw/src/oracle.rs` — `Ledger` derives nothing today. Adding `#[derive(Clone)]` to `Ledger` would modify a GAME file, which is forbidden. Instead clone manually: rebuild `l0` by calling `priced_world()` twice (deterministic credits) — replace `l0.clone()` with a second `priced_world()` call and use each world's own ledger. Implement it that way (the helper is deterministic, so the two ledgers are identical).
+NOTE: `Ledger` deliberately has no `Clone` (game file, untouchable) — the test above already
+embeds the workaround: two `priced_world()` calls produce identical deterministic worlds, and
+each run path uses its own ledger. This form was verified to compile and pass during plan review.
+
+ALSO append to `mod prop_tests` (spec §7 lists at-minimum-passes / one-below-fails as a
+PROPERTY, not just a default-params unit test — this closes that row over the whole regime
+space; checks the formula relations directly, which is what `validate_economics` enforces):
+
+```rust
+        use crate::engine::JobInputs;
+        use crate::ids::{JobId, ParticipantId};
+        use crate::job::{Job, JobSpec};
+
+        /// Funded-at-minimum always passes validate_economics; any single
+        /// component one-below-minimum fails with the MATCHING variant — over
+        /// the whole legal regime space, not just the defaults (spec §7).
+        #[test]
+        fn minimum_funding_is_the_exact_boundary(p in econ_params(), f in 0u64..=u64::MAX) {
+            let b = budget_min(f, &p).unwrap();
+            let eb = executor_bond_min(f, b, &p).unwrap();
+            let vb = verifier_bond_min(f, &p).unwrap();
+            prop_assert!(eb >= b, "Be >= B must hold by the max(…, budget) construction");
+
+            let claim = |h: &[u8; 32]| *h;
+            let reveal = |_: &ParticipantId, h: &[u8; 32], _: &[u8; 32]| *h;
+            let challenge = |_: &[u8; 32], _: &[u8; 32]| None;
+            let candidates: Vec<ParticipantId> =
+                (10u8..30).map(|n| ParticipantId([n; 32])).collect();
+            let submitter = ParticipantId([0; 32]);
+            let mk = |budget: u64, e_bond: u64, v_bond: u64| JobInputs {
+                job: Job {
+                    id: JobId::derive(&[7; 32], &[9; 32], &submitter, 0),
+                    submitter,
+                    spec: JobSpec { program_hash: [7; 32], input_hash: [9; 32] },
+                    budget,
+                },
+                input: b"in",
+                executor: ParticipantId([9; 32]),
+                executor_bond: e_bond,
+                executor_claim: &claim,
+                candidates: &candidates,
+                verifier_bond: v_bond,
+                verifier_reveal: &reveal,
+                challenge: &challenge,
+                challenger_bond: p.challenger_bond,
+            };
+
+            prop_assert!(validate_economics(&mk(b, eb, vb), f, &p).is_ok());
+            if b > 0 {
+                prop_assert!(matches!(
+                    validate_economics(&mk(b - 1, eb, vb), f, &p),
+                    Err(EconViolation::BudgetBelowMin { .. })
+                ));
+            }
+            if eb > 0 {
+                prop_assert!(matches!(
+                    validate_economics(&mk(b, eb - 1, vb), f, &p),
+                    Err(EconViolation::ExecutorBondBelowMin { .. })
+                ));
+            }
+            if vb > 0 {
+                prop_assert!(matches!(
+                    validate_economics(&mk(b, eb, vb - 1), f, &p),
+                    Err(EconViolation::VerifierBondBelowMin { .. })
+                ));
+            }
+        }
+```
+
+(One subtlety the implementer must preserve: `executor_bond_min` is evaluated at the job's
+ACTUAL budget inside `validate_economics`, so the `mk(b - 1, …)` case must fail on the BUDGET
+check before any bond check — the variant assertions above pin that ordering.)
 
 - [ ] **Step 2: Verify failure** — `cargo test -p commputer-pouw economics` → compile FAIL (`validate_economics`/`run_priced_job` missing).
 
@@ -764,7 +844,7 @@ mod sim_fixtures {
 }
 ```
 
-- [ ] **Step 3: Generate + verify.** Create `sim/fixtures/`, write both .wat files, run the regenerator (`cargo test -p commputer-pouw --features wasm-runtime regenerate_sim_fixtures -- --ignored`), then `cargo test -p commputer-pouw --features wasm-runtime sim_fixtures` → PASS (2 active tests). If `fixtures_pass_gate_and_meter_in_their_classes` reports out-of-range fuel, tune the iteration constants in the .wat, regenerate, re-run; record final measured fuel in your report.
+- [ ] **Step 3: Generate + verify.** Create `sim/fixtures/`, write both .wat files, then **create empty placeholders first** — `touch src/staging/pouw/sim/fixtures/light.wasm src/staging/pouw/sim/fixtures/heavy.wasm` — because `include_bytes!` of a missing file is a compile error, so the regenerator test cannot even compile until the files exist. Then run the regenerator (`cargo test -p commputer-pouw --features wasm-runtime regenerate_sim_fixtures -- --ignored`), then `cargo test -p commputer-pouw --features wasm-runtime sim_fixtures` → PASS (2 active tests). Expected measurements (verified empirically under wasmi 1.0.9 during plan review — the loop costs exactly 4 fuel/iteration + 9 overhead): light @600,000 iters = **2,400,009 fuel** (in (1M, 5M]); heavy @15,000,000 iters = **60,000,009 fuel** (in [30M, 100M], comfortably under the 100M cap). If your measurements differ materially, tune the .wat iteration constants — never the range bounds — and record what you measured.
 
 - [ ] **Step 4: Commit** (binaries deliberately included):
 
@@ -778,7 +858,7 @@ git commit -m "feat(pouw/sim): light/heavy fuel-class fixtures — committed wat
 ### Task 7: `sim/realfuel.rs` — additive events, dual population, sweep
 
 **Files:**
-- Modify: `src/staging/pouw/sim/tournament.rs` (visibility ONLY: `struct JobModel` → `pub(crate) struct JobModel` with `pub(crate)` fields, `fn settle_one_job` → `pub(crate) fn`, `fn wrong_hash` → `pub(crate) fn`, `fn pid` → `pub(crate) fn`; zero behavior change)
+- Modify: `src/staging/pouw/sim/tournament.rs` (visibility ONLY, zero behavior change: `pub(crate)` on `struct JobModel` + all its fields, `struct JobDeltas` + its `executor`/`verifiers` fields (it is `settle_one_job`'s return type — realfuel's fold must destructure it), `fn settle_one_job`, and `fn pid`. `wrong_hash` stays private — realfuel never uses it.)
 - Create: `src/staging/pouw/sim/realfuel.rs`
 - Modify: `src/staging/pouw/sim/main.rs`
 
@@ -864,13 +944,16 @@ pub struct CornerResult {
     pub budget: u64,
     pub executor_bond: u64,
     pub verifier_bond: u64,
-    /// honest-equilibrium run (all-honest committee):
+    /// honest-equilibrium run (all-honest committee — no jackpot income possible):
     pub honest_executor_ev: f64,
     pub honest_verifier_ev: f64,
     /// mixed run (one rubber-stamp seat):
     pub cheat_executor_ev: f64,
     pub lazy_executor_ev: f64,
     pub rubber_stamp_ev: f64,
+    /// the mixed run's honest-verifier EV — the rubber-stamp comparison baseline
+    /// (spec §5.7: the cheat must lose relative to honesty IN ITS OWN population).
+    pub mixed_honest_verifier_ev: f64,
     pub safe: bool,
 }
 
@@ -948,14 +1031,121 @@ fn run_population(
 }
 ```
 
-…plus `fold` (the per-strategy accumulation — same logic as `run_tournament`'s two fold blocks, with `cost = realized_cost if does_work`), `run_sweep(grid, classes, jobs, seed) -> Vec<CornerResult>` (for each corner × the headline class: compute `price_per_mfuel` so `work_cost(measured)` lands near 1_000 — `price = 1_000 / max(1, measured.div_ceil(1M))` clamped ≥1; `F = if tight_cap { measured } else { WasmLimits::default().fuel }`; `budget = budget_min(F, &p)?` — corners whose pricing errors are reported as unpriceable and skipped with a printed note, never silently dropped), the safety judgment:
+…plus the three remaining functions, frozen here because the bond wiring is the single most
+load-bearing detail of the sweep (verified empirically during plan review: WITHOUT it the sweep
+prints NO SAFE CORNER at all 72 corners — settlement escrows the toy 100/20 default bonds against
+~1,000-token re-execution costs; WITH it, ~48/72 corners pass):
 
 ```rust
-    let safe = cheat_executor_ev <= 0.0
-        && lazy_executor_ev <= 0.0
-        && rubber_stamp_ev < honest_verifier_ev_mixed   // mixed-run comparison for the cheat
-        && honest_executor_ev > 0.0                      // honest-equilibrium run
-        && honest_verifier_ev > 0.0;                     // honest-equilibrium run
+/// Fold one settle_one_job outcome into the strategy buckets. Mirrors
+/// run_tournament's fold blocks; cost = realized work_cost when the strategy
+/// does the work.
+#[allow(clippy::too_many_arguments)]
+fn fold(
+    deltas: &JobDeltas,
+    executor_strat: Executor,
+    realized_cost: u64,
+    he: &mut StratStats, ce: &mut StratStats, le: &mut StratStats,
+    hv: &mut StratStats, rs: &mut StratStats,
+) {
+    if let Some((_who, delta, caught)) = deltas.executor {
+        let cost = if executor_strat.does_work() { realized_cost as i64 } else { 0 };
+        let bucket = match executor_strat {
+            Executor::Honest => &mut *he,
+            Executor::Cheat => &mut *ce,
+            Executor::Lazy => &mut *le,
+        };
+        bucket.plays += 1;
+        bucket.ev += delta - cost;
+        if caught { bucket.caught += 1; }
+    }
+    for (strat, delta, caught) in &deltas.verifiers {
+        let executor = pid(1); // matches run_population's executor id
+        let cost = if strat.does_work(&executor) { realized_cost as i64 } else { 0 };
+        let bucket = match strat {
+            Verifier::Honest => &mut *hv,
+            Verifier::RubberStamp => &mut *rs,
+            Verifier::Collude(_) => continue, // unreachable: our committees never seat colluders
+        };
+        bucket.plays += 1;
+        bucket.ev += *delta - cost;
+        if *caught { bucket.caught += 1; }
+    }
+}
+
+/// The spec §5.4 grid: 3 × 2 × 3 × 2 × 2 = 72 corners.
+pub fn default_grid() -> Vec<Corner> {
+    let mut g = Vec::new();
+    for s_bps in [2_500u32, 5_000, 10_000] {
+        for t_bps in [1_000u32, 2_500] {
+            for v_bps in [1_000u32, 2_500, 4_000] {
+                for k in [3usize, 5] {
+                    for tight_cap in [false, true] {
+                        g.push(Corner { s_bps, t_bps, v_bps, k, tight_cap });
+                    }
+                }
+            }
+        }
+    }
+    g
+}
+
+/// Sweep one fuel class over the grid. CRITICAL WIRING (spec §5.4 "budgets/bonds
+/// set AT the formula minimums"): the formula bonds MUST be assigned into the
+/// corner's GameParams — settle_one_job escrows/slashes p.executor_bond and
+/// p.verifier_bond, NOT the CornerResult fields. Unpriceable corners (BadParams)
+/// are printed and skipped, never silently dropped.
+pub fn run_sweep(grid: &[Corner], class: &FuelClass, jobs: u64, seed: u64) -> Vec<CornerResult> {
+    let mut out = Vec::new();
+    for (i, c) in grid.iter().enumerate() {
+        // Scale price so work_cost(measured) lands near 1_000 (readable EVs;
+        // the regime is scale-invariant in price).
+        let price = (1_000 / class.measured_fuel.div_ceil(1_000_000).max(1)).max(1);
+        let fuel_cap = if c.tight_cap { class.measured_fuel } else { WasmLimits::default().fuel };
+        let mut p = corner_params(c, price);
+        let realized_cost = work_cost(class.measured_fuel, price);
+
+        let priced = budget_min(fuel_cap, &p).and_then(|b| {
+            let eb = executor_bond_min(fuel_cap, b, &p)?;
+            let vb = verifier_bond_min(fuel_cap, &p)?;
+            Ok((b, eb, vb))
+        });
+        let (budget, e_bond, v_bond) = match priced {
+            Ok(t) => t,
+            Err(e) => {
+                println!("corner {i} unpriceable ({e:?}) — skipped");
+                continue;
+            }
+        };
+        // THE LOAD-BEARING LINES: settlement must escrow the formula bonds.
+        p.executor_bond = e_bond;
+        p.verifier_bond = v_bond;
+
+        let (he, _, _, hv, _) =
+            run_population(jobs, &p, budget, realized_cost, false, seed ^ i as u64);
+        let (_, ce, le, hv_mixed, rs) =
+            run_population(jobs, &p, budget, realized_cost, true, seed ^ i as u64 ^ 0xA5A5);
+
+        out.push(CornerResult {
+            corner: *c,
+            budget,
+            executor_bond: e_bond,
+            verifier_bond: v_bond,
+            honest_executor_ev: he.mean_ev(),
+            honest_verifier_ev: hv.mean_ev(),
+            cheat_executor_ev: ce.mean_ev(),
+            lazy_executor_ev: le.mean_ev(),
+            rubber_stamp_ev: rs.mean_ev(),
+            mixed_honest_verifier_ev: hv_mixed.mean_ev(),
+            safe: ce.mean_ev() <= 0.0
+                && le.mean_ev() <= 0.0
+                && rs.mean_ev() < hv_mixed.mean_ev() // the cheat loses in ITS OWN population
+                && he.mean_ev() > 0.0                 // honest-equilibrium run
+                && hv.mean_ev() > 0.0,                // honest-equilibrium run
+        });
+    }
+    out
+}
 ```
 
 and `table(results) -> String` printing one row per corner — `s/t/v/k/cap | budget | v_bond | hx_ev | hv_ev | cheat_ev | lazy_ev | rs_ev | SAFE?` — ending with the machine-greppable line:
