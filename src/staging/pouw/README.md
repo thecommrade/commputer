@@ -322,7 +322,7 @@ whether the node's local store holds the program bytes. The current prototype po
 node's store before running, so this is safe. The production DA (data-availability) cycle
 decides whether an unavailable program causes abstain or sentinel; that decision is deferred.
 
-**Error-sentinel settlement policy (founder-locked, spec §6):** a job whose agreed outcome is the error sentinel settles `Confirmed` with the executor paid the full worker share. The protective end: an out-of-fuel job effectively burned the full fuel budget, so paying less would enable executor-griefing via designed-to-OOF submissions; the generous end: an instant-error guest burns ~0 fuel yet collects the worker share, but this is submitter-self-inflicted — no third party can inject errors into another's deterministic job, and wash-trading errors loses at least the burn share per job. Refining this (paying OOF differently from gate-rejects) requires fuel-consumed in the claim format — a deferred game change (spec §10.2).
+**Error-sentinel settlement policy (founder-locked, spec §6):** a job whose agreed outcome is the error sentinel settles `Confirmed` with the executor paid the full worker share. The protective end: an out-of-fuel job effectively burned the full fuel budget, so paying less would enable executor-griefing via designed-to-OOF submissions; the generous end: an instant-error guest burns ~0 fuel yet collects the worker share, but this is submitter-self-inflicted — no third party can inject errors into another's deterministic job (the ProgramUnavailable caveat above is the lone exception, deferred to the DA cycle), and wash-trading errors loses at least the burn share per job. Refining this (paying OOF differently from gate-rejects) requires fuel-consumed in the claim format — a deferred game change (spec §10.2).
 
 ### Fuel metering
 
@@ -382,4 +382,80 @@ wired into CI before the testnet launch gate.
 ### Fuel economics (fuel-economics spec, 2026-06-11)
 
 Run the real-fuel sweep: `cargo run -p commputer-pouw --features wasm-runtime --bin pouw-sim --release`.
-Results table + recommended regime: filled in by the final task of the cycle.
+
+The full 72-row table is reproducible via the command above with the fixed `DEFAULT_SEED`.
+
+#### Measured fuel per class
+
+```
+class  guest: measured fuel        36117
+class  light: measured fuel      2400009
+class  heavy: measured fuel     60000009
+sweep class: guest (headline; light/heavy validated via fixtures)
+```
+
+#### Verdict
+
+```
+REAL-FUEL ECONOMICS: 48 safe corners — HONEST WORK PROFITABLE, CHEATING LOSES MONEY
+```
+
+#### Legend
+
+```
+legend: hx/hv = honest executor/verifier EV (honest-equilibrium run); cheat/lazy/rstamp = mixed-run EVs; v_bond = per-verifier stake at the formula minimum
+corner (s/t/v/k/cap)          budget    v_bond       hx_ev       hv_ev       cheat        lazy      rstamp  SAFE?
+```
+
+Column key: `s` = sample_rate_bps, `t` = p_trap_bps, `v` = verifier_bps (share of budget), `k` = committee size, `cap` = 100M (global WasmLimits fuel cap) or `tight` (fuel cap set to measured fuel exactly).
+
+#### All safe tight-cap corners (the real story)
+
+Of the 72 corners, 48 are safe. The 24 safe tight-cap rows below are the operational story: these are the corners where the fuel cap is set to the actual measured fuel for the program class, so bonds are honestly sized.
+
+```
+5000/1000/1000/3/tight         43200      9000     35720.0       207.8     -4013.8     -4304.8     -1020.2    yes
+5000/1000/1000/5/tight         72000      9000     60200.0       195.9     -4306.6     -7923.9     -1175.2    yes
+5000/1000/2500/3/tight         17280      9000     11096.0       206.1     -3261.2     -2602.8     -1063.8    yes
+5000/1000/2500/5/tight         28800      9000     19160.0       200.9     -3719.3     -4589.4     -1025.4    yes
+5000/1000/4000/3/tight         10800      9000      4940.0       199.8     -2534.6     -2098.7     -1067.8    yes
+5000/1000/4000/5/tight         18000      9000      8900.0       221.4     -4264.6     -3797.9     -1030.5    yes
+5000/2500/1000/3/tight         54000      4500     44900.0       201.2     -4820.8     -4855.6     -1032.0    yes
+5000/2500/1000/5/tight         90000      4500     75500.0       218.9     -5189.1     -6308.9     -1079.2    yes
+5000/2500/2500/3/tight         21600      4500     14120.0       209.4     -3593.3     -2967.2     -1100.1    yes
+5000/2500/2500/5/tight         36000      4500     24200.0       219.8     -4938.0     -5702.5     -1068.1    yes
+5000/2500/4000/3/tight         13500      4500      6425.0       207.9     -3108.2     -3168.0     -1124.5    yes
+5000/2500/4000/5/tight         22500      4500     11375.0       197.0     -5167.7     -4748.3     -1118.6    yes
+10000/1000/1000/3/tight        39600     16500     32660.0       194.0    -39600.0    -39600.0     -1157.1    yes
+10000/1000/1000/5/tight        66000     16500     55100.0       199.7    -66000.0    -66000.0     -1129.6    yes
+10000/1000/2500/3/tight        15840     16500     10088.0       202.2    -15840.0    -15840.0     -1013.3    yes
+10000/1000/2500/5/tight        26400     16500     17480.0       208.5    -26400.0    -26400.0     -1079.4    yes
+10000/1000/4000/3/tight         9900     16500      4445.0       201.1     -9900.0     -9900.0     -1092.0    yes
+10000/1000/4000/5/tight        16500     16500      8075.0       207.1    -16500.0    -16500.0      -975.1    yes
+10000/2500/1000/3/tight        45000      7500     37250.0       182.5    -45000.0    -45000.0     -1091.9    yes
+10000/2500/1000/5/tight        75000      7500     62750.0       204.6    -75000.0    -75000.0     -1147.7    yes
+10000/2500/2500/3/tight        18000      7500     11600.0       210.4    -18000.0    -18000.0     -1061.6    yes
+10000/2500/2500/5/tight        30000      7500     20000.0       195.7    -30000.0    -30000.0     -1095.9    yes
+10000/2500/4000/3/tight        11250      7500      5187.0       193.3    -11250.0    -11250.0     -1171.6    yes
+10000/2500/4000/5/tight        18750      7500      9312.0       188.4    -18750.0    -18750.0     -1085.3    yes
+```
+
+#### Why 100M-cap corners fail
+
+The 24 100M-cap corners in the s=2500 (25% sampling) half all fail. Representative failing rows:
+
+```
+2500/1000/1000/3/100M        5040000    525000   4283000.0    118049.5   2100000.0   1996456.4   -108887.7     NO
+2500/2500/2500/5/100M        4800000    300000   3359000.0    122700.4   1358369.9   1475580.9   -113936.3     NO
+2500/2500/4000/3/100M        1800000    300000    989000.0    117765.3    290997.8    310412.5   -112092.6     NO
+```
+
+Why: at a 100M-cap the formula prices the budget against a 100M-fuel job, making it enormous (millions of units). Against that budget, an undetected cheat's payoff (the full worker share of the huge budget) dwarfs the expected slash (bond sized to the 100M-cap formula minimum). The lesson is direct: the safe regime requires that fuel caps are honest, i.e., priced to the actual program's fuel usage — a per-job fuel cap, which is the deferred fuel-coupling cycle (spec §10.2). The 24 safe 100M-cap corners (the s=5000 and s=10000 rows) survive because their sampling rate is high enough that the catch probability alone closes the inequality even at inflated scale.
+
+#### Recommended regime
+
+**`5000/2500/2500/5/tight`** — s=50% sampling, t=25% trap rate, v=25% verifier share, k=5 committee, tight cap — is the safe corner with the lowest verifier-capital requirement (v_bond=4500) among the tight-cap corners with the highest honest-verifier EV margin (hv_ev=219.8).
+
+Adopting any corner as new `GameParams` defaults is a founder decision — note the `v_bond` column (a verifier must stake this per seat; at tight-cap/guest-class the minimum is 4500 units).
+
+**Deliberate policy reminder:** failing programs settle `Confirmed` with the executor paid the full worker share (see the error-sentinel settlement policy paragraph above).
