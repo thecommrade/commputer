@@ -187,3 +187,86 @@ mod tests {
         assert_eq!(budget_min(100_000_000, &p), Ok(2_400));
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use crate::params::GameParams;
+    use proptest::prelude::*;
+
+    /// Pricing-legal GameParams: nonzero divisors, valid split, strict margin.
+    fn econ_params() -> impl Strategy<Value = GameParams> {
+        (
+            1u32..=10_000,        // sample_rate_bps
+            1u32..=10_000,        // p_trap_bps
+            1u32..=9_998,         // verifier_bps (leaves >=1 each for worker+burn)
+            1usize..=9,           // k
+            1u64..=1_000_000,     // price_per_mfuel
+            10_001u32..=30_000,   // profit_margin_bps (strict)
+            10_000u32..=30_000,   // bond_safety_bps
+        )
+            .prop_map(|(s, t, v, k, price, margin, safety)| {
+                let worker = 10_000 - v - 1; // burn gets 1
+                GameParams {
+                    sample_rate_bps: s,
+                    p_trap_bps: t,
+                    worker_bps: worker,
+                    verifier_bps: v,
+                    burn_bps: 1,
+                    k,
+                    k_escalate: 2 * k + 1,
+                    price_per_mfuel: price,
+                    profit_margin_bps: margin,
+                    bond_safety_bps: safety,
+                    ..GameParams::default()
+                }
+            })
+    }
+
+    proptest! {
+        /// Monotone in fuel AND in price (spec §7); minimums never panic on legal params.
+        #[test]
+        fn formulas_monotone_and_total(p in econ_params(), f1 in 0u64..=u64::MAX, f2 in 0u64..=u64::MAX) {
+            let (lo, hi) = (f1.min(f2), f1.max(f2));
+            prop_assert!(budget_min(lo, &p).unwrap() <= budget_min(hi, &p).unwrap());
+            prop_assert!(verifier_bond_min(lo, &p).unwrap() <= verifier_bond_min(hi, &p).unwrap());
+            prop_assert!(executor_bond_min(lo, 0, &p).unwrap() <= executor_bond_min(hi, 0, &p).unwrap());
+            // price-monotonicity: same fuel, cheaper price never prices higher.
+            let mut cheaper = p.clone();
+            cheaper.price_per_mfuel = p.price_per_mfuel.saturating_sub(1).max(1);
+            prop_assert!(budget_min(hi, &cheaper).unwrap() <= budget_min(hi, &p).unwrap());
+            prop_assert!(verifier_bond_min(hi, &cheaper).unwrap() <= verifier_bond_min(hi, &p).unwrap());
+            prop_assert!(executor_bond_min(hi, 0, &cheaper).unwrap() <= executor_bond_min(hi, 0, &p).unwrap());
+        }
+
+        /// budget_min dominates BOTH of its component constraints.
+        #[test]
+        fn budget_min_dominates_components(p in econ_params(), f in 0u64..=u64::MAX) {
+            let wc = work_cost(f, p.price_per_mfuel) as u128;
+            let bx = (wc * p.profit_margin_bps as u128).div_ceil(p.worker_bps as u128);
+            let bv = (p.k as u128 * wc * (p.sample_rate_bps as u128 + p.p_trap_bps as u128)
+                * p.profit_margin_bps as u128)
+                .div_ceil(p.verifier_bps as u128 * p.sample_rate_bps as u128);
+            let b = budget_min(f, &p).unwrap() as u128;
+            // compare in saturated space: b is the saturated max of bx/bv
+            prop_assert!(b >= bx.min(u64::MAX as u128));
+            prop_assert!(b >= bv.min(u64::MAX as u128));
+        }
+
+        /// Degenerate params NEVER panic — they error (each zeroed divisor).
+        #[test]
+        fn degenerate_params_error_not_panic(f in 0u64..=u64::MAX, which in 0usize..5) {
+            let mut p = GameParams::default();
+            match which {
+                0 => p.sample_rate_bps = 0,
+                1 => p.p_trap_bps = 0,
+                2 => p.worker_bps = 0,
+                3 => p.verifier_bps = 0,
+                _ => p.k = 0,
+            }
+            prop_assert!(matches!(budget_min(f, &p), Err(EconViolation::BadParams(_))));
+            prop_assert!(matches!(executor_bond_min(f, 0, &p), Err(EconViolation::BadParams(_))));
+            prop_assert!(matches!(verifier_bond_min(f, &p), Err(EconViolation::BadParams(_))));
+        }
+    }
+}
