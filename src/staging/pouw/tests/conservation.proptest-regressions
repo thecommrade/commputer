@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 20e76736188e5c4cac3f2bf5aae2d4f3e5ef2a2ba7b9b6c9c5760ea2d653b54d # shrinks to branch = 0, budget = 1, executor_bond = 0, challenger_bond = 0, v_bonds = [], p_bonds = [], r_bonds = []
+cc b8c5e38b73f7e9a6ae0e4504675373dc99ff9d8d2db46ae7d5763b925f0f647b # shrinks to branch = 1, budget = 1, executor_bond = 0, challenger_bond = 0, v_bonds = [], p_bonds = [], r_bonds = []

@@ -1,0 +1,18 @@
+//! Proof-of-useful-work verification & settlement game (deterministic prototype).
+//! See src/staging/docs/2026-06-10-pouw-verification-game-design.md.
+
+pub mod commit_reveal;
+pub mod committee;
+pub mod economics;
+pub mod engine;
+pub mod escalation;
+pub mod ids;
+pub mod job;
+pub mod oracle;
+pub mod params;
+pub mod settlement;
+pub mod trap;
+pub mod verdict;
+
+#[cfg(feature = "wasm-runtime")]
+pub mod wasm;

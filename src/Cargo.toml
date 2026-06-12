@@ -12,6 +12,7 @@ members = [
     "desktop",
     "doctor",
     "seed-node-kit",
+    "staging/pouw",
 ]
 
 [workspace.package]

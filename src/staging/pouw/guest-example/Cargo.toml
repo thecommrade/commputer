@@ -1,0 +1,19 @@
+# Standalone guest crate — NOT a workspace member. Built by build-guest.sh to
+# wasm32-unknown-unknown; the artifact is CHECKED IN under src/wasm/fixtures/
+# so `cargo test` never needs the wasm32 toolchain (spec §4).
+[package]
+name = "guest-example"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+
+# Empty table: detaches this crate from the enclosing workspace so cargo
+# builds it standalone inside the tree (spec §4 guest constraint c).
+[workspace]
