@@ -223,10 +223,21 @@ mod prop_tests {
             })
     }
 
+    /// Mixed-scale fuel: ceil-boundary region, mid-scale, and full-range — so
+    /// monotonicity is exercised where the math is live, not just at saturation.
+    fn fuel() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            0u64..=4 * 1_000_000,    // the MFUEL ceil-boundary region
+            0u64..=1 << 40,          // mid-scale (no saturation at small prices)
+            0u64..=u64::MAX,         // full range incl. the saturation regime
+        ]
+    }
+
     proptest! {
         /// Monotone in fuel AND in price (spec §7); minimums never panic on legal params.
         #[test]
-        fn formulas_monotone_and_total(p in econ_params(), f1 in 0u64..=u64::MAX, f2 in 0u64..=u64::MAX) {
+        fn formulas_monotone_and_total(p in econ_params(), f1 in fuel(), f2 in fuel()) {
+            prop_assert!(p.validate().is_ok(), "econ_params must generate validate()-legal params");
             let (lo, hi) = (f1.min(f2), f1.max(f2));
             prop_assert!(budget_min(lo, &p).unwrap() <= budget_min(hi, &p).unwrap());
             prop_assert!(verifier_bond_min(lo, &p).unwrap() <= verifier_bond_min(hi, &p).unwrap());
@@ -241,7 +252,7 @@ mod prop_tests {
 
         /// budget_min dominates BOTH of its component constraints.
         #[test]
-        fn budget_min_dominates_components(p in econ_params(), f in 0u64..=u64::MAX) {
+        fn budget_min_dominates_components(p in econ_params(), f in fuel()) {
             let wc = work_cost(f, p.price_per_mfuel) as u128;
             let bx = (wc * p.profit_margin_bps as u128).div_ceil(p.worker_bps as u128);
             let bv = (p.k as u128 * wc * (p.sample_rate_bps as u128 + p.p_trap_bps as u128)
