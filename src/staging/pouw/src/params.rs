@@ -17,6 +17,15 @@ pub struct GameParams {
     pub challenger_reward_bps: u32,// challenge-Disputed: share of slashed Be to the challenger
     pub escalation_reward_bps: u32,// escalation: share of slashed bond to the panel
     pub trap_jackpot_bps: u32,     // trap: share of slashed rubber-stamper bonds to honest verifiers
+
+    // --- Fuel-pricing knobs (fuel-economics spec §3). ---
+    /// Token units per 1,000,000 fuel — converts the engine's deterministic fuel
+    /// metering into money. Consensus-visible market knob.
+    pub price_per_mfuel: u64,
+    /// Strict profitability margin (> 10_000) applied to budget_min's constraints.
+    pub profit_margin_bps: u32,
+    /// Safety multiplier (≥ 10_000) applied to both bond formulas.
+    pub bond_safety_bps: u32,
 }
 
 impl Default for GameParams {
@@ -32,6 +41,9 @@ impl Default for GameParams {
             challenger_reward_bps: 1_000,
             escalation_reward_bps: 1_000,
             trap_jackpot_bps: 5_000,
+            price_per_mfuel: 1,
+            profit_margin_bps: 12_000,
+            bond_safety_bps: 15_000,
         }
     }
 }
@@ -47,6 +59,15 @@ impl GameParams {
         if self.k_escalate <= self.k { return Err("k_escalate must exceed k"); }
         if self.quorum_den == 0 || self.quorum_num > self.quorum_den {
             return Err("bad quorum fraction");
+        }
+        if self.price_per_mfuel == 0 {
+            return Err("price_per_mfuel must be >= 1");
+        }
+        if self.profit_margin_bps <= 10_000 {
+            return Err("profit_margin_bps must be a strict margin (> 10_000)");
+        }
+        if self.bond_safety_bps < 10_000 {
+            return Err("bond_safety_bps must be >= 10_000");
         }
         Ok(())
     }
@@ -82,6 +103,29 @@ mod tests {
     fn validate_rejects_bad_split() {
         let mut p = GameParams::default();
         p.burn_bps += 1; // now sums to 10_001
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn pricing_defaults_and_validation() {
+        let p = GameParams::default();
+        assert_eq!(p.price_per_mfuel, 1);
+        assert_eq!(p.profit_margin_bps, 12_000);
+        assert_eq!(p.bond_safety_bps, 15_000);
+        assert!(p.validate().is_ok());
+
+        // margin must be a STRICT margin (> 10_000): exact break-even would make an
+        // at-minimum-funded honest role EV-zero and fail the sweep's strict EV-positive bar.
+        let mut p = GameParams::default();
+        p.profit_margin_bps = 10_000;
+        assert!(p.validate().is_err());
+
+        let mut p = GameParams::default();
+        p.bond_safety_bps = 9_999;
+        assert!(p.validate().is_err());
+
+        let mut p = GameParams::default();
+        p.price_per_mfuel = 0;
         assert!(p.validate().is_err());
     }
 }
