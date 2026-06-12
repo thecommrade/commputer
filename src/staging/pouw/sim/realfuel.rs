@@ -275,15 +275,18 @@ pub fn run_sweep(grid: &[Corner], class: &FuelClass, jobs: u64, seed: u64) -> Ve
 /// Founder-readable corner table + the machine-greppable verdict line.
 pub fn table(results: &[CornerResult]) -> String {
     let mut s = String::new();
+    // Caption (main.rs sweeps classes[0] = guest; update caption if sweep order changes)
+    s.push_str("sweep class: guest (headline; light/heavy validated via fixtures)\n");
+    s.push_str("legend: hx/hv = honest executor/verifier EV (honest-equilibrium run); cheat/lazy/rstamp = mixed-run EVs; v_bond = per-verifier stake at the formula minimum\n");
     s.push_str(&format!(
-        "{:<26} {:>9} {:>9} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6}\n",
+        "{:<26} {:>9} {:>9} {:>11} {:>11} {:>11} {:>11} {:>11} {:>6}\n",
         "corner (s/t/v/k/cap)", "budget", "v_bond", "hx_ev", "hv_ev", "cheat", "lazy", "rstamp", "SAFE?"
     ));
-    s.push_str(&format!("{}\n", "-".repeat(100)));
+    s.push_str(&format!("{}\n", "-".repeat(112)));
     for r in results {
         let cap = if r.corner.tight_cap { "tight" } else { "100M" };
         s.push_str(&format!(
-            "{:<26} {:>9} {:>9} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>6}\n",
+            "{:<26} {:>9} {:>9} {:>11.1} {:>11.1} {:>11.1} {:>11.1} {:>11.1} {:>6}\n",
             format!("{}/{}/{}/{}/{}", r.corner.s_bps, r.corner.t_bps, r.corner.v_bps, r.corner.k, cap),
             r.budget,
             r.verifier_bond,
@@ -325,5 +328,16 @@ mod tests {
         // determinism: same seed, same result
         let again = run_sweep(&grid, &classes[0], 500, 7);
         assert_eq!(results[0].honest_verifier_ev, again[0].honest_verifier_ev);
+
+        // The jackpot-exclusion property, asserted (not just claimed): an
+        // all-honest population never seats a rubber-stamper.
+        let p = {
+            let mut p = corner_params(&grid[0], 1_000);
+            p.executor_bond = 4_000;
+            p.verifier_bond = 2_000;
+            p
+        };
+        let (_, _, _, _, rs) = run_population(200, &p, 4_000, 1_000, false, 7);
+        assert_eq!(rs.plays, 0, "all-honest population must never seat a rubber-stamper");
     }
 }
