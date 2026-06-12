@@ -442,7 +442,7 @@ Of the 72 corners, 48 are safe. The 24 safe tight-cap rows below are the operati
 
 #### Why 100M-cap corners fail
 
-The 24 100M-cap corners in the s=2500 (25% sampling) half all fail. Representative failing rows:
+All 24 s=2500 (25% sampling) corners fail — 12 tight-cap and 12 100M-cap: at 25% sampling an unsampled cheat is too likely regardless of cap; the 100M-cap rows below additionally show how cap slack amplifies the loss. Representative failing rows:
 
 ```
 2500/1000/1000/3/100M        5040000    525000   4283000.0    118049.5   2100000.0   1996456.4   -108887.7     NO
@@ -454,7 +454,7 @@ Why: at a 100M-cap the formula prices the budget against a 100M-fuel job, making
 
 #### Recommended regime
 
-**`5000/2500/2500/5/tight`** — s=50% sampling, t=25% trap rate, v=25% verifier share, k=5 committee, tight cap — is the safe corner with the lowest verifier-capital requirement (v_bond=4500) among the tight-cap corners with the highest honest-verifier EV margin (hv_ev=219.8).
+**`5000/2500/2500/5/tight`** — s=50% sampling, t=25% trap rate, v=25% verifier share, k=5 committee, tight cap — is the tight-cap safe corner with the LOWEST verifier-capital requirement (v_bond=4500; six corners tie), and among those six, the highest honest-verifier EV (hv_ev=219.8).
 
 Adopting any corner as new `GameParams` defaults is a founder decision — note the `v_bond` column (a verifier must stake this per seat; at tight-cap/guest-class the minimum is 4500 units).
 
