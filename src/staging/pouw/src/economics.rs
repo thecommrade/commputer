@@ -9,11 +9,11 @@ use crate::params::GameParams;
 
 /// One mega-fuel: the pricing granularity (spec §2 — keeps integer math at test scale).
 const MFUEL: u64 = 1_000_000;
-#[allow(dead_code)] // consumed by Task 3
 const BPS: u128 = 10_000;
 
 /// Token cost of `fuel_cap` fuel at `price_per_mfuel` (ceil to whole mega-fuels).
 /// u128 intermediates, ONE final saturation (spec §3 integer rule).
+/// (Why one saturation: a saturating-u64 CHAIN under-prices — a saturated numerator divides back down. Over-strict is safe; lenient is not. Consensus-destined rule, frozen — spec §3.)
 pub fn work_cost(fuel_cap: u64, price_per_mfuel: u64) -> u64 {
     let mfuels = fuel_cap.div_ceil(MFUEL) as u128;
     sat64(mfuels * price_per_mfuel as u128)
@@ -24,7 +24,6 @@ fn sat64(x: u128) -> u64 {
 }
 
 /// ceil(n/d). Caller guarantees d > 0 (the guard refuses zero divisors).
-#[allow(dead_code)] // consumed by Task 3
 fn ceil_div(n: u128, d: u128) -> u128 {
     n.div_ceil(d)
 }
@@ -61,22 +60,41 @@ fn guard(p: &GameParams) -> Result<(), EconViolation> {
     Ok(())
 }
 
+/// budget_min = max(Bx, Bv) — fuel-economics spec §3.
+///   Bx (executor profitable):  B ≥ wc·margin/worker
+///   Bv (each committee slot profitable under the ADDITIVE event model):
+///       B ≥ k·wc·(s+t)·margin/(v·s)   — the two 10_000 factors cancel.
+/// Worst-case u128: wc(2^64−1)·k(few)·(s+t)(≤20_000)·margin(≤30_000) ≈ 1.5e28 « u128::MAX ≈ 3.4e38.
 pub fn budget_min(fuel_cap: u64, p: &GameParams) -> Result<u64, EconViolation> {
     guard(p)?;
-    let _ = fuel_cap;
-    unimplemented!("fuel-econ Task 3") // guard test only exercises the Err path
+    let wc = work_cost(fuel_cap, p.price_per_mfuel) as u128;
+    let (s, t) = (p.sample_rate_bps as u128, p.p_trap_bps as u128);
+    let margin = p.profit_margin_bps as u128;
+    let bx = ceil_div(wc * margin, p.worker_bps as u128);
+    let bv = ceil_div(
+        p.k as u128 * wc * (s + t) * margin,
+        p.verifier_bps as u128 * s,
+    );
+    Ok(sat64(bx.max(bv)))
 }
 
+/// max(ceil(wc·safety/s), budget) — the parent-spec Be ≥ B rule preserved; under
+/// the additive model the executor's catch rate is exactly s. For k ≥ 2 the
+/// formula term never binds against the Bv-driven budget (spec §3 note).
 pub fn executor_bond_min(fuel_cap: u64, budget: u64, p: &GameParams) -> Result<u64, EconViolation> {
     guard(p)?;
-    let _ = (fuel_cap, budget);
-    unimplemented!("fuel-econ Task 3")
+    let wc = work_cost(fuel_cap, p.price_per_mfuel) as u128;
+    let formula = ceil_div(wc * p.bond_safety_bps as u128, p.sample_rate_bps as u128);
+    Ok(sat64(formula.max(budget as u128)))
 }
 
+/// ceil(wc·safety·(s+t)/(10_000·t)) — a rubber-stamper saves a FULL re-execution
+/// and is caught only on trap events (per-event probability t/(s+t)).
 pub fn verifier_bond_min(fuel_cap: u64, p: &GameParams) -> Result<u64, EconViolation> {
     guard(p)?;
-    let _ = fuel_cap;
-    unimplemented!("fuel-econ Task 3")
+    let wc = work_cost(fuel_cap, p.price_per_mfuel) as u128;
+    let (s, t) = (p.sample_rate_bps as u128, p.p_trap_bps as u128);
+    Ok(sat64(ceil_div(wc * p.bond_safety_bps as u128 * (s + t), BPS * t)))
 }
 
 #[cfg(test)]
@@ -98,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn degenerate_params_are_refused_not_paniced() {
+    fn degenerate_params_are_refused_not_panicked() {
         let zero = |f: fn(&mut GameParams)| {
             let mut p = GameParams::default();
             f(&mut p);
@@ -125,5 +143,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Hand-verified at the spec's defaults: F=100M, price=1 ⇒ wc=100;
+    /// k=3, s=10_000, t=1_000, v=1_000, w=8_500, margin=12_000, safety=15_000.
+    #[test]
+    fn formulas_at_spec_defaults() {
+        let p = GameParams::default();
+        let f = 100_000_000u64;
+        // Bx = ceil(100·12_000/8_500) = 142;  Bv = ceil(3·100·11_000·12_000/(1_000·10_000)) = 3_960
+        assert_eq!(budget_min(f, &p), Ok(3_960));
+        // formula term ceil(100·15_000/10_000)=150 never binds vs budget (spec §3 note)
+        assert_eq!(executor_bond_min(f, 3_960, &p), Ok(3_960));
+        assert_eq!(executor_bond_min(f, 100, &p), Ok(150)); // formula binds only when budget < it
+        // ceil(100·15_000·11_000/(10_000·1_000)) = 1_650
+        assert_eq!(verifier_bond_min(f, &p), Ok(1_650));
+    }
+
+    /// Spec §3 integer rule: never under-price at extremes. Every *_min must be
+    /// >= the saturated work_cost — u128 intermediates with ONE final saturation
+    /// (a saturating-u64 chain would collapse the numerator and under-price).
+    #[test]
+    fn no_underpricing_at_extremes() {
+        let mut p = GameParams::default();
+        p.price_per_mfuel = u64::MAX;
+        let f = u64::MAX;
+        let wc = work_cost(f, p.price_per_mfuel); // saturates to u64::MAX
+        assert_eq!(wc, u64::MAX);
+        assert!(budget_min(f, &p).unwrap() >= wc);
+        assert!(executor_bond_min(f, 0, &p).unwrap() >= wc);
+        assert!(verifier_bond_min(f, &p).unwrap() >= wc);
+    }
+
+    /// Bx can bind when the worker slice is thin: with v=9_000, w=500,
+    /// Bv = ceil(3·100·11_000·12_000/(9_000·10_000)) = 440 and
+    /// Bx = ceil(100·12_000/500) = 2_400 ⇒ budget_min = 2_400.
+    #[test]
+    fn bx_binds_when_worker_slice_is_thin() {
+        let mut p = GameParams::default();
+        p.worker_bps = 500;
+        p.verifier_bps = 9_000;
+        p.burn_bps = 500;
+        assert_eq!(budget_min(100_000_000, &p), Ok(2_400));
     }
 }
