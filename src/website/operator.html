@@ -6,7 +6,7 @@
     <title>Commputer — Run a Node</title>
     <meta name="description" content="5-minute operator guide: how to run a Commputer node, register as a validator, and earn block rewards.">
     <meta property="og:title" content="Commputer — Run a Node">
-    <meta property="og:description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources.">
+    <meta property="og:description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources. Local testnet running; mainnet not yet launched.">
     <meta property="og:image" content="https://commputer.xyz/og-image.png">
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -45,13 +45,13 @@
             <div class="steps">
                 <div class="step">
                     <span class="step-num">01</span>
-                    <h3>Install the Binary</h3>
-                    <p>Download the Commputer node for your platform. One file, no dependencies.</p>
+                    <h3>Build the Binary</h3>
+                    <p>Prebuilt binaries ship with the first tagged release. For now, build from source &mdash; install Rust (rustup.rs), then:</p>
                     <div class="code-block">
-                        <code>curl -sSf https://commputer.xyz/install.sh | sh</code>
-                        <button class="copy-btn" onclick="copyText('curl -sSf https://commputer.xyz/install.sh | sh')">copy</button>
+                        <code>git clone https://github.com/thecommrade/commputer &amp;&amp; cd commputer &amp;&amp; cargo build --release</code>
+                        <button class="copy-btn" onclick="copyText('git clone https://github.com/thecommrade/commputer &amp;&amp; cd commputer &amp;&amp; cargo build --release')">copy</button>
                     </div>
-                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">This downloads the latest binary and places it in <code style="color: var(--accent);">~/.local/bin/commputer</code>. If that directory isn't in your PATH, the installer will tell you how to add it.</p>
+                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">The binary lands at <code style="color: var(--accent);">target/release/commputer</code>. Copy it somewhere on your PATH (e.g. <code style="color: var(--accent);">~/.local/bin</code>).</p>
                 </div>
 
                 <div class="step">
@@ -143,7 +143,7 @@
 
                 <details>
                     <summary>How often do I earn rewards?</summary>
-                    <p>Block rewards are awarded per block (~every 2 seconds) and credited to your account automatically. The first reward comes at the next epoch boundary (which occurs roughly every 1800 blocks, or ~1 hour). All rewards are final and can't be taken away.</p>
+                    <p>Block rewards are awarded per block (~every 2 seconds) and credited to your account automatically. The first reward comes at the next epoch boundary (which occurs roughly every 1800 blocks, or ~1 hour). Earned block rewards are final and can't be taken away. (Separately, once compute jobs go live, bonds staked on job verification can be slashed for dishonest verdicts &mdash; that never touches block rewards already earned.)</p>
                 </details>
 
                 <details>
@@ -163,12 +163,12 @@
 
                 <details>
                     <summary>What's the testnet vs mainnet difference?</summary>
-                    <p>Testnet is the public proving ground for Commputer. Run here first to learn how the system works. Mainnet launches end of May 2026 with real economic value. Testnet coins are worthless. Plan to migrate your validator to mainnet when it launches.</p>
+                    <p>Testnet will be the public proving ground for Commputer — consensus is currently verified in local multi-node testing, with a wider public testnet as the next milestone. Run a node to learn how the system works. Mainnet launches May 2027 or sooner, with real economic value. Testnet coins are worthless. Plan to migrate your validator to mainnet when it launches.</p>
                 </details>
 
                 <details>
                     <summary>Where do I report bugs or ask for help?</summary>
-                    <p><a href="https://github.com/thecommrade/commputer" style="color: var(--accent);">GitHub Issues</a> for technical bugs. <a href="https://t.me/CommradeProject" style="color: var(--accent);">Telegram</a> for community questions.</p>
+                    <p><a href="https://github.com/thecommrade/commputer" style="color: var(--accent);">GitHub Issues</a> for technical bugs, or email <a href="mailto:bugreport@commputer.xyz" style="color: var(--accent);">bugreport@commputer.xyz</a>. <a href="https://t.me/CommradeProject" style="color: var(--accent);">Telegram</a> for community questions.</p>
                 </details>
             </div>
 
@@ -177,6 +177,7 @@
                 <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 8px;"><strong style="color: var(--text);">Stuck on installation?</strong> Make sure you have <code style="color: var(--accent);">curl</code> installed. On Linux: <code style="color: var(--accent);">sudo apt install curl</code>. On Mac: <code style="color: var(--accent);">brew install curl</code>.</p>
                 <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 8px;"><strong style="color: var(--text);">Node won't sync?</strong> Check your internet connection. The node needs to reach other nodes via TCP/QUIC. If you're behind a strict firewall, you might need to open ports.</p>
                 <p style="font-size: 13px; color: var(--text-dim);"><strong style="color: var(--text);">Lost your seed phrase?</strong> Your coins are still in your account on-chain. If you lose the seed AND your wallet file, you can't recover the keypair. Write it down immediately.</p>
+                <p style="font-size: 13px; color: var(--text-dim); margin-top: 8px;"><strong style="color: var(--text);">Still stuck?</strong> Email <a href="mailto:bugreport@commputer.xyz" style="color: var(--accent);">bugreport@commputer.xyz</a> with your node logs.</p>
             </div>
 
             <div style="text-align: center; margin-top: 48px;">
@@ -193,7 +194,8 @@
                 <div class="footer-links">
                     <a href="https://github.com/thecommrade/commputer">GitHub</a>
                     <a href="index.html#whitepaper">Whitepaper</a>
-                    <a href="#">Twitter</a>
+                    <a href="https://x.com/CommputerCoin">Twitter</a>
+                    <a href="mailto:commrade@commputer.xyz">Contact</a>
                 </div>
                 <p class="footer-copy">$COMME &middot; 2B supply &middot; burn-heavy &middot; scale hurts</p>
             </div>

@@ -66,7 +66,7 @@ Commputer launches as a working L1 blockchain. A Rust CLI node. Here is what it 
 
 ### Dual Burn Mechanics
 
-✅ Supply only goes down. Milestone burns trigger automatically when the network hits capacity thresholds. 🔧 Burst compute burns let holders spend $COMME on temporary compute beyond their tier — permanently burned. ✅ Transaction fees are burned. Details in Section 7.
+✅ Supply only goes down. Milestone burns trigger automatically when the network hits capacity thresholds. 🔧 Burst compute burns let holders spend $COMME on temporary compute beyond their tier — permanently burned. ✅ Transaction fees are burned. (Job-submission budgets are handled separately via escrow and a stake-weighted verification committee — see Section 9.) Details in Section 7.
 
 ### P2P Networking
 

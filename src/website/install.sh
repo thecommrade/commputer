@@ -15,6 +15,16 @@ main() {
     echo "  ╚═══════════════════════════════════════════╝"
     echo ""
 
+    # GATE: no prebuilt binaries are published yet — remove this block when the
+    # first tagged release ships with commputer-{linux,macos}-{x86_64,aarch64} assets.
+    echo "  Prebuilt binaries are not published yet."
+    echo "  Build from source instead (requires Rust — rustup.rs):"
+    echo ""
+    echo "    git clone https://github.com/$REPO && cd commputer && cargo build --release"
+    echo ""
+    echo "  The binary lands at target/release/commputer."
+    exit 1
+
     # Check for required tools
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
         echo "ERROR: curl or wget is required but neither was found."

@@ -87,7 +87,7 @@
                     <span class="stat-value" id="stat-pending">—</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-label">NERF %</span>
+                    <span class="stat-label">NERF FLOOR %</span>
                     <span class="stat-value" id="stat-nerf">80</span>
                 </div>
             </div>
@@ -104,16 +104,18 @@
             </div>
             <div style="background: var(--bg-card); border: 1px solid var(--border); padding: 24px; margin-bottom: 32px;">
                 <h3 style="color: var(--accent); margin-bottom: 12px;">What's Live Right Now</h3>
+                <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px;"><strong style="color: var(--text);">Update — June 10, 2026:</strong> Multi-node consensus verified in local testing — independent node instances finalize blocks and stay in agreement on the same chain, with no crashes. Anti-scale detection (datacenter / colocation) tightened. Next: a wider public testnet.</p>
                 <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px;"><strong style="color: var(--text);">Phase 1: Consensus Stability (Live)</strong></p>
                 <ul style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px; padding-left: 24px;">
-                    <li>Testnet running: consensus works, blocks finalize, coins are mined and burned</li>
+                    <li>Local testnet running: consensus works, blocks finalize, coins are mined and burned</li>
                     <li>Real network stats: peer count, block height, circulating supply, epoch number</li>
-                    <li>Validator registration: run a node, stake 0.01 COMME, earn block rewards</li>
+                    <li>Validator registration (testnet): run a node, stake 0.01 COMME, earn block rewards</li>
                     <li>Block explorer: search blocks by height, view transactions, trace accounts</li>
                 </ul>
                 <p style="font-size: 13px; color: var(--text-dim);"><strong style="color: var(--text);">Phase 2: In Flight</strong></p>
                 <ul style="font-size: 13px; color: var(--text-dim); padding-left: 24px;">
-                    <li>Proof-of-work scoring (weighted by machine capacity)</li>
+                    <li>Proof-of-useful-work scoring (weighted by machine capacity)</li>
+                    <li>Compute-job verification game &mdash; built in staging (stake-weighted committee, commit-reveal, fuel-metered deterministic WASM, Merkle/Reed-Solomon data-availability sampling); not yet wired into mainnet consensus</li>
                     <li>Anti-scale enforcement (single desktop max, warehouse penalty)</li>
                     <li>Grace periods (offline uptime tolerance)</li>
                     <li>Burn events (transaction fees, milestones, incentive burns)</li>
@@ -130,7 +132,7 @@
                 </div>
                 <div class="principle">
                     <h3>Burns Everything</h3>
-                    <p>2 billion $COMME. Fixed supply. Transaction fees burned. Every compute job, every milestone -- burned. Supply only goes down.</p>
+                    <p>2 billion $COMME. Fixed supply. Transaction fees burned. Burst-compute spending and milestones burned; every compute job pays a 5% protocol burn. Supply only goes down.</p>
                 </div>
                 <div class="principle">
                     <h3>Patience Rewards</h3>
@@ -154,7 +156,6 @@
                 <p>The complete protocol specification, tokenomics, and vision for Commputer.</p>
                 <div class="whitepaper-actions">
                     <a href="whitepaper.html" class="btn-primary">Read Online</a>
-                    <a href="commputer-whitepaper.pdf" class="btn-secondary">Download PDF</a>
                 </div>
             </div>
         </section>
@@ -165,23 +166,18 @@
             <div class="content-block">
                 <div id="download-detected">
                     <p>Detected: <strong id="detected-os">Unknown</strong></p>
-                    <a href="#" class="btn-primary" id="download-btn">Download for your platform</a>
+                    <a href="https://github.com/thecommrade/commputer" class="btn-primary" id="download-btn">Binaries coming soon &mdash; build from source</a>
                 </div>
                 <div class="install-command">
-                    <p>Or install via terminal:</p>
+                    <p>Build from source (requires Rust &mdash; rustup.rs):</p>
                     <div class="code-block">
-                        <code>curl -sSf https://commputer.xyz/install.sh | sh</code>
-                        <button class="copy-btn" onclick="copyText('curl -sSf https://commputer.xyz/install.sh | sh')">copy</button>
+                        <code>git clone https://github.com/thecommrade/commputer &amp;&amp; cd commputer &amp;&amp; cargo build --release</code>
+                        <button class="copy-btn" onclick="copyText('git clone https://github.com/thecommrade/commputer &amp;&amp; cd commputer &amp;&amp; cargo build --release')">copy</button>
                     </div>
                 </div>
                 <details class="other-platforms">
                     <summary>All platforms</summary>
-                    <table class="download-table">
-                        <tr><td>Linux x86_64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-linux-x86_64">commputer-linux-x86_64</a></td><td class="hash">sha256: —</td></tr>
-                        <tr><td>Linux aarch64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-linux-aarch64">commputer-linux-aarch64</a></td><td class="hash">sha256: —</td></tr>
-                        <tr><td>macOS x86_64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-macos-x86_64">commputer-macos-x86_64</a></td><td class="hash">sha256: —</td></tr>
-                        <tr><td>macOS aarch64</td><td><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-macos-aarch64">commputer-macos-aarch64</a></td><td class="hash">sha256: —</td></tr>
-                    </table>
+                    <p style="font-size: 13px; color: var(--text-dim); padding: 8px 0;">Prebuilt binaries (Linux/macOS, x86_64 + aarch64) with SHA-256 checksums will be published with the first tagged release. Until then, build from source with the command above.</p>
                 </details>
             </div>
         </section>
@@ -215,6 +211,7 @@
                 <div style="margin-top: 24px;">
                     <a href="operator.html" class="btn-primary">Read the Operator Guide</a>
                 </div>
+                <p style="margin-top: 16px; font-size: 14px; color: var(--text-dim);">Questions, press, or partnership? <a href="mailto:commrade@commputer.xyz" style="color: var(--accent);">commrade@commputer.xyz</a></p>
             </div>
 
             <div class="faq">
@@ -258,7 +255,8 @@
                 <div class="footer-links">
                     <a href="https://github.com/thecommrade/commputer">GitHub</a>
                     <a href="whitepaper.html">Whitepaper</a>
-                    <a href="#">Twitter</a>
+                    <a href="https://x.com/CommputerCoin">Twitter</a>
+                    <a href="mailto:commrade@commputer.xyz">Contact</a>
                 </div>
                 <p class="footer-copy">$COMME &middot; 2B supply &middot; burn-heavy &middot; scale hurts</p>
             </div>
