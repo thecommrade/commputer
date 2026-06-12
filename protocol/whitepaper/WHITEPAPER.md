@@ -323,13 +323,13 @@ The node software is written in Rust — the language the most battle-tested mod
 
 📋 The pooled resources are not theoretical. They are usable. Here is how:
 
-**Submitting a job:** A holder spends $COMME to submit a compute job — train a model, process a dataset, run inference, render video, anything that requires compute. The spent $COMME is permanently burned. The job specification describes resource requirements (CPU, GPU, RAM, storage, bandwidth), maximum duration, and the work to be done.
+**Submitting a job:** A holder spends $COMME to submit a compute job — train a model, process a dataset, run inference, render video, anything that requires compute. The spent $COMME is escrowed by the protocol, not destroyed: once the result is verified it is split between the executor who did the work, the verifiers who checked it, and a protocol burn — so every job still permanently removes a slice of supply. If the result is found incorrect, the submitter is refunded and the dishonest executor forfeits a staked bond. The job specification describes resource requirements (CPU, GPU, RAM, storage, bandwidth), maximum duration, and the work to be done.
 
 **Routing:** The network matches the job to validators with the right resource profile. A GPU-intensive job routes to validators with GPUs. A storage-heavy job routes to validators with disk space. The protocol respects the 51/49 split: jobs tagged by the core development team for communal products (storage, communication, AI, the Humanities Archive) get priority access to 51% of capacity. All other jobs share the remaining 49%.
 
 **Execution:** Jobs run in sandboxed environments on the validator's machine. The validator cannot see the job contents. The job cannot access the validator's system. Resource limits are enforced by the protocol.
 
-**Verification:** When a job completes, random validators independently re-execute a portion of the work. If results don't match, the job is disputed. The majority result wins. Incorrect executors are penalized. Correct verifiers earn a share of the job's budget.
+**Verification:** When a job completes, a stake-weighted committee of validators is sampled to independently re-execute the work, committing to their results before revealing them. If the committee reaches quorum against the executor's claim, the job is disputed, the executor's bond is slashed, and the submitter is refunded. Correct verifiers earn a share of the job's budget; a verifier who rubber-stamps a wrong result forfeits its own bond.
 
 **Pricing:** Dynamic, based on network load. When the network has surplus capacity, jobs are cheap. When capacity is scarce, prices rise steeply. Near full capacity, the price becomes prohibitive — the protocol's way of saying "the network needs more validators, not more jobs."
 

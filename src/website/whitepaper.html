@@ -402,10 +402,10 @@
             <p><strong>Resource Orchestration:</strong> Matches jobs to available resources. Respects the 51/49 split. Decomposes large tasks into desktop-sized pieces and reassembles results.</p>
 
             <h3>Compute Jobs</h3>
-            <p><strong>Submitting a job:</strong> A holder spends $COMME to submit a compute job. The spent $COMME is permanently burned. The job specification describes resource requirements, maximum duration, and the work to be done.</p>
+            <p><strong>Submitting a job:</strong> A holder spends $COMME to submit a compute job. The spent $COMME is escrowed by the protocol, not destroyed: once the result is verified it is split between the executor who did the work, the verifiers who checked it, and a protocol burn &mdash; so every job still permanently removes a slice of supply. If the result is found incorrect, the submitter is refunded and the dishonest executor forfeits a staked bond. The job specification describes resource requirements, maximum duration, and the work to be done.</p>
             <p><strong>Routing:</strong> The network matches the job to validators with the right resource profile. The protocol respects the 51/49 split.</p>
             <p><strong>Execution:</strong> Jobs run in sandboxed environments on the validator's machine. The validator cannot see the job contents. The job cannot access the validator's system.</p>
-            <p><strong>Verification:</strong> Random validators independently re-execute a portion of the work. If results don't match, the job is disputed. The majority result wins.</p>
+            <p><strong>Verification:</strong> When a job completes, a stake-weighted committee of validators is sampled to independently re-execute the work, committing to their results before revealing them. If the committee reaches quorum against the executor's claim, the job is disputed, the executor's bond is slashed, and the submitter is refunded. Correct verifiers earn a share of the job's budget; a verifier who rubber-stamps a wrong result forfeits its own bond.</p>
             <p><strong>Pricing:</strong> Dynamic, based on network load. Near full capacity, the price becomes prohibitive &mdash; the protocol's way of saying "the network needs more validators, not more jobs."</p>
 
             <hr>
