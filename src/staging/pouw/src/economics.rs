@@ -42,8 +42,8 @@ pub enum EconViolation {
 /// The spec §3 degenerate-params guard: a job cannot be PRICED in a regime with
 /// no proactive catching, no traps, no paid role, or no committee.
 /// Also enforces semantic upper bounds to prevent u128 wrap in budget_min /
-/// *_bond_min (probability bps capped at 10_000; multiplier fields capped at
-/// 100_000 / 1_000 respectively).
+/// *_bond_min (rate fields capped at 10_000 (probabilities); multiplier fields at
+/// 100_000 (10x); k at 1_000).
 fn guard(p: &GameParams) -> Result<(), EconViolation> {
     if p.sample_rate_bps == 0 {
         return Err(EconViolation::BadParams("sample_rate_bps == 0 (no proactive catching)"));
@@ -142,9 +142,26 @@ pub fn validate_economics(
     Ok(())
 }
 
+/// ## Error-outcome policy (founder-locked, fuel-economics spec §6)
+///
+/// A job whose agreed outcome is the error sentinel settles `Confirmed` with
+/// the executor paid the worker share — deliberately:
+/// * Protective end: an out-of-fuel job burned *effectively* the full fuel
+///   budget (wasmi leaves a small remainder), so paying less would open
+///   executor-griefing via designed-to-OOF jobs until executors stop accepting
+///   work.
+/// * Generous end (stated honestly): an instant-error guest burns ~0 fuel yet
+///   collects the full worker share of the Bv-driven budget. This is
+///   submitter-self-inflicted — no third party can inject errors into someone
+///   else's deterministic job, and wash-trading errors loses at least the burn
+///   share per job.
+/// Refining this (paying OOF differently from gate-rejects) requires fuel in
+/// the claim format — a deferred game change (spec §10.2).
+///
 /// THE enforcement surface (spec §4): validate, then delegate to the
 /// byte-identical engine::run_job. The on-chain cycle wires the real submit
 /// path to this same check; engine::run_job remains the unpriced core.
+/// fuel_cap is the job's DECLARED cap (v1: the global WasmLimits.fuel; per-job caps arrive with the on-chain job format) — wire the real submit path to call THIS function (or validate_economics before escrow).
 #[allow(clippy::too_many_arguments)]
 pub fn run_priced_job(
     l: &mut dyn ChainHooks,
@@ -424,7 +441,7 @@ mod tests {
         let (v2, o2) = run_job(&mut l_bare, &p, &inputs, &vm, &ByteEq, &stake, &mut rng);
 
         assert!(matches!(v1, Verdict::Confirmed { .. }));
-        assert_eq!(format!("{v1:?}"), format!("{v2:?}"));
+        assert_eq!(v1, v2);
         assert_eq!(o1, o2);
     }
 }
@@ -561,6 +578,7 @@ mod prop_tests {
             prop_assert!(validate_economics(&mk(b, eb, vb), f, &p).is_ok());
             if b > 0 {
                 let r = validate_economics(&mk(b - 1, eb, vb), f, &p);
+                // matches! expanded into a binding so failures print the actual error (prop_assert! chokes on brace patterns)
                 let ok = matches!(r, Err(EconViolation::BudgetBelowMin { .. }));
                 prop_assert!(ok, "expected BudgetBelowMin, got {:?}", r);
             }

@@ -447,7 +447,7 @@ mod priced_game {
     /// worker share — both ends of the rationale documented in economics.rs.
     #[test]
     fn error_sentinel_job_settles_confirmed_at_formula_minimums() {
-        let p = GameParams { p_trap_bps: 1_000, ..GameParams::default() };
+        let p = GameParams { p_trap_bps: 1_000, ..GameParams::default() }; // == default; pinned explicitly — the minimum formulas divide by it (guard rejects 0)
         let fuel_cap = WasmLimits::default().fuel;
         let budget = budget_min(fuel_cap, &p).unwrap();
         let e_bond = executor_bond_min(fuel_cap, budget, &p).unwrap();
@@ -513,6 +513,7 @@ mod priced_game {
     }
 
     /// budget_min scales with the measured fuel of a REAL program (spec §7).
+    /// Takeaway: you are priced on the cap you DECLARE, not the fuel you burn — a sub-mfuel job submitted at the global 100M cap pays ~100x (no refunds in v1; per-job caps + gas-style refunds are deferred).
     #[test]
     fn budget_min_scales_with_real_measured_fuel() {
         const GUEST: &[u8] = include_bytes!("../src/wasm/fixtures/guest_example.wasm");

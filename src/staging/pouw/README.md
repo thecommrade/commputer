@@ -322,6 +322,8 @@ whether the node's local store holds the program bytes. The current prototype po
 node's store before running, so this is safe. The production DA (data-availability) cycle
 decides whether an unavailable program causes abstain or sentinel; that decision is deferred.
 
+**Error-sentinel settlement policy (founder-locked, spec §6):** a job whose agreed outcome is the error sentinel settles `Confirmed` with the executor paid the full worker share. The protective end: an out-of-fuel job effectively burned the full fuel budget, so paying less would enable executor-griefing via designed-to-OOF submissions; the generous end: an instant-error guest burns ~0 fuel yet collects the worker share, but this is submitter-self-inflicted — no third party can inject errors into another's deterministic job, and wash-trading errors loses at least the burn share per job. Refining this (paying OOF differently from gate-rejects) requires fuel-consumed in the claim format — a deferred game change (spec §10.2).
+
 ### Fuel metering
 
 Wasmi's built-in instruction fuel counter is the **only** consensus meter. Wall-clock time is
@@ -376,3 +378,8 @@ wired into CI before the testnet launch gate.
 - **Compiled-module cache:** Wasmi compiles (`CompilationMode::Eager`) on every
   `Module::new` call. A per-node module cache keyed by `program_hash` is a follow-up
   performance optimisation; it does not affect consensus.
+
+### Fuel economics (fuel-economics spec, 2026-06-11)
+
+Run the real-fuel sweep: `cargo run -p commputer-pouw --features wasm-runtime --bin pouw-sim --release`.
+Results table + recommended regime: filled in by the final task of the cycle.
