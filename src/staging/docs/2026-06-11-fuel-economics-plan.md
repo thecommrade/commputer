@@ -27,7 +27,7 @@
 | `src/staging/pouw/src/economics.rs` | Create | formulas, guard, `EconViolation`, `validate_economics`, `run_priced_job`, unit+prop tests |
 | `src/staging/pouw/src/params.rs` | Modify | +3 fields, `validate()` rules, test updates |
 | `src/staging/pouw/src/lib.rs` | Modify | `pub mod economics;` (one line) |
-| `src/staging/pouw/sim/tournament.rs` | Modify | visibility lift only: `pub(crate)` on `JobModel`, `settle_one_job`, `wrong_hash`, `pid` |
+| `src/staging/pouw/sim/tournament.rs` | Modify | visibility lift only: `pub(crate)` on `JobModel` (+fields), `JobDeltas` (+fields), `settle_one_job`, `pid` |
 | `src/staging/pouw/sim/realfuel.rs` | Create | feature-gated real-fuel sweep (additive events, dual-population, table) |
 | `src/staging/pouw/sim/main.rs` | Modify | feature-gated `mod realfuel;` + invocation |
 | `src/staging/pouw/sim/fixtures/{light,heavy}.wat` + `.wasm` | Create | weight-class programs (committed .wat source + prebuilt .wasm) |
@@ -630,9 +630,11 @@ PROPERTY, not just a default-params unit test — this closes that row over the 
 space; checks the formula relations directly, which is what `validate_economics` enforces):
 
 ```rust
-        use crate::engine::JobInputs;
-        use crate::ids::{JobId, ParticipantId};
-        use crate::job::{Job, JobSpec};
+    // NOTE: these `use` lines go at `mod prop_tests` scope, OUTSIDE the
+    // proptest! { } macro (the macro body only accepts fn items).
+    use crate::engine::JobInputs;
+    use crate::ids::{JobId, ParticipantId};
+    use crate::job::{Job, JobSpec};
 
         /// Funded-at-minimum always passes validate_economics; any single
         /// component one-below-minimum fails with the MATCHING variant — over
