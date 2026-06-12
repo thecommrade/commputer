@@ -185,7 +185,7 @@ impl Report {
 /// Fixed roster of distinct participant ids the tournament draws from. Index 0 is the
 /// submitter; the rest are a candidate verifier pool. Ids are deterministic so a run is
 /// reproducible from its seed alone.
-fn pid(n: u8) -> ParticipantId {
+pub(crate) fn pid(n: u8) -> ParticipantId {
     ParticipantId([n; 32])
 }
 
@@ -197,27 +197,27 @@ fn pid(n: u8) -> ParticipantId {
 /// `committee` are the verifiers reviewing this job (with their strategies); `sampled` and
 /// `trap` were drawn by the caller from the RNG. The executor's true result is "hash A";
 /// an honest executor claims it, a cheat/lazy executor claims a wrong hash.
-struct JobModel<'a> {
-    p: &'a GameParams,
-    submitter: ParticipantId,
-    executor: ParticipantId,
-    budget: u64,
+pub(crate) struct JobModel<'a> {
+    pub(crate) p: &'a GameParams,
+    pub(crate) submitter: ParticipantId,
+    pub(crate) executor: ParticipantId,
+    pub(crate) budget: u64,
     /// The true result hash for this job (what an honest executor claims and an honest
     /// verifier reveals).
-    true_hash: [u8; 32],
+    pub(crate) true_hash: [u8; 32],
     /// The reviewing committee: each member's id and verifier strategy.
-    committee: &'a [(ParticipantId, Verifier)],
+    pub(crate) committee: &'a [(ParticipantId, Verifier)],
 }
 
 /// Outcome buckets for a single simulated job, keyed by strategy, so the tournament can
 /// fold them into the running [`StratStats`]. Amounts are ledger deltas (compute cost is
 /// added by the caller, which knows each actor's strategy).
 #[derive(Default)]
-struct JobDeltas {
+pub(crate) struct JobDeltas {
     /// `(participant, ledger_delta, caught)` for the executor.
-    executor: Option<(ParticipantId, i64, bool)>,
+    pub(crate) executor: Option<(ParticipantId, i64, bool)>,
     /// `(verifier_strategy_is_rubber, ledger_delta, caught)` per committee member, in order.
-    verifiers: Vec<(Verifier, i64, bool)>,
+    pub(crate) verifiers: Vec<(Verifier, i64, bool)>,
 }
 
 /// Settle one fully-modeled job against a fresh ledger and report the per-actor deltas.
@@ -235,7 +235,7 @@ struct JobDeltas {
 ///     ([`settle_confirmed_unsampled`]) — the executor is paid 85% whether or not it
 ///     cheated (this is exactly the gap sampling/traps must make unprofitable in
 ///     aggregate).
-fn settle_one_job(
+pub(crate) fn settle_one_job(
     m: &JobModel,
     executor_strat: Executor,
     sampled: bool,

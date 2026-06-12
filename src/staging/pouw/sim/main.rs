@@ -18,6 +18,8 @@
 mod agents;
 /// Monte-Carlo tournament + the per-strategy EV proof (Task 14).
 mod tournament;
+#[cfg(feature = "wasm-runtime")]
+mod realfuel;
 
 use tournament::{run_tournament, safe_regime};
 
@@ -31,4 +33,15 @@ fn main() {
     let (params, costs) = safe_regime();
     let report = run_tournament(DEFAULT_JOBS, &params, &costs, DEFAULT_SEED);
     print!("{}", report.table());
+
+    #[cfg(feature = "wasm-runtime")]
+    {
+        let classes = realfuel::measure_classes();
+        println!("\n=== REAL-FUEL ECONOMICS (fuel-economics spec §5) ===");
+        for c in &classes {
+            println!("class {:>6}: measured fuel {:>12}", c.name, c.measured_fuel);
+        }
+        let results = realfuel::run_sweep(&realfuel::default_grid(), &classes[0], 4_000, DEFAULT_SEED);
+        print!("{}", realfuel::table(&results));
+    }
 }
