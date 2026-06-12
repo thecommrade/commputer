@@ -41,6 +41,9 @@ pub enum EconViolation {
 
 /// The spec §3 degenerate-params guard: a job cannot be PRICED in a regime with
 /// no proactive catching, no traps, no paid role, or no committee.
+/// Also enforces semantic upper bounds to prevent u128 wrap in budget_min /
+/// *_bond_min (probability bps capped at 10_000; multiplier fields capped at
+/// 100_000 / 1_000 respectively).
 fn guard(p: &GameParams) -> Result<(), EconViolation> {
     if p.sample_rate_bps == 0 {
         return Err(EconViolation::BadParams("sample_rate_bps == 0 (no proactive catching)"));
@@ -57,6 +60,21 @@ fn guard(p: &GameParams) -> Result<(), EconViolation> {
     if p.k == 0 {
         return Err(EconViolation::BadParams("k == 0 (no committee)"));
     }
+    if p.sample_rate_bps > 10_000 {
+        return Err(EconViolation::BadParams("sample_rate_bps > 10_000 (probability > 1)"));
+    }
+    if p.p_trap_bps > 10_000 {
+        return Err(EconViolation::BadParams("p_trap_bps > 10_000 (probability > 1)"));
+    }
+    if p.profit_margin_bps > 100_000 {
+        return Err(EconViolation::BadParams("profit_margin_bps > 100_000 (10x cap, overflow bound)"));
+    }
+    if p.bond_safety_bps > 100_000 {
+        return Err(EconViolation::BadParams("bond_safety_bps > 100_000 (10x cap, overflow bound)"));
+    }
+    if p.k > 1_000 {
+        return Err(EconViolation::BadParams("k > 1_000 (overflow bound)"));
+    }
     Ok(())
 }
 
@@ -64,7 +82,7 @@ fn guard(p: &GameParams) -> Result<(), EconViolation> {
 ///   Bx (executor profitable):  B ≥ wc·margin/worker
 ///   Bv (each committee slot profitable under the ADDITIVE event model):
 ///       B ≥ k·wc·(s+t)·margin/(v·s)   — the two 10_000 factors cancel.
-/// Worst-case u128: wc(2^64−1)·k(few)·(s+t)(≤20_000)·margin(≤30_000) ≈ 1.5e28 « u128::MAX ≈ 3.4e38.
+/// Worst-case u128 (bounds ENFORCED by guard): wc(2^64−1)·k(≤1e3)·(s+t)(≤2e4)·margin(≤1e5) ≈ 3.7e31 « u128::MAX ≈ 3.4e38.
 pub fn budget_min(fuel_cap: u64, p: &GameParams) -> Result<u64, EconViolation> {
     guard(p)?;
     let wc = work_cost(fuel_cap, p.price_per_mfuel) as u128;
@@ -95,6 +113,51 @@ pub fn verifier_bond_min(fuel_cap: u64, p: &GameParams) -> Result<u64, EconViola
     let wc = work_cost(fuel_cap, p.price_per_mfuel) as u128;
     let (s, t) = (p.sample_rate_bps as u128, p.p_trap_bps as u128);
     Ok(sat64(ceil_div(wc * p.bond_safety_bps as u128 * (s + t), BPS * t)))
+}
+
+use crate::engine::{run_job, JobInputs};
+use crate::ids::ParticipantId;
+use crate::job::{SettlementOutcome, Verdict};
+use crate::oracle::{ChainHooks, EquivalenceOracle, ExecutionOracle};
+
+/// Enforce the spec §3 minimums against a job's funding. Pure read — no ledger
+/// access, no side effects; safe to call before any escrow.
+pub fn validate_economics(
+    inputs: &JobInputs,
+    fuel_cap: u64,
+    p: &GameParams,
+) -> Result<(), EconViolation> {
+    let min_budget = budget_min(fuel_cap, p)?;
+    if inputs.job.budget < min_budget {
+        return Err(EconViolation::BudgetBelowMin { budget: inputs.job.budget, min: min_budget });
+    }
+    let min_e = executor_bond_min(fuel_cap, inputs.job.budget, p)?;
+    if inputs.executor_bond < min_e {
+        return Err(EconViolation::ExecutorBondBelowMin { bond: inputs.executor_bond, min: min_e });
+    }
+    let min_v = verifier_bond_min(fuel_cap, p)?;
+    if inputs.verifier_bond < min_v {
+        return Err(EconViolation::VerifierBondBelowMin { bond: inputs.verifier_bond, min: min_v });
+    }
+    Ok(())
+}
+
+/// THE enforcement surface (spec §4): validate, then delegate to the
+/// byte-identical engine::run_job. The on-chain cycle wires the real submit
+/// path to this same check; engine::run_job remains the unpriced core.
+#[allow(clippy::too_many_arguments)]
+pub fn run_priced_job(
+    l: &mut dyn ChainHooks,
+    p: &GameParams,
+    inputs: &JobInputs,
+    fuel_cap: u64,
+    exec_oracle: &dyn ExecutionOracle,
+    eq: &dyn EquivalenceOracle,
+    stake_of: &dyn Fn(&ParticipantId) -> u64,
+    rng: &mut dyn rand::RngCore,
+) -> Result<(Verdict, SettlementOutcome), EconViolation> {
+    validate_economics(inputs, fuel_cap, p)?;
+    Ok(run_job(l, p, inputs, exec_oracle, eq, stake_of, rng))
 }
 
 #[cfg(test)]
@@ -186,11 +249,192 @@ mod tests {
         p.burn_bps = 500;
         assert_eq!(budget_min(100_000_000, &p), Ok(2_400));
     }
+
+    /// Upper-bound guard rejects each over-limit field with the correct needle
+    /// substring (spec §3 overflow-bound enforcement).
+    #[test]
+    fn upper_bound_params_are_refused() {
+        let over = |f: fn(&mut GameParams)| {
+            let mut p = GameParams::default();
+            f(&mut p);
+            p
+        };
+        let cases: [(GameParams, &str); 5] = [
+            (over(|p| p.sample_rate_bps = 10_001), "sample_rate_bps >"),
+            (over(|p| p.p_trap_bps = 10_001),      "p_trap_bps >"),
+            (over(|p| p.profit_margin_bps = 100_001), "profit_margin_bps >"),
+            (over(|p| p.bond_safety_bps = 100_001),   "bond_safety_bps >"),
+            (over(|p| p.k = 1_001),                   "k >"),
+        ];
+        for (p, needle) in cases {
+            for r in [
+                budget_min(100_000_000, &p),
+                executor_bond_min(100_000_000, 100, &p),
+                verifier_bond_min(100_000_000, &p),
+            ] {
+                match r {
+                    Err(EconViolation::BadParams(msg)) => {
+                        assert!(msg.contains(needle), "{needle}: got {msg:?}")
+                    }
+                    other => panic!("{needle}: expected BadParams, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    use crate::engine::{run_job, JobInputs};
+    use crate::ids::{JobId, ParticipantId};
+    use crate::job::{Job, JobSpec, Verdict};
+    use crate::oracle::{ByteEq, IteratedHashVm, Ledger};
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    fn pid(n: u8) -> ParticipantId {
+        ParticipantId([n; 32])
+    }
+
+    /// A fully-funded-at-minimum world for the default params.
+    fn priced_world() -> (GameParams, Ledger, ParticipantId, ParticipantId, Vec<ParticipantId>, u64, u64, u64) {
+        let p = GameParams::default();
+        let f = 100_000_000u64;
+        let budget = budget_min(f, &p).unwrap();                // 3_960
+        let e_bond = executor_bond_min(f, budget, &p).unwrap(); // 3_960
+        let v_bond = verifier_bond_min(f, &p).unwrap();         // 1_650
+        let submitter = pid(0);
+        let executor = pid(9);
+        let candidates: Vec<ParticipantId> = (10u8..30).map(pid).collect();
+        let mut l = Ledger::new();
+        l.credit(submitter, budget);
+        l.credit(executor, e_bond);
+        for c in &candidates {
+            l.credit(*c, v_bond);
+        }
+        (p, l, submitter, executor, candidates, budget, e_bond, v_bond)
+    }
+
+    fn job_for(submitter: ParticipantId, budget: u64) -> Job {
+        let spec = JobSpec { program_hash: [7; 32], input_hash: [9; 32] };
+        Job { id: JobId::derive(&[7; 32], &[9; 32], &submitter, 0), submitter, spec, budget }
+    }
+
+    #[test]
+    fn underfunded_job_rejected_with_zero_side_effects() {
+        let (p, mut l, submitter, executor, candidates, budget, e_bond, v_bond) = priced_world();
+        let total0 = l.total_supply();
+        let bal0 = l.balance_of(&submitter);
+
+        let job = job_for(submitter, budget - 1); // one below minimum
+        let honest_claim = |h: &[u8; 32]| *h;
+        let honest_reveal = |_: &ParticipantId, h: &[u8; 32], _: &[u8; 32]| *h;
+        let no_challenge = |_: &[u8; 32], _: &[u8; 32]| None;
+        let inputs = JobInputs {
+            job,
+            input: b"in",
+            executor,
+            executor_bond: e_bond,
+            executor_claim: &honest_claim,
+            candidates: &candidates,
+            verifier_bond: v_bond,
+            verifier_reveal: &honest_reveal,
+            challenge: &no_challenge,
+            challenger_bond: p.challenger_bond,
+        };
+        let vm = IteratedHashVm { rounds: 10 };
+        let stake = |_: &ParticipantId| 1u64;
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let r = run_priced_job(&mut l, &p, &inputs, 100_000_000, &vm, &ByteEq, &stake, &mut rng);
+        assert_eq!(
+            r.unwrap_err(),
+            EconViolation::BudgetBelowMin { budget: budget - 1, min: budget }
+        );
+        // The check runs BEFORE any escrow: nothing moved.
+        assert_eq!(l.total_supply(), total0);
+        assert_eq!(l.balance_of(&submitter), bal0);
+        assert_eq!(l.escrowed(), 0);
+    }
+
+    #[test]
+    fn each_violation_variant_fires() {
+        let (p, mut l, submitter, executor, candidates, budget, e_bond, v_bond) = priced_world();
+        let honest_claim = |h: &[u8; 32]| *h;
+        let honest_reveal = |_: &ParticipantId, h: &[u8; 32], _: &[u8; 32]| *h;
+        let no_challenge = |_: &[u8; 32], _: &[u8; 32]| None;
+        let mk = |budget: u64, e_bond: u64, v_bond: u64| JobInputs {
+            job: job_for(submitter, budget),
+            input: b"in",
+            executor,
+            executor_bond: e_bond,
+            executor_claim: &honest_claim,
+            candidates: &candidates,
+            verifier_bond: v_bond,
+            verifier_reveal: &honest_reveal,
+            challenge: &no_challenge,
+            challenger_bond: p.challenger_bond,
+        };
+        let vm = IteratedHashVm { rounds: 10 };
+        let stake = |_: &ParticipantId| 1u64;
+        let f = 100_000_000;
+
+        let mut rng = StdRng::seed_from_u64(1);
+        let r = run_priced_job(&mut l, &p, &mk(budget, e_bond - 1, v_bond), f, &vm, &ByteEq, &stake, &mut rng);
+        assert!(matches!(r, Err(EconViolation::ExecutorBondBelowMin { .. })));
+
+        let r = run_priced_job(&mut l, &p, &mk(budget, e_bond, v_bond - 1), f, &vm, &ByteEq, &stake, &mut rng);
+        assert!(matches!(r, Err(EconViolation::VerifierBondBelowMin { .. })));
+
+        let mut bad = p.clone();
+        bad.p_trap_bps = 0;
+        let r = run_priced_job(&mut l, &bad, &mk(budget, e_bond, v_bond), f, &vm, &ByteEq, &stake, &mut rng);
+        assert!(matches!(r, Err(EconViolation::BadParams(_))));
+    }
+
+    /// At-minimum funding passes, and run_priced_job is EXACTLY run_job after the
+    /// check: same seed ⇒ same verdict + same settlement outcome.
+    #[test]
+    fn priced_run_is_bare_run_after_the_check() {
+        let (p, _l0, submitter, executor, candidates, budget, e_bond, v_bond) = priced_world();
+        let honest_claim = |h: &[u8; 32]| *h;
+        let honest_reveal = |_: &ParticipantId, h: &[u8; 32], _: &[u8; 32]| *h;
+        let no_challenge = |_: &[u8; 32], _: &[u8; 32]| None;
+        let inputs = JobInputs {
+            job: job_for(submitter, budget),
+            input: b"in",
+            executor,
+            executor_bond: e_bond,
+            executor_claim: &honest_claim,
+            candidates: &candidates,
+            verifier_bond: v_bond,
+            verifier_reveal: &honest_reveal,
+            challenge: &no_challenge,
+            challenger_bond: p.challenger_bond,
+        };
+        let vm = IteratedHashVm { rounds: 10 };
+        let stake = |_: &ParticipantId| 1u64;
+
+        // Ledger does NOT implement Clone (game file, untouchable): build two
+        // identical worlds from the deterministic helper instead.
+        let (_, mut l_priced, ..) = priced_world();
+        let mut rng = StdRng::seed_from_u64(42);
+        let (v1, o1) = run_priced_job(&mut l_priced, &p, &inputs, 100_000_000, &vm, &ByteEq, &stake, &mut rng)
+            .expect("at-minimum funding must pass");
+
+        let (_, mut l_bare, ..) = priced_world();
+        let mut rng = StdRng::seed_from_u64(42);
+        let (v2, o2) = run_job(&mut l_bare, &p, &inputs, &vm, &ByteEq, &stake, &mut rng);
+
+        assert!(matches!(v1, Verdict::Confirmed { .. }));
+        assert_eq!(format!("{v1:?}"), format!("{v2:?}"));
+        assert_eq!(o1, o2);
+    }
 }
 
 #[cfg(test)]
 mod prop_tests {
     use super::*;
+    use crate::engine::JobInputs;
+    use crate::ids::{JobId, ParticipantId};
+    use crate::job::{Job, JobSpec};
     use crate::params::GameParams;
     use proptest::prelude::*;
 
@@ -278,6 +522,58 @@ mod prop_tests {
             prop_assert!(matches!(budget_min(f, &p), Err(EconViolation::BadParams(_))));
             prop_assert!(matches!(executor_bond_min(f, 0, &p), Err(EconViolation::BadParams(_))));
             prop_assert!(matches!(verifier_bond_min(f, &p), Err(EconViolation::BadParams(_))));
+        }
+
+        /// Funded-at-minimum always passes validate_economics; any single
+        /// component one-below-minimum fails with the MATCHING variant — over
+        /// the whole legal regime space, not just the defaults (spec §7).
+        #[test]
+        fn minimum_funding_is_the_exact_boundary(p in econ_params(), f in fuel()) {
+            let b = budget_min(f, &p).unwrap();
+            let eb = executor_bond_min(f, b, &p).unwrap();
+            let vb = verifier_bond_min(f, &p).unwrap();
+            prop_assert!(eb >= b, "Be >= B must hold by the max(…, budget) construction");
+
+            let claim = |h: &[u8; 32]| *h;
+            let reveal = |_: &ParticipantId, h: &[u8; 32], _: &[u8; 32]| *h;
+            let challenge = |_: &[u8; 32], _: &[u8; 32]| None;
+            let candidates: Vec<ParticipantId> =
+                (10u8..30).map(|n| ParticipantId([n; 32])).collect();
+            let submitter = ParticipantId([0; 32]);
+            let mk = |budget: u64, e_bond: u64, v_bond: u64| JobInputs {
+                job: Job {
+                    id: JobId::derive(&[7; 32], &[9; 32], &submitter, 0),
+                    submitter,
+                    spec: JobSpec { program_hash: [7; 32], input_hash: [9; 32] },
+                    budget,
+                },
+                input: b"in",
+                executor: ParticipantId([9; 32]),
+                executor_bond: e_bond,
+                executor_claim: &claim,
+                candidates: &candidates,
+                verifier_bond: v_bond,
+                verifier_reveal: &reveal,
+                challenge: &challenge,
+                challenger_bond: p.challenger_bond,
+            };
+
+            prop_assert!(validate_economics(&mk(b, eb, vb), f, &p).is_ok());
+            if b > 0 {
+                let r = validate_economics(&mk(b - 1, eb, vb), f, &p);
+                let ok = matches!(r, Err(EconViolation::BudgetBelowMin { .. }));
+                prop_assert!(ok, "expected BudgetBelowMin, got {:?}", r);
+            }
+            if eb > 0 {
+                let r = validate_economics(&mk(b, eb - 1, vb), f, &p);
+                let ok = matches!(r, Err(EconViolation::ExecutorBondBelowMin { .. }));
+                prop_assert!(ok, "expected ExecutorBondBelowMin, got {:?}", r);
+            }
+            if vb > 0 {
+                let r = validate_economics(&mk(b, eb, vb - 1), f, &p);
+                let ok = matches!(r, Err(EconViolation::VerifierBondBelowMin { .. }));
+                prop_assert!(ok, "expected VerifierBondBelowMin, got {:?}", r);
+            }
         }
     }
 }
