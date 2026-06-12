@@ -125,6 +125,10 @@ mod tests {
         assert!(p.validate().is_err());
 
         let mut p = GameParams::default();
+        p.bond_safety_bps = 10_000; // the inclusive valid edge — pins >= vs > distinction
+        assert!(p.validate().is_ok());
+
+        let mut p = GameParams::default();
         p.price_per_mfuel = 0;
         assert!(p.validate().is_err());
     }
