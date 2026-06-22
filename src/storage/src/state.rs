@@ -153,10 +153,18 @@ pub struct ChainState {
     /// so `total_burned` MUST NOT move when a budget is escrowed; only a resolver's burn slice
     /// at settlement increments it. Empty until the `SubmitJobV2` burn->escrow flip lands (P2).
     ///
-    /// WIRE-IN TODO (the live flip, P2): this map is in-memory only today. Before `SubmitJobV2`
-    /// is converted from burn-at-submit to escrow, it MUST be persisted to RocksDB (loaded in
-    /// `open`, flushed in `flush_to_rocks`); otherwise a restart with live escrow would lose
-    /// held funds and diverge consensus.
+    /// WIRE-IN TODO — FULL PERSISTENCE CHECKLIST (the live flip, P2; verified by the 2026-06-22
+    /// adversarial review). `escrow_by_job` AND `bonded_stake`/`unbonding_stake` are in-memory only
+    /// today. They are SAFE now ONLY because they stay empty until the live txs exist. Before
+    /// `SubmitJobV2`→escrow or a `BondStake`-style tx makes them live consensus state, ALL of the
+    /// following MUST land together (any one missing => restart value-loss or cross-node divergence):
+    ///   1. RocksStore (rocks.rs): add serialize/load for all three maps.
+    ///   2. `open()`: load them (currently they init empty at the `open` constructor).
+    ///   3. `flush_to_rocks()` + `apply_block_atomic()`: include them in the flush / WriteBatch.
+    ///   4. `compute_state_root()` AND `snapshot()`: fold them in — else two nodes with identical
+    ///      accounts but different escrow/stake share a state root yet diverge on committee draw.
+    ///   5. `revert_block()` + `try_reorg()`/`reset_to_genesis()`: roll back / reconstruct from the
+    ///      persisted source (today they `.clear()` with no recovery source — fork = permanent loss).
     pub escrow_by_job: HashMap<[u8; 32], u64>,
     /// PoUW P2 (G4): active bonded stake (`Address` -> raw units) — the committee-selection
     /// weight (`stake_of`) and the primary slash surface. Moved here from `Account.balance` by
@@ -1806,13 +1814,17 @@ impl ChainState {
         if amount == 0 {
             return Ok(());
         }
+        // Check the pot overflow BEFORE mutating the balance (no partial state on error) — mirrors
+        // bond(). (Under the supply cap a pot cannot reach u64::MAX, but stay checked + consistent
+        // with the sibling money ops rather than an unchecked `+=`.)
+        let pot = self.escrow_by_job.get(&job_id).copied().unwrap_or(0);
+        let new_pot = pot.checked_add(amount).ok_or(StateError::Overflow)?;
         let account = self.accounts.get_mut(who).ok_or(StateError::InsufficientBalance)?;
-        let debited = account
+        account.balance = account
             .balance
             .checked_sub(Amount::from_raw(amount))
             .ok_or(StateError::InsufficientBalance)?;
-        account.balance = debited;
-        *self.escrow_by_job.entry(job_id).or_insert(0) += amount;
+        self.escrow_by_job.insert(job_id, new_pot);
         Ok(())
     }
 
@@ -1976,7 +1988,7 @@ impl ChainState {
         let mut withdrawn = 0u64;
         chunks.retain(|c| {
             if c.matures_at <= now {
-                withdrawn += c.amount;
+                withdrawn = withdrawn.saturating_add(c.amount);
                 false
             } else {
                 true
@@ -1987,7 +1999,9 @@ impl ChainState {
         }
         if withdrawn > 0 {
             let account = self.accounts.get_or_create(*who);
-            // Overflow is impossible under the supply cap; saturating matches this file's idiom.
+            // The withdrawn value originated from THIS account's own balance (bond moved
+            // balance->bonded->cooldown), so crediting it back cannot exceed the pre-bond balance,
+            // which is <= the supply cap << u64::MAX — saturating_add can never actually cap here.
             account.balance = Amount::from_raw(account.balance.raw().saturating_add(withdrawn));
         }
         withdrawn
@@ -2004,7 +2018,7 @@ impl ChainState {
         if let Some(b) = self.bonded_stake.get_mut(who) {
             let take = remaining.min(*b);
             *b -= take;
-            slashed += take;
+            slashed = slashed.saturating_add(take); // bounded by total at-risk <= supply cap
             remaining -= take;
         }
         if self.bonded_stake.get(who).copied() == Some(0) {
@@ -2020,7 +2034,7 @@ impl ChainState {
                 }
                 let take = remaining.min(c.amount);
                 c.amount -= take;
-                slashed += take;
+                slashed = slashed.saturating_add(take); // bounded by total at-risk <= supply cap
                 remaining -= take;
             }
             chunks.retain(|c| c.amount > 0);
@@ -2265,6 +2279,23 @@ mod tests {
             conserved - 198,
             "conserved minus burn"
         );
+    }
+
+    #[test]
+    fn escrow_into_job_rejects_pot_overflow_without_partial_state() {
+        // Two whales escrow into the same pot; the second would overflow it → rejected, no debit.
+        let mut state = ChainState::new();
+        let job = [11u8; 32];
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(u64::MAX);
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(u64::MAX);
+        state.escrow_into_job(&addr(1), job, u64::MAX).unwrap(); // pot = u64::MAX
+        assert_eq!(state.escrowed_for_job(&job), u64::MAX);
+
+        let err = state.escrow_into_job(&addr(2), job, 1).unwrap_err(); // pot + 1 overflows
+        assert!(matches!(err, StateError::Overflow), "pot overflow rejected, got {err:?}");
+        // no partial state: addr(2) balance untouched, pot unchanged
+        assert_eq!(state.accounts.get(&addr(2)).unwrap().balance, Amount::from_raw(u64::MAX));
+        assert_eq!(state.escrowed_for_job(&job), u64::MAX);
     }
 
     // --- PoUW P2 (G4) bonded stake source ------------------------------------------
