@@ -13,6 +13,9 @@ commputer-network = { workspace = true }
 commputer-proofs = { workspace = true }
 commputer-storage = { workspace = true }
 commputer-validator = { workspace = true }
+# PoUW on-chain wiring (P0): deterministic fuel-metered execution + adapters.
+commputer-pouw = { path = "../staging/pouw", features = ["wasm-runtime"] }
+commputer-pouw-onchain = { path = "../staging/pouw-onchain" }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
@@ -42,3 +45,5 @@ chrono = "0.4"
 tower = { version = "0.5", features = ["util"] }
 # Tier B test harnesses — property-based testing.
 proptest = "1.4"
+# Assemble a WASM guest for the pouw_executor determinism/linchpin test.
+wat = "=1.251.0"

@@ -11,6 +11,7 @@ mod job_cancel;
 mod job_rpc;
 mod job_spec;
 mod parallel_sync;
+mod pouw_executor;
 mod proof_manager;
 mod result_cache;
 mod tier_rate_limit;

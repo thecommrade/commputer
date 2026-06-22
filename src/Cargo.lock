@@ -654,6 +654,8 @@ dependencies = [
  "commputer-consensus",
  "commputer-core",
  "commputer-network",
+ "commputer-pouw",
+ "commputer-pouw-onchain",
  "commputer-proofs",
  "commputer-storage",
  "commputer-validator",
@@ -675,6 +677,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "wat",
 ]
 
 [[package]]
