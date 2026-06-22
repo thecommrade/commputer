@@ -158,6 +158,23 @@ pub struct ChainState {
     /// `open`, flushed in `flush_to_rocks`); otherwise a restart with live escrow would lose
     /// held funds and diverge consensus.
     pub escrow_by_job: HashMap<[u8; 32], u64>,
+    /// PoUW P2 (G4): active bonded stake (`Address` -> raw units) — the committee-selection
+    /// weight (`stake_of`) and the primary slash surface. Moved here from `Account.balance` by
+    /// `bond`; counts toward selection + is slashable. Reuses `total_burned` as the slash sink.
+    pub bonded_stake: HashMap<Address, u64>,
+    /// PoUW P2 (G4): cooldown stake awaiting withdrawal (`Address` -> maturing chunks). Stops
+    /// counting toward selection the moment it is requested, but stays slashable until withdrawn
+    /// (anti-dodge). `withdraw_unbonded` returns matured chunks to `Account.balance`.
+    pub unbonding_stake: HashMap<Address, Vec<UnbondingChunk>>,
+    /// PoUW P2 (G4): staking params (cooldown length, min eligible bond). Genesis-anchored at
+    /// P3/G5; the default is a placeholder until then.
+    ///
+    /// WIRE-IN TODO (live bond txs, P2 committee-draw step): `bonded_stake`/`unbonding_stake`
+    /// are in-memory only today and are NOT yet in `compute_state_root`/RocksDB. Before a
+    /// `BondStake`-style tx makes them live consensus state, persist them and fold them into the
+    /// state root — else nodes diverge on committee selection. Safe now only because they stay
+    /// empty until that tx exists.
+    pub stake_params: StakeParams,
 }
 
 // Manual Debug impl since RocksStore doesn't derive Debug.
@@ -177,6 +194,8 @@ impl std::fmt::Debug for ChainState {
             .field("snapshot_height", &self.snapshot_height)
             .field("validator_performance", &self.validator_performance.len())
             .field("escrow_by_job", &self.escrow_by_job.len())
+            .field("bonded_stake", &self.bonded_stake.len())
+            .field("unbonding_stake", &self.unbonding_stake.len())
             .finish()
     }
 }
@@ -205,6 +224,9 @@ impl ChainState {
             snapshot_height: 0,
             validator_performance: HashMap::new(),
             escrow_by_job: HashMap::new(),
+            bonded_stake: HashMap::new(),
+            unbonding_stake: HashMap::new(),
+            stake_params: StakeParams::default(),
         }
     }
 
@@ -280,6 +302,9 @@ impl ChainState {
             snapshot_height: 0,
             validator_performance: HashMap::new(),
             escrow_by_job: HashMap::new(),
+            bonded_stake: HashMap::new(),
+            unbonding_stake: HashMap::new(),
+            stake_params: StakeParams::default(),
         })
     }
 
@@ -1604,6 +1629,8 @@ impl ChainState {
         self.total_emitted = 0;
         self.total_burned = 0;
         self.escrow_by_job.clear();
+        self.bonded_stake.clear();
+        self.unbonding_stake.clear();
         self.cumulative_score = 0;
         self.state_diffs.clear();
 
@@ -1678,6 +1705,8 @@ impl ChainState {
         self.total_emitted = 0;
         self.total_burned = 0;
         self.escrow_by_job.clear();
+        self.bonded_stake.clear();
+        self.unbonding_stake.clear();
         self.nerf_rate = NerfRate::INITIAL;
         self.current_epoch = 0;
         self.receipts = ReceiptStore::new();
@@ -1803,6 +1832,198 @@ impl ChainState {
     }
 }
 
+/// PoUW P2 (G4): genesis-anchored staking params (mirrors the staging
+/// `commputer-pouw-onchain::bonded_stake::StakeParams`). The P3 genesis wire-in replaces these
+/// defaults with the consensus values — all nodes MUST agree or they diverge on committee draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StakeParams {
+    /// Cooldown length (blocks) before unbonded stake is withdrawable.
+    pub unbonding_blocks: u64,
+    /// Minimum ACTIVE bond to be eligible for committee selection.
+    pub min_bond: u64,
+}
+
+impl Default for StakeParams {
+    fn default() -> Self {
+        // Placeholders — the founder sets the real genesis values (P3/G5).
+        Self { unbonding_blocks: 100, min_bond: 1_000 }
+    }
+}
+
+/// PoUW P2 (G4): one unbonding request in its cooldown window (slashable until withdrawn).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnbondingChunk {
+    amount: u64,
+    matures_at: u64, // block height at/after which this chunk is withdrawable
+}
+
+// ===================================================================================
+// PoUW P2 (G4) — on-chain bonded/slashable stake source: the committee-selection weight
+// (`stake_of`) + a slash surface. The on-chain analog of the staging
+// `commputer-pouw-onchain::bonded_stake::BondedStake`, but it REUSES the existing
+// `Account.balance` (spendable) and `total_burned` (the burn sink) rather than duplicating
+// them — only the active-bonded and cooldown buckets are new state here.
+//
+// PoS-style: bond (balance -> bonded) -> request_unbond (bonded -> cooldown) -> withdraw
+// (matured cooldown -> balance). Stake is slashable throughout bonding AND cooldown
+// (anti-dodge: unbonding before a slash does NOT escape it). `stake_of` = active bonded only
+// (cooldown is leaving, so excluded from selection weight); `is_eligible` floors at min_bond.
+//
+// CONSERVATION: `sum(Account.balance) + total_bonded() + total_unbonding() + total_burned` is
+// INVARIANT across bond/request_unbond/withdraw_unbonded, and `slash_stake` moves at-risk stake
+// into `total_burned` (so the four-bucket sum stays invariant and `circulating_supply()` drops
+// by exactly the slash). No method mints.
+//
+// WIRE-IN (P2 committee-draw step, event_loop.rs PROTECTED): filter the validator pool by
+// `is_eligible`, then pass `|p| chain.stake_of(p)` into the frozen `committee::select_committee`
+// (mapping Address <-> ParticipantId). The bond/unbond/withdraw triggers (a `BondStake`-style
+// TxKind, or staking via ValidatorRegister) and persistence/state-root are the later live-wiring
+// step; these primitives are the ledger they drive.
+// ===================================================================================
+impl ChainState {
+    /// Bond `amount`: move it from `who`'s spendable balance into active bonded stake. A zero
+    /// `amount` is a no-op. Returns `InsufficientBalance` if `who` has no account or cannot
+    /// cover `amount` (no state change on failure).
+    pub fn bond(&mut self, who: &Address, amount: u64) -> Result<(), StateError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        // Validate the bonded-side overflow before mutating the balance (no partial state on err).
+        let bonded = self.bonded_stake.get(who).copied().unwrap_or(0);
+        let new_bonded = bonded.checked_add(amount).ok_or(StateError::Overflow)?;
+        let account = self.accounts.get_mut(who).ok_or(StateError::InsufficientBalance)?;
+        account.balance = account
+            .balance
+            .checked_sub(Amount::from_raw(amount))
+            .ok_or(StateError::InsufficientBalance)?;
+        self.bonded_stake.insert(*who, new_bonded);
+        Ok(())
+    }
+
+    /// Request to unbond `amount`: move it from active bonded into a cooldown chunk maturing at
+    /// `now + unbonding_blocks`. It immediately stops counting toward `stake_of`/selection but
+    /// stays slashable. A zero `amount` is a no-op (no empty chunk). Returns `InsufficientStake`
+    /// if active bonded is short (no state change).
+    pub fn request_unbond(&mut self, who: &Address, amount: u64, now: u64) -> Result<(), StateError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let bonded = self.bonded_stake.get(who).copied().unwrap_or(0);
+        if bonded < amount {
+            return Err(StateError::InsufficientStake);
+        }
+        let remaining = bonded - amount;
+        if remaining == 0 {
+            self.bonded_stake.remove(who);
+        } else {
+            self.bonded_stake.insert(*who, remaining);
+        }
+        let matures_at = now.saturating_add(self.stake_params.unbonding_blocks);
+        self.unbonding_stake.entry(*who).or_default().push(UnbondingChunk { amount, matures_at });
+        Ok(())
+    }
+
+    /// Move all matured cooldown chunks (`matures_at <= now`) back to `who`'s spendable balance;
+    /// returns the total withdrawn (0 if none matured). Saturating; never errors.
+    pub fn withdraw_unbonded(&mut self, who: &Address, now: u64) -> u64 {
+        let chunks = match self.unbonding_stake.get_mut(who) {
+            Some(c) => c,
+            None => return 0,
+        };
+        let mut withdrawn = 0u64;
+        chunks.retain(|c| {
+            if c.matures_at <= now {
+                withdrawn += c.amount;
+                false
+            } else {
+                true
+            }
+        });
+        if chunks.is_empty() {
+            self.unbonding_stake.remove(who);
+        }
+        if withdrawn > 0 {
+            let account = self.accounts.get_or_create(*who);
+            // Overflow is impossible under the supply cap; saturating matches this file's idiom.
+            account.balance = Amount::from_raw(account.balance.raw().saturating_add(withdrawn));
+        }
+        withdrawn
+    }
+
+    /// Slash up to `amount` of `who`'s AT-RISK stake — active bonded FIRST, then cooldown chunks
+    /// in order — burning it (`total_burned += slashed`). Anti-dodge: cooldown stake is reachable.
+    /// Returns the amount actually slashed (capped at total at-risk = bonded + Σ unbonding). The
+    /// caller MUST inspect the return — a cap below `amount` means the actor was under-staked.
+    pub fn slash_stake(&mut self, who: &Address, amount: u64) -> u64 {
+        let mut remaining = amount;
+        let mut slashed = 0u64;
+        // bonded first (get_mut, not entry, so slashing a never-bonded account creates no 0 entry)
+        if let Some(b) = self.bonded_stake.get_mut(who) {
+            let take = remaining.min(*b);
+            *b -= take;
+            slashed += take;
+            remaining -= take;
+        }
+        if self.bonded_stake.get(who).copied() == Some(0) {
+            self.bonded_stake.remove(who);
+        }
+        // then cooldown chunks in stored order (anti-dodge)
+        if remaining > 0
+            && let Some(chunks) = self.unbonding_stake.get_mut(who)
+        {
+            for c in chunks.iter_mut() {
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(c.amount);
+                c.amount -= take;
+                slashed += take;
+                remaining -= take;
+            }
+            chunks.retain(|c| c.amount > 0);
+            if chunks.is_empty() {
+                self.unbonding_stake.remove(who);
+            }
+        }
+        self.total_burned = self.total_burned.saturating_add(slashed);
+        slashed
+    }
+
+    /// Active bonded stake for `who` (0 if none) — selectable + slashable.
+    pub fn bonded_of(&self, who: &Address) -> u64 {
+        self.bonded_stake.get(who).copied().unwrap_or(0)
+    }
+
+    /// Total cooldown (unbonding) stake for `who` (0 if none) — slashable, NOT selectable.
+    pub fn unbonding_of(&self, who: &Address) -> u64 {
+        self.unbonding_stake
+            .get(who)
+            .map(|v| v.iter().map(|c| c.amount).sum::<u64>())
+            .unwrap_or(0)
+    }
+
+    /// Committee-selection weight = ACTIVE bonded only (cooldown excluded — it is leaving).
+    pub fn stake_of(&self, who: &Address) -> u64 {
+        self.bonded_of(who)
+    }
+
+    /// Eligible for committee selection iff active bonded >= `min_bond` (the candidate-pool
+    /// filter applied BEFORE `select_committee`, which then weights by `stake_of`).
+    pub fn is_eligible(&self, who: &Address) -> bool {
+        self.bonded_of(who) >= self.stake_params.min_bond
+    }
+
+    /// Total active bonded stake across all accounts (for conservation/diagnostics).
+    pub fn total_bonded(&self) -> u64 {
+        self.bonded_stake.values().sum()
+    }
+
+    /// Total cooldown stake across all accounts (for conservation/diagnostics).
+    pub fn total_unbonding(&self) -> u64 {
+        self.unbonding_stake.values().flatten().map(|c| c.amount).sum()
+    }
+}
+
 impl Default for ChainState {
     fn default() -> Self {
         Self::new()
@@ -1819,6 +2040,8 @@ pub enum StateError {
     InsufficientBalance,
     #[error("escrow pot underflow")]
     EscrowUnderflow,
+    #[error("insufficient bonded stake")]
+    InsufficientStake,
     #[error("arithmetic overflow")]
     Overflow,
     #[error("storage error: {0}")]
@@ -1999,6 +2222,167 @@ mod tests {
             conserved - 198,
             "conserved minus burn"
         );
+    }
+
+    // --- PoUW P2 (G4) bonded stake source ------------------------------------------
+
+    /// The four-bucket conserved quantity: spendable + active bonded + cooldown + burned.
+    fn stake_conserved(state: &ChainState) -> u64 {
+        sum_balances(state) + state.total_bonded() + state.total_unbonding() + state.total_burned
+    }
+
+    #[test]
+    fn bond_moves_balance_to_bonded_and_conserves() {
+        let mut state = ChainState::new();
+        state.total_emitted = 5_000;
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(5_000);
+        let conserved = stake_conserved(&state);
+
+        state.bond(&addr(1), 3_000).unwrap();
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(2_000));
+        assert_eq!(state.bonded_of(&addr(1)), 3_000);
+        assert_eq!(stake_conserved(&state), conserved);
+
+        // over-balance bond rejected, no state change
+        assert!(matches!(state.bond(&addr(1), 9_999), Err(StateError::InsufficientBalance)));
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(2_000));
+        assert_eq!(state.bonded_of(&addr(1)), 3_000);
+    }
+
+    #[test]
+    fn request_unbond_moves_bonded_to_cooldown() {
+        let mut state = ChainState::new();
+        state.stake_params = StakeParams { unbonding_blocks: 100, min_bond: 1_000 };
+        state.total_emitted = 5_000;
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(5_000);
+        state.bond(&addr(1), 5_000).unwrap();
+        let conserved = stake_conserved(&state);
+
+        state.request_unbond(&addr(1), 2_000, 50).unwrap();
+        assert_eq!(state.bonded_of(&addr(1)), 3_000);
+        assert_eq!(state.unbonding_of(&addr(1)), 2_000); // matures at 150
+        assert_eq!(stake_conserved(&state), conserved);
+
+        // over-bonded unbond rejected
+        assert!(matches!(
+            state.request_unbond(&addr(1), 9_999, 50),
+            Err(StateError::InsufficientStake)
+        ));
+        // zero-amount unbond is a no-op (no empty cooldown chunk)
+        let before = state.unbonding_of(&addr(1));
+        state.request_unbond(&addr(1), 0, 50).unwrap();
+        assert_eq!(state.unbonding_of(&addr(1)), before, "zero unbond pushed no chunk");
+    }
+
+    #[test]
+    fn withdraw_unbonded_respects_maturity() {
+        let mut state = ChainState::new();
+        state.stake_params = StakeParams { unbonding_blocks: 100, min_bond: 1_000 };
+        state.total_emitted = 5_000;
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(5_000);
+        state.bond(&addr(1), 5_000).unwrap();
+        state.request_unbond(&addr(1), 1_000, 10).unwrap(); // matures 110
+        state.request_unbond(&addr(1), 2_000, 50).unwrap(); // matures 150
+        let conserved = stake_conserved(&state);
+
+        assert_eq!(state.withdraw_unbonded(&addr(1), 109), 0, "nothing matured yet");
+        assert_eq!(state.unbonding_of(&addr(1)), 3_000);
+        assert_eq!(state.withdraw_unbonded(&addr(1), 110), 1_000, "first chunk matured");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(1_000));
+        assert_eq!(state.unbonding_of(&addr(1)), 2_000);
+        assert_eq!(state.withdraw_unbonded(&addr(1), 200), 2_000, "second chunk matured");
+        assert_eq!(state.unbonding_of(&addr(1)), 0);
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(3_000));
+        assert_eq!(stake_conserved(&state), conserved);
+    }
+
+    #[test]
+    fn slash_stake_anti_dodge_reaches_cooldown_and_burns() {
+        let mut state = ChainState::new();
+        state.stake_params = StakeParams { unbonding_blocks: 100, min_bond: 1_000 };
+        state.total_emitted = 5_000;
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(5_000);
+        state.bond(&addr(1), 5_000).unwrap();
+        state.request_unbond(&addr(1), 5_000, 10).unwrap(); // ALL stake now in cooldown
+        let conserved = stake_conserved(&state);
+        let circ_before = state.circulating_supply();
+        assert_eq!(state.bonded_of(&addr(1)), 0);
+        assert_eq!(state.unbonding_of(&addr(1)), 5_000);
+
+        assert_eq!(state.slash_stake(&addr(1), 4_000), 4_000, "slash reaches cooldown stake");
+        assert_eq!(state.unbonding_of(&addr(1)), 1_000);
+        assert_eq!(state.total_burned, 4_000);
+        assert_eq!(state.circulating_supply(), circ_before - 4_000, "slashed stake leaves circulation");
+        assert_eq!(stake_conserved(&state), conserved, "at-risk -> burned, four-bucket sum invariant");
+
+        // a later withdraw only returns what survived the slash
+        assert_eq!(state.withdraw_unbonded(&addr(1), 110), 1_000);
+        assert_eq!(stake_conserved(&state), conserved);
+    }
+
+    #[test]
+    fn slash_stake_bonded_first_then_caps() {
+        let mut state = ChainState::new();
+        state.stake_params = StakeParams { unbonding_blocks: 100, min_bond: 1_000 };
+        state.total_emitted = 5_000;
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(5_000);
+        state.bond(&addr(1), 5_000).unwrap();
+        state.request_unbond(&addr(1), 2_000, 10).unwrap(); // 3_000 bonded, 2_000 cooldown
+        let conserved = stake_conserved(&state);
+
+        // partial slash hits bonded first
+        assert_eq!(state.slash_stake(&addr(1), 1_000), 1_000);
+        assert_eq!(state.bonded_of(&addr(1)), 2_000);
+        assert_eq!(state.unbonding_of(&addr(1)), 2_000);
+
+        // slash beyond total at-risk (now 4_000) burns everything and returns the cap
+        assert_eq!(state.slash_stake(&addr(1), 10_000), 4_000, "capped at total at-risk");
+        assert_eq!(state.bonded_of(&addr(1)), 0);
+        assert_eq!(state.unbonding_of(&addr(1)), 0);
+        assert!(!state.bonded_stake.contains_key(&addr(1)), "zeroed bonded entry removed");
+        assert_eq!(stake_conserved(&state), conserved);
+
+        // slashing an actor with nothing is a no-op and creates no entry
+        assert_eq!(state.slash_stake(&addr(9), 100), 0, "slashing nobody is a no-op");
+        assert!(!state.bonded_stake.contains_key(&addr(9)), "no entry for never-bonded");
+    }
+
+    #[test]
+    fn stake_of_excludes_unbonding_and_eligibility_floors_at_min_bond() {
+        let mut state = ChainState::new();
+        state.stake_params = StakeParams { unbonding_blocks: 100, min_bond: 1_000 };
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(5_000);
+        state.bond(&addr(1), 5_000).unwrap();
+        assert_eq!(state.stake_of(&addr(1)), 5_000);
+        assert!(state.is_eligible(&addr(1)));
+
+        state.request_unbond(&addr(1), 4_500, 10).unwrap(); // active bonded now 500
+        assert_eq!(state.stake_of(&addr(1)), 500, "cooldown excluded from selection weight");
+        assert_eq!(state.unbonding_of(&addr(1)), 4_500, "but still at-risk");
+        assert!(!state.is_eligible(&addr(1)), "500 < min_bond 1_000");
+
+        // eligibility boundary: == min_bond is eligible
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(1_000);
+        state.bond(&addr(2), 1_000).unwrap();
+        assert!(state.is_eligible(&addr(2)));
+    }
+
+    #[test]
+    fn every_stake_op_preserves_conservation() {
+        let mut state = ChainState::new();
+        state.stake_params = StakeParams { unbonding_blocks: 50, min_bond: 1_000 };
+        state.total_emitted = 10_000;
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(10_000);
+        let conserved = stake_conserved(&state);
+
+        state.bond(&addr(1), 8_000).unwrap();
+        assert_eq!(stake_conserved(&state), conserved, "bond: balance -> bonded");
+        state.request_unbond(&addr(1), 3_000, 5).unwrap();
+        assert_eq!(stake_conserved(&state), conserved, "request_unbond: bonded -> unbonding");
+        state.slash_stake(&addr(1), 2_000);
+        assert_eq!(stake_conserved(&state), conserved, "slash: at-risk -> burned");
+        state.withdraw_unbonded(&addr(1), 1_000);
+        assert_eq!(stake_conserved(&state), conserved, "withdraw: matured unbonding -> balance");
     }
 
     fn genesis_block() -> Block {
