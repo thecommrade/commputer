@@ -6,6 +6,7 @@ use commputer_core::identity::Address;
 use commputer_core::token::{Amount, TOTAL_SUPPLY};
 use commputer_core::transaction::{TxKind, Transaction};
 use commputer_core::compliance::{ComplianceStatus, NerfRate};
+use commputer_pouw_onchain::lifecycle::JobLifecycle;
 use ed25519_dalek::Verifier;
 use tracing::{info, warn};
 use crate::account::{Account, AccountStore};
@@ -183,6 +184,14 @@ pub struct ChainState {
     /// state root — else nodes diverge on committee selection. Safe now only because they stay
     /// empty until that tx exists.
     pub stake_params: StakeParams,
+    /// PoUW P2: per-job verification lifecycle (`job_id` -> `JobLifecycle`), the multi-block
+    /// commit-reveal state machine. Created at `ClaimJob` (AwaitingResult), committee drawn at
+    /// `CompleteJob`, fed by `Commit`/`Reveal`, advanced/settled by block height. Its money moves
+    /// run against `ChainState` via the §3 `Ledger` trait. Empty until the committee-draw wiring
+    /// (event_loop.rs) is live; covered by the same persistence checklist as `escrow_by_job`
+    /// (in-memory only today — see that field's WIRE-IN TODO; must be persisted + state-rooted before
+    /// the live committee draw).
+    pub job_lifecycles: HashMap<[u8; 32], JobLifecycle>,
 }
 
 // Manual Debug impl since RocksStore doesn't derive Debug.
@@ -204,6 +213,7 @@ impl std::fmt::Debug for ChainState {
             .field("escrow_by_job", &self.escrow_by_job.len())
             .field("bonded_stake", &self.bonded_stake.len())
             .field("unbonding_stake", &self.unbonding_stake.len())
+            .field("job_lifecycles", &self.job_lifecycles.len())
             .finish()
     }
 }
@@ -235,6 +245,7 @@ impl ChainState {
             bonded_stake: HashMap::new(),
             unbonding_stake: HashMap::new(),
             stake_params: StakeParams::default(),
+            job_lifecycles: HashMap::new(),
         }
     }
 
@@ -313,6 +324,7 @@ impl ChainState {
             bonded_stake: HashMap::new(),
             unbonding_stake: HashMap::new(),
             stake_params: StakeParams::default(),
+            job_lifecycles: HashMap::new(),
         })
     }
 
@@ -1682,6 +1694,7 @@ impl ChainState {
         self.escrow_by_job.clear();
         self.bonded_stake.clear();
         self.unbonding_stake.clear();
+        self.job_lifecycles.clear();
         self.cumulative_score = 0;
         self.state_diffs.clear();
 
@@ -1758,6 +1771,7 @@ impl ChainState {
         self.escrow_by_job.clear();
         self.bonded_stake.clear();
         self.unbonding_stake.clear();
+        self.job_lifecycles.clear();
         self.nerf_rate = NerfRate::INITIAL;
         self.current_epoch = 0;
         self.receipts = ReceiptStore::new();

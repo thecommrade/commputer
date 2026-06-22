@@ -29,10 +29,10 @@ use commputer_pouw::commit_reveal::reveal_matches;
 use commputer_pouw::committee::select_committee;
 use commputer_pouw::ids::ParticipantId;
 use commputer_pouw::job::{Commitment, Reveal, SettlementOutcome, Verdict};
-use commputer_pouw::oracle::{ChainHooks, EquivalenceOracle};
+use commputer_pouw::oracle::EquivalenceOracle;
 use commputer_pouw::params::GameParams;
 use commputer_pouw::verdict::compute_verdict;
-use crate::escrow_ledger::EscrowLedger;
+use crate::escrow_ledger::Ledger;
 use crate::settlement_resolution::{resolve_confirmed, resolve_disputed, resolve_timeout, ResolutionParams};
 
 /// Lifecycle phase. Advances by block height; `submit_result` moves AwaitingResult→Committing.
@@ -97,7 +97,8 @@ pub enum Terminal {
 }
 
 /// One compute job's primary verification round, as a deterministic multi-block state machine.
-/// Holds only plain data; `stake_of`/`eq`/`&mut EscrowLedger` are passed to the methods.
+/// Holds only plain data; `stake_of`/`eq`/`&mut impl Ledger` are passed to the methods (the ledger is
+/// the `EscrowLedger` reference in tests, `ChainState` on the live node — P2 §3 option B).
 pub struct JobLifecycle {
     job_id: [u8; 32],
     submitter: ParticipantId,
@@ -193,7 +194,7 @@ impl JobLifecycle {
 
     /// A committee verifier commits (DA-Available ⇒ they call this; Abstain ⇒ they don't).
     /// Validates phase/window/membership/bond/no-double-commit, then escrows the bond.
-    pub fn record_commit(&mut self, l: &mut EscrowLedger, c: Commitment, height: u64) -> EventResult {
+    pub fn record_commit(&mut self, l: &mut impl Ledger, c: Commitment, height: u64) -> EventResult {
         if self.phase != Phase::Committing {
             return EventResult::Rejected(RejectReason::WrongPhase);
         }
@@ -253,7 +254,7 @@ impl JobLifecycle {
     /// (NoQuorum, escrow held). **Idempotent:** the terminal is computed once and cached; a
     /// second call (a re-org or double block-tick at the wire-in) returns the same outcome
     /// and moves no value — symmetric with `advance`.
-    pub fn settle(&mut self, l: &mut EscrowLedger, eq: &dyn EquivalenceOracle) -> Terminal {
+    pub fn settle(&mut self, l: &mut impl Ledger, eq: &dyn EquivalenceOracle) -> Terminal {
         if let Some(t) = &self.settled {
             return t.clone();
         }
@@ -338,6 +339,8 @@ impl JobLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::escrow_ledger::EscrowLedger; // tests drive the concrete reference ledger
+    use commputer_pouw::oracle::ChainHooks; // for .escrow/.pay/.burn on the concrete EscrowLedger
 
     fn pid(n: u8) -> ParticipantId {
         ParticipantId([n; 32])

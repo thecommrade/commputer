@@ -20,10 +20,12 @@
 
 use commputer_pouw::ids::ParticipantId;
 use commputer_pouw::job::SettlementOutcome;
-use commputer_pouw::oracle::ChainHooks;
 use commputer_pouw::params::GameParams;
 use commputer_pouw::settlement::{bps, settle_committee_disputed, settle_confirmed_sampled};
-use crate::escrow_ledger::EscrowLedger;
+// The resolvers are generic over `Ledger` now (was a concrete `EscrowLedger`); the `&mut impl Ledger`
+// coerces to the `&mut dyn ChainHooks` the frozen `settle_*` take, so `ChainHooks` is no longer named
+// here. `EscrowLedger` is used only by the tests below.
+use crate::escrow_ledger::Ledger;
 
 /// Lifecycle-only resolution fees (the `Confirmed`/`Disputed` splits use `GameParams`).
 /// `GameParams` is a frozen game file, so these live here.
@@ -45,7 +47,7 @@ impl Default for ResolutionParams {
 /// `Cancel` (G7, pre-claim only): the submitter withdraws before any executor claims, so
 /// only the budget is escrowed. Burn `cancel_burn_bps` of the budget; refund the rest.
 pub fn resolve_cancel(
-    l: &mut EscrowLedger,
+    l: &mut impl Ledger,
     rp: &ResolutionParams,
     job_id: [u8; 32],
     budget: u64,
@@ -64,7 +66,7 @@ pub fn resolve_cancel(
 /// burn the remainder of the bond. (Timeout is pre-verification, so no committee bonds
 /// exist.) The full bond is recorded in `slashed` as a log.
 pub fn resolve_timeout(
-    l: &mut EscrowLedger,
+    l: &mut impl Ledger,
     rp: &ResolutionParams,
     job_id: [u8; 32],
     budget: u64,
@@ -90,7 +92,7 @@ pub fn resolve_timeout(
 /// `ResolutionParams`: the decision is a flat full refund (G8's withholding penalty is
 /// deferred; re-introducing it is a single `burn` over this structure).
 pub fn resolve_unavailable(
-    l: &mut EscrowLedger,
+    l: &mut impl Ledger,
     job_id: [u8; 32],
     budget: u64,
     submitter: ParticipantId,
@@ -114,7 +116,7 @@ pub fn resolve_unavailable(
 /// mirroring `engine.rs:251-258`.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_confirmed(
-    l: &mut EscrowLedger,
+    l: &mut impl Ledger,
     p: &GameParams,
     job_id: [u8; 32],
     budget: u64,
@@ -141,7 +143,7 @@ pub fn resolve_confirmed(
 /// returned committee bonds itself — mirroring `engine.rs:260-277`.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_disputed(
-    l: &mut EscrowLedger,
+    l: &mut impl Ledger,
     p: &GameParams,
     job_id: [u8; 32],
     budget: u64,
@@ -165,6 +167,8 @@ pub fn resolve_disputed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::escrow_ledger::EscrowLedger; // the tests drive the concrete reference ledger
+    use commputer_pouw::oracle::ChainHooks; // for .escrow/.pay/.burn on the concrete EscrowLedger
     use commputer_pouw::economics::{budget_min, executor_bond_min, run_priced_job, verifier_bond_min};
     use commputer_pouw::engine::JobInputs;
     use commputer_pouw::ids::JobId;

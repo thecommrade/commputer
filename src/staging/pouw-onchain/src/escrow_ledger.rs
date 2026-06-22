@@ -127,6 +127,25 @@ impl ChainHooks for EscrowLedger {
     }
 }
 
+/// The money-path surface the lifecycle + settlement resolvers run against: `ChainHooks`
+/// (escrow/pay/burn/slash/stake_of) plus a per-job-pot selector. `EscrowLedger` is the reference
+/// impl; the node impls this over `ChainState` (P2 §3 option B) so the SAME tested money logic drives
+/// the live chain. The `for_job` trait method has the same name as `EscrowLedger`'s inherent method
+/// on purpose: in a generic `impl Ledger` context the trait method is used; on a concrete
+/// `EscrowLedger` the inherent one wins (Rust inherent-method priority) — so call sites need no churn.
+pub trait Ledger: ChainHooks {
+    /// Scope subsequent escrow/pay/burn ops to `job_id`'s pot.
+    fn for_job(&mut self, job_id: [u8; 32]);
+}
+
+impl Ledger for EscrowLedger {
+    fn for_job(&mut self, job_id: [u8; 32]) {
+        // set the active job directly (active_job is private to this module); avoids any
+        // inherent-vs-trait resolution ambiguity inside the impl body.
+        self.active_job = Some(job_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
