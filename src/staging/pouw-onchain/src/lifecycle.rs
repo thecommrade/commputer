@@ -165,6 +165,18 @@ impl JobLifecycle {
         &self.committee
     }
 
+    /// Whether this job's window has elapsed and the node should call `settle` at `height`. The
+    /// deadlines are private, so the node (event_loop `enforce_timeouts`, P2) drives termination
+    /// through this: past `result_by` with no result (timeout), or past `reveal_by` once reached
+    /// Committing/Revealing. Already-`Settled` jobs return false (idempotent — nothing more to do).
+    pub fn should_settle(&self, height: u64) -> bool {
+        match self.phase {
+            Phase::AwaitingResult => height > self.deadlines.result_by, // executor never delivered
+            Phase::Committing | Phase::Revealing => height > self.deadlines.reveal_by,
+            Phase::Settled => false,
+        }
+    }
+
     /// Executor delivers CompleteJob{result_hash}. Records the claim, draws the committee
     /// from the consensus `seed` (known only AFTER the result, per engine.rs:107), and
     /// transitions to Committing. The seed/stake_of are inputs the chain supplies.
@@ -408,6 +420,34 @@ mod tests {
         );
         assert_eq!(lc.phase(), Phase::AwaitingResult);
         assert!(lc.committee().is_empty());
+    }
+
+    #[test]
+    fn should_settle_tracks_phase_windows() {
+        // deadlines: result_by 10, commit_by 20, reveal_by 30.
+        let mut lc = JobLifecycle::open(
+            [1u8; 32], pid(0), pid(9), 3960, 3960, 1650,
+            GameParams::default(), ResolutionParams::default(),
+            vec![pid(10), pid(11), pid(12)], deadlines(),
+        );
+        // AwaitingResult: settle once past result_by (executor never delivered).
+        assert!(!lc.should_settle(10));
+        assert!(lc.should_settle(11));
+        // Committing (committee drawn): settle once past reveal_by.
+        let stake = |_: &ParticipantId| 1u64;
+        lc.submit_result(pid(9), [7u8; 32], [42u8; 32], 5, &stake);
+        assert!(!lc.should_settle(30));
+        assert!(lc.should_settle(31));
+        // After settling, nothing more to do.
+        let mut l = EscrowLedger::new();
+        l.credit(pid(0), 3960);
+        l.credit(pid(9), 3960);
+        l.for_job([1u8; 32]);
+        l.escrow(pid(0), 3960);
+        l.escrow(pid(9), 3960);
+        lc.advance(31);
+        let _ = lc.settle(&mut l, &ByteEq);
+        assert!(!lc.should_settle(999), "Settled is terminal");
     }
 
     #[test]

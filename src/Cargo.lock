@@ -856,6 +856,7 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "commputer-core",
+ "commputer-pouw",
  "commputer-pouw-onchain",
  "ed25519-dalek",
  "hex",

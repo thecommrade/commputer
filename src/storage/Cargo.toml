@@ -9,9 +9,11 @@ description = "Blockchain state storage: blocks, accounts, proofs"
 [dependencies]
 commputer-core = { workspace = true }
 # PoUW P2: the per-job verification lifecycle held in ChainState (the §3 Ledger-trait integration
-# runs the staging lifecycle/settlement money logic against ChainState). No dep cycle: pouw-onchain
-# does not depend on storage.
+# runs the staging lifecycle/settlement money logic against ChainState). No dep cycle: neither
+# pouw-onchain nor pouw depends on storage. commputer-pouw supplies the trait/types the Ledger view
+# uses directly (ChainHooks, ParticipantId, Commitment/Reveal, EquivalenceOracle).
 commputer-pouw-onchain = { path = "../staging/pouw-onchain" }
+commputer-pouw = { path = "../staging/pouw" }
 serde = { workspace = true }
 borsh = { workspace = true }
 thiserror = { workspace = true }
