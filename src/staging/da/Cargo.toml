@@ -1,0 +1,17 @@
+[package]
+name = "commputer-da"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Data-availability sampling layer (Merkle-over-Reed-Solomon, no trusted setup) for the PoUW verification game"
+
+[dependencies]
+sha2 = { workspace = true }
+reed-solomon-erasure = "=6.0.0"   # probe-verified deterministic GF(2^8); behind the ErasureCoder trait
+
+[dev-dependencies]
+proptest = "1.4"
+
+[features]
+# GF(2^16) novelpoly coder for objects above the GF(2^8) 128-data-chunk ceiling (deferred).
+da-gf16 = []

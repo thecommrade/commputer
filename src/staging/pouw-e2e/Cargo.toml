@@ -1,0 +1,17 @@
+[package]
+name = "commputer-pouw-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "End-to-end PoUW job-lifecycle harness: composes the WASM runtime, fuel economics, and data-availability subsystems"
+
+[dependencies]
+commputer-pouw = { path = "../pouw", features = ["wasm-runtime"] }
+commputer-da = { path = "../da" }
+sha2 = { workspace = true }
+rand = { workspace = true }
+wat = "=1.251.0"   # assemble guest .wat -> .wasm (normal dep: used in src/programs.rs, compiled into lib+bin)
+
+[[bin]]
+name = "e2e-trace"
+path = "bin/e2e-trace.rs"

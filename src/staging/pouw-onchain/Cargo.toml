@@ -1,0 +1,18 @@
+[package]
+name = "commputer-pouw-onchain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "P0 on-chain wiring adapters: deterministic execution, job-spec mapping, reference escrow ledger"
+
+[dependencies]
+commputer-pouw = { path = "../pouw", features = ["wasm-runtime"] }
+sha2 = { workspace = true }
+commputer-da = { path = "../da" }
+
+[dev-dependencies]
+wat = "=1.251.0"   # assemble a guest for the exec-adapter test
+# rand: the escrow-ledger happy-path test drives run_priced_job, whose signature takes a
+# seeded &mut RngCore (mirrors pouw economics::priced_world + pouw-e2e world.rs). The spec's
+# Cargo.toml listed only `wat`; rand is the minimal addition required to exercise that test.
+rand = { workspace = true }

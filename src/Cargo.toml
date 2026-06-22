@@ -13,6 +13,9 @@ members = [
     "doctor",
     "seed-node-kit",
     "staging/pouw",
+    "staging/da",
+    "staging/pouw-e2e",
+    "staging/pouw-onchain",
 ]
 
 [workspace.package]
