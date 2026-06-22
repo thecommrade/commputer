@@ -157,6 +157,31 @@ pub enum TxKind {
 
     /// Item 14: Validator deregistration — clean network leave.
     ValidatorDeregister,
+
+    // NOTE: TxKind derives Borsh, which tags enum variants by DECLARATION POSITION. New variants
+    // MUST be appended at the END so existing variants keep their discriminants — inserting in the
+    // middle would re-tag every later variant and corrupt previously-serialized blocks. (Found by
+    // the P2 adversarial review, 2026-06-22.)
+
+    /// PoUW P2 / G2: a committee verifier commits to a job's result during the Committing phase.
+    /// `commit = H(result_hash‖salt‖verifier)` (the frozen `commit_reveal::make_commitment`);
+    /// `bond` is the verifier's stake, escrowed into the job pot on apply. The verifier is the
+    /// tx `from`. Opened later by `Reveal`. Maps to `JobLifecycle::record_commit` once the
+    /// committee draw (P2 protected wiring) is live; inert (accept + nonce, no escrow) until then.
+    Commit {
+        job_id: [u8; 32],
+        commit: [u8; 32],
+        bond: Amount,
+    },
+    /// PoUW P2 / G2: a committee verifier reveals `(result_hash, salt)` opening its `Commit`
+    /// during the Revealing phase (the verifier is the tx `from`). Validated against the stored
+    /// commitment by the frozen `commit_reveal::reveal_matches`. Maps to
+    /// `JobLifecycle::record_reveal`; inert (accept + nonce) until the P2 wiring is live.
+    Reveal {
+        job_id: [u8; 32],
+        result_hash: [u8; 32],
+        salt: [u8; 32],
+    },
 }
 
 /// Minimum transaction fee in raw units (0.0001 COMME = 100_000 raw units).

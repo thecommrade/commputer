@@ -947,6 +947,31 @@ impl ChainState {
                 sender.nonce += 1;
             }
 
+            TxKind::Commit { .. } => {
+                // PoUW P2 / G2: a committee verifier commits H(result_hash‖salt‖verifier) + a bond.
+                // INERT until the committee draw (event_loop, PROTECTED) creates the job's
+                // JobLifecycle and this routes to record_commit (which escrows the bond). Until
+                // then there is no lifecycle to record into, so accept + bump nonce only — the
+                // bond is NOT escrowed, so it cannot strand. Committee members are validators.
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can commit to compute jobs".into(),
+                    ));
+                }
+                sender.nonce += 1;
+            }
+
+            TxKind::Reveal { .. } => {
+                // PoUW P2 / G2: a committee verifier reveals (result_hash, salt) opening its Commit.
+                // INERT until wired to JobLifecycle::record_reveal — accept + bump nonce only.
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can reveal compute job results".into(),
+                    ));
+                }
+                sender.nonce += 1;
+            }
+
             TxKind::MiningReward { to, amount, .. } => {
                 // Item 13: Mining reward — protocol-issued, no nonce or fee.
                 // The actual balance change happens in the epoch processing;
@@ -1048,6 +1073,24 @@ impl ChainState {
                 if !sender.is_validator {
                     return Err(StateError::InvalidBlock(
                         "only validators can dispute compute jobs".into(),
+                    ));
+                }
+            }
+            TxKind::Commit { .. } => {
+                // PoUW P2 / G2: Commit in batch — verify validator (INERT until lifecycle wiring).
+                let sender = self.accounts.get_or_create(from);
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can commit to compute jobs".into(),
+                    ));
+                }
+            }
+            TxKind::Reveal { .. } => {
+                // PoUW P2 / G2: Reveal in batch — verify validator (INERT until lifecycle wiring).
+                let sender = self.accounts.get_or_create(from);
+                if !sender.is_validator {
+                    return Err(StateError::InvalidBlock(
+                        "only validators can reveal compute job results".into(),
                     ));
                 }
             }
@@ -2383,6 +2426,85 @@ mod tests {
         assert_eq!(stake_conserved(&state), conserved, "slash: at-risk -> burned");
         state.withdraw_unbonded(&addr(1), 1_000);
         assert_eq!(stake_conserved(&state), conserved, "withdraw: matured unbonding -> balance");
+    }
+
+    // --- PoUW P2 (G2) Commit/Reveal TxKinds (inert until the committee-draw wiring) ----
+
+    fn block_with(state: &ChainState, height: u64, txs: Vec<Transaction>) -> Block {
+        Block {
+            header: BlockHeader {
+                protocol_version: 1,
+                height,
+                parent_hash: state.blocks.latest().unwrap().hash(),
+                tx_root: [0u8; 32],
+                proof_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 2000 + height,
+                producer: addr(0),
+                epoch: 0,
+                producer_public_key: vec![],
+                signature: vec![],
+                checkpoint_hash: None,
+                chain_id: String::new(),
+            },
+            transactions: txs,
+            proof_summaries: vec![],
+            compliance_summary: None,
+            epoch_summary: None,
+        }
+    }
+
+    fn unsigned(from: Address, nonce: u64, kind: TxKind) -> Transaction {
+        Transaction { from, nonce, kind, fee: 0, signature: vec![], public_key: vec![], memo: None, timelock: None }
+    }
+
+    #[test]
+    fn commit_from_validator_is_inert_accepted() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let v = state.accounts.get_or_create(addr(1));
+        v.is_validator = true;
+        v.balance = Amount::from_comme(10);
+        state.total_emitted = Amount::from_comme(10).raw();
+        let burned_before = state.total_burned;
+        let bal_before = state.accounts.get(&addr(1)).unwrap().balance;
+
+        let commit = TxKind::Commit { job_id: [7u8; 32], commit: [2u8; 32], bond: Amount::from_raw(1_000) };
+        state.apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, commit)])).unwrap();
+
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 1, "nonce bumped");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, bal_before, "bond NOT escrowed (inert)");
+        assert_eq!(state.total_burned, burned_before, "Commit does not burn");
+        assert_eq!(state.escrowed_for_job(&[7u8; 32]), 0, "no escrow pot created yet");
+    }
+
+    #[test]
+    fn reveal_from_validator_is_inert_accepted() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).is_validator = true;
+
+        let reveal = TxKind::Reveal { job_id: [7u8; 32], result_hash: [3u8; 32], salt: [4u8; 32] };
+        state.apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, reveal)])).unwrap();
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 1, "nonce bumped");
+    }
+
+    #[test]
+    fn commit_and_reveal_from_non_validator_are_rejected() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_comme(10);
+
+        let commit = TxKind::Commit { job_id: [7u8; 32], commit: [2u8; 32], bond: Amount::from_raw(1_000) };
+        assert!(
+            state.apply_block(&block_with(&state, 1, vec![unsigned(addr(2), 0, commit)])).is_err(),
+            "non-validator Commit rejected"
+        );
+        let reveal = TxKind::Reveal { job_id: [7u8; 32], result_hash: [3u8; 32], salt: [4u8; 32] };
+        assert!(
+            state.apply_block(&block_with(&state, 1, vec![unsigned(addr(2), 0, reveal)])).is_err(),
+            "non-validator Reveal rejected"
+        );
     }
 
     fn genesis_block() -> Block {
