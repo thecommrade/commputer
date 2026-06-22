@@ -138,6 +138,40 @@ pub fn admit(p: &CapacityParams, churn_bps: u32, pending: &[PendingJob]) -> Admi
     }
 }
 
+/// Validator-set churn for the dynamic reserve, in bps ∈ [0, 10_000]. `churn = (joined + left) /
+/// prev_count`, clamped to 10_000 (a full turnover or more). `joined` and `left` are disjoint per
+/// epoch (a validator either joined or left, not both), so `joined + left == |joined ∪ left|`.
+/// `prev_count == 0` (genesis/bootstrap) yields 0 — no reserve inflation before there is a set to
+/// churn. Pure; the node computes `joined`/`left`/`prev_count` from the per-epoch validator delta
+/// and feeds the result to `dynamic_reserve_bps`/`available_slots`/`admit`.
+pub fn validator_churn_bps(prev_count: u64, joined: u64, left: u64) -> u32 {
+    if prev_count == 0 {
+        return 0;
+    }
+    let churned = joined.saturating_add(left);
+    let bps = churned.saturating_mul(10_000) / prev_count;
+    bps.min(10_000) as u32
+}
+
+/// The fields the chain destructures a pending `SubmitJob`/`SubmitJobV2` into to build an admission
+/// input — a mirror struct (the real `transaction.rs`/`event_loop.rs` read is founder-applied), the
+/// same decoupling pattern as `jobspec_map::SubmitJobFields`, keeping this crate independent of
+/// `commputer-core`. `is_flagship` = `l2::is_flagship(l2_id)` and `fee`/`job_id` are resolved by the
+/// chain (`job_id = PoolJobId(tx_hash.0)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingJobFields {
+    pub job_id: [u8; 32],
+    pub is_flagship: bool,
+    pub fee: u64,
+}
+
+/// Map a destructured pending job to a `PendingJob` (priority = fee — higher fee admits first, ties
+/// broken by job_id). The chain calls this for each mempool `SubmitJob`/`SubmitJobV2` to build the
+/// `admit` input.
+pub fn pending_job_from_fields(f: PendingJobFields) -> PendingJob {
+    PendingJob { job_id: f.job_id, is_flagship: f.is_flagship, priority: f.fee }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +319,37 @@ mod tests {
         let mut reversed = pending.clone();
         reversed.reverse();
         assert_eq!(admit(&p, 250, &pending), admit(&p, 250, &reversed));
+    }
+
+    #[test]
+    fn validator_churn_bps_formula() {
+        assert_eq!(validator_churn_bps(0, 5, 5), 0, "genesis/bootstrap: no prior set => 0 churn");
+        assert_eq!(validator_churn_bps(100, 0, 0), 0, "stable set => 0");
+        assert_eq!(validator_churn_bps(100, 3, 0), 300, "3 joined of 100 => 3%");
+        assert_eq!(validator_churn_bps(100, 2, 1), 300, "joined+left disjoint => 3%");
+        assert_eq!(validator_churn_bps(100, 100, 0), 10_000, "full turnover => 100%");
+        assert_eq!(validator_churn_bps(100, 200, 50), 10_000, ">full clamps to 100%");
+        assert_eq!(validator_churn_bps(3, 1, 0), 3_333, "integer division floor");
+    }
+
+    #[test]
+    fn churn_bps_feeds_reserve_end_to_end() {
+        let p = CapacityParams::default();
+        let churn = validator_churn_bps(100, 5, 0); // 500 bps = 5% churn
+        assert_eq!(churn, 500);
+        assert_eq!(dynamic_reserve_bps(&p, churn), 550, "5% floor + 10%*5% churn = 5.5%");
+    }
+
+    #[test]
+    fn pending_job_from_fields_maps_priority_to_fee_and_admits() {
+        let pj = pending_job_from_fields(PendingJobFields { job_id: [9u8; 32], is_flagship: true, fee: 4_200 });
+        assert_eq!(pj.job_id, [9u8; 32]);
+        assert!(pj.is_flagship);
+        assert_eq!(pj.priority, 4_200, "priority = fee");
+        // higher fee admits first into a single slot
+        let lo = pending_job_from_fields(PendingJobFields { job_id: [1u8; 32], is_flagship: true, fee: 1 });
+        let p = CapacityParams { total_slots: 1, reserve_floor_bps: 0, reserve_max_bps: 0, ..CapacityParams::default() };
+        let a = admit(&p, 0, &[lo, pj]);
+        assert_eq!(a.admitted, vec![[9u8; 32]], "higher fee admitted into the single slot");
     }
 }
