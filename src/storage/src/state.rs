@@ -2103,9 +2103,10 @@ impl ChainState {
 /// (P2 §3 option B) runs against the live chain. `for_job` sets the active job; escrow/pay/burn act on
 /// that job's pot through the audited `ChainState` primitives. `ParticipantId` <-> `Address` are
 /// `[u8;32]` newtype casts. The `ChainHooks` ops are infallible by contract (the frozen game panics on
-/// a malformed pot); on-chain that maps to `.expect(...)`, so the CALLER MUST pre-validate the pot (the
-/// P1 caller-contract: `escrowed_for_job == budget + Be + Σ committed bonds`) before driving a settle,
-/// or reject the terminal tx.
+/// a malformed pot); on-chain that maps to `.expect(...)`. The `lifecycle_*` helpers below ENFORCE the
+/// P1 pre-validation (`escrowed_for_job == expected_escrow()` for settle; committer balance ≥ bond for
+/// commit) and return `Err` on a mismatch BEFORE driving the lifecycle, so in practice these `.expect`s
+/// are unreachable — a malformed pot rejects the terminal tx instead of panicking the node.
 struct ChainLedger<'a> {
     chain: &'a mut ChainState,
     job: Option<[u8; 32]>,
@@ -2169,12 +2170,24 @@ impl ChainState {
         job_id: [u8; 32],
         c: Commitment,
         height: u64,
-    ) -> Option<EventResult> {
-        let mut life = self.job_lifecycles.remove(&job_id)?;
+    ) -> Result<Option<EventResult>, StateError> {
+        let mut life = match self.job_lifecycles.remove(&job_id) {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        // record_commit escrows c.bond from the committer (on Accepted) via the infallible ChainHooks
+        // surface; pre-check the balance so that escrow cannot panic the ledger. (record_commit may
+        // still Reject for phase/window/membership/double-commit — those move no money.)
+        let committer = Address(c.verifier.0);
+        let bal = self.accounts.get(&committer).map(|a| a.balance.raw()).unwrap_or(0);
+        if bal < c.bond {
+            self.job_lifecycles.insert(job_id, life);
+            return Err(StateError::InsufficientBalance);
+        }
         let mut view = ChainLedger::new(self);
         let r = life.record_commit(&mut view, c, height);
         self.job_lifecycles.insert(job_id, life);
-        Some(r)
+        Ok(Some(r))
     }
 
     /// Record a committee verifier's reveal (no money move). `None` if no lifecycle for `job_id`.
@@ -2202,12 +2215,27 @@ impl ChainState {
         &mut self,
         job_id: [u8; 32],
         eq: &dyn EquivalenceOracle,
-    ) -> Option<Terminal> {
-        let mut life = self.job_lifecycles.remove(&job_id)?;
+    ) -> Result<Option<Terminal>, StateError> {
+        let mut life = match self.job_lifecycles.remove(&job_id) {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        // Pre-validate the pot (P1 caller-contract) so a malformed pot REJECTS the terminal tx instead
+        // of panicking the ledger mid-settle. After this guard every pay/burn in settle is covered by
+        // the pot, so the ChainLedger .expect()s cannot fire — which also keeps the borrow dance
+        // panic-safe (no panic ⇒ the re-insert below always runs ⇒ the lifecycle is never lost).
+        let expected = life.expected_escrow();
+        let actual = self.escrowed_for_job(&job_id);
+        if actual != expected {
+            self.job_lifecycles.insert(job_id, life);
+            return Err(StateError::InvalidBlock(format!(
+                "job pot {actual} != expected {expected}; refusing to settle"
+            )));
+        }
         let mut view = ChainLedger::new(self);
         let terminal = life.settle(&mut view, eq);
         self.job_lifecycles.insert(job_id, life);
-        Some(terminal)
+        Ok(Some(terminal))
     }
 }
 
@@ -2251,6 +2279,32 @@ mod tests {
         let mut a = [0u8; 32];
         a[0] = n;
         Address(a)
+    }
+
+    // PoUW P2 §3 lifecycle-test helpers (JobLifecycle/Terminal/Commitment/Reveal/EventResult/Phase
+    // come via `use super::*`).
+    use commputer_pouw::commit_reveal::make_commitment;
+    use commputer_pouw::economics::{budget_min, executor_bond_min, verifier_bond_min};
+    use commputer_pouw::oracle::ByteEq;
+    use commputer_pouw::params::GameParams;
+    use commputer_pouw_onchain::lifecycle::PhaseDeadlines;
+    use commputer_pouw_onchain::settlement_resolution::ResolutionParams;
+
+    /// ParticipantId and the byte-identical on-chain Address (the ChainLedger casts between them).
+    fn lpid(n: u8) -> ParticipantId {
+        ParticipantId([n; 32])
+    }
+    fn lpaddr(n: u8) -> Address {
+        Address([n; 32])
+    }
+    fn fuel_mins() -> (u64, u64, u64) {
+        let p = GameParams::default();
+        let f = 100_000_000u64;
+        let b = budget_min(f, &p).unwrap();
+        (b, executor_bond_min(f, b, &p).unwrap(), verifier_bond_min(f, &p).unwrap())
+    }
+    fn test_deadlines() -> PhaseDeadlines {
+        PhaseDeadlines { result_by: 10, commit_by: 20, reveal_by: 30 }
     }
 
     // --- PoUW P1 escrow foundation -------------------------------------------------
@@ -2672,23 +2726,10 @@ mod tests {
 
     #[test]
     fn lifecycle_confirmed_round_moves_money_through_chainstate_and_conserves() {
-        use commputer_pouw::commit_reveal::make_commitment;
-        use commputer_pouw::economics::{budget_min, executor_bond_min, verifier_bond_min};
-        use commputer_pouw::job::Commitment;
-        use commputer_pouw::oracle::ByteEq;
-        use commputer_pouw::params::GameParams;
-        use commputer_pouw_onchain::lifecycle::{JobLifecycle, PhaseDeadlines, Terminal};
-        use commputer_pouw_onchain::settlement_resolution::ResolutionParams;
-
-        // Participant id and the byte-identical on-chain Address (the ChainLedger casts between them).
-        let pid = |n: u8| ParticipantId([n; 32]);
-        let paddr = |n: u8| Address([n; 32]);
-
+        let pid = lpid;
+        let paddr = lpaddr;
         let p = GameParams::default();
-        let f = 100_000_000u64;
-        let budget = budget_min(f, &p).unwrap(); // 3_960
-        let e_bond = executor_bond_min(f, budget, &p).unwrap(); // 3_960
-        let v_bond = verifier_bond_min(f, &p).unwrap(); // 1_650
+        let (budget, e_bond, v_bond) = fuel_mins(); // 3_960 / 3_960 / 1_650
         let committee = [pid(10), pid(11), pid(12)];
         let job = [1u8; 32];
         let result = [7u8; 32];
@@ -2720,7 +2761,7 @@ mod tests {
         // Every committee member commits (the ChainLedger escrows their bond into the pot)...
         for (i, c) in committee.iter().enumerate() {
             let commit: Commitment = make_commitment(c, &result, &[i as u8; 32], v_bond);
-            assert_eq!(state.lifecycle_record_commit(job, commit, 15), Some(EventResult::Accepted));
+            assert_eq!(state.lifecycle_record_commit(job, commit, 15).unwrap(), Some(EventResult::Accepted));
         }
         assert_eq!(
             state.escrowed_for_job(&job),
@@ -2738,7 +2779,7 @@ mod tests {
         state.lifecycle_advance(job, 31);
 
         // ...settle: Confirmed, money moves through ChainState (85/10/5 + bonds returned).
-        let term = state.lifecycle_settle(job, &ByteEq).expect("lifecycle exists");
+        let term = state.lifecycle_settle(job, &ByteEq).expect("pot pre-validates").expect("lifecycle exists");
         match term {
             Terminal::Confirmed(out) => {
                 assert_eq!(out.worker_paid, 3_366); // 85% of budget
@@ -2761,6 +2802,115 @@ mod tests {
             conserved,
             "supply conserved across the full on-chain round"
         );
+    }
+
+    #[test]
+    fn lifecycle_disputed_round_slashes_executor_through_chainstate() {
+        let (budget, e_bond, v_bond) = fuel_mins();
+        let committee = [lpid(10), lpid(11), lpid(12)];
+        let job = [3u8; 32];
+        let claimed = [7u8; 32]; // executor claims 7
+        let correct = [5u8; 32]; // committee proves 5 ⇒ Disputed
+
+        let mut state = ChainState::new();
+        state.total_emitted = budget + e_bond + 3 * v_bond;
+        state.accounts.get_or_create(lpaddr(0)).balance = Amount::from_raw(budget);
+        state.accounts.get_or_create(lpaddr(9)).balance = Amount::from_raw(e_bond);
+        for c in 10u8..13 {
+            state.accounts.get_or_create(lpaddr(c)).balance = Amount::from_raw(v_bond);
+        }
+        let conserved = sum_balances(&state) + state.total_escrowed() + state.total_burned;
+        state.escrow_into_job(&lpaddr(0), job, budget).unwrap();
+        state.escrow_into_job(&lpaddr(9), job, e_bond).unwrap();
+
+        let mut lc = JobLifecycle::open(
+            job, lpid(0), lpid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(), committee.to_vec(), test_deadlines(),
+        );
+        let stake = |_: &ParticipantId| 1u64;
+        assert_eq!(lc.submit_result(lpid(9), claimed, [42u8; 32], 5, &stake), EventResult::Accepted);
+        state.job_lifecycles.insert(job, lc);
+
+        for (i, c) in committee.iter().enumerate() {
+            let commit = make_commitment(c, &correct, &[i as u8; 32], v_bond);
+            assert_eq!(state.lifecycle_record_commit(job, commit, 15).unwrap(), Some(EventResult::Accepted));
+        }
+        state.lifecycle_advance(job, 21);
+        for (i, c) in committee.iter().enumerate() {
+            let r = Reveal { verifier: *c, result_hash: correct, salt: [i as u8; 32] };
+            assert_eq!(state.lifecycle_record_reveal(job, r, 25), Some(EventResult::Accepted));
+        }
+        state.lifecycle_advance(job, 31);
+
+        let term = state.lifecycle_settle(job, &ByteEq).expect("pot valid").expect("lifecycle");
+        assert!(matches!(term, Terminal::Disputed(_)), "expected Disputed, got {term:?}");
+        assert_eq!(state.accounts.get(&lpaddr(0)).unwrap().balance, Amount::from_raw(budget), "submitter refunded");
+        assert_eq!(state.accounts.get(&lpaddr(9)).unwrap().balance, Amount::from_raw(0), "executor bond slashed");
+        // committee: 20% of e_bond bounty (792) split across the 3 honest + all 3 bonds returned.
+        let committee_total: u64 = (10u8..13).map(|c| state.accounts.get(&lpaddr(c)).unwrap().balance.raw()).sum();
+        assert_eq!(committee_total, 792 + 3 * v_bond, "bounty + bonds to the honest committee");
+        assert_eq!(state.total_burned, e_bond - 792, "remainder of slashed exec bond burned");
+        assert_eq!(state.escrowed_for_job(&job), 0, "pot drained");
+        assert_eq!(sum_balances(&state) + state.total_escrowed() + state.total_burned, conserved);
+    }
+
+    #[test]
+    fn lifecycle_timeout_refunds_and_slashes_through_chainstate() {
+        let (budget, e_bond, v_bond) = fuel_mins();
+        let job = [2u8; 32];
+        let mut state = ChainState::new();
+        state.total_emitted = budget + e_bond;
+        state.accounts.get_or_create(lpaddr(0)).balance = Amount::from_raw(budget);
+        state.accounts.get_or_create(lpaddr(9)).balance = Amount::from_raw(e_bond);
+        let conserved = sum_balances(&state) + state.total_escrowed() + state.total_burned;
+        state.escrow_into_job(&lpaddr(0), job, budget).unwrap();
+        state.escrow_into_job(&lpaddr(9), job, e_bond).unwrap();
+
+        // Executor never submits a result. Advance past result_by, then settle → TimedOut.
+        let lc = JobLifecycle::open(
+            job, lpid(0), lpid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(),
+            vec![lpid(10), lpid(11), lpid(12)], test_deadlines(),
+        );
+        state.job_lifecycles.insert(job, lc);
+        state.lifecycle_advance(job, 11);
+
+        let term = state.lifecycle_settle(job, &ByteEq).expect("pot valid").expect("lifecycle");
+        assert!(matches!(term, Terminal::TimedOut(_)), "expected TimedOut, got {term:?}");
+        // resolve_timeout: budget + 20% of exec bond to submitter; 80% burned.
+        assert_eq!(state.accounts.get(&lpaddr(0)).unwrap().balance, Amount::from_raw(budget + e_bond / 5));
+        assert_eq!(state.accounts.get(&lpaddr(9)).unwrap().balance, Amount::from_raw(0), "executor bond slashed");
+        assert_eq!(state.total_burned, e_bond - e_bond / 5, "80% of exec bond burned");
+        assert_eq!(state.escrowed_for_job(&job), 0, "pot drained");
+        assert_eq!(sum_balances(&state) + state.total_escrowed() + state.total_burned, conserved);
+    }
+
+    #[test]
+    fn lifecycle_settle_rejects_malformed_pot_without_panic() {
+        // The pre-validation guard: a pot that doesn't equal expected_escrow() is REJECTED (Err),
+        // not panicked. Here we under-fund (escrow budget but NOT the executor bond).
+        let (budget, e_bond, v_bond) = fuel_mins();
+        let job = [4u8; 32];
+        let mut state = ChainState::new();
+        state.total_emitted = budget + e_bond;
+        state.accounts.get_or_create(lpaddr(0)).balance = Amount::from_raw(budget);
+        state.accounts.get_or_create(lpaddr(9)).balance = Amount::from_raw(e_bond);
+        state.escrow_into_job(&lpaddr(0), job, budget).unwrap(); // executor bond NOT escrowed → malformed
+
+        let lc = JobLifecycle::open(
+            job, lpid(0), lpid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(),
+            vec![lpid(10), lpid(11), lpid(12)], test_deadlines(),
+        );
+        state.job_lifecycles.insert(job, lc);
+        state.lifecycle_advance(job, 11);
+
+        // expected_escrow == budget + e_bond, but the pot only holds budget → clean rejection.
+        let r = state.lifecycle_settle(job, &ByteEq);
+        assert!(matches!(r, Err(StateError::InvalidBlock(_))), "malformed pot rejected, got {r:?}");
+        assert!(state.job_lifecycles.contains_key(&job), "lifecycle restored on rejection");
+        assert_eq!(state.escrowed_for_job(&job), budget, "pot untouched on rejection");
+        assert_eq!(state.total_burned, 0, "nothing burned on rejection");
     }
 
     fn genesis_block() -> Block {

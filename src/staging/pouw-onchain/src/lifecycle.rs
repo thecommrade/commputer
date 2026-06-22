@@ -165,6 +165,17 @@ impl JobLifecycle {
         &self.committee
     }
 
+    /// The exact pot the job MUST hold at settlement: budget + executor bond + every committed
+    /// verifier bond (revealed or not — a committed-but-unrevealed bond is still escrowed and is burnt
+    /// as forfeiture at settle). The chain pre-validates `escrowed_for(job) == expected_escrow()` before
+    /// driving `settle`, so a malformed pot is REJECTED rather than panicking the ledger mid-settle.
+    pub fn expected_escrow(&self) -> u64 {
+        let bonds: u64 = self.commitments.iter().map(|c| c.bond).sum();
+        self.budget
+            .saturating_add(self.executor_bond)
+            .saturating_add(bonds)
+    }
+
     /// Whether this job's window has elapsed and the node should call `settle` at `height`. The
     /// deadlines are private, so the node (event_loop `enforce_timeouts`, P2) drives termination
     /// through this: past `result_by` with no result (timeout), or past `reveal_by` once reached
