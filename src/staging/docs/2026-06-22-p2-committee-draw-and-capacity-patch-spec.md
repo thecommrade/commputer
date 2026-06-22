@@ -11,6 +11,20 @@ source = the on-chain bonded stake just built; seed grinding hardening (VRF) def
 **Depends on:** P0 (execution) + P1 (escrow foundation) + the G4 stake source + the Commit/Reveal
 TxKinds (all on this branch). Apply those first.
 
+> **✅ Fact-check corrections folded (2026-06-22, 3-reviewer adversarial pass).** Substantive: (1) the
+> committee candidate filter now uses ONLY deterministic finalized on-chain state — do NOT use the
+> node-local `consensus.slashed_validators` runtime set (it is intra-epoch, message-order-dependent →
+> committee divergence); see §2. (2) §3 now states honestly that the staging `JobLifecycle` APPLIES
+> money internally via `EscrowLedger` (record_commit escrows; settle pays/burns), so the integration is
+> NOT a clean decide-then-apply — the options are re-framed accordingly. Factual: `EventLoop.consensus`
+> (not `consensus_manager`); compliance variant is `ComplianceStatus::Compliant` (no `Active`);
+> Address↔ParticipantId are inline `ParticipantId(a.0)`/`Address(p.0)` (no helper exists); deadlines via
+> `life.deadlines.reveal_by`; the golden-equivalence test is WRITTEN AFTER the on-chain resolvers exist
+> (the staging `resolve_confirmed_matches_run_priced_job_end_state` compares two staging paths, not the
+> boundary); resolve which `genesis.json` is authoritative (root vs `src/genesis.json`, the latter is 31
+> lines w/o consensus_params) before §7; the `job_lifecycles` field + inline casts are a NON-PROTECTED
+> foundation step to add BEFORE the protected edits (see Apply order).
+
 ---
 
 ## 0. What is already built (non-protected, on this branch — no founder action needed)
@@ -61,28 +75,35 @@ TxKind::CompleteJob { job_id, result_hash } => {
     let jid = PoolJobId(*job_id);
     self.job_pool.complete_job(&jid, *result_hash, height); // unchanged (pool view)
 
-    // NEW: open the lifecycle's Committing phase + draw the committee.
-    if let Some(life) = self.state.job_lifecycles.get_mut(job_id) {     // created at SubmitJob+ClaimJob (see §3)
+    // NEW: open the lifecycle's Committing phase + draw the committee. The lifecycle was created at
+    // ClaimJob (see §3 — `job_lifecycles` is a NON-PROTECTED foundation field to add BEFORE this).
+    if let Some(life) = self.state.job_lifecycles.get_mut(job_id) {
         let seed = current_block_hash.0;                                // §1
-        // candidate pool: eligible bonded validators, minus the executor (open-Q#10 filter, §6).
+        // Candidate pool: filter ONLY by DETERMINISTIC finalized on-chain state (see warning below).
+        // Address and ParticipantId are both [u8;32] newtypes — cast inline (no helper exists).
         let candidates: Vec<ParticipantId> = self.state.accounts.iter()
-            .filter(|a| a.is_validator)
-            .map(|a| a.address)
-            .filter(|addr| self.state.is_eligible(addr)                 // bonded >= min_bond
-                && !self.consensus_manager.slashed_validators.contains(addr)
-                && /* compliant */ true
-                && *addr != executor_addr)
-            .map(addr_to_participant)                                   // [u8;32] passthrough
+            .filter(|a| a.is_validator
+                && self.state.is_eligible(&a.address)                  // bonded >= min_bond (deterministic)
+                && a.compliance == ComplianceStatus::Compliant         // deterministic on-chain status
+                && a.address != executor_addr)
+            .map(|a| ParticipantId(a.address.0))
             .collect();
-        let stake_of = |p: &ParticipantId| self.state.stake_of(&participant_to_addr(p));
-        life.submit_result(executor_pid, *result_hash, seed, height, &stake_of);
+        let stake_of = |p: &ParticipantId| self.state.stake_of(&Address(p.0));
+        life.submit_result(ParticipantId(executor_addr.0), *result_hash, seed, height, &stake_of);
     }
 }
 ```
 
-`ParticipantId`/`Address` are both `[u8;32]` newtypes — `addr_to_participant`/`participant_to_addr`
-are field passthroughs (`ParticipantId(addr.0)` / `Address(pid.0)`). The committee is now stored in the
-lifecycle and is identical on every node (same seed, same eligible set, same `stake_of`).
+The committee is stored in the lifecycle and is identical on every node (same seed, same eligible set,
+same `stake_of`).
+
+> **⚠ CONSENSUS DETERMINISM (fact-check blocker, fixed above).** The candidate filter MUST read only
+> finalized on-chain state. Do **NOT** use `EventLoop.consensus.slashed_validators` — it is a node-local,
+> intra-epoch, message-arrival-order-dependent runtime set, so different nodes would draw different
+> committees for the same `CompleteJob` at the same height and fork. A validator slashed enough to drop
+> below `min_bond` is already excluded by `is_eligible` (bonded stake is finalized on-chain state). If you
+> want an additional "slashed-this-epoch" exclusion, derive it from a **persisted, deterministically-
+> updated** slashed set in `ChainState` (updated by block application), never the consensus runtime set.
 
 ---
 
@@ -101,29 +122,41 @@ on `CompleteJob` (§2), fed by Commit/Reveal (§4), and advanced/settled by heig
 
 ### ⚠ The one real design decision: lifecycle money-path ↔ `escrow_by_job`
 
-`JobLifecycle::record_commit(l: &mut EscrowLedger, ...)` and `settle(l: &mut EscrowLedger, eq)` move
-money through the **staging `EscrowLedger`** type, but on-chain the pot lives in `ChainState`'s
-`escrow_by_job` + `Account.balance`. These must be reconciled. Three options:
+**Honest framing (fact-check correction):** the staging `JobLifecycle` does NOT just *decide* — it
+*moves money inside its methods* via the staging `EscrowLedger`: `record_commit` calls
+`l.escrow(verifier, verifier_bond)` (lifecycle.rs ~212) and `settle` calls the resolvers which
+`l.pay(...)`/`l.burn(...)` (lifecycle.rs ~284-329 → settlement_resolution.rs). On-chain the pot is
+`ChainState`'s `escrow_by_job` + `Account.balance`. So there is no "free" decide-then-apply: every
+option below either runs the reference money logic against an on-chain-backed ledger, or reimplements
+it. Three honest options:
 
-- **(A) Transient-ledger adapter.** Before each lifecycle call, build an `EscrowLedger` seeded from the
-  job's pot + participant balances; call the method; diff balances back into `ChainState`. *Rejected:*
-  `EscrowLedger.credit` is a mint and its `balances` map is a separate universe — reconciling which
-  accounts changed is fragile for consensus money.
-- **(B) Trait-abstract the ledger.** Refactor the staging settlement/lifecycle to take a `Ledger` trait
-  both `EscrowLedger` and `ChainState` implement. *Cleanest long-term* but edits the frozen reference;
-  defer.
-- **(C, RECOMMENDED for v1) Decide-then-apply.** Use the lifecycle/`compute_verdict` logic to DECIDE the
-  terminal (`Verdict` + committee + per-bond data — all already on-chain data), then apply the money via
-  the **on-chain** `pay_from_job`/`burn_from_job` by reimplementing the 5 resolvers' splits against
-  `ChainState` (they are short: 85/10/5, dispute bounty, forfeiture). Pin them with a **golden-
-  equivalence test** asserting the on-chain end-state equals the staging `settlement_resolution`
-  reference for the same inputs (the staging crate already has `resolve_confirmed_matches_run_priced_job`
-  — mirror that across the boundary). This reuses the *decision* logic (the hard part) and keeps the
-  *money moves* in the audited on-chain primitives.
+- **(A) Transient-ledger adapter.** Per settlement, build an `EscrowLedger` seeded from the job pot +
+  participant balances, run the lifecycle method (it moves money in the transient ledger), then diff the
+  result back into `ChainState`. Reuses the tested logic unchanged, but the reconcile-back step
+  (`EscrowLedger.credit` is a mint; its `balances` is a separate map) is fiddly and must be proven not
+  to mint/lose value.
+- **(B, RECOMMENDED) Trait-abstract the ledger.** Give the lifecycle/settlement a small `Ledger` trait
+  (`escrow`/`pay`/`burn`/`for_job`) and `impl Ledger for ChainState` (delegating to
+  `escrow_into_job`/`pay_from_job`/`burn_from_job`). The lifecycle's *tested* money logic then runs
+  UNCHANGED against the real chain ledger — no reimplementation, no reconcile. Cost: a contained edit to
+  the staging reference (parameterize `&mut EscrowLedger` → `&mut impl Ledger`); `EscrowLedger` keeps
+  satisfying the trait so its existing tests are untouched. This is the soundest path now that we know
+  the lifecycle applies money internally.
+- **(C) Refactor the lifecycle to decision-only.** Strip the `l.escrow/pay/burn` calls so methods return
+  only `Verdict`/`Terminal` data, then apply money on-chain via reimplemented resolvers. More invasive to
+  the reference than (B) and loses the reference's money-move tests; not recommended.
 
-**This decision needs founder sign-off before implementation** — it is the only non-mechanical piece of
-P2. Recommendation: (C). Until signed off, the lifecycle store is the only deferred sub-item; everything
-else below is mechanical.
+**Golden-equivalence test (corrected):** whichever option, the cross-boundary equivalence test
+(on-chain end-state == staging reference end-state) is **written AFTER the chosen integration is
+implemented** — it does not exist yet. The existing `settlement_resolution::
+resolve_confirmed_matches_run_priced_job_end_state` compares two *staging* paths (engine vs resolver),
+not the on-chain boundary; it is the *pattern* to mirror, not a pre-built cross-boundary check.
+
+**This decision needs founder sign-off before implementation** — it is the one non-mechanical piece of
+P2. Recommendation: **(B) trait-abstract the ledger** (reuses the tested money logic verbatim). Until
+signed off, the lifecycle store + its money-path wiring (this §3, the Commit/Reveal escrow routing in
+§4, and the settle calls in §5) are ALL deferred; the genuinely mechanical items are §6 (filter), §7
+(genesis params), §8 (G6 admission), §9 (substrate).
 
 ---
 
@@ -135,31 +168,33 @@ The inert `TxKind::Commit`/`TxKind::Reveal` arms (built this branch) become:
 TxKind::Commit { job_id, commit, bond } => {
     if !sender.is_validator { return Err(/* unchanged */); }
     let height = /* current */;
-    if let Some(life) = self.job_lifecycles.get_mut(job_id) {
-        // escrow the bond into the job pot (P1), then record. record_commit validates phase/window/
-        // membership/no-double-commit and (option C) the chain escrows on Accepted only.
-        let c = Commitment { verifier: ParticipantId(sender_addr.0), commit: *commit, bond: bond.raw() };
-        match life.record_commit(&mut ledger_view, c, height) {        // or the option-C decide-then-apply
-            EventResult::Accepted => { self.escrow_into_job(&sender_addr, *job_id, bond.raw())?; }
-            EventResult::Rejected(r) => return Err(StateError::InvalidBlock(format!("commit rejected: {r:?}"))),
-        }
+    // With §3 option B (Ledger trait), record_commit ESCROWS THE BOND ITSELF via the ChainState-backed
+    // ledger (staging lifecycle.rs ~212 does `l.escrow(verifier, verifier_bond)` internally) — do NOT
+    // also call escrow_into_job here (that would double-escrow). On Rejected, nothing was escrowed.
+    let c = Commitment { verifier: ParticipantId(sender_addr.0), commit: *commit, bond: bond.raw() };
+    if let EventResult::Rejected(r) = self.record_job_commit(job_id, c, height) {   // see borrow note
+        return Err(StateError::InvalidBlock(format!("commit rejected: {r:?}")));
     }
     sender.nonce += 1;
 }
 TxKind::Reveal { job_id, result_hash, salt } => {
     if !sender.is_validator { return Err(/* unchanged */); }
-    if let Some(life) = self.job_lifecycles.get_mut(job_id) {
-        let r = Reveal { verifier: ParticipantId(sender_addr.0), result_hash: *result_hash, salt: *salt };
-        if let EventResult::Rejected(reason) = life.record_reveal(r, height) {
-            return Err(StateError::InvalidBlock(format!("reveal rejected: {reason:?}")));
-        }
+    let r = Reveal { verifier: ParticipantId(sender_addr.0), result_hash: *result_hash, salt: *salt };
+    if let EventResult::Rejected(reason) = self.record_job_reveal(job_id, r, height) {
+        return Err(StateError::InvalidBlock(format!("reveal rejected: {reason:?}")));
     }
     sender.nonce += 1;
 }
 ```
 
-Escrow the bond **only on `Accepted`** so a rejected commit strands nothing. (Borrow note: compute the
-`record_*` result, then call `self.escrow_into_job` after the `life` borrow ends.)
+**Borrow note (important).** The lifecycle lives INSIDE `ChainState` (`job_lifecycles`) but
+`record_commit` also needs the ledger (the rest of `ChainState`). You cannot `&mut`-borrow
+`self.job_lifecycles` and `&mut self` (as the ledger) at once. Wrap the call in a `ChainState` helper
+(`record_job_commit`/`record_job_reveal`) that either (a) `remove`s the lifecycle from the map, runs
+`record_commit` with `&mut self` as the `impl Ledger`, then re-inserts it, or (b) impls `Ledger` on a
+disjoint view holding `&mut self.escrow_by_job` + `&mut self.accounts` (NOT all of `self`) so the split
+borrow is legal. The bond escrows on `Accepted` only (staging semantics), so a rejected commit strands
+nothing.
 
 ---
 
@@ -171,8 +206,11 @@ jobs. Repurpose it to drive the lifecycle by block height:
 ```rust
 for (job_id, life) in self.state.job_lifecycles.iter_mut() {
     life.advance(height);                          // Committing→Revealing at commit_by; →settle window
-    if life.phase() == Phase::Revealing && height > reveal_deadline(life)
-        || /* result_by passed with no result */ {
+    // Settle when the reveal window passed OR the result window passed with no result. NOTE: the
+    // lifecycle's `deadlines`/phase-internals are PRIVATE fields — add a public signal to lifecycle.rs
+    // (a contained, non-protected change), e.g. `pub fn should_settle(&self, height: u64) -> bool`
+    // (true once past reveal_by in Revealing, or past result_by in AwaitingResult). Then:
+    if life.should_settle(height) {
         // PRE-VALIDATE the pot == budget + Be + Σ committed bonds (P1 caller-contract) THEN settle.
         let terminal = life.settle(&mut ledger_view, &ByteEq);     // (option C: decide-then-apply on-chain)
         match terminal {
@@ -199,8 +237,14 @@ exclude: the executor (done in §2), **slashed** validators (`consensus_manager.
 
 ---
 
-## 7. Genesis consensus params *(PROTECTED: genesis.json — confirm which of root vs src/genesis.json
-   is authoritative first)*
+## 7. Genesis consensus params *(PROTECTED: genesis.json)*
+
+> **⚠ Which genesis.json?** TWO exist: root `genesis.json` (14 lines, commit b8a0630) and
+> `src/genesis.json` (31 lines, commit 7bef0fd). The node loads `"genesis.json"` from its run dir,
+> trying CWD then `../` (`main.rs:1894`), with the CLI default `"genesis.json"` (`main.rs:199`). So which
+> is authoritative depends on the node's working directory at launch. **Confirm the testnet run dir /
+> packaging and add the `consensus_params` section to THAT file** (and keep the other in sync or remove
+> it to avoid drift). This ties into the distribution blueprint (the bundled genesis for joiners).
 
 These ALL must be genesis-anchored and identical across nodes (the node should `refuse_to_bind` on
 divergence — see the P3 `consensus_params` spec). Add a `consensus_params` section:
@@ -264,11 +308,15 @@ divergence check. No new long-lived services — the lifecycle store lives in `C
 ## Apply order
 
 1. (done on branch) escrow + bonded-stake foundations + Commit/Reveal TxKinds.
-2. **Sign off the §3 lifecycle money-path integration (recommend option C).**
-3. Non-protected: `job_lifecycles` store + the option-(C) resolvers + Commit/Reveal routing (§3,§4,§10).
-4. PROTECTED: committee draw (§2) + candidate filter (§6) + phase advance/settle (§5) + G6 admission
+2. **Sign off the §3 lifecycle money-path integration (recommend option B: trait-abstract the ledger).**
+3. Non-protected foundation (do BEFORE the protected edits): add `job_lifecycles` field to `ChainState`
+   (+ init in `new`/`open`, Debug, resets, RocksDB persistence per the escrow WIRE-IN TODO pattern); add
+   the chosen §3 integration (option B: a `Ledger` trait + `impl Ledger for ChainState`, parameterizing
+   the staging `&mut EscrowLedger` → `&mut impl Ledger`); add `pub fn should_settle(&self, height)` to
+   `lifecycle.rs`; then the Commit/Reveal escrow routing (§4).
+4. PROTECTED: committee draw (§2, deterministic filter only) + phase advance/settle (§5) + G6 admission
    (§8) + main.rs substrate (§9).
-5. PROTECTED: genesis consensus params (§7).
+5. PROTECTED: genesis consensus params (§7 — confirm which genesis.json first).
 6. Verify (done-when): a committee is drawn deterministically from the post-result block hash on every
    node; verifiers commit then reveal across blocks; a wrong result → `Disputed` + slashed bond; an
    unavailable program shrinks the effective committee → `NoQuorum`→`Escalate` with escrow held; a
