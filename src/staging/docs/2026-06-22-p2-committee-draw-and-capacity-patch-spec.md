@@ -239,12 +239,15 @@ exclude: the executor (done in §2), **slashed** validators (`consensus_manager.
 
 ## 7. Genesis consensus params *(PROTECTED: genesis.json)*
 
-> **⚠ Which genesis.json?** TWO exist: root `genesis.json` (14 lines, commit b8a0630) and
-> `src/genesis.json` (31 lines, commit 7bef0fd). The node loads `"genesis.json"` from its run dir,
-> trying CWD then `../` (`main.rs:1894`), with the CLI default `"genesis.json"` (`main.rs:199`). So which
-> is authoritative depends on the node's working directory at launch. **Confirm the testnet run dir /
-> packaging and add the `consensus_params` section to THAT file** (and keep the other in sync or remove
-> it to avoid drift). This ties into the distribution blueprint (the bundled genesis for joiners).
+> **✅ D-2 RESOLVED (2026-06-23): canonical = ROOT `genesis.json`.** `GenesisConfig`
+> (`core/src/genesis.rs`) expects the FLAT schema (`emission_base_rate`/`emission_floor_rate`/
+> `channel_floors`), with `emission_base_rate` a REQUIRED field. The root `genesis.json` matches it;
+> `src/genesis.json` uses a different nested schema (`emission{}`/`channel_floors_bps`/
+> `reference_node_specs`/`protocol_version`) that `load_genesis` CANNOT parse → it returns `Err` → the
+> node falls back to **default genesis** (wrong genesis hash → peers reject it). The node loads
+> `"genesis.json"` from CWD then `../` (`main.rs:1894`). **Founder action: DELETE `src/genesis.json`**
+> (stale, footgun) so only the canonical root file remains; add `consensus_params` to the ROOT
+> `genesis.json` + matching fields on `GenesisConfig`.
 
 These ALL must be genesis-anchored and identical across nodes (the node should `refuse_to_bind` on
 divergence — see the P3 `consensus_params` spec). Add a `consensus_params` section:
