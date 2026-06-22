@@ -111,6 +111,21 @@ pub enum TxKind {
         comme_budget: Amount,
         l2_id: Option<String>,
     },
+    /// PoUW P0 / G3: the on-chain job format with the linchpin identity —
+    /// `program_hash = sha256(wasm)`, binary `input_hash`, and `da_root` (DA-sampling anchor) —
+    /// replacing the opaque `job_spec_hash`. Enables enforced deterministic execution
+    /// (`exec_adapter`) + DA sampling. Economically mirrors `SubmitJob` at P0 (burns comme_budget at
+    /// submit); P1 converts V2 settlement to escrow-and-split. The legacy `SubmitJob` stays valid and
+    /// drains at the migration height (open-Q#11 tx-format versioning).
+    SubmitJobV2 {
+        program_hash: [u8; 32],
+        input_hash: [u8; 32],
+        da_root: [u8; 32],
+        resources: crate::compute::ResourceRequirements,
+        max_duration_secs: u64,
+        comme_budget: Amount,
+        l2_id: Option<String>,
+    },
 
     /// Feature 53: Validator claims a pending compute job.
     ClaimJob {
@@ -200,9 +215,10 @@ impl Transaction {
             TxKind::BurstCompute { .. }
             | TxKind::MilestoneBurn { .. }
             | TxKind::CharitableDonation { .. }
-            | TxKind::SubmitJob { .. } => true,
+            | TxKind::SubmitJob { .. }
+            | TxKind::SubmitJobV2 { .. } => true,
             TxKind::Batch { operations } => operations.iter().any(|op| matches!(op,
-                TxKind::BurstCompute { .. } | TxKind::MilestoneBurn { .. } | TxKind::CharitableDonation { .. } | TxKind::SubmitJob { .. }
+                TxKind::BurstCompute { .. } | TxKind::MilestoneBurn { .. } | TxKind::CharitableDonation { .. } | TxKind::SubmitJob { .. } | TxKind::SubmitJobV2 { .. }
             )),
             _ => false,
         }
@@ -247,6 +263,7 @@ impl Transaction {
             TxKind::MilestoneBurn { burn_amount, .. } => *burn_amount,
             TxKind::CharitableDonation { burn_amount, .. } => *burn_amount,
             TxKind::SubmitJob { comme_budget, .. } => *comme_budget,
+            TxKind::SubmitJobV2 { comme_budget, .. } => *comme_budget,
             TxKind::Batch { operations } => {
                 let mut total = Amount::ZERO;
                 for op in operations {
@@ -256,7 +273,8 @@ impl Transaction {
                         | TxKind::CharitableDonation { burn_amount, .. } => {
                             total = total.checked_add(*burn_amount).unwrap_or(total);
                         }
-                        TxKind::SubmitJob { comme_budget, .. } => {
+                        TxKind::SubmitJob { comme_budget, .. }
+                        | TxKind::SubmitJobV2 { comme_budget, .. } => {
                             total = total.checked_add(*comme_budget).unwrap_or(total);
                         }
                         _ => {}

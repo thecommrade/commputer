@@ -862,7 +862,10 @@ impl ChainState {
                 sender.nonce += 1;
             }
 
-            TxKind::SubmitJob { comme_budget, .. } => {
+            // SubmitJob (legacy) + SubmitJobV2 (PoUW P0/G3) share identical economics at P0:
+            // verify budget >= min and burn comme_budget at submit. (P1 converts V2 to escrow.)
+            TxKind::SubmitJob { comme_budget, .. }
+            | TxKind::SubmitJobV2 { comme_budget, .. } => {
                 // Feature 52: Submit a compute job — verify budget and burn.
                 if comme_budget.raw() < commputer_core::compute::MIN_JOB_BUDGET {
                     return Err(StateError::InvalidBlock(format!(
@@ -971,8 +974,9 @@ impl ChainState {
                     .ok_or(StateError::Overflow)?;
                 self.total_burned = self.total_burned.saturating_add(burn_amount.raw());
             }
-            TxKind::SubmitJob { comme_budget, .. } => {
-                // Feature 52: SubmitJob in batch — verify budget and burn.
+            TxKind::SubmitJob { comme_budget, .. }
+            | TxKind::SubmitJobV2 { comme_budget, .. } => {
+                // Feature 52: SubmitJob/V2 in batch — verify budget and burn (V2 mirrors V1 at P0).
                 if comme_budget.raw() < commputer_core::compute::MIN_JOB_BUDGET {
                     return Err(StateError::InvalidBlock(format!(
                         "compute job budget {} below minimum {}",
