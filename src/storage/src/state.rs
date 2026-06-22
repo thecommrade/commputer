@@ -148,6 +148,16 @@ pub struct ChainState {
     pub snapshot_height: u64,
     /// Feature 10: Per-validator performance history.
     pub validator_performance: HashMap<Address, ValidatorPerformance>,
+    /// PoUW P1: $COMME escrowed per live compute job (`job_id` -> raw units). The sum
+    /// (`total_escrowed`) is part of circulating supply — escrowed value is HELD, not burned —
+    /// so `total_burned` MUST NOT move when a budget is escrowed; only a resolver's burn slice
+    /// at settlement increments it. Empty until the `SubmitJobV2` burn->escrow flip lands (P2).
+    ///
+    /// WIRE-IN TODO (the live flip, P2): this map is in-memory only today. Before `SubmitJobV2`
+    /// is converted from burn-at-submit to escrow, it MUST be persisted to RocksDB (loaded in
+    /// `open`, flushed in `flush_to_rocks`); otherwise a restart with live escrow would lose
+    /// held funds and diverge consensus.
+    pub escrow_by_job: HashMap<[u8; 32], u64>,
 }
 
 // Manual Debug impl since RocksStore doesn't derive Debug.
@@ -166,6 +176,7 @@ impl std::fmt::Debug for ChainState {
             .field("archived_accounts", &self.archived_accounts.len())
             .field("snapshot_height", &self.snapshot_height)
             .field("validator_performance", &self.validator_performance.len())
+            .field("escrow_by_job", &self.escrow_by_job.len())
             .finish()
     }
 }
@@ -193,6 +204,7 @@ impl ChainState {
             retention_policy: RetentionPolicy::default(),
             snapshot_height: 0,
             validator_performance: HashMap::new(),
+            escrow_by_job: HashMap::new(),
         }
     }
 
@@ -267,6 +279,7 @@ impl ChainState {
             retention_policy: RetentionPolicy::default(),
             snapshot_height: 0,
             validator_performance: HashMap::new(),
+            escrow_by_job: HashMap::new(),
         })
     }
 
@@ -1590,6 +1603,7 @@ impl ChainState {
         self.blocks = BlockStore::new();
         self.total_emitted = 0;
         self.total_burned = 0;
+        self.escrow_by_job.clear();
         self.cumulative_score = 0;
         self.state_diffs.clear();
 
@@ -1663,6 +1677,7 @@ impl ChainState {
         self.blocks = BlockStore::new();
         self.total_emitted = 0;
         self.total_burned = 0;
+        self.escrow_by_job.clear();
         self.nerf_rate = NerfRate::INITIAL;
         self.current_epoch = 0;
         self.receipts = ReceiptStore::new();
@@ -1684,6 +1699,110 @@ impl ChainState {
     }
 }
 
+// ===================================================================================
+// PoUW P1 — per-job escrow foundation (the on-chain analog of the staging
+// `commputer-pouw-onchain::escrow_ledger::EscrowLedger`).
+//
+// These are the conservation-preserving primitives every terminal settlement resolver
+// (`resolve_confirmed`/`disputed`/`cancel`/`timeout`/`unavailable`) will call once the
+// committee/verdict DATA exists on-chain (P2). They are wired but NOT yet exercised by the
+// live tx path: `SubmitJobV2` still burns at submit (see the `SubmitJob`/`SubmitJobV2` apply
+// arm) — flipping it to `escrow_into_job` is the P2 change, because draining a pot needs the
+// committee/verdict a P2 commit-reveal round produces. Adding escrow-in without a drain would
+// strand budgets, so the flip is deliberately deferred.
+//
+// CONSERVATION (the invariant these maintain):
+//   `sum(account balances) + total_escrowed()` is UNCHANGED by `escrow_into_job`/`pay_from_job`
+//   and DECREASES by exactly `amount` on `burn_from_job` (which also bumps `total_burned`, so
+//   `circulating_supply()` drops by the same `amount`). No method mints.
+//
+// All return `Result` (never panic): on-chain the pot amounts become attacker-influenced data,
+// so an under-funded pot must reject the terminal tx, not halt the node. Callers should still
+// pre-validate the pot equals the exact sum they will move (P1 caller-contract #1).
+// ===================================================================================
+impl ChainState {
+    /// Move `amount` raw units from `who`'s spendable balance into `job_id`'s escrow pot.
+    /// Value stays inside circulating supply (held, not burned). The pot is created on first
+    /// escrow. A zero `amount` is a no-op. Returns `InsufficientBalance` if `who` has no
+    /// account or cannot cover `amount` (no pot is created on failure).
+    pub fn escrow_into_job(
+        &mut self,
+        who: &Address,
+        job_id: [u8; 32],
+        amount: u64,
+    ) -> Result<(), StateError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let account = self.accounts.get_mut(who).ok_or(StateError::InsufficientBalance)?;
+        let debited = account
+            .balance
+            .checked_sub(Amount::from_raw(amount))
+            .ok_or(StateError::InsufficientBalance)?;
+        account.balance = debited;
+        *self.escrow_by_job.entry(job_id).or_insert(0) += amount;
+        Ok(())
+    }
+
+    /// Pay `amount` raw units out of `job_id`'s pot to `to` (a settlement payout or refund),
+    /// crediting `to`'s balance (creating the account if needed). The pot entry is removed
+    /// once it reaches zero. A zero `amount` is a no-op. Returns `EscrowUnderflow` if the pot
+    /// holds less than `amount`.
+    pub fn pay_from_job(
+        &mut self,
+        job_id: [u8; 32],
+        to: &Address,
+        amount: u64,
+    ) -> Result<(), StateError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        self.debit_job_pot(&job_id, amount)?;
+        let account = self.accounts.get_or_create(*to);
+        account.balance = account
+            .balance
+            .checked_add(Amount::from_raw(amount))
+            .ok_or(StateError::Overflow)?;
+        Ok(())
+    }
+
+    /// Burn `amount` raw units from `job_id`'s pot — value LEAVES circulating supply
+    /// (`total_burned += amount`). The pot entry is removed once it reaches zero. A zero
+    /// `amount` is a no-op. Returns `EscrowUnderflow` if the pot holds less than `amount`.
+    pub fn burn_from_job(&mut self, job_id: [u8; 32], amount: u64) -> Result<(), StateError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        self.debit_job_pot(&job_id, amount)?;
+        self.total_burned = self.total_burned.saturating_add(amount);
+        Ok(())
+    }
+
+    /// Raw units currently escrowed for `job_id` (0 if there is no pot).
+    pub fn escrowed_for_job(&self, job_id: &[u8; 32]) -> u64 {
+        self.escrow_by_job.get(job_id).copied().unwrap_or(0)
+    }
+
+    /// Total raw units held across every job pot (part of circulating supply).
+    pub fn total_escrowed(&self) -> u64 {
+        self.escrow_by_job.values().sum()
+    }
+
+    /// Internal: remove `amount` from `job_id`'s pot, deleting the entry when it hits zero
+    /// (no lingering empty pots — same hygiene as the bonded-stake slash path). Returns
+    /// `EscrowUnderflow` if the pot is absent or holds less than `amount`.
+    fn debit_job_pot(&mut self, job_id: &[u8; 32], amount: u64) -> Result<(), StateError> {
+        let pot = self.escrow_by_job.get_mut(job_id).ok_or(StateError::EscrowUnderflow)?;
+        let remaining = pot.checked_sub(amount).ok_or(StateError::EscrowUnderflow)?;
+        if remaining == 0 {
+            self.escrow_by_job.remove(job_id);
+        } else {
+            *pot = remaining;
+        }
+        Ok(())
+    }
+}
+
 impl Default for ChainState {
     fn default() -> Self {
         Self::new()
@@ -1698,6 +1817,8 @@ pub enum StateError {
     InvalidNonce { expected: u64, got: u64 },
     #[error("insufficient balance")]
     InsufficientBalance,
+    #[error("escrow pot underflow")]
+    EscrowUnderflow,
     #[error("arithmetic overflow")]
     Overflow,
     #[error("storage error: {0}")]
@@ -1720,6 +1841,164 @@ mod tests {
         let mut a = [0u8; 32];
         a[0] = n;
         Address(a)
+    }
+
+    // --- PoUW P1 escrow foundation -------------------------------------------------
+
+    /// Sum of every account's spendable balance (raw units) — the other half of the
+    /// conservation identity `sum(balances) + total_escrowed()`.
+    fn sum_balances(state: &ChainState) -> u64 {
+        state.accounts.iter().map(|a| a.balance.raw()).sum()
+    }
+
+    #[test]
+    fn escrow_into_job_holds_value_in_circulation() {
+        let mut state = ChainState::new();
+        state.total_emitted = 10_000;
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(10_000);
+        let conserved = sum_balances(&state) + state.total_escrowed();
+        let circ_before = state.circulating_supply();
+
+        let job = [7u8; 32];
+        state.escrow_into_job(&addr(1), job, 4_000).unwrap();
+
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(6_000));
+        assert_eq!(state.escrowed_for_job(&job), 4_000);
+        assert_eq!(state.total_escrowed(), 4_000);
+        assert_eq!(state.total_burned, 0, "escrow does not burn");
+        assert_eq!(state.circulating_supply(), circ_before, "escrow stays in circulation");
+        assert_eq!(sum_balances(&state) + state.total_escrowed(), conserved, "conserved");
+    }
+
+    #[test]
+    fn pay_from_job_drains_pot_and_credits_recipients() {
+        let mut state = ChainState::new();
+        state.total_emitted = 10_000;
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(10_000);
+        let conserved = sum_balances(&state) + state.total_escrowed();
+
+        let job = [8u8; 32];
+        state.escrow_into_job(&addr(1), job, 10_000).unwrap();
+        state.pay_from_job(job, &addr(2), 7_000).unwrap();
+        state.pay_from_job(job, &addr(3), 3_000).unwrap();
+
+        assert_eq!(state.accounts.get(&addr(2)).unwrap().balance, Amount::from_raw(7_000));
+        assert_eq!(state.accounts.get(&addr(3)).unwrap().balance, Amount::from_raw(3_000));
+        assert_eq!(state.escrowed_for_job(&job), 0, "pot fully paid out");
+        assert!(!state.escrow_by_job.contains_key(&job), "drained pot entry removed");
+        assert_eq!(state.total_burned, 0, "pay does not burn");
+        assert_eq!(sum_balances(&state) + state.total_escrowed(), conserved);
+    }
+
+    #[test]
+    fn burn_from_job_reduces_circulating_supply_by_exactly_the_burn() {
+        let mut state = ChainState::new();
+        state.total_emitted = 10_000;
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(10_000);
+        let conserved = sum_balances(&state) + state.total_escrowed();
+        let circ_before = state.circulating_supply();
+
+        let job = [9u8; 32];
+        state.escrow_into_job(&addr(1), job, 10_000).unwrap();
+        // Settle like a Confirmed split: pay 9_500, burn the 500 remainder.
+        state.pay_from_job(job, &addr(2), 9_500).unwrap();
+        state.burn_from_job(job, 500).unwrap();
+
+        assert_eq!(state.total_burned, 500, "exactly the burn slice left supply");
+        assert_eq!(state.circulating_supply(), circ_before - 500);
+        assert_eq!(state.escrowed_for_job(&job), 0, "pot drained");
+        assert!(!state.escrow_by_job.contains_key(&job));
+        assert_eq!(
+            sum_balances(&state) + state.total_escrowed(),
+            conserved - 500,
+            "conserved minus exactly the burn"
+        );
+    }
+
+    #[test]
+    fn pay_more_than_pot_is_rejected_and_pot_untouched() {
+        let mut state = ChainState::new();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(1_000);
+        let job = [1u8; 32];
+        state.escrow_into_job(&addr(1), job, 1_000).unwrap();
+
+        let err = state.pay_from_job(job, &addr(2), 1_001).unwrap_err();
+        assert!(matches!(err, StateError::EscrowUnderflow));
+        assert_eq!(state.escrowed_for_job(&job), 1_000, "pot unchanged on rejection");
+        assert!(state.accounts.get(&addr(2)).is_none(), "recipient not credited");
+    }
+
+    #[test]
+    fn escrow_more_than_balance_is_rejected_and_no_pot_created() {
+        let mut state = ChainState::new();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(500);
+        let job = [2u8; 32];
+
+        let err = state.escrow_into_job(&addr(1), job, 501).unwrap_err();
+        assert!(matches!(err, StateError::InsufficientBalance));
+        assert_eq!(
+            state.accounts.get(&addr(1)).unwrap().balance,
+            Amount::from_raw(500),
+            "balance untouched"
+        );
+        assert!(!state.escrow_by_job.contains_key(&job), "no pot on failed escrow");
+    }
+
+    #[test]
+    fn full_confirmed_lifecycle_conserves_supply() {
+        // Mirror a Confirmed settlement end-to-end: submitter escrows budget, executor +
+        // 3 committee escrow bonds, then resolve 85/10/5 of budget + return every bond.
+        let mut state = ChainState::new();
+        let (budget, e_bond, v_bond) = (3_960u64, 3_960u64, 1_650u64);
+        let funded = budget + e_bond + 3 * v_bond;
+        state.total_emitted = funded;
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(budget); // submitter
+        state.accounts.get_or_create(addr(9)).balance = Amount::from_raw(e_bond); // executor
+        for c in 10u8..13 {
+            state.accounts.get_or_create(addr(c)).balance = Amount::from_raw(v_bond);
+        }
+        let conserved = sum_balances(&state) + state.total_escrowed();
+
+        let job = [42u8; 32];
+        state.escrow_into_job(&addr(1), job, budget).unwrap();
+        state.escrow_into_job(&addr(9), job, e_bond).unwrap();
+        for c in 10u8..13 {
+            state.escrow_into_job(&addr(c), job, v_bond).unwrap();
+        }
+        assert_eq!(state.escrowed_for_job(&job), funded, "whole pot escrowed");
+
+        // Confirmed split: 85% worker, 10% across 3 committee, 5% burn; all bonds returned.
+        state.pay_from_job(job, &addr(9), 3_366).unwrap(); // 85% of budget -> executor
+        for c in 10u8..13 {
+            state.pay_from_job(job, &addr(c), 132).unwrap(); // 10% / 3 -> each verifier
+        }
+        state.burn_from_job(job, 198).unwrap(); // 5% burned
+        state.pay_from_job(job, &addr(9), e_bond).unwrap(); // executor bond back
+        for c in 10u8..13 {
+            state.pay_from_job(job, &addr(c), v_bond).unwrap(); // committee bonds back
+        }
+
+        assert_eq!(state.escrowed_for_job(&job), 0, "pot fully drained");
+        assert!(!state.escrow_by_job.contains_key(&job));
+        assert_eq!(state.total_burned, 198, "only the 5% slice burned");
+        assert_eq!(
+            state.accounts.get(&addr(9)).unwrap().balance,
+            Amount::from_raw(3_366 + e_bond)
+        );
+        assert_eq!(
+            state.accounts.get(&addr(10)).unwrap().balance,
+            Amount::from_raw(132 + v_bond)
+        );
+        assert_eq!(
+            state.accounts.get(&addr(1)).unwrap().balance,
+            Amount::from_raw(0),
+            "submitter spent budget"
+        );
+        assert_eq!(
+            sum_balances(&state) + state.total_escrowed(),
+            conserved - 198,
+            "conserved minus burn"
+        );
     }
 
     fn genesis_block() -> Block {
