@@ -1,16 +1,24 @@
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use commputer_core::block::{Block, BlockHash};
 use commputer_core::identity::Address;
 use tracing::info;
 use crate::account::Account;
+use crate::state::UnbondingChunk;
 
 const CF_BLOCKS: &str = "blocks";
 const CF_BLOCK_HEIGHTS: &str = "block_heights";
 const CF_ACCOUNTS: &str = "accounts";
 const CF_META: &str = "meta";
 const CF_ARCHIVED: &str = "archived_accounts";
+// PoUW P2 (B1a): dedicated CFs for the consensus money/stake maps (one borsh-encoded value per
+// raw 32-byte key, mirroring CF_ACCOUNTS). create_missing_column_families=true auto-creates them on
+// existing DBs, so no data migration is needed.
+const CF_ESCROW: &str = "escrow_by_job";
+const CF_BONDED: &str = "bonded_stake";
+const CF_UNBONDING: &str = "unbonding_stake";
 
 pub const META_TOTAL_EMITTED: &str = "total_emitted";
 pub const META_TOTAL_BURNED: &str = "total_burned";
@@ -54,7 +62,10 @@ impl RocksStore {
         // Feature 189: Ensure WAL is enabled (RocksDB default, but be explicit).
         opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::PointInTime);
 
-        let cf_names = [CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED];
+        let cf_names = [
+            CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
+            CF_ESCROW, CF_BONDED, CF_UNBONDING,
+        ];
         let cfs: Vec<ColumnFamilyDescriptor> = cf_names
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
@@ -347,7 +358,10 @@ impl RocksStore {
         let range_start: &[u8] = &[];
         let range_end: &[u8] = &[0xFF; 128]; // Covers any key length
         let mut batch = rocksdb::WriteBatch::default();
-        for cf_name in &[CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED] {
+        for cf_name in &[
+            CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
+            CF_ESCROW, CF_BONDED, CF_UNBONDING,
+        ] {
             let cf = self.cf(cf_name);
             batch.delete_range_cf(&cf, range_start, range_end);
         }
@@ -355,12 +369,161 @@ impl RocksStore {
         Ok(())
     }
 
+    // ── PoUW P2 (B1a): consensus money/stake map persistence ──
+    // escrow_by_job / bonded_stake / unbonding_stake mirror the per-account pattern (one borsh value
+    // per raw 32-byte key in a dedicated CF). delete_* variants exist for the future P2 dirty-key flush
+    // (emptied pots / withdrawn chunks); B1a flushes whole maps (they stay empty until the live flip).
+
+    pub fn put_escrow(&self, job_id: &[u8; 32], amount: u64) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_ESCROW);
+        self.db.put_cf(&cf, job_id, amount.to_le_bytes())
+    }
+    pub fn delete_escrow(&self, job_id: &[u8; 32]) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_ESCROW);
+        self.db.delete_cf(&cf, job_id)
+    }
+    pub fn all_escrow(&self) -> HashMap<[u8; 32], u64> {
+        let cf = self.cf(CF_ESCROW);
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let mut map = HashMap::new();
+        for item in iter {
+            match item {
+                Ok((key, value)) if key.len() == 32 && value.len() == 8 => {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(&key);
+                    let mut v = [0u8; 8];
+                    v.copy_from_slice(&value);
+                    map.insert(k, u64::from_le_bytes(v));
+                }
+                Ok((key, value)) => tracing::warn!(
+                    "skipping malformed CF_ESCROW row (key {}B, val {}B) — consensus state may be corrupt",
+                    key.len(), value.len()
+                ),
+                Err(e) => tracing::warn!("CF_ESCROW iterator error: {e}"),
+            }
+        }
+        map
+    }
+
+    pub fn put_bonded(&self, who: &Address, amount: u64) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_BONDED);
+        self.db.put_cf(&cf, who.0, amount.to_le_bytes())
+    }
+    pub fn delete_bonded(&self, who: &Address) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_BONDED);
+        self.db.delete_cf(&cf, who.0)
+    }
+    pub fn all_bonded(&self) -> HashMap<Address, u64> {
+        let cf = self.cf(CF_BONDED);
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let mut map = HashMap::new();
+        for item in iter {
+            match item {
+                Ok((key, value)) if key.len() == 32 && value.len() == 8 => {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(&key);
+                    let mut v = [0u8; 8];
+                    v.copy_from_slice(&value);
+                    map.insert(Address(k), u64::from_le_bytes(v));
+                }
+                Ok((key, value)) => tracing::warn!(
+                    "skipping malformed CF_BONDED row (key {}B, val {}B) — consensus state may be corrupt",
+                    key.len(), value.len()
+                ),
+                Err(e) => tracing::warn!("CF_BONDED iterator error: {e}"),
+            }
+        }
+        map
+    }
+
+    pub fn put_unbonding(&self, who: &Address, chunks: &[UnbondingChunk]) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_UNBONDING);
+        let encoded =
+            borsh::to_vec(&chunks.to_vec()).expect("unbonding borsh serialization should not fail");
+        self.db.put_cf(&cf, who.0, &encoded)
+    }
+    pub fn delete_unbonding(&self, who: &Address) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_UNBONDING);
+        self.db.delete_cf(&cf, who.0)
+    }
+    pub fn all_unbonding(&self) -> HashMap<Address, Vec<UnbondingChunk>> {
+        let cf = self.cf(CF_UNBONDING);
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let mut map = HashMap::new();
+        for item in iter {
+            match item {
+                Ok((key, value)) if key.len() == 32 => {
+                    match borsh::from_slice::<Vec<UnbondingChunk>>(&value) {
+                        Ok(chunks) => {
+                            let mut k = [0u8; 32];
+                            k.copy_from_slice(&key);
+                            map.insert(Address(k), chunks);
+                        }
+                        Err(e) => tracing::warn!(
+                            "skipping un-decodable CF_UNBONDING row — consensus state may be corrupt: {e}"
+                        ),
+                    }
+                }
+                Ok((key, _)) => tracing::warn!(
+                    "skipping malformed CF_UNBONDING row (key {}B) — consensus state may be corrupt",
+                    key.len()
+                ),
+                Err(e) => tracing::warn!("CF_UNBONDING iterator error: {e}"),
+            }
+        }
+        map
+    }
+
+    // Batch variants for atomic block application (mirror batch_put_account).
+    pub fn batch_put_escrow(&self, batch: &mut WriteBatch, job_id: &[u8; 32], amount: u64) {
+        let cf = self.cf(CF_ESCROW);
+        batch.put_cf(&cf, job_id, amount.to_le_bytes());
+    }
+    pub fn batch_delete_escrow(&self, batch: &mut WriteBatch, job_id: &[u8; 32]) {
+        let cf = self.cf(CF_ESCROW);
+        batch.delete_cf(&cf, job_id);
+    }
+    pub fn batch_put_bonded(&self, batch: &mut WriteBatch, who: &Address, amount: u64) {
+        let cf = self.cf(CF_BONDED);
+        batch.put_cf(&cf, who.0, amount.to_le_bytes());
+    }
+    pub fn batch_delete_bonded(&self, batch: &mut WriteBatch, who: &Address) {
+        let cf = self.cf(CF_BONDED);
+        batch.delete_cf(&cf, who.0);
+    }
+    pub fn batch_put_unbonding(&self, batch: &mut WriteBatch, who: &Address, chunks: &[UnbondingChunk]) {
+        let cf = self.cf(CF_UNBONDING);
+        let encoded =
+            borsh::to_vec(&chunks.to_vec()).expect("unbonding borsh serialization should not fail");
+        batch.put_cf(&cf, who.0, &encoded);
+    }
+    pub fn batch_delete_unbonding(&self, batch: &mut WriteBatch, who: &Address) {
+        let cf = self.cf(CF_UNBONDING);
+        batch.delete_cf(&cf, who.0);
+    }
+
+    /// Wipe ONLY the three PoUW consensus-map CFs (used by `try_reorg` to drop stale rows before
+    /// re-flushing the replayed maps). Mirrors `clear_all`'s delete_range approach.
+    pub fn clear_consensus_maps(&self) -> Result<(), rocksdb::Error> {
+        let range_start: &[u8] = &[];
+        let range_end: &[u8] = &[0xFF; 128];
+        let mut batch = WriteBatch::default();
+        for cf_name in &[CF_ESCROW, CF_BONDED, CF_UNBONDING] {
+            let cf = self.cf(cf_name);
+            batch.delete_range_cf(&cf, range_start, range_end);
+        }
+        self.db.write(batch)
+    }
+
     // ── Feature 188: Storage metrics ──
 
     /// Estimate database size on disk (in bytes).
     pub fn estimate_db_size(&self) -> u64 {
         let mut total: u64 = 0;
-        for cf_name in &[CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED] {
+        for cf_name in &[
+            CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
+            CF_ESCROW, CF_BONDED, CF_UNBONDING,
+        ] {
             if let Some(cf) = self.db.cf_handle(cf_name)
                 && let Ok(Some(size_str)) = self.db.property_value_cf(&cf, "rocksdb.estimate-live-data-size")
                     && let Ok(size) = size_str.parse::<u64>() {

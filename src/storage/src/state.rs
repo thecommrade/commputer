@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
+use borsh::{BorshSerialize, BorshDeserialize};
+use sha2::{Digest, Sha256};
 use commputer_core::block::Block;
 use commputer_core::identity::Address;
 use commputer_core::token::{Amount, TOTAL_SUPPLY};
@@ -299,13 +301,20 @@ impl ChainState {
             blocks.put(block);
         }
 
+        // PoUW P2 (B1a): load the persisted consensus money/stake maps (empty until the live flip).
+        let escrow_by_job = rocks.all_escrow();
+        let bonded_stake = rocks.all_bonded();
+        let unbonding_stake = rocks.all_unbonding();
+
         let account_count = accounts.len();
         let block_count = blocks.len();
         let height = blocks.height();
 
         info!(
-            "Loaded state from disk: {} blocks (height {}), {} accounts, epoch {}",
+            "Loaded state from disk: {} blocks (height {}), {} accounts, epoch {}; \
+             escrow_pots={}, bonded={}, unbonding={}",
             block_count, height, account_count, current_epoch,
+            escrow_by_job.len(), bonded_stake.len(), unbonding_stake.len(),
         );
 
         Ok(Self {
@@ -324,9 +333,9 @@ impl ChainState {
             retention_policy: RetentionPolicy::default(),
             snapshot_height: 0,
             validator_performance: HashMap::new(),
-            escrow_by_job: HashMap::new(),
-            bonded_stake: HashMap::new(),
-            unbonding_stake: HashMap::new(),
+            escrow_by_job,
+            bonded_stake,
+            unbonding_stake,
             stake_params: StakeParams::default(),
             job_lifecycles: HashMap::new(),
         })
@@ -377,6 +386,27 @@ impl ChainState {
             })
         }).collect();
 
+        // PoUW P2 (B1a): the consensus money/stake maps (sorted for stable diffs; debug-only — the
+        // authoritative commitment is `state_root`).
+        let mut escrow: Vec<(&[u8; 32], &u64)> = self.escrow_by_job.iter().collect();
+        escrow.sort_by(|a, b| a.0.cmp(b.0));
+        let escrow_json: Vec<serde_json::Value> = escrow.iter()
+            .map(|(id, amt)| serde_json::json!({ "job_id": hex::encode(id), "amount": **amt }))
+            .collect();
+        let mut bonded: Vec<(&Address, &u64)> = self.bonded_stake.iter().collect();
+        bonded.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        let bonded_json: Vec<serde_json::Value> = bonded.iter()
+            .map(|(addr, amt)| serde_json::json!({ "address": hex::encode(addr.0), "amount": **amt }))
+            .collect();
+        let mut unbonding: Vec<(&Address, &Vec<UnbondingChunk>)> = self.unbonding_stake.iter().collect();
+        unbonding.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        let unbonding_json: Vec<serde_json::Value> = unbonding.iter().map(|(addr, chunks)| {
+            let cs: Vec<serde_json::Value> = chunks.iter()
+                .map(|c| serde_json::json!({ "amount": c.amount, "matures_at": c.matures_at }))
+                .collect();
+            serde_json::json!({ "address": hex::encode(addr.0), "chunks": cs })
+        }).collect();
+
         serde_json::json!({
             "height": self.blocks.height(),
             "total_emitted": self.total_emitted,
@@ -384,6 +414,9 @@ impl ChainState {
             "current_epoch": self.current_epoch,
             "state_root": hex::encode(self.compute_state_root()),
             "accounts": accounts,
+            "escrow_by_job": escrow_json,
+            "bonded_stake": bonded_json,
+            "unbonding_stake": unbonding_json,
         })
     }
 
@@ -398,9 +431,62 @@ impl ChainState {
         Ok(())
     }
 
-    /// Compute the state root from the current account store.
+    /// Compute the state root.
+    ///
+    /// PoUW P2 (B1a) — POLICY B (zero consensus change until the money path goes live): while all
+    /// three consensus maps are empty (the case today, until the live-enablement flip), this returns
+    /// the accounts-only root BYTE-IDENTICAL to before B1a. Once any map is non-empty, the root folds
+    /// the accounts root + the three maps (each iterated in SORTED key order — HashMap iteration is
+    /// nondeterministic — and length-prefixed so the encoding is injective across map boundaries). The
+    /// format change is thus deferred to the same moment the txs go live (a coordinated consensus
+    /// change), not introduced now.
     pub fn compute_state_root(&self) -> [u8; 32] {
-        self.accounts.compute_state_root()
+        let accounts_root = self.accounts.compute_state_root();
+        if self.escrow_by_job.is_empty()
+            && self.bonded_stake.is_empty()
+            && self.unbonding_stake.is_empty()
+        {
+            return accounts_root;
+        }
+        let mut h = Sha256::new();
+        h.update(accounts_root);
+
+        // escrow_by_job: sorted by job_id, length-prefixed.
+        let mut escrow: Vec<(&[u8; 32], &u64)> = self.escrow_by_job.iter().collect();
+        escrow.sort_by(|a, b| a.0.cmp(b.0));
+        h.update((escrow.len() as u64).to_le_bytes());
+        for (job_id, amount) in escrow {
+            h.update(job_id);
+            h.update(amount.to_le_bytes());
+        }
+
+        // bonded_stake: sorted by address, length-prefixed.
+        let mut bonded: Vec<(&Address, &u64)> = self.bonded_stake.iter().collect();
+        bonded.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        h.update((bonded.len() as u64).to_le_bytes());
+        for (addr, amount) in bonded {
+            h.update(addr.0);
+            h.update(amount.to_le_bytes());
+        }
+
+        // unbonding_stake: sorted by address; per-address chunk list length-prefixed AND sorted by
+        // (matures_at, amount) so the root never depends on the chunks' in-memory append order (e.g.
+        // after a reorg replay) — all integers folded little-endian for cross-platform determinism.
+        let mut unbonding: Vec<(&Address, &Vec<UnbondingChunk>)> = self.unbonding_stake.iter().collect();
+        unbonding.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        h.update((unbonding.len() as u64).to_le_bytes());
+        for (addr, chunks) in unbonding {
+            h.update(addr.0);
+            h.update((chunks.len() as u64).to_le_bytes());
+            let mut cs: Vec<&UnbondingChunk> = chunks.iter().collect();
+            cs.sort_by(|a, b| a.matures_at.cmp(&b.matures_at).then(a.amount.cmp(&b.amount)));
+            for c in cs {
+                h.update(c.amount.to_le_bytes());
+                h.update(c.matures_at.to_le_bytes());
+            }
+        }
+
+        h.finalize().into()
     }
 
     /// Remaining supply available for emission.
@@ -1421,6 +1507,19 @@ impl ChainState {
                 }
             }
 
+            // PoUW P2 (B1a): keep the consensus money/stake maps atomic with the block+accounts+meta
+            // in the SAME commit. Full-map PUT is fine while the maps stay empty (the live flip is
+            // gated); TODO(P2): switch to dirty-key put + batch_delete_* for emptied pots/chunks.
+            for (job_id, amount) in &self.escrow_by_job {
+                rocks.batch_put_escrow(&mut batch, job_id, *amount);
+            }
+            for (addr, amount) in &self.bonded_stake {
+                rocks.batch_put_bonded(&mut batch, addr, *amount);
+            }
+            for (addr, chunks) in &self.unbonding_stake {
+                rocks.batch_put_unbonding(&mut batch, addr, chunks);
+            }
+
             rocks.write_batch(batch)
                 .map_err(|e| StateError::StorageError(e.to_string()))?;
 
@@ -1715,6 +1814,16 @@ impl ChainState {
         self.cumulative_score = competing_score;
         self.rocks = saved_rocks;
 
+        // PoUW P2 (B1a): the reorg replayed with rocks=None, so the persisted consensus-map CFs still
+        // hold the PRE-reorg rows while the in-memory maps were cleared+rebuilt. Drop the stale rows
+        // and re-flush the rebuilt maps so a later restart loads the winning chain's state, not stale
+        // rows. (No-op while the maps are empty; correct once the live flip lands.)
+        if let Some(ref rocks) = self.rocks {
+            rocks.clear_consensus_maps()
+                .map_err(|e| StateError::StorageError(e.to_string()))?;
+            self.flush_consensus_maps(rocks)?;
+        }
+
         info!(
             "Chain reorganization complete: rolled back to height {}, applied {} new blocks (new height {})",
             fork_height.saturating_sub(1),
@@ -1747,6 +1856,9 @@ impl ChainState {
         // so we use the flush_accounts helper.
         self.flush_accounts(rocks)?;
 
+        // PoUW P2 (B1a): flush the consensus money/stake maps.
+        self.flush_consensus_maps(rocks)?;
+
         Ok(())
     }
 
@@ -1755,6 +1867,25 @@ impl ChainState {
         let mut batch = rocks.new_write_batch();
         for account in self.accounts.iter() {
             rocks.batch_put_account(&mut batch, account);
+        }
+        rocks.write_batch(batch)
+            .map_err(|e| StateError::StorageError(e.to_string()))
+    }
+
+    /// PoUW P2 (B1a): persist the three consensus money/stake maps in one WriteBatch (mirrors
+    /// `flush_accounts`). NOTE: this PUTs every live entry; it does not delete entries removed
+    /// in-memory. That is fine for B1a (the maps stay empty until the live flip) — the P2 live-tx
+    /// path must switch to dirty-key put + `batch_delete_*` for emptied pots / withdrawn chunks.
+    fn flush_consensus_maps(&self, rocks: &RocksStore) -> Result<(), StateError> {
+        let mut batch = rocks.new_write_batch();
+        for (job_id, amount) in &self.escrow_by_job {
+            rocks.batch_put_escrow(&mut batch, job_id, *amount);
+        }
+        for (addr, amount) in &self.bonded_stake {
+            rocks.batch_put_bonded(&mut batch, addr, *amount);
+        }
+        for (addr, chunks) in &self.unbonding_stake {
+            rocks.batch_put_unbonding(&mut batch, addr, chunks);
         }
         rocks.write_batch(batch)
             .map_err(|e| StateError::StorageError(e.to_string()))
@@ -1924,7 +2055,9 @@ impl Default for StakeParams {
 }
 
 /// PoUW P2 (G4): one unbonding request in its cooldown window (slashable until withdrawn).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Borsh-serialized for RocksDB persistence (B1a) — treat the field layout as a stable on-disk
+/// schema (a field reorder/add changes the on-disk bytes; version it if the fields ever grow).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct UnbondingChunk {
     amount: u64,
     matures_at: u64, // block height at/after which this chunk is withdrawable
@@ -3172,6 +3305,101 @@ mod tests {
             assert_eq!(state.total_emitted, Amount::from_comme(100).raw());
             assert_eq!(state.current_epoch, 5);
         }
+    }
+
+    // --- PoUW P2 (B1a): consensus money/stake map persistence + state root ---------
+
+    #[test]
+    fn b1a_consensus_maps_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.escrow_by_job.insert([7u8; 32], 4_000);
+            state.escrow_by_job.insert([8u8; 32], 1_500);
+            state.bonded_stake.insert(addr(1), 9_000);
+            state.bonded_stake.insert(addr(2), 250);
+            state.unbonding_stake.insert(addr(1), vec![
+                UnbondingChunk { amount: 500, matures_at: 100 },
+                UnbondingChunk { amount: 750, matures_at: 200 },
+            ]);
+            state.flush().unwrap();
+        }
+        let state = ChainState::open(dir.path()).unwrap();
+        assert_eq!(state.escrow_by_job.len(), 2);
+        assert_eq!(state.escrow_by_job.get(&[7u8; 32]), Some(&4_000));
+        assert_eq!(state.escrow_by_job.get(&[8u8; 32]), Some(&1_500));
+        assert_eq!(state.bonded_stake.get(&addr(1)), Some(&9_000));
+        assert_eq!(state.bonded_stake.get(&addr(2)), Some(&250));
+        assert_eq!(state.unbonding_stake.get(&addr(1)).unwrap().len(), 2);
+        assert_eq!(state.unbonding_of(&addr(1)), 1_250); // 500 + 750 round-tripped
+    }
+
+    #[test]
+    fn b1a_state_root_policy_b_and_order_independent() {
+        // Policy B: while all three maps are empty, the root is the accounts-only root (byte-identical
+        // to before B1a — no consensus change yet).
+        let mut s1 = ChainState::new();
+        s1.accounts.get_or_create(addr(1)).balance = Amount::from_raw(100);
+        let accounts_only = s1.accounts.compute_state_root();
+        assert_eq!(s1.compute_state_root(), accounts_only, "empty maps => accounts-only root");
+
+        // Non-empty => the maps fold into the root (differs from accounts-only).
+        s1.escrow_by_job.insert([1u8; 32], 10);
+        s1.bonded_stake.insert(addr(2), 20);
+        s1.unbonding_stake.insert(addr(3), vec![UnbondingChunk { amount: 5, matures_at: 9 }]);
+        let folded = s1.compute_state_root();
+        assert_ne!(folded, accounts_only, "non-empty maps fold into the root");
+
+        // Order-independence: the SAME entries inserted in a different order => identical root.
+        let mut s2 = ChainState::new();
+        s2.accounts.get_or_create(addr(1)).balance = Amount::from_raw(100);
+        s2.unbonding_stake.insert(addr(3), vec![UnbondingChunk { amount: 5, matures_at: 9 }]);
+        s2.bonded_stake.insert(addr(2), 20);
+        s2.escrow_by_job.insert([1u8; 32], 10);
+        assert_eq!(s2.compute_state_root(), folded, "root deterministic regardless of insert order");
+
+        // Non-vacuous: a changed amount changes the root.
+        let mut s3 = ChainState::new();
+        s3.accounts.get_or_create(addr(1)).balance = Amount::from_raw(100);
+        s3.escrow_by_job.insert([1u8; 32], 11);
+        s3.bonded_stake.insert(addr(2), 20);
+        s3.unbonding_stake.insert(addr(3), vec![UnbondingChunk { amount: 5, matures_at: 9 }]);
+        assert_ne!(s3.compute_state_root(), folded, "a changed amount changes the root");
+    }
+
+    #[test]
+    fn b1a_reset_to_genesis_wipes_persisted_maps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(dir.path()).unwrap();
+        state.escrow_by_job.insert([7u8; 32], 4_000);
+        state.bonded_stake.insert(addr(1), 9_000);
+        state.unbonding_stake.insert(addr(1), vec![UnbondingChunk { amount: 1, matures_at: 1 }]);
+        state.flush().unwrap();
+        state.reset_to_genesis().unwrap();
+        assert!(state.escrow_by_job.is_empty() && state.bonded_stake.is_empty() && state.unbonding_stake.is_empty());
+        // and the persisted CF rows are gone after a reopen.
+        drop(state);
+        let reopened = ChainState::open(dir.path()).unwrap();
+        assert!(reopened.escrow_by_job.is_empty(), "reset wiped persisted escrow rows");
+        assert!(reopened.bonded_stake.is_empty(), "reset wiped persisted bonded rows");
+        assert!(reopened.unbonding_stake.is_empty(), "reset wiped persisted unbonding rows");
+    }
+
+    #[test]
+    fn b1a_apply_block_atomic_persists_maps() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            state.escrow_by_job.insert([9u8; 32], 2_222);
+            state.bonded_stake.insert(addr(5), 333);
+            // apply a block atomically — the maps must ride the same WriteBatch.
+            let block = block_with(&state, 1, vec![]);
+            state.apply_block_atomic(&block).unwrap();
+        }
+        let state = ChainState::open(dir.path()).unwrap();
+        assert_eq!(state.escrow_by_job.get(&[9u8; 32]), Some(&2_222), "escrow persisted by apply_block_atomic");
+        assert_eq!(state.bonded_stake.get(&addr(5)), Some(&333));
     }
 
     #[test]
