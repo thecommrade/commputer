@@ -9,6 +9,7 @@ description = "P0 on-chain wiring adapters: deterministic execution, job-spec ma
 commputer-pouw = { path = "../pouw", features = ["wasm-runtime"] }
 sha2 = { workspace = true }
 commputer-da = { path = "../da" }
+borsh = { workspace = true }
 
 [dev-dependencies]
 wat = "=1.251.0"   # assemble a guest for the exec-adapter test

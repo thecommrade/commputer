@@ -13,6 +13,8 @@ use commputer_pouw_onchain::escrow_ledger::Ledger;
 use commputer_pouw::oracle::{ChainHooks, EquivalenceOracle};
 use commputer_pouw::ids::ParticipantId;
 use commputer_pouw::job::{Commitment, Reveal};
+use commputer_pouw::params::GameParams;
+use commputer_pouw_onchain::settlement_resolution::ResolutionParams;
 use ed25519_dalek::Verifier;
 use tracing::{info, warn};
 use crate::account::{Account, AccountStore};
@@ -190,6 +192,13 @@ pub struct ChainState {
     /// state root — else nodes diverge on committee selection. Safe now only because they stay
     /// empty until that tx exists.
     pub stake_params: StakeParams,
+    /// PoUW P2 (B1b): genesis-anchored consensus params (G5) needed to reconstruct each persisted
+    /// `JobLifecycle` on load. Every lifecycle is created with these identical params, so they are NOT
+    /// persisted per-job — they are RECONSTRUCTED-from-config here and re-injected in `from_record`
+    /// (no RocksDB round-trip). TODO(B8, PROTECTED genesis): populate both from `GenesisConfig`;
+    /// default until then.
+    pub game_params: GameParams,
+    pub resolution_params: ResolutionParams,
     /// PoUW P2: per-job verification lifecycle (`job_id` -> `JobLifecycle`), the multi-block
     /// commit-reveal state machine. Created at `ClaimJob` (AwaitingResult), committee drawn at
     /// `CompleteJob`, fed by `Commit`/`Reveal`, advanced/settled by block height. Its money moves
@@ -251,6 +260,8 @@ impl ChainState {
             bonded_stake: HashMap::new(),
             unbonding_stake: HashMap::new(),
             stake_params: StakeParams::default(),
+            game_params: GameParams::default(),
+            resolution_params: ResolutionParams::default(),
             job_lifecycles: HashMap::new(),
         }
     }
@@ -306,15 +317,28 @@ impl ChainState {
         let bonded_stake = rocks.all_bonded();
         let unbonding_stake = rocks.all_unbonding();
 
+        // PoUW P2 (B1b): load persisted job_lifecycles. GameParams/ResolutionParams are genesis-anchored
+        // (identical for every job) so they are NOT persisted per-job — reconstruct + re-inject them.
+        // TODO(B8, PROTECTED genesis): populate these from GenesisConfig; default until then. Because
+        // every lifecycle was created with the same consensus params, re-injecting this copy reproduces
+        // the original params exactly (true now with defaults, and post-B8 with genesis values).
+        let game_params = GameParams::default();
+        let resolution_params = ResolutionParams::default();
+        let job_lifecycles: HashMap<[u8; 32], JobLifecycle> = rocks
+            .all_lifecycle()
+            .into_iter()
+            .map(|(id, rec)| (id, JobLifecycle::from_record(rec, game_params.clone(), resolution_params)))
+            .collect();
+
         let account_count = accounts.len();
         let block_count = blocks.len();
         let height = blocks.height();
 
         info!(
             "Loaded state from disk: {} blocks (height {}), {} accounts, epoch {}; \
-             escrow_pots={}, bonded={}, unbonding={}",
+             escrow_pots={}, bonded={}, unbonding={}, lifecycles={}",
             block_count, height, account_count, current_epoch,
-            escrow_by_job.len(), bonded_stake.len(), unbonding_stake.len(),
+            escrow_by_job.len(), bonded_stake.len(), unbonding_stake.len(), job_lifecycles.len(),
         );
 
         Ok(Self {
@@ -337,7 +361,9 @@ impl ChainState {
             bonded_stake,
             unbonding_stake,
             stake_params: StakeParams::default(),
-            job_lifecycles: HashMap::new(),
+            game_params,
+            resolution_params,
+            job_lifecycles,
         })
     }
 
@@ -407,6 +433,22 @@ impl ChainState {
             serde_json::json!({ "address": hex::encode(addr.0), "chunks": cs })
         }).collect();
 
+        // PoUW P2 (B1b): job_lifecycles (debug-only; the authoritative commitment is `state_root`).
+        let mut lifecycles: Vec<(&[u8; 32], &JobLifecycle)> = self.job_lifecycles.iter().collect();
+        lifecycles.sort_by(|a, b| a.0.cmp(b.0));
+        let lifecycles_json: Vec<serde_json::Value> = lifecycles.iter().map(|(id, lc)| {
+            let r = lc.to_record();
+            serde_json::json!({
+                "job_id": hex::encode(id),
+                "phase": format!("{:?}", lc.phase()),
+                "committee": r.committee.len(),
+                "commitments": r.commitments.len(),
+                "reveals": r.reveals.len(),
+                "settled": r.settled.is_some(),
+                "expected_escrow": lc.expected_escrow(),
+            })
+        }).collect();
+
         serde_json::json!({
             "height": self.blocks.height(),
             "total_emitted": self.total_emitted,
@@ -417,6 +459,7 @@ impl ChainState {
             "escrow_by_job": escrow_json,
             "bonded_stake": bonded_json,
             "unbonding_stake": unbonding_json,
+            "job_lifecycles": lifecycles_json,
         })
     }
 
@@ -445,6 +488,7 @@ impl ChainState {
         if self.escrow_by_job.is_empty()
             && self.bonded_stake.is_empty()
             && self.unbonding_stake.is_empty()
+            && self.job_lifecycles.is_empty()
         {
             return accounts_root;
         }
@@ -484,6 +528,23 @@ impl ChainState {
                 h.update(c.amount.to_le_bytes());
                 h.update(c.matures_at.to_le_bytes());
             }
+        }
+
+        // job_lifecycles: sorted by job_id, length-prefixed; value = borsh(JobLifecycleRecord). The DTO
+        // holds only Vec/Option/primitive fields (NO HashMap/HashSet) ⇒ borsh is canonical, Vec order is
+        // the chain's append order (consensus-deterministic) ⇒ the fold is injective + deterministic
+        // across nodes. Per-entry blob length-prefixed (LE) so the encoding stays injective. B1b
+        // FINALIZES the Policy-B fold to four sections; while ALL four maps are empty (the case until the
+        // coordinated live flip) the root stays the pre-B1a accounts-only root byte-for-byte.
+        let mut lifecycles: Vec<(&[u8; 32], &JobLifecycle)> = self.job_lifecycles.iter().collect();
+        lifecycles.sort_by(|a, b| a.0.cmp(b.0));
+        h.update((lifecycles.len() as u64).to_le_bytes());
+        for (job_id, lc) in lifecycles {
+            h.update(job_id);
+            let blob = borsh::to_vec(&lc.to_record())
+                .expect("lifecycle record borsh serialization should not fail");
+            h.update((blob.len() as u64).to_le_bytes());
+            h.update(&blob);
         }
 
         h.finalize().into()
@@ -1562,6 +1623,11 @@ impl ChainState {
             for (addr, chunks) in &self.unbonding_stake {
                 rocks.batch_put_unbonding(&mut batch, addr, chunks);
             }
+            // PoUW P2 (B1b): persist job_lifecycles in the SAME atomic commit (whole-map PUT of the DTO;
+            // TODO(P2): dirty-key put + batch_delete_lifecycle for settled/removed jobs, as with the maps).
+            for (job_id, lc) in &self.job_lifecycles {
+                rocks.batch_put_lifecycle(&mut batch, job_id, &lc.to_record());
+            }
 
             rocks.write_batch(batch)
                 .map_err(|e| StateError::StorageError(e.to_string()))?;
@@ -1915,10 +1981,11 @@ impl ChainState {
             .map_err(|e| StateError::StorageError(e.to_string()))
     }
 
-    /// PoUW P2 (B1a): persist the three consensus money/stake maps in one WriteBatch (mirrors
-    /// `flush_accounts`). NOTE: this PUTs every live entry; it does not delete entries removed
-    /// in-memory. That is fine for B1a (the maps stay empty until the live flip) — the P2 live-tx
-    /// path must switch to dirty-key put + `batch_delete_*` for emptied pots / withdrawn chunks.
+    /// PoUW P2 (B1a/B1b): persist the FOUR consensus maps (escrow_by_job / bonded_stake /
+    /// unbonding_stake / job_lifecycles) in one WriteBatch (mirrors `flush_accounts`). NOTE: this PUTs
+    /// every live entry; it does not delete entries removed in-memory. That is fine while the maps stay
+    /// empty until the live flip — the P2 live-tx path must switch to dirty-key put + `batch_delete_*`
+    /// for emptied pots / withdrawn chunks / settled jobs.
     fn flush_consensus_maps(&self, rocks: &RocksStore) -> Result<(), StateError> {
         let mut batch = rocks.new_write_batch();
         for (job_id, amount) in &self.escrow_by_job {
@@ -1929,6 +1996,9 @@ impl ChainState {
         }
         for (addr, chunks) in &self.unbonding_stake {
             rocks.batch_put_unbonding(&mut batch, addr, chunks);
+        }
+        for (job_id, lc) in &self.job_lifecycles {
+            rocks.batch_put_lifecycle(&mut batch, job_id, &lc.to_record());
         }
         rocks.write_batch(batch)
             .map_err(|e| StateError::StorageError(e.to_string()))
@@ -3591,6 +3661,109 @@ mod tests {
         let state = ChainState::open(dir.path()).unwrap();
         assert_eq!(state.escrow_by_job.get(&[9u8; 32]), Some(&2_222), "escrow persisted by apply_block_atomic");
         assert_eq!(state.bonded_stake.get(&addr(5)), Some(&333));
+    }
+
+    // --- PoUW P2 (B1b): job_lifecycles persistence + state-root folding ------------
+
+    /// A non-trivial persisted lifecycle: committee drawn (Committing), executor_hash set. `exec_seed`
+    /// varies the result hash so distinct jobs fold to distinct state-root blobs.
+    fn sample_lifecycle(job: [u8; 32], exec_seed: u8) -> JobLifecycle {
+        let (budget, e_bond, v_bond) = fuel_mins();
+        let mut lc = JobLifecycle::open(
+            job, lpid(0), lpid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(),
+            vec![lpid(10), lpid(11), lpid(12)], test_deadlines(),
+        );
+        let stake = |_: &ParticipantId| 1u64;
+        assert_eq!(lc.submit_result(lpid(9), [exec_seed; 32], [42u8; 32], 5, &stake), EventResult::Accepted);
+        lc
+    }
+
+    #[test]
+    fn b1b_job_lifecycles_persist_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = [21u8; 32];
+        let original_rec;
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            let lc = sample_lifecycle(job, 7);
+            original_rec = lc.to_record();
+            state.job_lifecycles.insert(job, lc);
+            state.flush().unwrap();
+        }
+        let state = ChainState::open(dir.path()).unwrap();
+        assert_eq!(state.job_lifecycles.len(), 1);
+        let reloaded = state.job_lifecycles.get(&job).expect("lifecycle reloaded");
+        assert_eq!(reloaded.to_record(), original_rec, "lifecycle round-trips through RocksDB");
+        assert_eq!(reloaded.phase(), Phase::Committing);
+        assert_eq!(reloaded.committee().len(), 3);
+    }
+
+    #[test]
+    fn b1b_lifecycle_state_root_policy_b_and_order_independent() {
+        // Policy B: all four consensus maps empty ⇒ accounts-only root (byte-identical to pre-B1a).
+        let mut s1 = ChainState::new();
+        s1.accounts.get_or_create(addr(1)).balance = Amount::from_raw(100);
+        let accounts_only = s1.accounts.compute_state_root();
+        assert_eq!(s1.compute_state_root(), accounts_only, "empty maps ⇒ accounts-only root");
+
+        // Non-empty lifecycles fold into the root.
+        let job_a = [1u8; 32];
+        let job_b = [2u8; 32];
+        s1.job_lifecycles.insert(job_a, sample_lifecycle(job_a, 7));
+        s1.job_lifecycles.insert(job_b, sample_lifecycle(job_b, 8));
+        let folded = s1.compute_state_root();
+        assert_ne!(folded, accounts_only, "non-empty lifecycles fold into the root");
+
+        // Order-independence: reverse insert order ⇒ identical root (fold sorts by job_id).
+        let mut s2 = ChainState::new();
+        s2.accounts.get_or_create(addr(1)).balance = Amount::from_raw(100);
+        s2.job_lifecycles.insert(job_b, sample_lifecycle(job_b, 8));
+        s2.job_lifecycles.insert(job_a, sample_lifecycle(job_a, 7));
+        assert_eq!(s2.compute_state_root(), folded, "root deterministic regardless of insert order");
+
+        // Non-vacuity: a differing lifecycle (different executor_hash) ⇒ different root.
+        let mut s3 = ChainState::new();
+        s3.accounts.get_or_create(addr(1)).balance = Amount::from_raw(100);
+        s3.job_lifecycles.insert(job_a, sample_lifecycle(job_a, 99));
+        s3.job_lifecycles.insert(job_b, sample_lifecycle(job_b, 8));
+        assert_ne!(s3.compute_state_root(), folded, "a differing lifecycle changes the root");
+    }
+
+    #[test]
+    fn b1b_reset_to_genesis_wipes_persisted_lifecycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = [22u8; 32];
+        let mut state = ChainState::open(dir.path()).unwrap();
+        state.job_lifecycles.insert(job, sample_lifecycle(job, 7));
+        state.flush().unwrap();
+        state.reset_to_genesis().unwrap();
+        assert!(state.job_lifecycles.is_empty(), "reset cleared in-memory lifecycles");
+        drop(state);
+        let reopened = ChainState::open(dir.path()).unwrap();
+        assert!(reopened.job_lifecycles.is_empty(), "reset wiped persisted lifecycle rows");
+    }
+
+    #[test]
+    fn b1b_apply_block_atomic_persists_lifecycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let job = [23u8; 32];
+        let rec;
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            let lc = sample_lifecycle(job, 7);
+            rec = lc.to_record();
+            state.job_lifecycles.insert(job, lc);
+            let block = block_with(&state, 1, vec![]);
+            state.apply_block_atomic(&block).unwrap();
+        }
+        let state = ChainState::open(dir.path()).unwrap();
+        assert_eq!(
+            state.job_lifecycles.get(&job).map(|l| l.to_record()),
+            Some(rec),
+            "lifecycle persisted by apply_block_atomic",
+        );
     }
 
     #[test]

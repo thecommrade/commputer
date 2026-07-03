@@ -34,6 +34,7 @@ use commputer_pouw::params::GameParams;
 use commputer_pouw::verdict::compute_verdict;
 use crate::escrow_ledger::Ledger;
 use crate::settlement_resolution::{resolve_confirmed, resolve_disputed, resolve_timeout, ResolutionParams};
+use borsh::{BorshSerialize, BorshDeserialize};
 
 /// Lifecycle phase. Advances by block height; `submit_result` moves AwaitingResult→Committing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +95,181 @@ pub enum Terminal {
     Disputed(SettlementOutcome),
     TimedOut(SettlementOutcome),
     Escalate(EscalationHandoff),
+}
+
+// ── PoUW P2 (B1b): persistable DTO for RocksDB persistence + state-root folding ──────────────
+// JobLifecycle embeds FROZEN game types (GameParams/Commitment/Reveal/SettlementOutcome/
+// ParticipantId) that derive no Borsh; the frozen `pouw` crate must stay byte-identical. So we
+// mirror every field to primitives/local Borsh types here (same module ⇒ to_record/from_record read
+// JobLifecycle's private fields directly). GameParams/ResolutionParams are genesis-anchored consensus
+// params identical for every job (G5) — NOT persisted per-job; re-injected in `from_record`.
+// The DTO holds only Vec/Option/primitive/array/tuple fields (no HashMap/HashSet) ⇒ borsh is canonical
+// ⇒ deterministic across nodes for state-root folding.
+
+/// Mirror of the local `Phase` enum (4 unit variants; declaration order == borsh discriminant).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum PhaseRec { AwaitingResult, Committing, Revealing, Settled }
+
+/// Mirror of the local `PhaseDeadlines`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct PhaseDeadlinesRec { pub result_by: u64, pub commit_by: u64, pub reveal_by: u64 }
+
+/// Mirror of the frozen `Commitment` (ParticipantId → [u8;32]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct CommitmentRec { pub verifier: [u8; 32], pub commit: [u8; 32], pub bond: u64 }
+
+/// Mirror of the frozen `Reveal`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct RevealRec { pub verifier: [u8; 32], pub result_hash: [u8; 32], pub salt: [u8; 32] }
+
+/// Mirror of the frozen `SettlementOutcome` (ALL 7 u64 fields + the slashed log).
+#[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct SettlementOutcomeRec {
+    pub worker_paid: u64,
+    pub verifiers_paid: u64,
+    pub burned: u64,
+    pub submitter_refunded: u64,
+    pub challenger_paid: u64,
+    pub panel_paid: u64,
+    pub bonds_returned: u64,
+    pub slashed: Vec<([u8; 32], u64)>,
+}
+
+/// Mirror of the local `EscalationHandoff`.
+#[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct EscalationHandoffRec {
+    pub budget: u64,
+    pub submitter: [u8; 32],
+    pub executor: [u8; 32],
+    pub executor_hash: [u8; 32],
+    pub executor_bond: u64,
+    pub committee_reveals: Vec<RevealRec>,
+    pub committee_bonds: Vec<u64>,
+    pub verifier_bond: u64,
+}
+
+/// Mirror of the local `Terminal` (declaration order == borsh discriminant).
+#[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
+pub enum TerminalRec {
+    Confirmed(SettlementOutcomeRec),
+    Disputed(SettlementOutcomeRec),
+    TimedOut(SettlementOutcomeRec),
+    Escalate(EscalationHandoffRec),
+}
+
+/// Persistable, borsh-canonical mirror of `JobLifecycle`. Omits `params`/`rparams` (genesis-anchored
+/// consensus params re-injected in `from_record`). Treat the field layout as a STABLE on-disk schema:
+/// a reorder/add changes the on-disk bytes AND the state root — version it if the fields ever grow.
+#[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct JobLifecycleRecord {
+    pub job_id: [u8; 32],
+    pub submitter: [u8; 32],
+    pub executor: [u8; 32],
+    pub executor_bond: u64,
+    pub budget: u64,
+    pub verifier_bond: u64,
+    pub candidates: Vec<[u8; 32]>,
+    pub deadlines: PhaseDeadlinesRec,
+    pub phase: PhaseRec,
+    pub executor_hash: Option<[u8; 32]>,
+    pub committee: Vec<[u8; 32]>,
+    pub commitments: Vec<CommitmentRec>,
+    pub reveals: Vec<RevealRec>,
+    pub settled: Option<TerminalRec>,
+}
+
+// ---- field-level conversions (private module helpers) ----
+fn phase_to_rec(p: Phase) -> PhaseRec {
+    match p {
+        Phase::AwaitingResult => PhaseRec::AwaitingResult,
+        Phase::Committing => PhaseRec::Committing,
+        Phase::Revealing => PhaseRec::Revealing,
+        Phase::Settled => PhaseRec::Settled,
+    }
+}
+fn phase_from_rec(p: PhaseRec) -> Phase {
+    match p {
+        PhaseRec::AwaitingResult => Phase::AwaitingResult,
+        PhaseRec::Committing => Phase::Committing,
+        PhaseRec::Revealing => Phase::Revealing,
+        PhaseRec::Settled => Phase::Settled,
+    }
+}
+fn commit_to_rec(c: &Commitment) -> CommitmentRec {
+    CommitmentRec { verifier: c.verifier.0, commit: c.commit, bond: c.bond }
+}
+fn commit_from_rec(c: &CommitmentRec) -> Commitment {
+    Commitment { verifier: ParticipantId(c.verifier), commit: c.commit, bond: c.bond }
+}
+fn reveal_to_rec(r: &Reveal) -> RevealRec {
+    RevealRec { verifier: r.verifier.0, result_hash: r.result_hash, salt: r.salt }
+}
+fn reveal_from_rec(r: &RevealRec) -> Reveal {
+    Reveal { verifier: ParticipantId(r.verifier), result_hash: r.result_hash, salt: r.salt }
+}
+fn outcome_to_rec(o: &SettlementOutcome) -> SettlementOutcomeRec {
+    SettlementOutcomeRec {
+        worker_paid: o.worker_paid,
+        verifiers_paid: o.verifiers_paid,
+        burned: o.burned,
+        submitter_refunded: o.submitter_refunded,
+        challenger_paid: o.challenger_paid,
+        panel_paid: o.panel_paid,
+        bonds_returned: o.bonds_returned,
+        slashed: o.slashed.iter().map(|(p, a)| (p.0, *a)).collect(),
+    }
+}
+fn outcome_from_rec(o: &SettlementOutcomeRec) -> SettlementOutcome {
+    SettlementOutcome {
+        worker_paid: o.worker_paid,
+        verifiers_paid: o.verifiers_paid,
+        burned: o.burned,
+        submitter_refunded: o.submitter_refunded,
+        challenger_paid: o.challenger_paid,
+        panel_paid: o.panel_paid,
+        bonds_returned: o.bonds_returned,
+        slashed: o.slashed.iter().map(|(p, a)| (ParticipantId(*p), *a)).collect(),
+    }
+}
+fn handoff_to_rec(h: &EscalationHandoff) -> EscalationHandoffRec {
+    EscalationHandoffRec {
+        budget: h.budget,
+        submitter: h.submitter.0,
+        executor: h.executor.0,
+        executor_hash: h.executor_hash,
+        executor_bond: h.executor_bond,
+        committee_reveals: h.committee_reveals.iter().map(reveal_to_rec).collect(),
+        committee_bonds: h.committee_bonds.clone(),
+        verifier_bond: h.verifier_bond,
+    }
+}
+fn handoff_from_rec(h: &EscalationHandoffRec) -> EscalationHandoff {
+    EscalationHandoff {
+        budget: h.budget,
+        submitter: ParticipantId(h.submitter),
+        executor: ParticipantId(h.executor),
+        executor_hash: h.executor_hash,
+        executor_bond: h.executor_bond,
+        committee_reveals: h.committee_reveals.iter().map(reveal_from_rec).collect(),
+        committee_bonds: h.committee_bonds.clone(),
+        verifier_bond: h.verifier_bond,
+    }
+}
+fn terminal_to_rec(t: &Terminal) -> TerminalRec {
+    match t {
+        Terminal::Confirmed(o) => TerminalRec::Confirmed(outcome_to_rec(o)),
+        Terminal::Disputed(o) => TerminalRec::Disputed(outcome_to_rec(o)),
+        Terminal::TimedOut(o) => TerminalRec::TimedOut(outcome_to_rec(o)),
+        Terminal::Escalate(h) => TerminalRec::Escalate(handoff_to_rec(h)),
+    }
+}
+fn terminal_from_rec(t: &TerminalRec) -> Terminal {
+    match t {
+        TerminalRec::Confirmed(o) => Terminal::Confirmed(outcome_from_rec(o)),
+        TerminalRec::Disputed(o) => Terminal::Disputed(outcome_from_rec(o)),
+        TerminalRec::TimedOut(o) => Terminal::TimedOut(outcome_from_rec(o)),
+        TerminalRec::Escalate(h) => Terminal::Escalate(handoff_from_rec(h)),
+    }
 }
 
 /// One compute job's primary verification round, as a deterministic multi-block state machine.
@@ -174,6 +350,59 @@ impl JobLifecycle {
         self.budget
             .saturating_add(self.executor_bond)
             .saturating_add(bonds)
+    }
+
+    /// PoUW P2 (B1b): project to the persistable, borsh-canonical DTO. Reads private fields directly
+    /// (same module). `params`/`rparams` are NOT included — they are genesis-anchored consensus params.
+    pub fn to_record(&self) -> JobLifecycleRecord {
+        JobLifecycleRecord {
+            job_id: self.job_id,
+            submitter: self.submitter.0,
+            executor: self.executor.0,
+            executor_bond: self.executor_bond,
+            budget: self.budget,
+            verifier_bond: self.verifier_bond,
+            candidates: self.candidates.iter().map(|p| p.0).collect(),
+            deadlines: PhaseDeadlinesRec {
+                result_by: self.deadlines.result_by,
+                commit_by: self.deadlines.commit_by,
+                reveal_by: self.deadlines.reveal_by,
+            },
+            phase: phase_to_rec(self.phase),
+            executor_hash: self.executor_hash,
+            committee: self.committee.iter().map(|p| p.0).collect(),
+            commitments: self.commitments.iter().map(commit_to_rec).collect(),
+            reveals: self.reveals.iter().map(reveal_to_rec).collect(),
+            settled: self.settled.as_ref().map(terminal_to_rec),
+        }
+    }
+
+    /// PoUW P2 (B1b): rebuild a full `JobLifecycle` from its DTO, RE-INJECTING the genesis-anchored
+    /// consensus params (identical for every job, so this reproduces the original params exactly —
+    /// true both now with defaults and post-B8 with genesis values).
+    pub fn from_record(rec: JobLifecycleRecord, params: GameParams, rparams: ResolutionParams) -> Self {
+        Self {
+            job_id: rec.job_id,
+            submitter: ParticipantId(rec.submitter),
+            executor: ParticipantId(rec.executor),
+            executor_bond: rec.executor_bond,
+            budget: rec.budget,
+            verifier_bond: rec.verifier_bond,
+            params,
+            rparams,
+            candidates: rec.candidates.iter().map(|b| ParticipantId(*b)).collect(),
+            deadlines: PhaseDeadlines {
+                result_by: rec.deadlines.result_by,
+                commit_by: rec.deadlines.commit_by,
+                reveal_by: rec.deadlines.reveal_by,
+            },
+            phase: phase_from_rec(rec.phase),
+            executor_hash: rec.executor_hash,
+            committee: rec.committee.iter().map(|b| ParticipantId(*b)).collect(),
+            commitments: rec.commitments.iter().map(commit_from_rec).collect(),
+            reveals: rec.reveals.iter().map(reveal_from_rec).collect(),
+            settled: rec.settled.as_ref().map(terminal_from_rec),
+        }
     }
 
     /// Whether this job's window has elapsed and the node should call `settle` at `height`. The
@@ -859,5 +1088,63 @@ mod tests {
             assert_eq!(l1.balance_of(&who), l2.balance_of(&who));
         }
         assert_eq!(l1.total_supply(), l2.total_supply());
+    }
+
+    #[test]
+    fn job_lifecycle_record_round_trips_through_borsh() {
+        // Non-trivial: committee drawn, 3 commit, only 2 reveal (a non-revealer), settled Confirmed.
+        let (budget, e_bond, v_bond) = min_funding();
+        let job = [1u8; 32];
+        let result = [7u8; 32];
+        let (mut l, _t0) = funded(job, budget, e_bond, v_bond, &cands3());
+        let mut lc = opened_committing(job, result, budget, e_bond, v_bond);
+        for (i, c) in cands3().iter().enumerate() {
+            assert_eq!(lc.record_commit(&mut l, commit_of(*c, result, [i as u8; 32], v_bond), 15), EventResult::Accepted);
+        }
+        assert_eq!(lc.advance(21), Phase::Revealing);
+        for (i, c) in cands3().iter().take(2).enumerate() {
+            assert_eq!(lc.record_reveal(reveal_of(*c, result, [i as u8; 32]), 25), EventResult::Accepted);
+        }
+        lc.advance(31);
+        assert!(matches!(lc.settle(&mut l, &ByteEq), Terminal::Confirmed(_)));
+
+        let rec = lc.to_record();
+        let bytes = borsh::to_vec(&rec).expect("serialize");
+        let rec2: JobLifecycleRecord = borsh::from_slice(&bytes).expect("deserialize");
+        assert_eq!(rec, rec2, "DTO borsh round-trips");
+
+        let lc2 = JobLifecycle::from_record(rec2, GameParams::default(), ResolutionParams::default());
+        assert_eq!(lc2.to_record(), rec, "from_record ∘ to_record is identity under the same params");
+        assert_eq!(lc2.phase(), lc.phase());
+        assert_eq!(lc2.committee(), lc.committee());
+        assert_eq!(lc2.expected_escrow(), lc.expected_escrow());
+    }
+
+    #[test]
+    fn job_lifecycle_record_round_trips_escalate_handoff() {
+        // Exercises TerminalRec::Escalate + EscalationHandoffRec: 3-way split ⇒ NoQuorum ⇒ Escalate.
+        let (budget, e_bond, v_bond) = min_funding();
+        let job = [4u8; 32];
+        let result = [7u8; 32];
+        let (mut l, _t0) = funded(job, budget, e_bond, v_bond, &cands3());
+        let mut lc = opened_committing(job, result, budget, e_bond, v_bond);
+        let revealed = [(pid(10), [1u8; 32]), (pid(11), [2u8; 32]), (pid(12), [3u8; 32])];
+        for (i, c) in cands3().iter().enumerate() {
+            let h = revealed.iter().find(|(v, _)| v == c).map(|(_, h)| *h).unwrap();
+            assert_eq!(lc.record_commit(&mut l, commit_of(*c, h, [i as u8; 32], v_bond), 15), EventResult::Accepted);
+        }
+        assert_eq!(lc.advance(21), Phase::Revealing);
+        for (i, c) in cands3().iter().enumerate() {
+            let h = revealed.iter().find(|(v, _)| v == c).map(|(_, h)| *h).unwrap();
+            assert_eq!(lc.record_reveal(reveal_of(*c, h, [i as u8; 32]), 25), EventResult::Accepted);
+        }
+        lc.advance(31);
+        assert!(matches!(lc.settle(&mut l, &ByteEq), Terminal::Escalate(_)));
+
+        let rec = lc.to_record();
+        let rec2: JobLifecycleRecord = borsh::from_slice(&borsh::to_vec(&rec).unwrap()).unwrap();
+        assert_eq!(rec, rec2);
+        let lc2 = JobLifecycle::from_record(rec2, GameParams::default(), ResolutionParams::default());
+        assert_eq!(lc2.to_record(), rec);
     }
 }
