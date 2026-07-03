@@ -182,6 +182,26 @@ pub enum TxKind {
         result_hash: [u8; 32],
         salt: [u8; 32],
     },
+
+    /// PoUW P2 / G4: bond `amount` from spendable balance into active bonded stake — the
+    /// committee-selection weight (`stake_of`). Routes to `ChainState::bond`. Permissionless:
+    /// any account may bond (bonding is the on-ramp to committee eligibility; the validator
+    /// filter is applied later at the committee draw). Not a burn — value moves balance->bonded,
+    /// supply is conserved. The staker is the tx `from`.
+    Bond {
+        amount: Amount,
+    },
+    /// PoUW P2 / G4: request to unbond `amount` — moves it from active bonded into a cooldown
+    /// chunk maturing at `now + unbonding_blocks` (`now` = current chain tip height, NOT a tx
+    /// field). Stops counting toward selection immediately but stays slashable. Routes to
+    /// `ChainState::request_unbond`. The staker is the tx `from`.
+    RequestUnbond {
+        amount: Amount,
+    },
+    /// PoUW P2 / G4: withdraw ALL matured cooldown chunks back to spendable balance. `now` (the
+    /// current chain tip height) is derived at apply time, NOT a tx field. Routes to
+    /// `ChainState::withdraw_unbonded` (saturating; never errors). The staker is the tx `from`.
+    WithdrawUnbonded,
 }
 
 /// Minimum transaction fee in raw units (0.0001 COMME = 100_000 raw units).
@@ -431,6 +451,15 @@ mod tests {
             amount: Amount::from_comme(1),
         });
         assert!(tx.validate_shape().is_ok());
+    }
+
+    #[test]
+    fn validate_shape_accepts_bond_family() {
+        // PoUW P2 / G4: Bond/RequestUnbond carry a fixed-size Amount; WithdrawUnbonded is a unit
+        // variant. All three pass shape validation via the catch-all (no dedicated arm needed).
+        assert!(shell_tx(TxKind::Bond { amount: Amount::from_comme(1) }).validate_shape().is_ok());
+        assert!(shell_tx(TxKind::RequestUnbond { amount: Amount::from_comme(1) }).validate_shape().is_ok());
+        assert!(shell_tx(TxKind::WithdrawUnbonded).validate_shape().is_ok());
     }
 
     #[test]

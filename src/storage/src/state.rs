@@ -1103,6 +1103,34 @@ impl ChainState {
                 sender.nonce += 1;
                 info!("Validator {} deregistered cleanly", tx.from);
             }
+
+            // PoUW P2 / G4: bonded-stake lifecycle — expose the audited ChainState stake methods
+            // as on-chain txs so `bonded_stake` can fill (committee selection depends on it).
+            // BORROW NOTE: the outer `sender` (bound at 781) is NOT referenced in these arms, so
+            // under NLL its &mut borrow of self.accounts is already dead here and we may call the
+            // &mut self stake methods — identical to how the Batch arm calls
+            // self.apply_batch_operation(...). `now` is bound FIRST as a plain &self read.
+            TxKind::Bond { amount } => {
+                // Permissionless on-ramp: any account may bond (see design decision). The
+                // committee draw later filters by both is_eligible AND validator status, so a
+                // non-validator's bond simply sits inert and can never cause an unqualified draw.
+                // InsufficientBalance/Overflow => `?` returns BEFORE the nonce bump, so an invalid
+                // tx rejects the whole block atomically (mirrors the SubmitJobV2 path).
+                self.bond(&tx.from, amount.raw())?;
+                self.accounts.get_or_create(tx.from).nonce += 1;
+            }
+
+            TxKind::RequestUnbond { amount } => {
+                let now = self.blocks.height();
+                self.request_unbond(&tx.from, amount.raw(), now)?;
+                self.accounts.get_or_create(tx.from).nonce += 1;
+            }
+
+            TxKind::WithdrawUnbonded => {
+                let now = self.blocks.height();
+                let _ = self.withdraw_unbonded(&tx.from, now); // saturating; never errors
+                self.accounts.get_or_create(tx.from).nonce += 1;
+            }
         }
 
         Ok(())
@@ -1203,6 +1231,21 @@ impl ChainState {
                         "only validators can reveal compute job results".into(),
                     ));
                 }
+            }
+            // PoUW P2 / G4: bonded-stake ops inside a batch. `from` is the owned Copy param and no
+            // outer `sender` borrow is held here, so the &mut self stake methods are unobstructed.
+            // No per-op nonce/fee: the outer Batch arm bumps nonce once; the fee is burned once in
+            // apply_transaction before the match.
+            TxKind::Bond { amount } => {
+                self.bond(&from, amount.raw())?;
+            }
+            TxKind::RequestUnbond { amount } => {
+                let now = self.blocks.height();
+                self.request_unbond(&from, amount.raw(), now)?;
+            }
+            TxKind::WithdrawUnbonded => {
+                let now = self.blocks.height();
+                let _ = self.withdraw_unbonded(&from, now);
             }
             // Nested batches are not allowed.
             TxKind::Batch { .. } => {
@@ -2853,6 +2896,154 @@ mod tests {
             state.apply_block(&block_with(&state, 1, vec![unsigned(addr(2), 0, reveal)])).is_err(),
             "non-validator Reveal rejected"
         );
+    }
+
+    // --- PoUW P2 (G4) Bond/RequestUnbond/WithdrawUnbonded TxKinds (apply-path wiring) ---
+
+    #[test]
+    fn bond_tx_grows_bonded_drops_balance_and_conserves() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap(); // height 0
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(5_000);
+        state.total_emitted = 5_000;
+        let conserved = stake_conserved(&state);
+
+        let bond = TxKind::Bond { amount: Amount::from_raw(3_000) };
+        state.apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, bond)])).unwrap();
+
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(2_000));
+        assert_eq!(state.bonded_of(&addr(1)), 3_000);
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 1, "nonce bumped");
+        assert_eq!(state.total_burned, 0, "Bond does not burn");
+        assert_eq!(stake_conserved(&state), conserved, "four buckets conserved");
+    }
+
+    #[test]
+    fn bond_tx_insufficient_balance_rejected_no_partial_state() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(1_000);
+        state.total_emitted = 1_000;
+
+        let bond = TxKind::Bond { amount: Amount::from_raw(2_000) }; // > balance
+        let res = state.apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, bond)]));
+        assert!(res.is_err(), "over-balance bond rejects the block");
+        // bond() validates before mutating; fee is 0, so nothing changed:
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(1_000), "balance untouched");
+        assert_eq!(state.bonded_of(&addr(1)), 0, "no bond recorded");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 0, "nonce not bumped on failure");
+    }
+
+    #[test]
+    fn request_unbond_tx_moves_bonded_to_cooldown_and_conserves() {
+        let mut state = ChainState::new();
+        state.stake_params = StakeParams { unbonding_blocks: 100, min_bond: 1_000 };
+        state.apply_block(&genesis_block()).unwrap(); // height 0
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(5_000);
+        state.total_emitted = 5_000;
+        state.bond(&addr(1), 5_000).unwrap(); // pre-seed active bond (bond() itself is unit-tested)
+        let conserved = stake_conserved(&state);
+
+        let ru = TxKind::RequestUnbond { amount: Amount::from_raw(2_000) };
+        state.apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, ru)])).unwrap();
+
+        // now during apply = blocks.height() = 0 -> matures_at = 0 + 100 = 100
+        assert_eq!(state.bonded_of(&addr(1)), 3_000, "active bonded reduced");
+        assert_eq!(state.unbonding_of(&addr(1)), 2_000, "moved to cooldown (still supply)");
+        assert_eq!(state.stake_of(&addr(1)), 3_000, "cooldown excluded from selection weight");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 1, "nonce bumped");
+        assert_eq!(stake_conserved(&state), conserved);
+    }
+
+    #[test]
+    fn withdraw_unbonded_tx_respects_maturity_through_apply() {
+        let mut state = ChainState::new();
+        state.stake_params = StakeParams { unbonding_blocks: 2, min_bond: 1_000 };
+        state.apply_block(&genesis_block()).unwrap(); // height 0
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(5_000);
+        state.total_emitted = 5_000;
+        state.bond(&addr(1), 5_000).unwrap();
+        let conserved = stake_conserved(&state);
+
+        // Block 1: RequestUnbond 2_000. now = height 0 -> matures_at = 0 + 2 = 2.
+        let ru = TxKind::RequestUnbond { amount: Amount::from_raw(2_000) };
+        state.apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, ru)])).unwrap();
+        assert_eq!(state.unbonding_of(&addr(1)), 2_000);
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(0));
+
+        // Block 2: WithdrawUnbonded BEFORE maturity. now = height 1 < 2 -> no credit, nonce bumps.
+        let w = TxKind::WithdrawUnbonded;
+        state.apply_block(&block_with(&state, 2, vec![unsigned(addr(1), 1, w.clone())])).unwrap();
+        assert_eq!(state.unbonding_of(&addr(1)), 2_000, "not matured -> still in cooldown");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(0), "no credit yet");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 2, "nonce bumped on no-op withdraw");
+
+        // Block 3: WithdrawUnbonded AT maturity. now = height 2 >= 2 -> credited back.
+        state.apply_block(&block_with(&state, 3, vec![unsigned(addr(1), 2, w)])).unwrap();
+        assert_eq!(state.unbonding_of(&addr(1)), 0, "matured chunk withdrawn");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(2_000), "credited back");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 3);
+        assert_eq!(stake_conserved(&state), conserved, "withdraw conserves");
+    }
+
+    #[test]
+    fn bond_inside_batch_conserves_and_bumps_nonce_once() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(5_000);
+        state.total_emitted = 5_000;
+        let conserved = stake_conserved(&state);
+
+        let batch = TxKind::Batch { operations: vec![
+            TxKind::Bond { amount: Amount::from_raw(1_000) },
+            TxKind::Bond { amount: Amount::from_raw(2_000) },
+        ] };
+        state.apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, batch)])).unwrap();
+
+        assert_eq!(state.bonded_of(&addr(1)), 3_000, "both batched bonds applied");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(2_000));
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 1, "batch bumps nonce once");
+        assert_eq!(stake_conserved(&state), conserved);
+    }
+
+    #[test]
+    fn failing_bond_in_batch_rejects_block_and_conserves() {
+        // NOTE ON ATOMICITY: the non-atomic `apply_block` path (used here and by tests) mutates
+        // `self` in place and does NOT roll back a batch's earlier ops when a later op fails — op1's
+        // Bond is left applied in the in-memory state, but the block is REJECTED (returns Err, is
+        // never stored) and the nonce is NOT bumped, so the chain never advances on it. Callers that
+        // require rollback use `apply_block_atomic`. Crucially, conservation still holds: a partial
+        // Bond only moves value balance->bonded within the same account, minting/burning nothing.
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(1_000);
+        state.total_emitted = 1_000;
+        let before = stake_conserved(&state);
+
+        let batch = TxKind::Batch { operations: vec![
+            TxKind::Bond { amount: Amount::from_raw(500) },
+            TxKind::Bond { amount: Amount::from_raw(5_000) }, // 2nd op fails: over balance
+        ] };
+        let res = state.apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, batch)]));
+        assert!(res.is_err(), "a failing op rejects the whole block");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 0, "nonce not bumped -> chain does not advance");
+        assert_eq!(state.blocks.height(), 0, "rejected block was never stored");
+        assert_eq!(stake_conserved(&state), before, "no value minted/burned even with partial op");
+    }
+
+    #[test]
+    fn bond_from_non_validator_is_permitted() {
+        // Locks the design decision: bonding is a permissionless on-ramp (contrast Commit/Reveal,
+        // which require is_validator). Override to validators-only if the founder chooses.
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(2_000);
+        state.total_emitted = 2_000;
+        assert!(!state.accounts.get(&addr(1)).unwrap().is_validator, "addr(1) is NOT a validator");
+
+        let bond = TxKind::Bond { amount: Amount::from_raw(1_000) };
+        state.apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, bond)])).unwrap();
+        assert_eq!(state.bonded_of(&addr(1)), 1_000, "non-validator may bond");
     }
 
     // --- PoUW P2 §3: end-to-end lifecycle money-path through ChainState (the Ledger trait) --------
