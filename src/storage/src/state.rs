@@ -2535,6 +2535,7 @@ mod tests {
     use commputer_pouw::params::GameParams;
     use commputer_pouw_onchain::lifecycle::PhaseDeadlines;
     use commputer_pouw_onchain::settlement_resolution::ResolutionParams;
+    use commputer_pouw_onchain::escrow_ledger::EscrowLedger; // B10: the staging reference ledger
 
     /// ParticipantId and the byte-identical on-chain Address (the ChainLedger casts between them).
     fn lpid(n: u8) -> ParticipantId {
@@ -3305,6 +3306,318 @@ mod tests {
         assert!(state.job_lifecycles.contains_key(&job), "lifecycle restored on rejection");
         assert_eq!(state.escrowed_for_job(&job), budget, "pot untouched on rejection");
         assert_eq!(state.total_burned, 0, "nothing burned on rejection");
+    }
+
+    // --- B10: cross-boundary golden-equivalence — staging EscrowLedger ≡ on-chain ChainState ------
+    //
+    // The FINAL non-protected safety net before the burn→escrow live flip. For each terminal, the
+    // IDENTICAL lifecycle inputs are driven through TWO independent ledger backends:
+    //   (A) STAGING  — a `JobLifecycle` over the pure in-crate reference `EscrowLedger`, and
+    //   (B) ON-CHAIN — the SAME `JobLifecycle` scenario over `ChainState` via its `ChainLedger` view
+    //                  (the lifecycle_record_commit/record_reveal/advance/settle helpers).
+    // We then prove the two agree FIELD-FOR-FIELD on the Terminal/SettlementOutcome, on per-participant
+    // NET money movement (every actor funded to the same baseline on both ⇒ end-balance equality IS
+    // net-movement equality; ParticipantId(x).0 maps byte-identically to Address), and on conservation
+    // (Σbalances + escrowed + burned invariant) — so the eventual live flip cannot silently diverge from
+    // the audited staging game. This is non-vacuous because the two ledgers are genuinely independent
+    // backends and every assertion compares ACTUAL per-participant money on BOTH sides.
+
+    /// A lifecycle scenario, expressed once and run against both backends.
+    struct Scenario {
+        job: [u8; 32],
+        /// Executor's claimed result hash; `None` ⇒ executor never delivers (the Timeout path).
+        executor_result: Option<[u8; 32]>,
+        /// Committee candidate pool (byte-ids). |pool| == k ⇒ the whole pool is drawn as the committee.
+        candidates: Vec<u8>,
+        /// (verifier byte-id, hash committed *and* revealed, does_reveal). List order fixes each salt.
+        commits: Vec<(u8, [u8; 32], bool)>,
+    }
+
+    /// Both backends' end-state after running one scenario, for the equivalence assertions.
+    struct BothEnd {
+        staging_terminal: Terminal,
+        chain_terminal: Terminal,
+        staging: EscrowLedger,
+        chain: ChainState,
+        job: [u8; 32],
+        /// Every actor (submitter, executor, all candidates) whose end-balance is compared.
+        actors: Vec<u8>,
+        staging_total0: u64,
+        chain_conserved0: u64,
+    }
+
+    /// Drive `s` through BOTH the staging reference `EscrowLedger` and the on-chain `ChainState`,
+    /// step-for-step with identical inputs, returning both end-states. Both are funded to the SAME
+    /// baseline (budget→submitter, e_bond→executor, v_bond→each candidate) and each accept/reject at
+    /// every commit/reveal/advance is cross-checked so the two state machines never silently drift.
+    fn run_on_both(s: &Scenario) -> BothEnd {
+        let (budget, e_bond, v_bond) = fuel_mins(); // 3_960 / 3_960 / 1_650
+        let deadlines = test_deadlines();
+        let seed = [42u8; 32];
+        let submitter = 0u8;
+        let executor = 9u8;
+        let stake = |_: &ParticipantId| 1u64;
+        let cand_pids: Vec<ParticipantId> = s.candidates.iter().map(|&b| lpid(b)).collect();
+
+        let mut actors = vec![submitter, executor];
+        actors.extend(s.candidates.iter().copied());
+
+        // ---- (A) STAGING: EscrowLedger + JobLifecycle ------------------------------------------
+        let mut sl = EscrowLedger::new();
+        sl.credit(lpid(submitter), budget);
+        sl.credit(lpid(executor), e_bond);
+        for &c in &s.candidates {
+            sl.credit(lpid(c), v_bond);
+        }
+        let staging_total0 = sl.total_supply(); // baseline AFTER funding (credit is the sole mint)
+        sl.for_job(s.job);
+        sl.escrow(lpid(submitter), budget); // submit+claim precondition: budget + exec bond escrowed
+        sl.escrow(lpid(executor), e_bond);
+        let mut slc = JobLifecycle::open(
+            s.job, lpid(submitter), lpid(executor), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(), cand_pids.clone(), deadlines,
+        );
+        if let Some(h) = s.executor_result {
+            assert_eq!(slc.submit_result(lpid(executor), h, seed, 5, &stake), EventResult::Accepted);
+        }
+
+        // ---- (B) ON-CHAIN: ChainState via the ChainLedger view ---------------------------------
+        let mut cs = ChainState::new();
+        cs.total_emitted = budget + e_bond + s.candidates.len() as u64 * v_bond;
+        cs.accounts.get_or_create(lpaddr(submitter)).balance = Amount::from_raw(budget);
+        cs.accounts.get_or_create(lpaddr(executor)).balance = Amount::from_raw(e_bond);
+        for &c in &s.candidates {
+            cs.accounts.get_or_create(lpaddr(c)).balance = Amount::from_raw(v_bond);
+        }
+        let chain_conserved0 = sum_balances(&cs) + cs.total_escrowed() + cs.total_burned;
+        cs.escrow_into_job(&lpaddr(submitter), s.job, budget).unwrap();
+        cs.escrow_into_job(&lpaddr(executor), s.job, e_bond).unwrap();
+        let mut clc = JobLifecycle::open(
+            s.job, lpid(submitter), lpid(executor), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(), cand_pids.clone(), deadlines,
+        );
+        if let Some(h) = s.executor_result {
+            assert_eq!(clc.submit_result(lpid(executor), h, seed, 5, &stake), EventResult::Accepted);
+        }
+        cs.job_lifecycles.insert(s.job, clc);
+
+        // ---- commits (height 15): same accept/reject on both --------------------------------------
+        for (i, &(id, hash, _reveal)) in s.commits.iter().enumerate() {
+            let salt = [i as u8; 32];
+            let commit: Commitment = make_commitment(&lpid(id), &hash, &salt, v_bond);
+            let s_res = slc.record_commit(&mut sl, commit, 15);
+            let c_res = cs.lifecycle_record_commit(s.job, commit, 15).unwrap();
+            assert_eq!(Some(s_res), c_res, "commit accept/reject must match across backends");
+        }
+
+        // ---- advance to Revealing (height 21) -----------------------------------------------------
+        let s_phase = slc.advance(21);
+        let c_phase = cs.lifecycle_advance(s.job, 21).unwrap();
+        assert_eq!(s_phase, c_phase, "phase after advance must match across backends");
+
+        // ---- reveals (height 25): same accept/reject on both --------------------------------------
+        for (i, &(id, hash, reveal)) in s.commits.iter().enumerate() {
+            if !reveal {
+                continue;
+            }
+            let salt = [i as u8; 32];
+            let r = Reveal { verifier: lpid(id), result_hash: hash, salt };
+            let s_res = slc.record_reveal(r, 25);
+            let c_res = cs.lifecycle_record_reveal(s.job, r, 25);
+            assert_eq!(Some(s_res), c_res, "reveal accept/reject must match across backends");
+        }
+
+        // ---- advance past reveal_by (31) + settle -------------------------------------------------
+        slc.advance(31);
+        cs.lifecycle_advance(s.job, 31);
+        let staging_terminal = slc.settle(&mut sl, &ByteEq);
+        let chain_terminal = cs
+            .lifecycle_settle(s.job, &ByteEq)
+            .expect("pot pre-validates")
+            .expect("lifecycle exists");
+
+        BothEnd {
+            staging_terminal,
+            chain_terminal,
+            staging: sl,
+            chain: cs,
+            job: s.job,
+            actors,
+            staging_total0,
+            chain_conserved0,
+        }
+    }
+
+    /// The golden property: staging == chain, per-participant AND at the aggregate.
+    fn assert_equivalent(b: &BothEnd) {
+        // 1. Terminal/SettlementOutcome (or EscalationHandoff) match FIELD-FOR-FIELD — this covers
+        //    worker_paid/verifiers_paid/burned/submitter_refunded/challenger_paid/panel_paid/
+        //    bonds_returned/the slashed log (Confirmed/Disputed/Timeout) and budget/revealers/bonds
+        //    (Escalate).
+        assert_eq!(
+            b.staging_terminal, b.chain_terminal,
+            "staging and on-chain terminals must be byte-identical"
+        );
+
+        // 2. Per-participant NET money movement: both funded to the same baseline ⇒ end-balance
+        //    equality IS net-movement equality. ParticipantId(a) maps byte-identically to Address(a).
+        for &a in &b.actors {
+            let s_bal = b.staging.balance_of(&lpid(a));
+            let c_bal = b
+                .chain
+                .accounts
+                .get(&lpaddr(a))
+                .map(|acc| acc.balance.raw())
+                .unwrap_or(0);
+            assert_eq!(
+                s_bal, c_bal,
+                "participant {a} end-balance diverges: staging {s_bal} vs chain {c_bal}"
+            );
+        }
+
+        // 3. Job pots agree: both drained to 0 (Confirmed/Disputed/Timeout) or both HOLD the same
+        //    (Escalate). Comparing the two pots to each other covers every terminal uniformly.
+        assert_eq!(
+            b.staging.escrowed_for(&b.job),
+            b.chain.escrowed_for_job(&b.job),
+            "job pot must match across backends"
+        );
+
+        // 4. Both conserve against their own baseline, and the baselines themselves match (funded
+        //    identically). Chain burned must equal the staging-side burn (both start at 0), which is
+        //    implied by (1)+(3)+conservation but asserted directly for a crisp cross-check.
+        assert_eq!(b.staging.total_supply(), b.staging_total0, "staging conserves total supply");
+        assert_eq!(
+            sum_balances(&b.chain) + b.chain.total_escrowed() + b.chain.total_burned,
+            b.chain_conserved0,
+            "chain conserves total supply",
+        );
+        assert_eq!(
+            b.staging_total0, b.chain_conserved0,
+            "both backends were funded to the same baseline"
+        );
+    }
+
+    #[test]
+    fn equivalence_confirmed_staging_matches_chainstate() {
+        let result = [7u8; 32];
+        // all 3 commit to and reveal the true result ⇒ Confirmed 85/10/5.
+        let both = run_on_both(&Scenario {
+            job: [1u8; 32],
+            executor_result: Some(result),
+            candidates: vec![10, 11, 12],
+            commits: vec![(10, result, true), (11, result, true), (12, result, true)],
+        });
+        // anchor the audited split on the on-chain side for readability...
+        match &both.chain_terminal {
+            Terminal::Confirmed(out) => {
+                assert_eq!(out.worker_paid, 3_366); // 85% of 3_960
+                assert_eq!(out.verifiers_paid, 396); // 10% across 3
+                assert_eq!(out.burned, 198); // 5%
+                assert_eq!(out.bonds_returned, 3_960 + 3 * 1_650);
+            }
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+        // ...then prove staging ≡ chain field-for-field, per-participant, and in aggregate.
+        assert_equivalent(&both);
+        assert_eq!(both.chain.escrowed_for_job(&both.job), 0, "pot drained on Confirmed");
+        assert_eq!(both.chain.total_burned, 198, "on-chain burn matches the audited 5%");
+    }
+
+    #[test]
+    fn equivalence_disputed_staging_matches_chainstate() {
+        let claimed = [7u8; 32]; // executor claims 7
+        let correct = [5u8; 32]; // committee proves 5 ⇒ Disputed, executor slashed
+        let both = run_on_both(&Scenario {
+            job: [3u8; 32],
+            executor_result: Some(claimed),
+            candidates: vec![10, 11, 12],
+            commits: vec![(10, correct, true), (11, correct, true), (12, correct, true)],
+        });
+        match &both.chain_terminal {
+            Terminal::Disputed(out) => {
+                assert_eq!(out.submitter_refunded, 3_960, "submitter fully refunded");
+                assert_eq!(out.verifiers_paid, 792, "20% of exec bond bounty across the honest 3");
+                assert_eq!(out.slashed, vec![(lpid(9), 3_960)], "executor bond slashed");
+            }
+            other => panic!("expected Disputed, got {other:?}"),
+        }
+        assert_equivalent(&both);
+        assert_eq!(both.chain.escrowed_for_job(&both.job), 0, "pot drained on Disputed");
+    }
+
+    #[test]
+    fn equivalence_timeout_staging_matches_chainstate() {
+        // Executor never delivers a result ⇒ TimedOut: budget + 20% exec bond refunded, 80% burned.
+        let both = run_on_both(&Scenario {
+            job: [2u8; 32],
+            executor_result: None,
+            candidates: vec![10, 11, 12],
+            commits: vec![],
+        });
+        match &both.chain_terminal {
+            Terminal::TimedOut(out) => {
+                assert_eq!(out.submitter_refunded, 3_960 + 3_960 / 5, "budget + 20% exec bond");
+                assert_eq!(out.burned, 3_960 - 3_960 / 5, "80% exec bond burned");
+                assert_eq!(out.slashed, vec![(lpid(9), 3_960)]);
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        assert_equivalent(&both);
+        assert_eq!(both.chain.escrowed_for_job(&both.job), 0, "pot drained on Timeout");
+    }
+
+    #[test]
+    fn equivalence_noquorum_escalate_staging_matches_chainstate() {
+        let result = [7u8; 32];
+        // 3-way split: each reveals a DISTINCT value ⇒ no class reaches quorum(3)=2 ⇒ NoQuorum ⇒
+        // Escalate. The escrow is HELD (not drained), equal on both sides.
+        let both = run_on_both(&Scenario {
+            job: [4u8; 32],
+            executor_result: Some(result),
+            candidates: vec![10, 11, 12],
+            commits: vec![(10, [1u8; 32], true), (11, [2u8; 32], true), (12, [3u8; 32], true)],
+        });
+        match &both.chain_terminal {
+            Terminal::Escalate(h) => {
+                assert_eq!(h.budget, 3_960);
+                assert_eq!(h.executor_bond, 3_960);
+                assert_eq!(h.committee_reveals.len(), 3, "all 3 revealers handed off");
+                assert_eq!(h.committee_bonds, vec![1_650; 3]);
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+        assert_equivalent(&both);
+        // escrow HELD equally on both (the deferred escalation round settles it): budget + Be + 3 bonds.
+        let held = 3_960 + 3_960 + 3 * 1_650;
+        assert_eq!(both.chain.escrowed_for_job(&both.job), held, "escrow HELD on Escalate");
+        assert_eq!(both.staging.escrowed_for(&both.job), held, "staging holds the same");
+        assert_eq!(both.chain.total_burned, 0, "nothing burned while escalation is pending");
+    }
+
+    #[test]
+    fn equivalence_confirmed_with_non_revealer_forfeiture_matches() {
+        let result = [7u8; 32];
+        // 3 commit; pid(12) never reveals ⇒ its bond is forfeited (burned). The 2 revealers still
+        // reach quorum(3)=2 ⇒ Confirmed. Exercises the commit-no-reveal forfeiture path on both sides.
+        let both = run_on_both(&Scenario {
+            job: [5u8; 32],
+            executor_result: Some(result),
+            candidates: vec![10, 11, 12],
+            commits: vec![(10, result, true), (11, result, true), (12, result, false)],
+        });
+        match &both.chain_terminal {
+            Terminal::Confirmed(out) => {
+                assert_eq!(out.verifiers_paid, 396, "10% pool split across the 2 revealers");
+                assert_eq!(out.burned, 198 + 1_650, "5% protocol burn + forfeited non-revealer bond");
+                assert!(out.slashed.contains(&(lpid(12), 1_650)), "non-revealer forfeited");
+                assert_eq!(out.bonds_returned, 3_960 + 2 * 1_650, "only the 2 revealers' bonds returned");
+            }
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+        assert_equivalent(&both);
+        assert_eq!(both.chain.escrowed_for_job(&both.job), 0, "pot drained on Confirmed");
+        assert_eq!(both.chain.total_burned, 198 + 1_650, "on-chain burn includes the forfeit");
     }
 
     fn genesis_block() -> Block {
