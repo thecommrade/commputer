@@ -14,7 +14,7 @@ full-codebase survey (9-agent sweep; every load-bearing claim spot-checked again
 | # | Decision | Choice |
 |---|----------|--------|
 | D1 | Merge `agent-persist-20260623` → `main` | **APPROVED & DONE** — ff to `a950fdf`, branch deleted after test verification |
-| D2 | NoQuorum verdict handling in v1 | **Fallback terminal** — settle via an existing conserved resolver (timeout-style: partial executor comp, refund remainder, return bonds). On-chain EscalationRound becomes a post-flip fast-follow with its own DTO/persistence/settler work. |
+| D2 | NoQuorum verdict handling in v1 | **Fallback terminal, ZERO COMP (refined 2026-07-06)** — pure refund/return: full budget back to submitter, executor + revealer bonds returned (non-revealer forfeitures keep the audited settle behavior). No comp parameter at all: the 3-lens review showed any comp on NoQuorum creates profitable forced-NoQuorum (2-of-3 collusion / DA-starvation) strategies; matches resolve_unavailable's no-verification-no-pay precedent. On-chain EscalationRound = post-flip fast-follow (D8: JobLifecycleRecord carries program_hash/input_hash/da_root from day one so that follow-up needs no disk-schema migration). |
 | D3 | RPC posture for public testnet | **Public/keyed route split** — read-only routes (/status, /block, /peers, /tx) public + rate-limited; admin/operator routes API-key gated; TLS via reverse proxy in front. |
 | D4 | Cloud-IP nerf policy | **Display-only for testnet** — flag stays visible in /peers + dashboard; reward enforcement + exemption mechanism designed properly before mainnet genesis. |
 
@@ -49,15 +49,30 @@ bonded/unbonding rows resurrect across restarts = value duplication; crash after
   duplicate value).
 - Fix stale in-code comments claiming the maps are "in-memory only".
 
-**1.1 B2–B4 (non-protected state.rs, gate-bound — built together, committed together)**
-- B2: SubmitJobV2 burn→escrow at the shared arm (~state.rs:1076-1093, also the Batch arm ~:1240); remove
-  SubmitJobV2 from `is_burn`/`burn_amount`; `total_burned` must NOT move on escrow.
-- B3: `JobLifecycle::open` at ClaimJob + escrow budget & executor bond.
+**1.1 B2–B4 (non-protected state.rs + pouw-onchain + core/transaction.rs, gate-bound — built together,
+committed together). FULL BUILD SPEC: `2026-07-06-phase11-build-spec.md` (reviewed design + binding
+amendments P1–P12 — that doc is authoritative over this summary).**
+- B2: SubmitJobV2 burn→escrow (split from the shared SubmitJob arm; V2-in-Batch rejected; job_id =
+  tx hash; duplicate-id guard); remove SubmitJobV2 from `is_burn`/`burn_amount`; `total_burned` must
+  NOT move on escrow. NEW 5th consensus map `pending_jobs` (submit→claim carrier: submitter, budget,
+  program identity, claim deadline) — rides step 1.0's CF/mirror/state-root machinery as a 5th section.
+- B3: ClaimJob opens the lifecycle (candidates snapshotted + SORTED at open; executor bond
+  max(budget, game_params.executor_bond) escrowed) + expiry refund path for unclaimed jobs.
 - B4: route Commit/Reveal arms → `lifecycle_record_commit`/`lifecycle_record_reveal` (record_commit escrows
-  the bond ITSELF — do not also escrow_into_job = double-escrow). Closes the inert-Commit spam window
-  (arbitrary declared bonds accepted at fee-only cost today).
-- D2 fallback: NoQuorum/Escalate terminals settle via the conserved fallback resolver — no job pot may
-  strand. Cover the fallback terminal with a new B10-style equivalence case.
+  the bond ITSELF — do not also escrow_into_job = double-escrow). Pre-B5 (no committee on chain) any
+  Commit/Reveal deterministically rejects.
+- D2-FINAL: Escalate/NoQuorum settles via the ZERO-COMP fallback (pure refund/return, no comp param);
+  new B10-style equivalence case incl. the forfeiture variant.
+- P1 (from review, BLOCKER-fix): block-level rollback-on-Err in all three apply paths — step 1.0 made
+  mid-block smear durable; rocks-backed nodes reload pre-block state from CFs on Err, memory-only
+  snapshots+restores. Without this, one invalid block forks honest nodes' roots.
+- P8: deterministic in-apply settlement driver `settle_due_jobs(height)` in the shared apply tail
+  (sorted job order, ByteEq oracle pinned as const) — B6's PROTECTED tick then only observes/logs;
+  settlement never runs from wall-clock ticks (fork risk). Supersedes patch-spec §5's tick-driven sketch.
+- Zero-address guards MANDATORY on all PoUW money arms + Bond family + candidate filter (zero-from txs
+  skip signature verification — forged keyless bonded validators are otherwise possible).
+- JobLifecycleRecord carries program_hash/input_hash/da_root from day one (D8) — schema settled
+  pre-deployment so the EscalationRound fast-follow needs no disk migration.
 
 **1.2 B5–B8 (PROTECTED `event_loop.rs` / `main.rs` / genesis — founder approves each edit)**
 - B5: committee draw at CompleteJob. Seed = post-result block hash (founder-locked v1). Candidate filter
@@ -66,8 +81,19 @@ bonded/unbonding rows resurrect across restarts = value duplication; crash after
   committees). D5 (permissionless bonding) confirmed here.
 - B6: lifecycle loop in `enforce_timeouts` tick — advance + should_settle + pot pre-validation + settle +
   drain terminals (Escalate → D2 fallback in v1).
-- B7: G6 capacity admission in block assembly. Prerequisite non-protected glue first: `pending_job_from_tx`
-  + `validator_churn_bps` helpers (NOT yet built — do these in 1.1's window).
+- B7: G6 capacity admission in block assembly. CORRECTION (2026-07-06 review): the §10 glue already
+  exists in pouw-onchain capacity.rs — `validator_churn_bps` (counts-based, prev_count==0→0 bootstrap
+  semantics, test-pinned; do NOT redefine) and `pending_job_from_fields`; only a thin
+  `pending_job_from_tx` adapter over the latter remains (in the 1.1 build spec).
+- **1.2-MEMPOOL (PROTECTED event_loop.rs, NEW — found by 1.1 review):** kind-aware mempool admission /
+  producer-side speculative-apply filter. Post-B4 several mempool-admissible txs become deterministic
+  apply-Errs (any pre-B5 Commit/Reveal, double/expired ClaimJob, V2-in-Batch, duplicate job_id), and a
+  block containing one is dropped whole — without this filter a single junk fee-priced Commit tx is a
+  zero-cost block-production DoS. Must land with B5/B6.
+- **1.2-POOL (PROTECTED event_loop.rs, NEW — found by 1.1 review):** `process_job_tx` has NO SubmitJobV2
+  arm (falls to `_ => {}`), so V2 jobs — the only kind that escrows — never enter any executor's job
+  pool and no ClaimJob is ever sent: every pot would dead-end at expiry-refund. Add the V2→PoolJob arm
+  with B5/B6 or the flip is incoherent in practice.
 - B8: genesis consensus_params (Game/Resolution/PhaseDeadlines/Stake/Capacity/WasmLimits) into ROOT
   genesis.json + GenesisConfig, AND populate the `game_params`/`resolution_params` ChainState fields B1b
   left defaulted (`TODO(B8)` at state.rs open() load path) — same change, or reloaded lifecycles get stale
