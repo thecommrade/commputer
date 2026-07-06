@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 use borsh::{BorshSerialize, BorshDeserialize};
 use sha2::{Digest, Sha256};
@@ -127,7 +128,8 @@ pub const ARCHIVAL_EPOCH_THRESHOLD: u64 = 1000;
 pub const COLD_ACCOUNT_EPOCH_THRESHOLD: u64 = 100;
 
 /// The full chain state — accounts, blocks, supply tracking.
-/// Optionally backed by RocksDB for persistence across restarts.
+/// Optionally backed by RocksDB for persistence across restarts. When backed, every applied
+/// block is persisted atomically (state survives a crash without a clean-shutdown flush).
 pub struct ChainState {
     pub accounts: AccountStore,
     pub blocks: BlockStore,
@@ -162,18 +164,13 @@ pub struct ChainState {
     /// so `total_burned` MUST NOT move when a budget is escrowed; only a resolver's burn slice
     /// at settlement increments it. Empty until the `SubmitJobV2` burn->escrow flip lands (P2).
     ///
-    /// WIRE-IN TODO — FULL PERSISTENCE CHECKLIST (the live flip, P2; verified by the 2026-06-22
-    /// adversarial review). `escrow_by_job` AND `bonded_stake`/`unbonding_stake` are in-memory only
-    /// today. They are SAFE now ONLY because they stay empty until the live txs exist. Before
-    /// `SubmitJobV2`→escrow or a `BondStake`-style tx makes them live consensus state, ALL of the
-    /// following MUST land together (any one missing => restart value-loss or cross-node divergence):
-    ///   1. RocksStore (rocks.rs): add serialize/load for all three maps.
-    ///   2. `open()`: load them (currently they init empty at the `open` constructor).
-    ///   3. `flush_to_rocks()` + `apply_block_atomic()`: include them in the flush / WriteBatch.
-    ///   4. `compute_state_root()` AND `snapshot()`: fold them in — else two nodes with identical
-    ///      accounts but different escrow/stake share a state root yet diverge on committee draw.
-    ///   5. `revert_block()` + `try_reorg()`/`reset_to_genesis()`: roll back / reconstruct from the
-    ///      persisted source (today they `.clear()` with no recovery source — fork = permanent loss).
+    /// PERSISTENCE (P2 step 1.0, complete — applies to all FOUR consensus maps): every
+    /// `apply_*` commits block + meta + dirty accounts + map deltas in ONE WriteBatch
+    /// (`persist_applied_block`); entries removed in-memory are CF-deleted via the
+    /// persisted-key mirrors; loaded in `open()`; folded into `compute_state_root` (Policy B).
+    /// `revert_block` refuses blocks that touch these maps — fork recovery is
+    /// `reset_to_genesis` + resync (or `try_reorg`, which replays then reconciles the CFs in
+    /// one atomic batch).
     pub escrow_by_job: HashMap<[u8; 32], u64>,
     /// PoUW P2 (G4): active bonded stake (`Address` -> raw units) — the committee-selection
     /// weight (`stake_of`) and the primary slash surface. Moved here from `Account.balance` by
@@ -184,13 +181,10 @@ pub struct ChainState {
     /// (anti-dodge). `withdraw_unbonded` returns matured chunks to `Account.balance`.
     pub unbonding_stake: HashMap<Address, Vec<UnbondingChunk>>,
     /// PoUW P2 (G4): staking params (cooldown length, min eligible bond). Genesis-anchored at
-    /// P3/G5; the default is a placeholder until then.
-    ///
-    /// WIRE-IN TODO (live bond txs, P2 committee-draw step): `bonded_stake`/`unbonding_stake`
-    /// are in-memory only today and are NOT yet in `compute_state_root`/RocksDB. Before a
-    /// `BondStake`-style tx makes them live consensus state, persist them and fold them into the
-    /// state root — else nodes diverge on committee selection. Safe now only because they stay
-    /// empty until that tx exists.
+    /// P3/G5; the default is a placeholder until then — all nodes MUST agree or they diverge
+    /// on committee draw. `bonded_stake`/`unbonding_stake` are persisted per-block and folded
+    /// into the state root (see the PERSISTENCE note on `escrow_by_job`);
+    /// Bond/RequestUnbond/WithdrawUnbonded are live TxKinds (N1).
     pub stake_params: StakeParams,
     /// PoUW P2 (B1b): genesis-anchored consensus params (G5) needed to reconstruct each persisted
     /// `JobLifecycle` on load. Every lifecycle is created with these identical params, so they are NOT
@@ -203,10 +197,21 @@ pub struct ChainState {
     /// commit-reveal state machine. Created at `ClaimJob` (AwaitingResult), committee drawn at
     /// `CompleteJob`, fed by `Commit`/`Reveal`, advanced/settled by block height. Its money moves
     /// run against `ChainState` via the §3 `Ledger` trait. Empty until the committee-draw wiring
-    /// (event_loop.rs) is live; covered by the same persistence checklist as `escrow_by_job`
-    /// (in-memory only today — see that field's WIRE-IN TODO; must be persisted + state-rooted before
-    /// the live committee draw).
+    /// (event_loop.rs) is live. Persisted per-block as borsh `JobLifecycleRecord` DTOs
+    /// (CF_LIFECYCLE) and folded into the state root; params re-injected on load (see the B1b
+    /// note on `game_params` above).
     pub job_lifecycles: HashMap<[u8; 32], JobLifecycle>,
+    // Node-local mirrors of the keys currently persisted in each consensus-map CF (never
+    // state-rooted, never serialized). Each persist computes `mirror − current_keys` to
+    // CF-delete removed entries, then re-puts every live entry full-value; the mirror advances
+    // to the new key set only AFTER the WriteBatch commits. Because the diff is computed from
+    // ground truth at write time, direct `pub`-field map mutation cannot bypass it (contrast
+    // `AccountStore`, whose privacy makes dirty-tracking sufficient — that asymmetry is
+    // deliberate).
+    persisted_escrow_keys: HashSet<[u8; 32]>,
+    persisted_bonded_keys: HashSet<Address>,
+    persisted_unbonding_keys: HashSet<Address>,
+    persisted_lifecycle_keys: HashSet<[u8; 32]>,
 }
 
 // Manual Debug impl since RocksStore doesn't derive Debug.
@@ -263,11 +268,21 @@ impl ChainState {
             game_params: GameParams::default(),
             resolution_params: ResolutionParams::default(),
             job_lifecycles: HashMap::new(),
+            persisted_escrow_keys: HashSet::new(),
+            persisted_bonded_keys: HashSet::new(),
+            persisted_unbonding_keys: HashSet::new(),
+            persisted_lifecycle_keys: HashSet::new(),
         }
     }
 
     /// Open a persistent ChainState backed by RocksDB at the given path.
     /// Loads all state from disk into the in-memory stores.
+    ///
+    /// MIGRATION NOTE: data dirs written by the pre-per-block-persistence code (put-only
+    /// flushes, no delete reconcile) may already contain resurrected stale rows that this code
+    /// cannot distinguish from real state; deployment assumes fresh data dirs or a
+    /// reset_to_genesis + resync at upgrade. No deployed network exists, so no schema-version
+    /// bump.
     pub fn open(path: &Path) -> Result<Self, StateError> {
         // Item 16: Try to open, and if it fails, attempt repair then retry.
         let rocks = match RocksStore::open(path) {
@@ -305,6 +320,10 @@ impl ChainState {
         for account in rocks.all_accounts() {
             accounts.put(account);
         }
+        // Disk == memory by construction at this point (the `put`s above journaled every loaded
+        // address) — start with clean dirty/removed journals so the first block's batch carries
+        // only that block's touched accounts.
+        accounts.clear_dirty_and_removed();
 
         // Load all blocks into the in-memory store.
         let mut blocks = BlockStore::new();
@@ -329,6 +348,15 @@ impl ChainState {
             .into_iter()
             .map(|(id, rec)| (id, JobLifecycle::from_record(rec, game_params.clone(), resolution_params)))
             .collect();
+
+        // Persisted-key mirrors start EXACT: load IS a CF scan, so each loaded key set equals
+        // the rows on disk. (Warn-skipped malformed rows linger as junk OUTSIDE the mirror and
+        // the state root; they are re-skipped on every open and cannot resurrect — no
+        // delete-on-load.)
+        let persisted_escrow_keys: HashSet<[u8; 32]> = escrow_by_job.keys().copied().collect();
+        let persisted_bonded_keys: HashSet<Address> = bonded_stake.keys().copied().collect();
+        let persisted_unbonding_keys: HashSet<Address> = unbonding_stake.keys().copied().collect();
+        let persisted_lifecycle_keys: HashSet<[u8; 32]> = job_lifecycles.keys().copied().collect();
 
         let account_count = accounts.len();
         let block_count = blocks.len();
@@ -364,14 +392,23 @@ impl ChainState {
             game_params,
             resolution_params,
             job_lifecycles,
+            persisted_escrow_keys,
+            persisted_bonded_keys,
+            persisted_unbonding_keys,
+            persisted_lifecycle_keys,
         })
     }
 
-    /// Flush the full current state to RocksDB. Call after applying blocks or
-    /// modifying accounts directly (e.g., funding via emission).
-    pub fn flush(&self) -> Result<(), StateError> {
-        if let Some(ref rocks) = self.rocks {
-            self.flush_to_rocks(rocks)?;
+    /// Flush the full current state to RocksDB — a reconciling sweep: CF rows for removed
+    /// accounts/map entries are deleted, then everything live is re-put. Per-block persistence
+    /// (`persist_applied_block`) already covers block application; this remains the
+    /// shutdown-tail sweeper for out-of-band mutations after the last applied block (grace
+    /// drains, epoch bump on an idle node). Any future non-shutdown caller inherits the same
+    /// reconcile semantics: mirrors committed + removed-set drained only after a successful
+    /// write.
+    pub fn flush(&mut self) -> Result<(), StateError> {
+        if self.rocks.is_some() {
+            self.flush_to_rocks()?;
         }
         Ok(())
     }
@@ -693,14 +730,9 @@ impl ChainState {
         // Store block.
         self.blocks.put(block.clone());
 
-        // Persist to RocksDB if enabled.
-        if let Some(ref rocks) = self.rocks {
-            rocks.put_block(block)
-                .map_err(|e| StateError::StorageError(e.to_string()))?;
-            self.flush_meta(rocks)?;
-            // Prune old blocks from memory (they remain in RocksDB).
-            self.blocks.prune(Self::MEMORY_BLOCK_RETENTION);
-        }
+        // Atomically persist block + meta + dirty accounts + consensus-map deltas
+        // (one WriteBatch; crash-safe).
+        self.persist_applied_block(block)?;
 
         Ok(())
     }
@@ -783,14 +815,9 @@ impl ChainState {
         // Store block.
         self.blocks.put(block.clone());
 
-        // Persist to RocksDB if enabled.
-        if let Some(ref rocks) = self.rocks {
-            rocks.put_block(block)
-                .map_err(|e| StateError::StorageError(e.to_string()))?;
-            self.flush_meta(rocks)?;
-            // Prune old blocks from memory (they remain in RocksDB).
-            self.blocks.prune(Self::MEMORY_BLOCK_RETENTION);
-        }
+        // Atomically persist block + meta + dirty accounts + consensus-map deltas
+        // (one WriteBatch; crash-safe).
+        self.persist_applied_block(block)?;
 
         Ok(())
     }
@@ -1325,6 +1352,12 @@ impl ChainState {
 
     /// Revert the block at the given height, undoing all account state changes.
     /// Uses the StateDiff recorded during apply_block. Can only revert the tip.
+    ///
+    /// FAIL-SAFE: the StateDiff restores balance+nonce only — it CANNOT roll back the PoUW
+    /// consensus maps (escrow pots, bonded/unbonding stake, lifecycles mutate with full-value
+    /// semantics and no before-image exists). Any block that could have touched them is
+    /// refused: guard 1 (maps non-empty) backstops guard 2 (tx-kind scan), which will go stale
+    /// as B2–B4 add map-touching kinds.
     pub fn revert_block(&mut self, height: u64) -> Result<(), StateError> {
         if height != self.blocks.height() {
             return Err(StateError::InvalidBlock(format!(
@@ -1335,7 +1368,29 @@ impl ChainState {
             return Err(StateError::InvalidBlock("cannot revert genesis block".into()));
         }
 
-        // Restore account states from the diff
+        const REVERT_REFUSAL: &str =
+            "revert_block cannot roll back PoUW consensus maps; use reset_to_genesis + resync \
+             (or try_reorg once wired)";
+        // Guard 1: any live map state means this block (or an out-of-band mutation) may be
+        // entangled with it — refuse. Pre-flip the maps are always empty, so behavior is
+        // unchanged for today's callers.
+        if !self.escrow_by_job.is_empty()
+            || !self.bonded_stake.is_empty()
+            || !self.unbonding_stake.is_empty()
+            || !self.job_lifecycles.is_empty()
+        {
+            return Err(StateError::InvalidBlock(REVERT_REFUSAL.into()));
+        }
+        // Guard 2: a map-touching tx kind (including inside a Batch) is refused even when the
+        // maps ended the block empty (e.g. bond → withdraw-all within the block).
+        if let Some(block) = self.blocks.get_by_height(height)
+            && block.transactions.iter().any(tx_touches_consensus_maps)
+        {
+            return Err(StateError::InvalidBlock(REVERT_REFUSAL.into()));
+        }
+
+        // Restore account states from the diff. (These go through `get_mut`, so every reverted
+        // account is re-journaled dirty and the next persist heals the disk copy.)
         if let Some(diff) = self.state_diffs.remove(&height) {
             for (addr, account_diff) in &diff.changes {
                 if let Some(account) = self.accounts.get_mut(addr) {
@@ -1595,45 +1650,10 @@ impl ChainState {
         // Store block in memory.
         self.blocks.put(block.clone());
 
-        // Feature 190: Atomically persist everything to RocksDB using WriteBatch.
-        if let Some(ref rocks) = self.rocks {
-            let mut batch = rocks.new_write_batch();
-            rocks.batch_put_block(&mut batch, block);
-            rocks.batch_put_meta_u64(&mut batch, rocks::META_TOTAL_EMITTED, self.total_emitted);
-            rocks.batch_put_meta_u64(&mut batch, rocks::META_TOTAL_BURNED, self.total_burned);
-            rocks.batch_put_meta_u64(&mut batch, rocks::META_CURRENT_EPOCH, self.current_epoch);
-            rocks.batch_put_meta_u64(&mut batch, rocks::META_NERF_RATE_BPS, self.nerf_rate.rate_bps as u64);
-
-            // Include all modified accounts in the batch.
-            for addr in before_states.keys() {
-                if let Some(account) = self.accounts.get(addr) {
-                    rocks.batch_put_account(&mut batch, account);
-                }
-            }
-
-            // PoUW P2 (B1a): keep the consensus money/stake maps atomic with the block+accounts+meta
-            // in the SAME commit. Full-map PUT is fine while the maps stay empty (the live flip is
-            // gated); TODO(P2): switch to dirty-key put + batch_delete_* for emptied pots/chunks.
-            for (job_id, amount) in &self.escrow_by_job {
-                rocks.batch_put_escrow(&mut batch, job_id, *amount);
-            }
-            for (addr, amount) in &self.bonded_stake {
-                rocks.batch_put_bonded(&mut batch, addr, *amount);
-            }
-            for (addr, chunks) in &self.unbonding_stake {
-                rocks.batch_put_unbonding(&mut batch, addr, chunks);
-            }
-            // PoUW P2 (B1b): persist job_lifecycles in the SAME atomic commit (whole-map PUT of the DTO;
-            // TODO(P2): dirty-key put + batch_delete_lifecycle for settled/removed jobs, as with the maps).
-            for (job_id, lc) in &self.job_lifecycles {
-                rocks.batch_put_lifecycle(&mut batch, job_id, &lc.to_record());
-            }
-
-            rocks.write_batch(batch)
-                .map_err(|e| StateError::StorageError(e.to_string()))?;
-
-            self.blocks.prune(Self::MEMORY_BLOCK_RETENTION);
-        }
+        // Atomically persist block + meta + dirty accounts + consensus-map deltas in one
+        // WriteBatch (shared helper — the dirty journal also covers batch-inner recipients and
+        // the producer, which the `before_states` scan above misses).
+        self.persist_applied_block(block)?;
 
         Ok(())
     }
@@ -1885,18 +1905,42 @@ impl ChainState {
         // Roll back: rebuild state up to fork_height - 1.
         // For simplicity, we rebuild the entire chain state from genesis.
         // In production this would use snapshots.
-        let saved_rocks = self.rocks.take();
-        let _saved_epoch = self.current_epoch;
-        let _saved_emitted = self.total_emitted;
-        let _saved_burned = self.total_burned;
+        //
+        // NB try_reorg has ZERO production callers today (test-only; future sync_machine_v2
+        // wiring). The PRODUCTION fork-recovery path is reset_to_genesis + block-by-block
+        // resync via apply_block_validated. Hardened here as pre-wiring.
 
-        // Collect blocks before the fork point.
+        // Collect the pre-fork blocks BEFORE detaching rocks: past MEMORY_BLOCK_RETENTION the
+        // in-memory BlockStore has pruned them, so get_block_by_height must still be able to
+        // fall back to RocksDB.
         let mut pre_fork_blocks = Vec::new();
         for h in 0..fork_height {
             if let Some(block) = self.get_block_by_height(h) {
                 pre_fork_blocks.push(block);
             }
         }
+
+        // Replay runs with rocks detached so per-block persistence is intentionally skipped.
+        // The handle MUST be reattached on EVERY exit path — a dropped handle silently
+        // disables all persistence for the rest of the process — so the fallible replay is
+        // wrapped and its Err intercepted rather than `?`-propagated across the take/restore
+        // window.
+        let saved_rocks = self.rocks.take();
+        let _saved_epoch = self.current_epoch;
+        let _saved_emitted = self.total_emitted;
+        let _saved_burned = self.total_burned;
+
+        // Snapshot the map mirrors alongside rocks: the rocks=None replay advances them to the
+        // winning chain's key sets (A5 memory-only commit) while the CFs still hold the LOSING
+        // chain. If replay or the reconcile write below fails, they must be restored to keep
+        // describing CF reality — otherwise stale_keys computes empty deletes forever and the
+        // losing chain's map rows resurrect at the next open().
+        let saved_mirrors = (
+            self.persisted_escrow_keys.clone(),
+            self.persisted_bonded_keys.clone(),
+            self.persisted_unbonding_keys.clone(),
+            self.persisted_lifecycle_keys.clone(),
+        );
 
         // Reset state.
         self.accounts = AccountStore::new();
@@ -1910,28 +1954,81 @@ impl ChainState {
         self.cumulative_score = 0;
         self.state_diffs.clear();
 
-        // Re-apply pre-fork blocks.
-        for block in &pre_fork_blocks {
-            self.apply_block(block)?;
-        }
-
-        // Apply the new competing chain.
-        for block in &competing_chain {
-            self.apply_block(block)?;
+        let replay_result: Result<(), StateError> = (|| {
+            // Re-apply pre-fork blocks, then the new competing chain.
+            for block in &pre_fork_blocks {
+                self.apply_block(block)?;
+            }
+            for block in &competing_chain {
+                self.apply_block(block)?;
+            }
+            Ok(())
+        })();
+        self.rocks = saved_rocks;
+        if let Err(e) = replay_result {
+            // In-memory state is half-rebuilt (caller must treat this as fatal: retry the
+            // reorg or reset_to_genesis), but the CFs still hold the intact losing chain —
+            // restore the mirrors to match so any later flush/persist diffs against reality.
+            (
+                self.persisted_escrow_keys,
+                self.persisted_bonded_keys,
+                self.persisted_unbonding_keys,
+                self.persisted_lifecycle_keys,
+            ) = saved_mirrors;
+            return Err(e);
         }
 
         self.cumulative_score = competing_score;
-        self.rocks = saved_rocks;
 
-        // PoUW P2 (B1a): the reorg replayed with rocks=None, so the persisted consensus-map CFs still
-        // hold the PRE-reorg rows while the in-memory maps were cleared+rebuilt. Drop the stale rows
-        // and re-flush the rebuilt maps so a later restart loads the winning chain's state, not stale
-        // rows. (No-op while the maps are empty; correct once the live flip lands.)
+        // Post-reorg CF reconcile: the replay ran with rocks=None, so every CF still holds the
+        // LOSING chain (accounts, meta, maps, block-height index). Rewrite the winning state
+        // in ONE WriteBatch — the delete_ranges and re-puts commit atomically, so a crash
+        // leaves either the old rows or the complete winning state, never an empty CF. Stale
+        // by-hash rows for orphaned blocks in CF_BLOCKS are unreachable via the height index
+        // and are left behind (accepted).
+        self.accounts.mark_all_dirty(); // fail-safe: if the write below errors, the next
+        // successful per-block persist re-puts every account.
         if let Some(ref rocks) = self.rocks {
-            rocks.clear_consensus_maps()
-                .map_err(|e| StateError::StorageError(e.to_string()))?;
-            self.flush_consensus_maps(rocks)?;
+            let mut batch = rocks.new_write_batch();
+            rocks.batch_put_meta_u64(&mut batch, rocks::META_TOTAL_EMITTED, self.total_emitted);
+            rocks.batch_put_meta_u64(&mut batch, rocks::META_TOTAL_BURNED, self.total_burned);
+            rocks.batch_put_meta_u64(&mut batch, rocks::META_CURRENT_EPOCH, self.current_epoch);
+            rocks.batch_put_meta_u64(&mut batch, rocks::META_NERF_RATE_BPS, self.nerf_rate.rate_bps as u64);
+            rocks.batch_put_meta_u64(&mut batch, rocks::META_CHAIN_HEIGHT, self.blocks.height());
+            rocks.batch_clear_accounts(&mut batch);
+            for account in self.accounts.iter() {
+                rocks.batch_put_account(&mut batch, account);
+            }
+            rocks.batch_clear_consensus_maps(&mut batch);
+            // The mirror-diff deletes inside are no-ops after the range clear; the full-value
+            // re-puts are what matter here.
+            self.batch_map_deltas(rocks, &mut batch);
+            for block in &pre_fork_blocks {
+                rocks.batch_put_block(&mut batch, block);
+            }
+            for block in &competing_chain {
+                rocks.batch_put_block(&mut batch, block);
+            }
+            if let Err(e) = rocks.write_batch(batch) {
+                // Disk still holds the losing chain while memory (and the replay-advanced
+                // mirrors) hold the winner. Restore the mirrors to CF reality so a later
+                // flush/persist mirror-diff can still delete the losing chain's map rows.
+                // Losing-chain-only ACCOUNT rows have no mirror — mark_all_dirty above heals
+                // puts only, so full cleanup after a failed reconcile requires retrying the
+                // reorg or reset_to_genesis (accepted per design risk #3: a failing batch
+                // write means the disk itself is failing).
+                (
+                    self.persisted_escrow_keys,
+                    self.persisted_bonded_keys,
+                    self.persisted_unbonding_keys,
+                    self.persisted_lifecycle_keys,
+                ) = saved_mirrors;
+                return Err(StateError::StorageError(e.to_string()));
+            }
         }
+        // Reached only if the reconcile committed (or the node is memory-only).
+        self.accounts.clear_dirty_and_removed();
+        self.commit_map_mirrors();
 
         info!(
             "Chain reorganization complete: rolled back to height {}, applied {} new blocks (new height {})",
@@ -1941,6 +2038,105 @@ impl ChainState {
         );
 
         Ok(orphaned_txs)
+    }
+
+    /// Atomically persist an applied block + height index + meta + all dirty accounts +
+    /// consensus-map deltas in ONE RocksDB WriteBatch. Called at the tail of every `apply_*`
+    /// after in-memory application succeeded. On success this drains the dirty/removed account
+    /// journals and commits the map mirrors; on failure they are RETAINED, so the next
+    /// successful persist re-covers all account/map/meta state (self-healing) — the only
+    /// permanent artifact of a failed write is a block-history gap in CF_BLOCKS, which affects
+    /// serving sync, not state correctness (`open()` loads state from CFs, not replay).
+    fn persist_applied_block(&mut self, block: &Block) -> Result<(), StateError> {
+        let Some(rocks) = self.rocks.as_ref() else {
+            // Memory-only mode: clear the bookkeeping anyway — it bounds journal/mirror growth
+            // and keeps the mirrors equal to the current key sets, so a later reconcile path
+            // (e.g. try_reorg's post-replay pass) is the sole source of truth. Blocks are NOT
+            // pruned: a pure in-memory node cannot reload them from disk.
+            self.accounts.clear_dirty_and_removed();
+            self.commit_map_mirrors();
+            return Ok(());
+        };
+
+        let mut batch = rocks.new_write_batch();
+        rocks.batch_put_block(&mut batch, block);
+        // The block was just applied, so block.height() == self.blocks.height() and
+        // put_block's monotonic height guard is trivially satisfied — write META_CHAIN_HEIGHT
+        // unconditionally (write-only today: no readers in tree).
+        rocks.batch_put_meta_u64(&mut batch, rocks::META_CHAIN_HEIGHT, block.height());
+        // Meta counters ride every block's batch — this is also what carries the event loop's
+        // out-of-band current_epoch bump to disk at the next block.
+        rocks.batch_put_meta_u64(&mut batch, rocks::META_TOTAL_EMITTED, self.total_emitted);
+        rocks.batch_put_meta_u64(&mut batch, rocks::META_TOTAL_BURNED, self.total_burned);
+        rocks.batch_put_meta_u64(&mut batch, rocks::META_CURRENT_EPOCH, self.current_epoch);
+        rocks.batch_put_meta_u64(&mut batch, rocks::META_NERF_RATE_BPS, self.nerf_rate.rate_bps as u64);
+        // Accounts: deletes BEFORE puts — WriteBatch is last-write-wins per key, so a
+        // remove-then-recreate within one block resolves to the put (the live value).
+        for addr in self.accounts.removed() {
+            rocks.batch_delete_account(&mut batch, addr);
+        }
+        for addr in self.accounts.dirty() {
+            if let Some(account) = self.accounts.get(addr) {
+                rocks.batch_put_account(&mut batch, account);
+            }
+        }
+        self.batch_map_deltas(rocks, &mut batch);
+
+        rocks.write_batch(batch)
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+
+        // Only after the atomic commit: drain the journals and advance the mirrors.
+        self.accounts.clear_dirty_and_removed();
+        self.commit_map_mirrors();
+        // Prune old blocks from memory (they remain in RocksDB).
+        self.blocks.prune(Self::MEMORY_BLOCK_RETENTION);
+        Ok(())
+    }
+
+    /// Append the four consensus maps' CF deltas to `batch`: delete every persisted key that
+    /// no longer exists in memory (`mirror − current`), then re-put every live entry
+    /// FULL-VALUE — lifecycles mutate internally without key churn, so key-level tracking
+    /// alone cannot suffice, and a value re-put is O(map size), trivial at testnet scale
+    /// (device write amplification ~10–30× on the logical bytes; B7/G6 capacity admission is
+    /// the real bound, and a per-entry value-hash mirror is the mainnet optimization — it
+    /// would also skip the redundant per-block `to_record()` for unchanged lifecycles).
+    /// Deletes are appended before puts (WriteBatch is last-write-wins per key). The caller
+    /// commits the batch and, ONLY on success, calls `commit_map_mirrors`.
+    fn batch_map_deltas(&self, rocks: &RocksStore, batch: &mut WriteBatch) {
+        for job_id in stale_keys(&self.persisted_escrow_keys, &self.escrow_by_job) {
+            rocks.batch_delete_escrow(batch, job_id);
+        }
+        for (job_id, amount) in &self.escrow_by_job {
+            rocks.batch_put_escrow(batch, job_id, *amount);
+        }
+        for who in stale_keys(&self.persisted_bonded_keys, &self.bonded_stake) {
+            rocks.batch_delete_bonded(batch, who);
+        }
+        for (who, amount) in &self.bonded_stake {
+            rocks.batch_put_bonded(batch, who, *amount);
+        }
+        for who in stale_keys(&self.persisted_unbonding_keys, &self.unbonding_stake) {
+            rocks.batch_delete_unbonding(batch, who);
+        }
+        for (who, chunks) in &self.unbonding_stake {
+            rocks.batch_put_unbonding(batch, who, chunks);
+        }
+        for job_id in stale_keys(&self.persisted_lifecycle_keys, &self.job_lifecycles) {
+            rocks.batch_delete_lifecycle(batch, job_id);
+        }
+        for (job_id, lc) in &self.job_lifecycles {
+            rocks.batch_put_lifecycle(batch, job_id, &lc.to_record());
+        }
+    }
+
+    /// Advance all four persisted-key mirrors to the maps' current key sets. Call ONLY after
+    /// a successful CF write — on failure the stale mirror recomputes a superset of deletes at
+    /// the next attempt (deleting an absent key is a RocksDB no-op, so over-deleting is safe).
+    fn commit_map_mirrors(&mut self) {
+        self.persisted_escrow_keys = self.escrow_by_job.keys().copied().collect();
+        self.persisted_bonded_keys = self.bonded_stake.keys().copied().collect();
+        self.persisted_unbonding_keys = self.unbonding_stake.keys().copied().collect();
+        self.persisted_lifecycle_keys = self.job_lifecycles.keys().copied().collect();
     }
 
     /// Persist all meta counters to RocksDB.
@@ -1957,51 +2153,54 @@ impl ChainState {
     }
 
     /// Flush the full state (all accounts, blocks, meta) to RocksDB.
-    fn flush_to_rocks(&self, rocks: &RocksStore) -> Result<(), StateError> {
+    fn flush_to_rocks(&mut self) -> Result<(), StateError> {
         // Flush meta.
-        self.flush_meta(rocks)?;
+        if let Some(ref rocks) = self.rocks {
+            self.flush_meta(rocks)?;
+        }
 
-        // Flush all accounts. AccountStore doesn't expose iteration,
-        // so we use the flush_accounts helper.
-        self.flush_accounts(rocks)?;
+        // Flush all accounts (reconciling: removed rows deleted first).
+        self.flush_accounts()?;
 
-        // PoUW P2 (B1a): flush the consensus money/stake maps.
-        self.flush_consensus_maps(rocks)?;
+        // Flush the consensus money/stake maps (reconciling, via the persisted-key mirrors).
+        self.flush_consensus_maps()?;
 
         Ok(())
     }
 
     /// Item 66: Persist all in-memory accounts to RocksDB using a single WriteBatch.
-    fn flush_accounts(&self, rocks: &RocksStore) -> Result<(), StateError> {
+    /// Reconciling: rows for removed accounts are deleted first (a put-only flush would
+    /// resurrect archived/removed accounts at the next open); the removed journal is drained
+    /// only after the write succeeds.
+    fn flush_accounts(&mut self) -> Result<(), StateError> {
+        let Some(rocks) = self.rocks.as_ref() else { return Ok(()) };
         let mut batch = rocks.new_write_batch();
+        // Deletes BEFORE puts (last-write-wins per key; see persist_applied_block).
+        for addr in self.accounts.removed() {
+            rocks.batch_delete_account(&mut batch, addr);
+        }
         for account in self.accounts.iter() {
             rocks.batch_put_account(&mut batch, account);
         }
         rocks.write_batch(batch)
-            .map_err(|e| StateError::StorageError(e.to_string()))
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        // Every live account was just written, so the dirty journal is covered too.
+        self.accounts.clear_dirty_and_removed();
+        Ok(())
     }
 
-    /// PoUW P2 (B1a/B1b): persist the FOUR consensus maps (escrow_by_job / bonded_stake /
-    /// unbonding_stake / job_lifecycles) in one WriteBatch (mirrors `flush_accounts`). NOTE: this PUTs
-    /// every live entry; it does not delete entries removed in-memory. That is fine while the maps stay
-    /// empty until the live flip — the P2 live-tx path must switch to dirty-key put + `batch_delete_*`
-    /// for emptied pots / withdrawn chunks / settled jobs.
-    fn flush_consensus_maps(&self, rocks: &RocksStore) -> Result<(), StateError> {
+    /// PoUW P2: reconciling flush of the FOUR consensus maps (escrow_by_job / bonded_stake /
+    /// unbonding_stake / job_lifecycles) — deletes CF rows for keys removed in-memory (via the
+    /// persisted-key mirrors), then re-puts every live entry, in one WriteBatch. Safe to call
+    /// at any time; kept as the shutdown-tail sweeper behind the per-block batch.
+    fn flush_consensus_maps(&mut self) -> Result<(), StateError> {
+        let Some(rocks) = self.rocks.as_ref() else { return Ok(()) };
         let mut batch = rocks.new_write_batch();
-        for (job_id, amount) in &self.escrow_by_job {
-            rocks.batch_put_escrow(&mut batch, job_id, *amount);
-        }
-        for (addr, amount) in &self.bonded_stake {
-            rocks.batch_put_bonded(&mut batch, addr, *amount);
-        }
-        for (addr, chunks) in &self.unbonding_stake {
-            rocks.batch_put_unbonding(&mut batch, addr, chunks);
-        }
-        for (job_id, lc) in &self.job_lifecycles {
-            rocks.batch_put_lifecycle(&mut batch, job_id, &lc.to_record());
-        }
+        self.batch_map_deltas(rocks, &mut batch);
         rocks.write_batch(batch)
-            .map_err(|e| StateError::StorageError(e.to_string()))
+            .map_err(|e| StateError::StorageError(e.to_string()))?;
+        self.commit_map_mirrors();
+        Ok(())
     }
 
     /// Wipe all blocks and account state, reinitialize to genesis (height 0).
@@ -2036,9 +2235,45 @@ impl ChainState {
                 .map_err(|e| StateError::StorageError(format!("failed to clear RocksDB: {}", e)))?;
         }
 
+        // The CFs are empty (and `accounts` above is a fresh store with clean dirty/removed
+        // journals) — reset the persisted-key mirrors to match.
+        self.persisted_escrow_keys.clear();
+        self.persisted_bonded_keys.clear();
+        self.persisted_unbonding_keys.clear();
+        self.persisted_lifecycle_keys.clear();
+
         info!("Chain state reset to genesis complete");
         Ok(())
     }
+}
+
+/// Keys present in the persisted-key `mirror` but absent from the live `current` map — the CF
+/// rows the next batch must delete. Pure; over-deletion on a retry after a failed write is
+/// safe (deleting an absent key is a RocksDB no-op).
+fn stale_keys<'a, K, V>(
+    mirror: &'a HashSet<K>,
+    current: &'a HashMap<K, V>,
+) -> impl Iterator<Item = &'a K>
+where
+    K: Eq + std::hash::Hash,
+{
+    mirror.iter().filter(move |k| !current.contains_key(k))
+}
+
+/// Whether `tx` (including ops nested in a `Batch`) is of a kind that mutates the PoUW
+/// consensus maps. Used by `revert_block`'s guard 2. Extend with
+/// `SubmitJobV2`/`ClaimJob`/`Commit`/`Reveal`/`CompleteJob` at the B2–B4 live flip — until
+/// then those kinds move no map state, and guard 1 (maps non-empty) makes any staleness here
+/// fail-safe rather than unsound.
+fn tx_touches_consensus_maps(tx: &Transaction) -> bool {
+    fn kind_touches(kind: &TxKind) -> bool {
+        match kind {
+            TxKind::Bond { .. } | TxKind::RequestUnbond { .. } | TxKind::WithdrawUnbonded => true,
+            TxKind::Batch { operations } => operations.iter().any(kind_touches),
+            _ => false,
+        }
+    }
+    kind_touches(&tx.kind)
 }
 
 // ===================================================================================
@@ -4942,5 +5177,615 @@ mod tests {
         let account = state.accounts.get(&producer).expect("producer should exist");
         assert_eq!(account.balance.raw(), 100);
         assert_eq!(state.total_emitted, commputer_core::token::TOTAL_SUPPLY);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════
+    // Step 1.0 — per-block durable persistence: crash-simulation, stale-row reconcile,
+    // journal/mirror unit tests, revert guards, resync + reorg restart consistency.
+    // Crash simulation = drop the ChainState WITHOUT flush(); the per-block WriteBatch alone
+    // must reproduce the exact pre-crash state (root equality = the fork-after-restart bar).
+    // ═══════════════════════════════════════════════════════════════════════════════════
+
+    use commputer_core::wallet::Wallet;
+    use commputer_core::signing::sign_transaction;
+
+    fn signed_tx(wallet: &Wallet, nonce: u64, kind: TxKind, fee: u64) -> Transaction {
+        let mut tx = Transaction {
+            from: *wallet.address(),
+            nonce,
+            kind,
+            fee,
+            signature: vec![],
+            public_key: vec![],
+            memo: None,
+            timelock: None,
+        };
+        sign_transaction(&mut tx, wallet);
+        tx
+    }
+
+    /// A block with correct merkle roots + chosen producer, ready for `apply_block_validated`.
+    fn validated_block(state: &ChainState, height: u64, producer: Address, txs: Vec<Transaction>) -> Block {
+        let mut block = block_with(state, height, txs);
+        block.header.producer = producer;
+        block.header.tx_root = block.compute_tx_root();
+        block.header.proof_root = block.compute_proof_root();
+        block
+    }
+
+    /// A raw block with explicit parent/timestamp (for building fork chains ahead of apply).
+    fn raw_block(height: u64, parent: BlockHash, producer: Address, timestamp: u64, txs: Vec<Transaction>) -> Block {
+        Block {
+            header: BlockHeader {
+                protocol_version: 1,
+                height,
+                parent_hash: parent,
+                tx_root: [0u8; 32],
+                proof_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp,
+                producer,
+                epoch: 0,
+                producer_public_key: vec![],
+                signature: vec![],
+                checkpoint_hash: None,
+                chain_id: String::new(),
+            },
+            transactions: txs,
+            proof_summaries: vec![],
+            compliance_summary: None,
+            epoch_summary: None,
+        }
+    }
+
+    // --- crash simulation (defect 1: per-block durability without flush) ---------------
+
+    #[test]
+    fn crash_survives_bond_block_without_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::generate();
+        let sender = *wallet.address();
+        let (root, bonded, balance, emitted, burned);
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(sender).balance = Amount::from_raw(5_000);
+            state.total_emitted = 5_000;
+
+            let tx = signed_tx(&wallet, 0, TxKind::Bond { amount: Amount::from_raw(3_000) }, 0);
+            let block = validated_block(&state, 1, addr(0), vec![tx]);
+            state.apply_block_validated(&block).unwrap();
+
+            root = state.compute_state_root();
+            bonded = state.bonded_stake.clone();
+            balance = state.accounts.get(&sender).unwrap().balance;
+            emitted = state.total_emitted;
+            burned = state.total_burned;
+            // DROP WITHOUT flush() — the per-block batch alone must carry everything.
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(re.bonded_stake, bonded, "bonded_stake survives crash");
+        assert_eq!(re.bonded_of(&sender), 3_000);
+        assert_eq!(re.accounts.get(&sender).unwrap().balance, balance);
+        assert_eq!(re.total_emitted, emitted);
+        assert_eq!(re.total_burned, burned);
+        assert_eq!(
+            re.compute_state_root(), root,
+            "state root identical after crash-reopen (the fork-after-restart criterion)"
+        );
+    }
+
+    #[test]
+    fn crash_survives_transfer_and_producer_reward() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::generate();
+        let sender = *wallet.address();
+        let producer = addr(5); // non-zero: earns the block reward (in no tx's address list)
+        let (root, sender_bal, recipient_bal, producer_bal, emitted);
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(sender).balance = Amount::from_comme(100);
+            state.total_emitted = Amount::from_comme(100).raw();
+
+            let tx = signed_tx(
+                &wallet, 0,
+                TxKind::Transfer { to: addr(2), amount: Amount::from_comme(33) },
+                commputer_core::transaction::ACCOUNT_CREATION_FEE,
+            );
+            let block = validated_block(&state, 1, producer, vec![tx]);
+            state.apply_block_validated(&block).unwrap();
+
+            root = state.compute_state_root();
+            sender_bal = state.accounts.get(&sender).unwrap().balance;
+            recipient_bal = state.accounts.get(&addr(2)).unwrap().balance;
+            producer_bal = state.accounts.get(&producer).unwrap().balance;
+            emitted = state.total_emitted;
+            assert!(producer_bal.raw() > 0, "producer earned the block reward");
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(re.accounts.get(&sender).unwrap().balance, sender_bal);
+        assert_eq!(re.accounts.get(&addr(2)).unwrap().balance, recipient_bal, "recipient survives");
+        assert_eq!(
+            re.accounts.get(&producer).unwrap().balance, producer_bal,
+            "producer reward survives (dirty-journal coverage — producer appears in no tx list)"
+        );
+        assert_eq!(re.total_emitted, emitted);
+        assert_eq!(re.compute_state_root(), root);
+    }
+
+    #[test]
+    fn crash_survives_escrow_and_lifecycle() {
+        // Escrow/lifecycle aren't tx-reachable pre-flip — populate directly, then one applied
+        // block must persist them (the B2–B4 forward-guarantee).
+        let dir = tempfile::tempdir().unwrap();
+        let job = [31u8; 32];
+        let (root, rec);
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            state.escrow_by_job.insert([7u8; 32], 4_000);
+            let lc = sample_lifecycle(job, 7);
+            rec = lc.to_record();
+            state.job_lifecycles.insert(job, lc);
+
+            let block = validated_block(&state, 1, addr(0), vec![]);
+            state.apply_block_validated(&block).unwrap();
+            root = state.compute_state_root();
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(re.escrow_by_job.get(&[7u8; 32]), Some(&4_000), "escrow survives crash");
+        assert_eq!(
+            re.job_lifecycles.get(&job).map(|l| l.to_record()),
+            Some(rec),
+            "lifecycle survives crash"
+        );
+        assert_eq!(re.compute_state_root(), root);
+    }
+
+    #[test]
+    fn batch_inner_recipient_persists_without_flush() {
+        // Regression for the before_states gap class: a Batch-inner Transfer recipient appears
+        // in no top-level tx address list — only the dirty journal catches it.
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::generate();
+        let sender = *wallet.address();
+        let fresh = addr(77);
+        let root;
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(sender).balance = Amount::from_comme(10);
+            state.total_emitted = Amount::from_comme(10).raw();
+
+            let batch = TxKind::Batch {
+                operations: vec![TxKind::Transfer { to: fresh, amount: Amount::from_comme(1) }],
+            };
+            let tx = signed_tx(&wallet, 0, batch, 0);
+            let block = validated_block(&state, 1, addr(0), vec![tx]);
+            state.apply_block_validated(&block).unwrap();
+            root = state.compute_state_root();
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(
+            re.accounts.get(&fresh).map(|a| a.balance),
+            Some(Amount::from_comme(1)),
+            "batch-inner recipient survives crash"
+        );
+        assert_eq!(re.compute_state_root(), root);
+    }
+
+    #[test]
+    fn out_of_band_mutation_swept_by_next_block() {
+        // Mutations outside block apply (event_loop grace drains / uptime bookkeeping) sit in
+        // the dirty journal and ride the NEXT block's batch.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(1_000);
+            let b1 = validated_block(&state, 1, addr(0), vec![]);
+            state.apply_block_validated(&b1).unwrap();
+
+            // Out-of-band mutation between blocks (simulates an event_loop grace drain).
+            state.accounts.get_mut(&addr(1)).unwrap().cumulative_uptime_secs = 12_345;
+
+            let b2 = validated_block(&state, 2, addr(0), vec![]);
+            state.apply_block_validated(&b2).unwrap();
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(
+            re.accounts.get(&addr(1)).unwrap().cumulative_uptime_secs,
+            12_345,
+            "out-of-band mutation swept into the next block's batch"
+        );
+    }
+
+    #[test]
+    fn removed_and_recreated_accounts_persist_correctly_across_crash() {
+        // A1: delete-before-put means remove→recreate resolves to the put; removal alone
+        // CF-deletes the row (the archived-account-resurrection class bug).
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(111);
+            state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(222);
+            let b1 = validated_block(&state, 1, addr(0), vec![]);
+            state.apply_block_validated(&b1).unwrap();
+
+            // Remove both, recreate only addr(1) — same inter-block window.
+            state.accounts.remove(&addr(1));
+            state.accounts.remove(&addr(2));
+            state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(333);
+
+            let b2 = validated_block(&state, 2, addr(0), vec![]);
+            state.apply_block_validated(&b2).unwrap();
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(
+            re.accounts.get(&addr(1)).map(|a| a.balance),
+            Some(Amount::from_raw(333)),
+            "recreated account survives with its new value (delete-before-put)"
+        );
+        assert!(
+            re.accounts.get(&addr(2)).is_none(),
+            "removed account's CF row was deleted, not resurrected"
+        );
+    }
+
+    // --- stale-row resurrection (defect 2: reconciling deletes) ------------------------
+
+    #[test]
+    fn withdraw_all_leaves_no_resurrected_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::generate();
+        let sender = *wallet.address();
+        let root;
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.stake_params = StakeParams { unbonding_blocks: 0, min_bond: 1_000 };
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(sender).balance = Amount::from_raw(5_000);
+            state.total_emitted = 5_000;
+
+            let b1 = validated_block(&state, 1, addr(0), vec![
+                signed_tx(&wallet, 0, TxKind::Bond { amount: Amount::from_raw(5_000) }, 0),
+            ]);
+            state.apply_block_validated(&b1).unwrap();
+            let b2 = validated_block(&state, 2, addr(0), vec![
+                signed_tx(&wallet, 1, TxKind::RequestUnbond { amount: Amount::from_raw(5_000) }, 0),
+            ]);
+            state.apply_block_validated(&b2).unwrap();
+            let b3 = validated_block(&state, 3, addr(0), vec![
+                signed_tx(&wallet, 2, TxKind::WithdrawUnbonded, 0),
+            ]);
+            state.apply_block_validated(&b3).unwrap();
+
+            assert!(state.bonded_stake.is_empty(), "bonded entry removed in-memory");
+            assert!(state.unbonding_stake.is_empty(), "unbonding entry removed in-memory");
+            assert_eq!(state.accounts.get(&sender).unwrap().balance, Amount::from_raw(5_000));
+            root = state.compute_state_root();
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert!(re.bonded_stake.is_empty(), "no resurrected bonded row after crash-reopen");
+        assert!(re.unbonding_stake.is_empty(), "no resurrected unbonding row after crash-reopen");
+        assert_eq!(re.accounts.get(&sender).unwrap().balance, Amount::from_raw(5_000));
+        assert_eq!(re.compute_state_root(), root);
+    }
+
+    #[test]
+    fn flush_after_removal_reconciles() {
+        // The shutdown-path sweeper: even a DIRECT pub-field `.remove` (bypassing every method)
+        // is caught, because the mirror diff is computed from ground truth at write time.
+        let dir = tempfile::tempdir().unwrap();
+        let job = [33u8; 32];
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.bonded_stake.insert(addr(1), 500);
+            state.job_lifecycles.insert(job, sample_lifecycle(job, 7));
+            state.flush().unwrap();
+
+            state.bonded_stake.remove(&addr(1)); // direct bypass
+            state.job_lifecycles.remove(&job); // direct bypass
+            state.flush().unwrap();
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert!(re.bonded_stake.is_empty(), "flush deleted the removed bonded row");
+        assert!(re.job_lifecycles.is_empty(), "flush deleted the removed lifecycle row");
+    }
+
+    // --- pure reconcile / journal semantics ---------------------------------------------
+
+    #[test]
+    fn stale_keys_is_mirror_minus_current() {
+        let mut mirror: HashSet<[u8; 32]> = HashSet::new();
+        mirror.insert([1u8; 32]);
+        mirror.insert([2u8; 32]);
+        let mut current: HashMap<[u8; 32], u64> = HashMap::new();
+        current.insert([2u8; 32], 9);
+        current.insert([3u8; 32], 9);
+        let stale: Vec<[u8; 32]> = stale_keys(&mirror, &current).copied().collect();
+        assert_eq!(stale, vec![[1u8; 32]], "deletes = mirror − current; current keys are re-put");
+    }
+
+    #[test]
+    fn in_memory_apply_clears_bookkeeping_and_keeps_all_blocks() {
+        // A5 pinned semantics for rocks=None: journals cleared + mirrors committed (bounds
+        // growth), but blocks are NOT pruned (nothing to reload them from).
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(10_000);
+        state.bonded_stake.insert(addr(2), 7);
+        let b1 = block_with(&state, 1, vec![]);
+        state.apply_block(&b1).unwrap();
+
+        assert_eq!(state.accounts.dirty().count(), 0, "dirty journal cleared without rocks");
+        assert_eq!(state.accounts.removed().count(), 0);
+        assert!(
+            state.persisted_bonded_keys.contains(&addr(2)),
+            "mirror committed to current keys without rocks"
+        );
+
+        for h in 2..=(ChainState::MEMORY_BLOCK_RETENTION + 5) {
+            let b = block_with(&state, h, vec![]);
+            state.apply_block(&b).unwrap();
+        }
+        assert!(
+            state.blocks.get_by_height(0).is_some(),
+            "genesis retained: memory-only mode must not prune"
+        );
+        assert_eq!(state.blocks.len() as u64, ChainState::MEMORY_BLOCK_RETENTION + 6);
+    }
+
+    #[test]
+    fn mirrors_and_journals_advance_only_through_persist() {
+        // Rocks-backed: mirrors/journals move exactly at the persist boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(dir.path()).unwrap();
+        state.apply_block(&genesis_block()).unwrap();
+
+        state.bonded_stake.insert(addr(1), 500);
+        state.accounts.get_or_create(addr(3)).balance = Amount::from_raw(1);
+        assert!(!state.persisted_bonded_keys.contains(&addr(1)), "mirror lags until persist");
+        assert_eq!(state.accounts.dirty().count(), 1);
+
+        let b1 = validated_block(&state, 1, addr(0), vec![]);
+        state.apply_block_validated(&b1).unwrap();
+        assert!(state.persisted_bonded_keys.contains(&addr(1)), "mirror advanced on persist");
+        assert_eq!(state.accounts.dirty().count(), 0, "journal drained on persist");
+    }
+
+    #[test]
+    fn open_starts_with_clean_dirty_tracking() {
+        // A3: open() loads disk == memory, so nothing is dirty; the first block's batch then
+        // carries only that block's touched accounts.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(100);
+            state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(200);
+            let b1 = validated_block(&state, 1, addr(0), vec![]);
+            state.apply_block_validated(&b1).unwrap();
+        }
+        let mut re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(re.accounts.dirty().count(), 0, "open() starts with a clean dirty journal");
+        assert_eq!(re.accounts.removed().count(), 0);
+        re.accounts.get_mut(&addr(1)).unwrap().balance = Amount::from_raw(101);
+        assert_eq!(re.accounts.dirty().count(), 1, "only the touched account rides the next batch");
+    }
+
+    // --- revert_block fail-safe guards ---------------------------------------------------
+
+    #[test]
+    fn revert_block_refuses_when_maps_nonempty() {
+        // Guard 1: live map state → refuse, even for a pure-transfer block (backstop for any
+        // staleness in the tx-kind scan).
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(10_000_000);
+        state.accounts.get_or_create(addr(2));
+        let block = block_with(&state, 1, vec![Transaction {
+            from: addr(1),
+            nonce: 0,
+            kind: TxKind::Transfer { to: addr(2), amount: Amount::from_raw(500_000) },
+            fee: 100_000,
+            signature: vec![],
+            public_key: vec![],
+            memo: None,
+            timelock: None,
+        }]);
+        state.apply_block(&block).unwrap();
+
+        state.bonded_stake.insert(addr(9), 1);
+        let err = state.revert_block(1).unwrap_err();
+        assert!(
+            err.to_string().contains("consensus maps"),
+            "guard 1 refuses with the map message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn revert_block_refuses_map_touching_block_even_with_empty_maps() {
+        // Guard 2: bond → unbond-all → withdraw within ONE block leaves the maps empty, but
+        // the block still moved map state — the tx-kind scan (incl. Batch-inner) refuses it.
+        let mut state = ChainState::new();
+        state.stake_params = StakeParams { unbonding_blocks: 0, min_bond: 1_000 };
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(1_000);
+        state.total_emitted = 1_000;
+
+        let block = block_with(&state, 1, vec![
+            unsigned(addr(1), 0, TxKind::Batch {
+                operations: vec![TxKind::Bond { amount: Amount::from_raw(1_000) }],
+            }),
+            unsigned(addr(1), 1, TxKind::RequestUnbond { amount: Amount::from_raw(1_000) }),
+            unsigned(addr(1), 2, TxKind::WithdrawUnbonded),
+        ]);
+        state.apply_block(&block).unwrap();
+        assert!(state.bonded_stake.is_empty() && state.unbonding_stake.is_empty());
+
+        let err = state.revert_block(1).unwrap_err();
+        assert!(
+            err.to_string().contains("consensus maps"),
+            "guard 2 refuses the map-touching block, got: {err}"
+        );
+    }
+
+    #[test]
+    fn revert_block_still_works_on_pure_transfers_with_empty_maps() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(10_000_000);
+        state.accounts.get_or_create(addr(2)); // pre-create: no account-creation fee
+        let before = state.accounts.get(&addr(1)).unwrap().balance.raw();
+
+        let block = block_with(&state, 1, vec![Transaction {
+            from: addr(1),
+            nonce: 0,
+            kind: TxKind::Transfer { to: addr(2), amount: Amount::from_raw(500_000) },
+            fee: 100_000,
+            signature: vec![],
+            public_key: vec![],
+            memo: None,
+            timelock: None,
+        }]);
+        state.apply_block(&block).unwrap();
+
+        state.accounts.clear_dirty_and_removed(); // isolate: prove revert re-journals
+        state.revert_block(1).unwrap();
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance.raw(), before);
+        assert_eq!(state.blocks.height(), 0);
+        assert!(
+            state.accounts.dirty().any(|a| *a == addr(1)),
+            "reverted accounts re-journaled dirty (next persist heals the disk copy)"
+        );
+    }
+
+    // --- fork recovery: resync (production path) + try_reorg (pre-wiring) ----------------
+
+    #[test]
+    fn resync_crash_consistency() {
+        // The PRODUCTION fork-recovery path: reset_to_genesis + block-by-block resync via
+        // apply_block_validated, then crash without flush.
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::generate();
+        let sender = *wallet.address();
+        let fee = commputer_core::transaction::ACCOUNT_CREATION_FEE;
+        let root;
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(sender).balance = Amount::from_comme(100);
+            state.total_emitted = Amount::from_comme(100).raw();
+            let b1 = validated_block(&state, 1, addr(0), vec![
+                signed_tx(&wallet, 0, TxKind::Transfer { to: addr(2), amount: Amount::from_comme(1) }, fee),
+            ]);
+            state.apply_block_validated(&b1).unwrap();
+            let b2 = validated_block(&state, 2, addr(0), vec![
+                signed_tx(&wallet, 1, TxKind::Transfer { to: addr(3), amount: Amount::from_comme(2) }, fee),
+            ]);
+            state.apply_block_validated(&b2).unwrap();
+
+            // Fork detected → wipe and resync onto a different chain.
+            state.reset_to_genesis().unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(sender).balance = Amount::from_comme(100);
+            state.total_emitted = Amount::from_comme(100).raw();
+            let nb1 = validated_block(&state, 1, addr(0), vec![
+                signed_tx(&wallet, 0, TxKind::Transfer { to: addr(4), amount: Amount::from_comme(3) }, fee),
+            ]);
+            state.apply_block_validated(&nb1).unwrap();
+
+            root = state.compute_state_root();
+            // DROP WITHOUT flush.
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(re.blocks.height(), 1, "resynced chain height survives crash");
+        assert_eq!(
+            re.accounts.get(&addr(4)).map(|a| a.balance),
+            Some(Amount::from_comme(3)),
+            "resynced-chain account survives"
+        );
+        assert!(re.accounts.get(&addr(2)).is_none(), "pre-reset chain's account is gone");
+        assert!(re.accounts.get(&addr(3)).is_none(), "pre-reset chain's account is gone");
+        assert_eq!(re.compute_state_root(), root, "root matches the resynced chain exactly");
+    }
+
+    #[test]
+    fn reorg_persists_winning_chain_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let fee = commputer_core::transaction::ACCOUNT_CREATION_FEE;
+        let (root, emitted);
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            let genesis = genesis_block();
+            state.apply_block(&genesis).unwrap();
+
+            // Losing chain: producer addr(1) earns the reward in b1, spends to addr(2) and
+            // bonds 500_000 in b2 — the bond puts a LIVE row in CF_BONDED that the reorg's
+            // delete_range+re-put reconcile must replace, not resurrect.
+            let b1 = raw_block(1, genesis.hash(), addr(1), 2001, vec![]);
+            state.apply_block(&b1).unwrap();
+            let b2 = raw_block(2, b1.hash(), addr(1), 2002, vec![
+                unsigned_with_fee(addr(1), 0, TxKind::Transfer { to: addr(2), amount: Amount::from_raw(500_000) }, fee),
+                unsigned_with_fee(addr(1), 1, TxKind::Bond { amount: Amount::from_raw(500_000) }, fee),
+            ]);
+            state.apply_block(&b2).unwrap();
+            assert!(state.accounts.get(&addr(2)).is_some());
+            assert_eq!(state.bonded_of(&addr(1)), 500_000);
+
+            // Winning chain: longer, pays addr(3) instead and bonds a DIFFERENT amount.
+            let c1 = raw_block(1, genesis.hash(), addr(1), 3001, vec![]);
+            let c2 = raw_block(2, c1.hash(), addr(1), 3002, vec![
+                unsigned_with_fee(addr(1), 0, TxKind::Transfer { to: addr(3), amount: Amount::from_raw(700_000) }, fee),
+                unsigned_with_fee(addr(1), 1, TxKind::Bond { amount: Amount::from_raw(300_000) }, fee),
+            ]);
+            let c3 = raw_block(3, c2.hash(), addr(1), 3003, vec![]);
+            state.try_reorg(vec![c1, c2, c3], 1).unwrap();
+
+            assert_eq!(state.blocks.height(), 3);
+            assert!(state.accounts.get(&addr(2)).is_none(), "losing-chain account gone in memory");
+            assert_eq!(
+                state.accounts.get(&addr(3)).map(|a| a.balance),
+                Some(Amount::from_raw(700_000)),
+            );
+            assert_eq!(state.bonded_of(&addr(1)), 300_000, "winning-chain bond in memory");
+            root = state.compute_state_root();
+            emitted = state.total_emitted;
+            // DROP WITHOUT flush — the one-batch post-reorg reconcile must have covered disk.
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(re.blocks.height(), 3, "winning-chain height survives restart");
+        assert!(
+            re.accounts.get(&addr(2)).is_none(),
+            "losing-chain account row was deleted from CF_ACCOUNTS (clear+rewrite)"
+        );
+        assert_eq!(
+            re.accounts.get(&addr(3)).map(|a| a.balance),
+            Some(Amount::from_raw(700_000)),
+            "winning-chain account survives restart"
+        );
+        assert_eq!(
+            re.bonded_of(&addr(1)),
+            300_000,
+            "winning-chain bonded row survives restart; losing-chain 500_000 did not resurrect"
+        );
+        assert_eq!(re.total_emitted, emitted);
+        assert_eq!(re.compute_state_root(), root, "root matches the winning chain exactly");
+    }
+
+    fn unsigned_with_fee(from: Address, nonce: u64, kind: TxKind, fee: u64) -> Transaction {
+        Transaction {
+            from,
+            nonce,
+            kind,
+            fee,
+            signature: vec![],
+            public_key: vec![],
+            memo: None,
+            timelock: None,
+        }
     }
 }

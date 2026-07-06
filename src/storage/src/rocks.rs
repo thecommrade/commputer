@@ -65,6 +65,10 @@ impl RocksStore {
         opts.create_missing_column_families(true);
         // Feature 189: Ensure WAL is enabled (RocksDB default, but be explicit).
         opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::PointInTime);
+        // Cross-CF consistency on memtable flushes: with atomic_flush a power loss rewinds to a
+        // WriteBatch boundary across ALL CFs; without it cross-CF skew is possible. (A process
+        // crash — SIGKILL/panic — loses nothing either way: the WAL already has the batch.)
+        opts.set_atomic_flush(true);
 
         let cf_names = [
             CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
@@ -329,6 +333,13 @@ impl RocksStore {
         batch.put_cf(&cf, account.address.0, &encoded);
     }
 
+    /// Add an account row deletion to a batch (removed/archived accounts — a put-only flush
+    /// would resurrect them at the next open). Mirrors `batch_delete_bonded`.
+    pub fn batch_delete_account(&self, batch: &mut WriteBatch, address: &Address) {
+        let cf = self.cf(CF_ACCOUNTS);
+        batch.delete_cf(&cf, address.0);
+    }
+
     /// Add a block write to a batch.
     pub fn batch_put_block(&self, batch: &mut WriteBatch, block: &Block) {
         let hash = block.hash();
@@ -375,8 +386,9 @@ impl RocksStore {
 
     // ── PoUW P2 (B1a): consensus money/stake map persistence ──
     // escrow_by_job / bonded_stake / unbonding_stake mirror the per-account pattern (one borsh value
-    // per raw 32-byte key in a dedicated CF). delete_* variants exist for the future P2 dirty-key flush
-    // (emptied pots / withdrawn chunks); B1a flushes whole maps (they stay empty until the live flip).
+    // per raw 32-byte key in a dedicated CF). delete_* / batch_delete_* are used by the per-block
+    // persist and the reconciling flush to drop entries removed in-memory (emptied pots /
+    // fully-withdrawn stake / settled jobs).
 
     pub fn put_escrow(&self, job_id: &[u8; 32], amount: u64) -> Result<(), rocksdb::Error> {
         let cf = self.cf(CF_ESCROW);
@@ -553,17 +565,33 @@ impl RocksStore {
         batch.delete_cf(&cf, job_id);
     }
 
-    /// Wipe ONLY the four PoUW consensus-map CFs (used by `try_reorg` to drop stale rows before
-    /// re-flushing the replayed maps). Mirrors `clear_all`'s delete_range approach.
+    /// Wipe ONLY the four PoUW consensus-map CFs (standalone commit). `try_reorg` uses the
+    /// batch variant below so its clear+rewrite is a single atomic WriteBatch.
     pub fn clear_consensus_maps(&self) -> Result<(), rocksdb::Error> {
+        let mut batch = WriteBatch::default();
+        self.batch_clear_consensus_maps(&mut batch);
+        self.db.write(batch)
+    }
+
+    /// Append a full-range delete of CF_ACCOUNTS to `batch` — for try_reorg's atomic
+    /// clear+rewrite (the delete_range and the re-puts commit in ONE WriteBatch, so a crash
+    /// can never observe an empty accounts CF).
+    pub fn batch_clear_accounts(&self, batch: &mut WriteBatch) {
         let range_start: &[u8] = &[];
         let range_end: &[u8] = &[0xFF; 128];
-        let mut batch = WriteBatch::default();
+        let cf = self.cf(CF_ACCOUNTS);
+        batch.delete_range_cf(&cf, range_start, range_end);
+    }
+
+    /// Append full-range deletes of all four consensus-map CFs to `batch` (same atomicity
+    /// contract as `batch_clear_accounts`).
+    pub fn batch_clear_consensus_maps(&self, batch: &mut WriteBatch) {
+        let range_start: &[u8] = &[];
+        let range_end: &[u8] = &[0xFF; 128];
         for cf_name in &[CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE] {
             let cf = self.cf(cf_name);
             batch.delete_range_cf(&cf, range_start, range_end);
         }
-        self.db.write(batch)
     }
 
     // ── Feature 188: Storage metrics ──

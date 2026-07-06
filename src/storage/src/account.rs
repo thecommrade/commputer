@@ -179,10 +179,24 @@ impl Account {
     }
 }
 
-/// In-memory account store. Will be backed by RocksDB in production.
+/// In-memory account store, mirrored to RocksDB per applied block.
+///
+/// INVARIANT: `accounts` MUST stay private — every mutation funnels through
+/// `get_mut`/`get_or_create`/`put`/`remove`, which maintain the `dirty`/`removed` journals the
+/// per-block persistence batch is built from. A `pub` accessor leaking `&mut` internals would
+/// silently break crash durability.
+///
+/// INVARIANT: `dirty ∩ removed == ∅` at all times — `remove` moves an address from `dirty`
+/// to `removed`; every (re-)insert clears it from `removed`.
 #[derive(Debug, Default, Clone)]
 pub struct AccountStore {
     accounts: std::collections::HashMap<Address, Account>,
+    /// Addresses mutated (or possibly mutated — `get_mut` over-approximates) since the last
+    /// successful persist. Drained only after the RocksDB batch commits.
+    dirty: std::collections::HashSet<Address>,
+    /// Addresses removed since the last successful persist. Their CF rows need deletion — a
+    /// put-only flush would resurrect them at the next open.
+    removed: std::collections::HashSet<Address>,
 }
 
 impl AccountStore {
@@ -196,18 +210,27 @@ impl AccountStore {
         self.accounts.get(address)
     }
 
-    /// Get a mutable reference to an account.
+    /// Get a mutable reference to an account. Marks the address dirty (over-approximates: a
+    /// read-modify site that doesn't write still rides the next batch as a redundant put).
     pub fn get_mut(&mut self, address: &Address) -> Option<&mut Account> {
+        if self.accounts.contains_key(address) {
+            self.dirty.insert(*address);
+            self.removed.remove(address);
+        }
         self.accounts.get_mut(address)
     }
 
     /// Get or create an account for the given address.
     pub fn get_or_create(&mut self, address: Address) -> &mut Account {
+        self.dirty.insert(address);
+        self.removed.remove(&address);
         self.accounts.entry(address).or_insert_with(|| Account::new(address))
     }
 
     /// Insert or update an account.
     pub fn put(&mut self, account: Account) {
+        self.dirty.insert(account.address);
+        self.removed.remove(&account.address);
         self.accounts.insert(account.address, account);
     }
 
@@ -229,14 +252,43 @@ impl AccountStore {
         self.accounts.is_empty()
     }
 
-    /// Remove an account from the store.
+    /// Remove an account from the store. Moves the address from `dirty` to `removed` so the
+    /// next persist CF-deletes its row (only when it actually existed).
     pub fn remove(&mut self, address: &Address) -> Option<Account> {
-        self.accounts.remove(address)
+        let prev = self.accounts.remove(address);
+        if prev.is_some() {
+            self.dirty.remove(address);
+            self.removed.insert(*address);
+        }
+        prev
     }
 
     /// Iterate over all accounts.
     pub fn iter(&self) -> impl Iterator<Item = &Account> {
         self.accounts.values()
+    }
+
+    /// Addresses mutated since the last successful persist.
+    pub fn dirty(&self) -> impl Iterator<Item = &Address> {
+        self.dirty.iter()
+    }
+
+    /// Addresses removed since the last successful persist.
+    pub fn removed(&self) -> impl Iterator<Item = &Address> {
+        self.removed.iter()
+    }
+
+    /// Drain both journals. Call ONLY after a successful RocksDB commit — retaining them on
+    /// failure is what makes the next successful persist self-healing.
+    pub fn clear_dirty_and_removed(&mut self) {
+        self.dirty.clear();
+        self.removed.clear();
+    }
+
+    /// Mark every live account dirty (try_reorg / load-repair paths: if the one-batch CF
+    /// reconcile fails, the next successful per-block persist re-puts every account).
+    pub fn mark_all_dirty(&mut self) {
+        self.dirty = self.accounts.keys().copied().collect();
     }
 
     /// Compute the merkle root of all account states.
@@ -504,6 +556,88 @@ mod tests {
             assert_eq!(acct.grace_balance_secs, Account::MAX_GRACE_SECS);
             assert!(acct.grace_balance_secs <= 10 * one_year);
         }
+    }
+
+    // ── Dirty/removed journal tracking (per-block persistence) ──
+
+    #[test]
+    fn dirty_marked_on_every_mutator() {
+        let mut store = AccountStore::new();
+        assert_eq!(store.dirty().count(), 0, "fresh store has no dirty entries");
+
+        // get_or_create marks dirty.
+        store.get_or_create(test_address(1));
+        assert!(store.dirty().any(|a| *a == test_address(1)));
+
+        // put marks dirty.
+        store.put(Account::new(test_address(2)));
+        assert!(store.dirty().any(|a| *a == test_address(2)));
+
+        // get_mut marks dirty (over-approximation: even a pure read through it).
+        store.clear_dirty_and_removed();
+        assert!(store.get_mut(&test_address(1)).is_some());
+        assert!(store.dirty().any(|a| *a == test_address(1)));
+        assert_eq!(store.dirty().count(), 1, "only the touched account is dirty");
+
+        // get_mut on a missing address marks nothing.
+        store.clear_dirty_and_removed();
+        assert!(store.get_mut(&test_address(9)).is_none());
+        assert_eq!(store.dirty().count(), 0);
+
+        // get (read-only) marks nothing.
+        let _ = store.get(&test_address(1));
+        assert_eq!(store.dirty().count(), 0);
+    }
+
+    #[test]
+    fn remove_moves_dirty_to_removed() {
+        let mut store = AccountStore::new();
+        store.get_or_create(test_address(1));
+        assert_eq!(store.dirty().count(), 1);
+
+        assert!(store.remove(&test_address(1)).is_some());
+        assert_eq!(store.dirty().count(), 0, "removal clears the address from dirty");
+        assert!(store.removed().any(|a| *a == test_address(1)));
+
+        // Removing a nonexistent address journals nothing.
+        assert!(store.remove(&test_address(9)).is_none());
+        assert_eq!(store.removed().count(), 1);
+    }
+
+    #[test]
+    fn dirty_and_removed_stay_disjoint_after_remove_then_recreate() {
+        let mut store = AccountStore::new();
+        store.get_or_create(test_address(1));
+        store.remove(&test_address(1));
+        // Re-create: the address must leave `removed` and re-enter `dirty` — the persist batch
+        // appends deletes before puts, so even a same-batch collision resolves to the put.
+        store.get_or_create(test_address(1)).balance = Amount::from_comme(3);
+        assert!(store.dirty().any(|a| *a == test_address(1)));
+        assert!(!store.removed().any(|a| *a == test_address(1)));
+
+        // The invariant holds for every mutator that (re-)inserts.
+        store.remove(&test_address(1));
+        store.put(Account::new(test_address(1)));
+        assert!(!store.removed().any(|a| *a == test_address(1)));
+        let dirty: std::collections::HashSet<Address> = store.dirty().copied().collect();
+        let removed: std::collections::HashSet<Address> = store.removed().copied().collect();
+        assert!(dirty.is_disjoint(&removed), "dirty ∩ removed must be empty");
+    }
+
+    #[test]
+    fn clear_and_mark_all_dirty() {
+        let mut store = AccountStore::new();
+        store.get_or_create(test_address(1));
+        store.get_or_create(test_address(2));
+        store.remove(&test_address(2));
+
+        store.clear_dirty_and_removed();
+        assert_eq!(store.dirty().count(), 0);
+        assert_eq!(store.removed().count(), 0);
+
+        store.mark_all_dirty();
+        assert_eq!(store.dirty().count(), 1, "every live account marked (removed ones are not)");
+        assert!(store.dirty().any(|a| *a == test_address(1)));
     }
 
     #[test]
