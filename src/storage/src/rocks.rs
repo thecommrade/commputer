@@ -402,7 +402,11 @@ impl RocksStore {
         let cf = self.cf(CF_ESCROW);
         self.db.delete_cf(&cf, job_id)
     }
-    pub fn all_escrow(&self) -> HashMap<[u8; 32], u64> {
+    /// M1: fail-HARD load of the escrow consensus map. A present-but-malformed row (wrong key/value
+    /// width) or an iterator error is a CORRUPT consensus CF — return an actionable startup error
+    /// instead of warn-skipping (a silently-dropped consensus row makes P8's pot guard reject every
+    /// block forever, surfaced only as a boot warning). An EMPTY CF is fine (empty map, no error).
+    pub fn all_escrow(&self) -> Result<HashMap<[u8; 32], u64>, String> {
         let cf = self.cf(CF_ESCROW);
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         let mut map = HashMap::new();
@@ -415,14 +419,14 @@ impl RocksStore {
                     v.copy_from_slice(&value);
                     map.insert(k, u64::from_le_bytes(v));
                 }
-                Ok((key, value)) => tracing::warn!(
-                    "skipping malformed CF_ESCROW row (key {}B, val {}B) — consensus state may be corrupt",
-                    key.len(), value.len()
-                ),
-                Err(e) => tracing::warn!("CF_ESCROW iterator error: {e}"),
+                Ok((key, value)) => return Err(format!(
+                    "corrupt CF_ESCROW row (key {}B, val {}B) — consensus state is unreadable; \
+                     resync from a fresh data dir", key.len(), value.len()
+                )),
+                Err(e) => return Err(format!("CF_ESCROW iterator error: {e}")),
             }
         }
-        map
+        Ok(map)
     }
 
     pub fn put_bonded(&self, who: &Address, amount: u64) -> Result<(), rocksdb::Error> {
@@ -433,7 +437,8 @@ impl RocksStore {
         let cf = self.cf(CF_BONDED);
         self.db.delete_cf(&cf, who.0)
     }
-    pub fn all_bonded(&self) -> HashMap<Address, u64> {
+    /// M1: fail-HARD load of the bonded-stake consensus map (see `all_escrow`).
+    pub fn all_bonded(&self) -> Result<HashMap<Address, u64>, String> {
         let cf = self.cf(CF_BONDED);
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         let mut map = HashMap::new();
@@ -446,14 +451,14 @@ impl RocksStore {
                     v.copy_from_slice(&value);
                     map.insert(Address(k), u64::from_le_bytes(v));
                 }
-                Ok((key, value)) => tracing::warn!(
-                    "skipping malformed CF_BONDED row (key {}B, val {}B) — consensus state may be corrupt",
-                    key.len(), value.len()
-                ),
-                Err(e) => tracing::warn!("CF_BONDED iterator error: {e}"),
+                Ok((key, value)) => return Err(format!(
+                    "corrupt CF_BONDED row (key {}B, val {}B) — consensus state is unreadable; \
+                     resync from a fresh data dir", key.len(), value.len()
+                )),
+                Err(e) => return Err(format!("CF_BONDED iterator error: {e}")),
             }
         }
-        map
+        Ok(map)
     }
 
     pub fn put_unbonding(&self, who: &Address, chunks: &[UnbondingChunk]) -> Result<(), rocksdb::Error> {
@@ -466,7 +471,8 @@ impl RocksStore {
         let cf = self.cf(CF_UNBONDING);
         self.db.delete_cf(&cf, who.0)
     }
-    pub fn all_unbonding(&self) -> HashMap<Address, Vec<UnbondingChunk>> {
+    /// M1: fail-HARD load of the unbonding-stake consensus map (see `all_escrow`).
+    pub fn all_unbonding(&self) -> Result<HashMap<Address, Vec<UnbondingChunk>>, String> {
         let cf = self.cf(CF_UNBONDING);
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         let mut map = HashMap::new();
@@ -479,19 +485,20 @@ impl RocksStore {
                             k.copy_from_slice(&key);
                             map.insert(Address(k), chunks);
                         }
-                        Err(e) => tracing::warn!(
-                            "skipping un-decodable CF_UNBONDING row — consensus state may be corrupt: {e}"
-                        ),
+                        Err(e) => return Err(format!(
+                            "un-decodable CF_UNBONDING row — consensus state is unreadable; \
+                             resync from a fresh data dir: {e}"
+                        )),
                     }
                 }
-                Ok((key, _)) => tracing::warn!(
-                    "skipping malformed CF_UNBONDING row (key {}B) — consensus state may be corrupt",
-                    key.len()
-                ),
-                Err(e) => tracing::warn!("CF_UNBONDING iterator error: {e}"),
+                Ok((key, _)) => return Err(format!(
+                    "corrupt CF_UNBONDING row (key {}B) — consensus state is unreadable; \
+                     resync from a fresh data dir", key.len()
+                )),
+                Err(e) => return Err(format!("CF_UNBONDING iterator error: {e}")),
             }
         }
-        map
+        Ok(map)
     }
 
     // Batch variants for atomic block application (mirror batch_put_account).
@@ -532,7 +539,8 @@ impl RocksStore {
         let cf = self.cf(CF_LIFECYCLE);
         self.db.delete_cf(&cf, job_id)
     }
-    pub fn all_lifecycle(&self) -> HashMap<[u8; 32], JobLifecycleRecord> {
+    /// M1: fail-HARD load of the per-job lifecycle consensus map (see `all_escrow`).
+    pub fn all_lifecycle(&self) -> Result<HashMap<[u8; 32], JobLifecycleRecord>, String> {
         let cf = self.cf(CF_LIFECYCLE);
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         let mut map = HashMap::new();
@@ -545,19 +553,20 @@ impl RocksStore {
                             k.copy_from_slice(&key);
                             map.insert(k, rec);
                         }
-                        Err(e) => tracing::warn!(
-                            "skipping un-decodable CF_LIFECYCLE row — consensus state may be corrupt: {e}"
-                        ),
+                        Err(e) => return Err(format!(
+                            "un-decodable CF_LIFECYCLE row — consensus state is unreadable; \
+                             resync from a fresh data dir: {e}"
+                        )),
                     }
                 }
-                Ok((key, _)) => tracing::warn!(
-                    "skipping malformed CF_LIFECYCLE row (key {}B) — consensus state may be corrupt",
-                    key.len()
-                ),
-                Err(e) => tracing::warn!("CF_LIFECYCLE iterator error: {e}"),
+                Ok((key, _)) => return Err(format!(
+                    "corrupt CF_LIFECYCLE row (key {}B) — consensus state is unreadable; \
+                     resync from a fresh data dir", key.len()
+                )),
+                Err(e) => return Err(format!("CF_LIFECYCLE iterator error: {e}")),
             }
         }
-        map
+        Ok(map)
     }
     pub fn batch_put_lifecycle(&self, batch: &mut WriteBatch, job_id: &[u8; 32], rec: &JobLifecycleRecord) {
         let cf = self.cf(CF_LIFECYCLE);
@@ -579,7 +588,8 @@ impl RocksStore {
         let cf = self.cf(CF_PENDING);
         self.db.delete_cf(&cf, job_id)
     }
-    pub fn all_pending(&self) -> HashMap<[u8; 32], PendingJobRecord> {
+    /// M1: fail-HARD load of the pending-job consensus map (see `all_escrow`).
+    pub fn all_pending(&self) -> Result<HashMap<[u8; 32], PendingJobRecord>, String> {
         let cf = self.cf(CF_PENDING);
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         let mut map = HashMap::new();
@@ -592,19 +602,20 @@ impl RocksStore {
                             k.copy_from_slice(&key);
                             map.insert(k, rec);
                         }
-                        Err(e) => tracing::warn!(
-                            "skipping un-decodable CF_PENDING row — consensus state may be corrupt: {e}"
-                        ),
+                        Err(e) => return Err(format!(
+                            "un-decodable CF_PENDING row — consensus state is unreadable; \
+                             resync from a fresh data dir: {e}"
+                        )),
                     }
                 }
-                Ok((key, _)) => tracing::warn!(
-                    "skipping malformed CF_PENDING row (key {}B) — consensus state may be corrupt",
-                    key.len()
-                ),
-                Err(e) => tracing::warn!("CF_PENDING iterator error: {e}"),
+                Ok((key, _)) => return Err(format!(
+                    "corrupt CF_PENDING row (key {}B) — consensus state is unreadable; \
+                     resync from a fresh data dir", key.len()
+                )),
+                Err(e) => return Err(format!("CF_PENDING iterator error: {e}")),
             }
         }
-        map
+        Ok(map)
     }
     pub fn batch_put_pending(&self, batch: &mut WriteBatch, job_id: &[u8; 32], rec: &PendingJobRecord) {
         let cf = self.cf(CF_PENDING);
@@ -643,6 +654,15 @@ impl RocksStore {
             let cf = self.cf(cf_name);
             batch.delete_range_cf(&cf, range_start, range_end);
         }
+    }
+
+    /// Test-only: write a deliberately-malformed row into a consensus CF so an out-of-module test
+    /// (`ChainState::open`) can exercise the M1 fail-hard load path. `CF_ESCROW` with a 3-byte value
+    /// (≠ the 8-byte width) is a corrupt consensus row.
+    #[cfg(test)]
+    pub fn debug_put_corrupt_escrow_row(&self) {
+        let cf = self.cf(CF_ESCROW);
+        self.db.put_cf(&cf, [0xEEu8; 32], [0u8; 3]).expect("test put");
     }
 
     // ── Feature 188: Storage metrics ──
@@ -769,6 +789,40 @@ mod tests {
             assert!(store.get_account(&test_address(5)).unwrap().is_some());
             assert_eq!(store.get_meta_u64("total_emitted").unwrap(), Some(999));
         }
+    }
+
+    #[test]
+    fn m1_all_escrow_fails_hard_on_malformed_value_width() {
+        // M1: a present-but-malformed consensus row (wrong value width) is a CORRUPT CF — fail hard
+        // with an actionable error rather than warn-skipping (a dropped consensus row makes P8's pot
+        // guard reject every block forever). A valid row + an empty CF still load Ok.
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksStore::open(dir.path()).unwrap();
+        assert!(store.all_escrow().unwrap().is_empty(), "empty CF loads Ok");
+        store.put_escrow(&[1u8; 32], 42).unwrap();
+        assert_eq!(store.all_escrow().unwrap().len(), 1, "valid row loads Ok");
+        // Inject a 3-byte value (≠ 8) directly into the CF.
+        let cf = store.cf(CF_ESCROW);
+        store.db.put_cf(&cf, [2u8; 32], [0u8; 3]).unwrap();
+        let err = store.all_escrow().unwrap_err();
+        assert!(err.contains("corrupt CF_ESCROW"), "got: {err}");
+    }
+
+    #[test]
+    fn m1_all_lifecycle_fails_hard_on_undecodable_row() {
+        // M1: an undecodable borsh value in a consensus CF fails hard (not warn-skip).
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksStore::open(dir.path()).unwrap();
+        assert!(store.all_lifecycle().unwrap().is_empty(), "empty CF loads Ok");
+        let cf = store.cf(CF_LIFECYCLE);
+        store.db.put_cf(&cf, [7u8; 32], b"not-a-borsh-record").unwrap();
+        let err = store.all_lifecycle().unwrap_err();
+        assert!(err.contains("un-decodable CF_LIFECYCLE"), "got: {err}");
+        // A malformed key width also fails hard.
+        let cf2 = store.cf(CF_PENDING);
+        store.db.put_cf(&cf2, [1u8; 7], b"x").unwrap();
+        let err2 = store.all_pending().unwrap_err();
+        assert!(err2.contains("corrupt CF_PENDING"), "got: {err2}");
     }
 
     #[test]

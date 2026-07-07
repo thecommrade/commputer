@@ -4,7 +4,7 @@ use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 use borsh::{BorshSerialize, BorshDeserialize};
 use sha2::{Digest, Sha256};
-use commputer_core::block::Block;
+use commputer_core::block::{Block, BlockHash};
 use commputer_core::identity::Address;
 use commputer_core::token::{Amount, TOTAL_SUPPLY};
 use commputer_core::transaction::{TxKind, Transaction};
@@ -350,22 +350,30 @@ impl ChainState {
             blocks.put(block);
         }
 
-        // PoUW P2 (B1a): load the persisted consensus money/stake maps.
-        let escrow_by_job = rocks.all_escrow();
-        let bonded_stake = rocks.all_bonded();
-        let unbonding_stake = rocks.all_unbonding();
+        // PoUW P2 (B1a): load the persisted consensus money/stake maps. M1: a corrupt (present-but-
+        // undecodable) consensus row now FAILS the open with an actionable error rather than
+        // warn-skipping — a silently-dropped consensus row makes P8's pot guard reject every block
+        // forever. An empty CF loads as an empty map (no error).
+        let escrow_by_job = rocks.all_escrow().map_err(StateError::StorageError)?;
+        let bonded_stake = rocks.all_bonded().map_err(StateError::StorageError)?;
+        let unbonding_stake = rocks.all_unbonding().map_err(StateError::StorageError)?;
         // Phase 1.1 (B2/G-B): the 5th map — submitted-but-unclaimed jobs.
-        let pending_jobs = rocks.all_pending();
+        let pending_jobs = rocks.all_pending().map_err(StateError::StorageError)?;
 
         // PoUW P2 (B1b): load persisted job_lifecycles. GameParams/ResolutionParams are genesis-anchored
         // (identical for every job) so they are NOT persisted per-job — reconstruct + re-inject them.
         // TODO(B8, PROTECTED genesis): populate these from GenesisConfig; default until then. Because
         // every lifecycle was created with the same consensus params, re-injecting this copy reproduces
         // the original params exactly (true now with defaults, and post-B8 with genesis values).
+        // open() reconstructs lifecycles with DEFAULT params (byte-identical to pre-B8 behavior); the
+        // node's `set_consensus_params` call right after open() (1.2b main.rs) RE-INJECTS the genesis
+        // params into every lifecycle before any block settles (C1 — the fork-safety fix), so settling
+        // with these defaults never reaches consensus.
         let game_params = GameParams::default();
         let resolution_params = ResolutionParams::default();
         let job_lifecycles: HashMap<[u8; 32], JobLifecycle> = rocks
             .all_lifecycle()
+            .map_err(StateError::StorageError)?
             .into_iter()
             .map(|(id, rec)| (id, JobLifecycle::from_record(rec, game_params.clone(), resolution_params)))
             .collect();
@@ -728,6 +736,10 @@ impl ChainState {
             for tx in &block.transactions {
                 self.apply_transaction(tx)?;
             }
+            // B5: draw the committee for every job whose executor posted a result (this block or
+            // earlier) but whose committee is not yet drawn — BETWEEN the tx loop and settlement,
+            // inside the rollback envelope. Money-free + deterministic (seed = block.hash()).
+            self.draw_committees_for_completed_jobs(block.hash());
             // P8: the deterministic in-apply settlement driver — runs INSIDE the rollback
             // envelope (its guards are unreachable by construction, but if one ever fires the
             // block is rejected without smear) and BEFORE the block is stored/persisted, so
@@ -1361,9 +1373,27 @@ impl ChainState {
                 self.accounts.get_or_create(tx.from).nonce += 1;
             }
 
-            TxKind::CompleteJob { .. } => {
-                // Feature 54: Executor submits result hash.
-                sender.nonce += 1;
+            TxKind::CompleteJob { job_id, result_hash } => {
+                // B5 (flip): the executor posts its result hash. `post_result` RECORDS it (validating
+                // phase/executor/window at PARENT height); the committee is DRAWN in the block tail
+                // (`draw_committees_for_completed_jobs`) from the `block.hash()` seed — never here (the
+                // tx arm has no block hash). Unknown / wrong-phase / wrong-executor / past-window all
+                // reject the whole block (consensus-format change in the coordinated flip). No money
+                // moves. BORROW NOTE: the outer `sender` is not referenced (Bond-arm pattern); nonce
+                // via a fresh get_or_create after the fallible check.
+                // P3: the keyless zero address can never be an executor.
+                if tx.from.is_zero() {
+                    return Err(StateError::InvalidBlock("zero address cannot complete jobs".into()));
+                }
+                let height = self.blocks.height(); // G-F parent height
+                match self.lifecycle_post_result(*job_id, ParticipantId(tx.from.0), *result_hash, height) {
+                    Some(EventResult::Accepted) => {}
+                    Some(EventResult::Rejected(r)) => {
+                        return Err(StateError::InvalidBlock(format!("complete rejected: {r:?}")));
+                    }
+                    None => return Err(StateError::InvalidBlock("complete: unknown job".into())),
+                }
+                self.accounts.get_or_create(tx.from).nonce += 1;
             }
 
             TxKind::DisputeJob { .. } => {
@@ -1526,8 +1556,20 @@ impl ChainState {
                 // the outer Batch arm bumps the nonce once.
                 self.apply_claim_job(from, *job_id)?;
             }
-            TxKind::CompleteJob { .. } => {
-                // Feature 54: CompleteJob in batch — no-op beyond nonce (handled at batch level).
+            TxKind::CompleteJob { job_id, result_hash } => {
+                // B5 (flip): identical semantics to the top-level arm (shared `lifecycle_post_result`);
+                // the outer Batch arm bumps the nonce once. The block-tail draw runs after all ops.
+                if from.is_zero() {
+                    return Err(StateError::InvalidBlock("zero address cannot complete jobs".into()));
+                }
+                let height = self.blocks.height();
+                match self.lifecycle_post_result(*job_id, ParticipantId(from.0), *result_hash, height) {
+                    Some(EventResult::Accepted) => {}
+                    Some(EventResult::Rejected(r)) => {
+                        return Err(StateError::InvalidBlock(format!("complete rejected: {r:?}")));
+                    }
+                    None => return Err(StateError::InvalidBlock("complete: unknown job".into())),
+                }
             }
             TxKind::DisputeJob { .. } => {
                 // Feature 55: DisputeJob in batch — verify validator.
@@ -1602,8 +1644,14 @@ impl ChainState {
                 "only validators can claim compute jobs".into(),
             ));
         }
+        // M2 (flip): an unknown/expired job id now REJECTS the whole block instead of the legacy
+        // silent no-op accept. Deterministic (reads only `pending_jobs`), symmetric with the
+        // Commit/Reveal/CompleteJob unknown-id rejections in this bundle. A V1 SubmitJob pool job
+        // never entered `pending_jobs`, so its on-chain ClaimJob was always a meaningless no-op —
+        // rejecting it breaks no money flow. Honest producers avoid building such a block via the
+        // 1.2b mempool ingress pre-filter (C7).
         let Some(rec) = self.pending_jobs.get(&job_id).copied() else {
-            return Ok(()); // legacy path: V1 pool job / unknown id — accept, no money (unchanged)
+            return Err(StateError::InvalidBlock("claim: unknown or expired job id".into()));
         };
         let height = self.blocks.height(); // G-F: parent height during apply
         if height > rec.claim_by {
@@ -2766,6 +2814,84 @@ pub fn pending_job_from_tx(
     }
 }
 
+/// B8: the genesis-anchored consensus params in their live `ChainState` form. Converted from the
+/// dependency-free `core::genesis::ConsensusParamsConfig` HERE (storage can reference the pouw
+/// types; `commputer-core` cannot). Carries the four scalar param structs `set_consensus_params`
+/// installs, plus the full `ConsensusParams` bundle the node's 1.2b startup gate feeds to
+/// `refuse_to_bind`.
+pub struct GenesisConsensusParams {
+    pub game: GameParams,
+    pub resolution: ResolutionParams,
+    pub phase_windows: PhaseWindows,
+    pub stake: StakeParams,
+    /// Full bundle for `refuse_to_bind` (fingerprint + validate). `wasm_limits`/`chunking` are not
+    /// genesis-configurable this pass, so they keep the node's COMPILED defaults — exactly what
+    /// `ChainState` uses today.
+    pub bundle: commputer_pouw_onchain::consensus_params::ConsensusParams,
+}
+
+/// B8 converter: `core::genesis::ConsensusParamsConfig` → the live consensus-param structs. Pure.
+/// A config equal to `ConsensusParamsConfig::default()` yields EXACTLY the `pouw`/`pouw-onchain`
+/// defaults `ChainState` uses today (the C9c drift-guard test asserts this field-for-field).
+pub fn genesis_consensus_params(
+    cfg: &commputer_core::genesis::ConsensusParamsConfig,
+) -> GenesisConsensusParams {
+    let g = &cfg.game;
+    let game = GameParams {
+        k: g.k,
+        k_escalate: g.k_escalate,
+        sample_rate_bps: g.sample_rate_bps,
+        p_trap_bps: g.p_trap_bps,
+        quorum_num: g.quorum_num,
+        quorum_den: g.quorum_den,
+        worker_bps: g.worker_bps,
+        verifier_bps: g.verifier_bps,
+        burn_bps: g.burn_bps,
+        executor_bond: g.executor_bond,
+        verifier_bond: g.verifier_bond,
+        challenger_bond: g.challenger_bond,
+        dispute_bounty_bps: g.dispute_bounty_bps,
+        challenger_reward_bps: g.challenger_reward_bps,
+        escalation_reward_bps: g.escalation_reward_bps,
+        trap_jackpot_bps: g.trap_jackpot_bps,
+        price_per_mfuel: g.price_per_mfuel,
+        profit_margin_bps: g.profit_margin_bps,
+        bond_safety_bps: g.bond_safety_bps,
+    };
+    let resolution = ResolutionParams {
+        cancel_burn_bps: cfg.resolution.cancel_burn_bps,
+        timeout_submitter_comp_bps: cfg.resolution.timeout_submitter_comp_bps,
+    };
+    let phase_windows = PhaseWindows {
+        result_blocks: cfg.phase_windows.result_blocks,
+        commit_blocks: cfg.phase_windows.commit_blocks,
+        reveal_blocks: cfg.phase_windows.reveal_blocks,
+        claim_blocks: cfg.phase_windows.claim_blocks,
+    };
+    let stake = StakeParams {
+        unbonding_blocks: cfg.stake.unbonding_blocks,
+        min_bond: cfg.stake.min_bond,
+    };
+    let capacity = commputer_pouw_onchain::capacity::CapacityParams {
+        total_slots: cfg.capacity.total_slots,
+        flagship_reserve_bps: cfg.capacity.flagship_reserve_bps,
+        reserve_floor_bps: cfg.capacity.reserve_floor_bps,
+        reserve_max_bps: cfg.capacity.reserve_max_bps,
+        reserve_churn_coeff_bps: cfg.capacity.reserve_churn_coeff_bps,
+    };
+    // Compiled-default bundle with the genesis-configurable groups overridden; `wasm_limits`/
+    // `chunking` stay at the node's compiled defaults (struct-update syntax — no clippy churn).
+    let bundle = commputer_pouw_onchain::consensus_params::ConsensusParams {
+        game: game.clone(),
+        resolution,
+        phase_windows,
+        capacity,
+        min_fuel_cap: cfg.min_fuel_cap,
+        ..commputer_pouw_onchain::consensus_params::ConsensusParams::default()
+    };
+    GenesisConsensusParams { game, resolution, phase_windows, stake, bundle }
+}
+
 // ===================================================================================
 // PoUW P1 — per-job escrow foundation (the on-chain analog of the staging
 // `commputer-pouw-onchain::escrow_ledger::EscrowLedger`).
@@ -3195,6 +3321,62 @@ impl ChainState {
         Some(life.record_reveal(r, height))
     }
 
+    /// B5 step 1: record the executor's result (no money move; the committee is drawn later in the
+    /// block tail by `draw_committees_for_completed_jobs`). `None` if no lifecycle for `job_id`. A
+    /// `get_mut` borrow suffices — `post_result` touches no ledger (mirror of
+    /// `lifecycle_record_reveal`).
+    pub fn lifecycle_post_result(
+        &mut self,
+        job_id: [u8; 32],
+        executor: ParticipantId,
+        result_hash: [u8; 32],
+        height: u64,
+    ) -> Option<EventResult> {
+        let life = self.job_lifecycles.get_mut(&job_id)?;
+        Some(life.post_result(executor, result_hash, height))
+    }
+
+    /// B5 step 2 (block tail): draw the committee for every lifecycle whose executor has posted a
+    /// result but whose committee is not yet drawn. Runs once per applied block, INSIDE the
+    /// rollback envelope, BETWEEN the tx loop and `settle_due_jobs`. Money-free.
+    ///
+    /// DETERMINISM (fork-safety, §0): every input is consensus state. The per-job seed is
+    /// `hash(block_hash‖job_id)` (frozen `ids::hash_parts`) — `block.hash()` is node-independent
+    /// once the block is finalized, and mixing `job_id` de-correlates jobs sharing a block. The
+    /// candidates were snapshotted + SORTED at ClaimJob (already in the state root); `stake_of`
+    /// reads only `bonded_stake`; `k` is the genesis game param. NOTHING here reads
+    /// `consensus.slashed_validators`, the wall-clock, an RNG, or HashMap iteration order — the
+    /// job_ids are SORTED before the draw so HashMap order can never reach the committee (which
+    /// folds into the state root). The frozen `select_committee` (sorts by `(ticket, id)`) is the
+    /// only selection logic.
+    fn draw_committees_for_completed_jobs(&mut self, block_hash: BlockHash) {
+        let mut jobs: Vec<[u8; 32]> = self
+            .job_lifecycles
+            .iter()
+            .filter(|(_, l)| {
+                l.phase() == Phase::AwaitingResult
+                    && l.executor_hash_is_set()
+                    && l.committee().is_empty()
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        jobs.sort_unstable(); // HashMap order must never reach consensus
+        for job_id in jobs {
+            let seed = commputer_pouw::ids::hash_parts(&[&block_hash.0, &job_id]);
+            // Borrow dance: own the lifecycle OUT of the map so the `&*self` stake reads (bonded_stake)
+            // don't alias the map mutation — same shape as `lifecycle_record_commit`'s pre-check.
+            let mut life = self
+                .job_lifecycles
+                .remove(&job_id)
+                .expect("job_id came from the filtered live set");
+            {
+                let chain = &*self;
+                life.draw_committee(seed, &|p| chain.stake_of(&Address(p.0)));
+            }
+            self.job_lifecycles.insert(job_id, life);
+        }
+    }
+
     /// Advance the lifecycle's phase by block height (no money move). `None` if no lifecycle.
     pub fn lifecycle_advance(&mut self, job_id: [u8; 32], height: u64) -> Option<Phase> {
         let life = self.job_lifecycles.get_mut(&job_id)?;
@@ -3277,6 +3459,118 @@ impl ChainState {
         };
         self.job_lifecycles.remove(&job_id); // drain (the pot is 0 on every path here)
         Ok(Some((terminal, fb)))
+    }
+
+    /// B8 (C1): install the genesis-anchored consensus params AND re-inject them into every
+    /// in-memory `JobLifecycle`. The node calls this once, right after `open()` (1.2b main.rs), so
+    /// a node that restarted mid-lifecycle settles with GENESIS params, not the defaults `open()`
+    /// reconstructs with.
+    ///
+    /// C1 (the fork-safety fix): `open()` rebuilds each lifecycle via
+    /// `from_record(rec, GameParams::default(), ResolutionParams::default())` (game/resolution are
+    /// not persisted per-job). `settle` reads the per-lifecycle `self.params`/`self.rparams`, so a
+    /// node that settled a reloaded lifecycle with DEFAULT params while peers used GENESIS params
+    /// would compute a different Terminal → a different `SettlementOutcomeRec` in the state root →
+    /// a HARD FORK. So after setting the scalar fields we REBUILD every lifecycle through its DTO
+    /// with the just-installed params — `to_record()`/`from_record` round-trips every per-job field
+    /// (phase/committee/commitments/reveals/deadlines/executor_hash/settled), changing ONLY the
+    /// re-injected params. No money moves; no settlement runs in the startup window, so the rebuild
+    /// is sufficient and keeps the protected footprint to this one call.
+    ///
+    /// C4: rejects any phase window < 1 (a zero window would let a same-block draw be swept to
+    /// instant NoQuorum by `settle_due_jobs`). 1.2b's `refuse_to_bind` is the full startup gate;
+    /// this guard keeps `set_consensus_params` self-consistent.
+    pub fn set_consensus_params(
+        &mut self,
+        game: GameParams,
+        resolution: ResolutionParams,
+        phase_windows: PhaseWindows,
+        stake: StakeParams,
+    ) -> Result<(), StateError> {
+        if phase_windows.result_blocks < 1
+            || phase_windows.commit_blocks < 1
+            || phase_windows.reveal_blocks < 1
+            || phase_windows.claim_blocks < 1
+        {
+            return Err(StateError::InvalidBlock(
+                "consensus phase windows must be >= 1 block".into(),
+            ));
+        }
+        self.game_params = game;
+        self.resolution_params = resolution;
+        self.phase_windows = phase_windows;
+        self.stake_params = stake;
+        // C1: re-inject the params into every reconstructed lifecycle (see doc above).
+        for life in self.job_lifecycles.values_mut() {
+            let rec = life.to_record();
+            *life = JobLifecycle::from_record(rec, self.game_params.clone(), self.resolution_params);
+        }
+        Ok(())
+    }
+
+    /// 1.2-MEMPOOL (soundness engine, logic non-protected): from `candidates` (already sig/nonce/
+    /// fee-validated for the mempool) return `(kept, requeue)`, where `kept` is the largest in-order
+    /// prefix-closed subset that applies CLEANLY in sequence on top of the CURRENT committed state
+    /// (so a block built from `kept` cannot fail apply), and `requeue` holds txs that are merely
+    /// early/late in their PoUW phase window (C3) — the caller pushes them back into the mempool
+    /// like a future-nonce tx. Permanently-doomed txs (insufficient balance, zero-from, unknown/
+    /// duplicate job, V2-in-Batch, …) are dropped into neither set.
+    ///
+    /// C2 (no clone; guaranteed restore): `ChainState` is NOT `Clone`, so this MUTATES `self` to
+    /// trial-apply and then FULLY restores it from the entry snapshot before returning. Restoration
+    /// is guaranteed: the only early return is the final one AFTER the restore, every per-tx failure
+    /// is rolled back to the per-tx snapshot immediately, and `apply_transaction` is panic-free by
+    /// the P1 pre-validation contract (the same contract `apply_txs_with_rollback` already relies
+    /// on). The caller therefore sees `self` byte-identical to entry — post-call state root ==
+    /// pre-call root, no smear (the class P1 rollback fixed).
+    pub fn select_applicable_txs(
+        &mut self,
+        candidates: Vec<Transaction>,
+    ) -> (Vec<Transaction>, Vec<Transaction>) {
+        let entry = self.capture_pre_block();
+        let mut kept = Vec::with_capacity(candidates.len());
+        let mut requeue = Vec::new();
+        for tx in candidates {
+            // Per-tx snapshot: `apply_transaction` deducts+burns the fee BEFORE the arm, so a
+            // mid-arm Err leaves a partial smear that must be rolled back before the next trial.
+            let per_tx = self.capture_pre_block();
+            match self.apply_transaction(&tx) {
+                Ok(()) => kept.push(tx),
+                Err(e) => {
+                    self.rollback_to_pre_block(per_tx);
+                    if self.tx_is_phase_deferred(&tx, &e) {
+                        requeue.push(tx);
+                    }
+                    // else: permanently doomed at this committed state — drop.
+                }
+            }
+        }
+        self.rollback_to_pre_block(entry);
+        (kept, requeue)
+    }
+
+    /// C3 classifier: whether a rejected candidate is merely EARLY/LATE in its PoUW phase window
+    /// (requeue) versus permanently doomed (drop). Reads only committed state (post per-tx rollback)
+    /// — deterministic. A Commit/Reveal/CompleteJob whose job EXISTS (a live lifecycle, or a pending
+    /// record a later ClaimJob will open) is phase-deferred: e.g. a Commit sharing a block with its
+    /// own CompleteJob sees an empty committee (the draw runs in the tail) → WrongPhase now, valid
+    /// once the phase advances. Insufficient-balance and zero-from are permanently doomed regardless
+    /// of kind; every other failure (unknown job, duplicate job, V2-in-Batch, non-job txs) drops.
+    fn tx_is_phase_deferred(&self, tx: &Transaction, err: &StateError) -> bool {
+        if matches!(err, StateError::InsufficientBalance) {
+            return false; // doomed at this state (C3)
+        }
+        if tx.from.is_zero() {
+            return false; // keyless zero address is permanently invalid on every money arm
+        }
+        match &tx.kind {
+            TxKind::Commit { job_id, .. }
+            | TxKind::Reveal { job_id, .. }
+            | TxKind::CompleteJob { job_id, .. } => {
+                self.job_lifecycles.contains_key(job_id) || self.pending_jobs.contains_key(job_id)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -6721,19 +7015,29 @@ mod tests {
     }
 
     #[test]
-    fn b3_claim_unknown_id_is_legacy_accept_no_money() {
-        // V1 pool jobs / unknown ids keep the legacy accept (nonce only) — unchanged behavior.
+    fn m2_claim_unknown_id_rejects_block_no_smear() {
+        // M2 (flip): an unknown/expired job id now REJECTS the whole block (was the legacy no-op
+        // accept). Deterministic reject, P1 rollback leaves no trace (root unchanged).
         let mut state = ChainState::new();
         state.apply_block(&genesis_block()).unwrap();
         let v = state.accounts.get_or_create(addr(1));
         v.is_validator = true;
         v.balance = Amount::from_raw(1_000);
-        state
+        let root = state.compute_state_root();
+        let err = state
             .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: [9u8; 32] })]))
-            .unwrap();
-        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 1, "accepted, nonce bumped");
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown or expired job id"), "got: {err}");
+        assert_eq!(state.accounts.get(&addr(1)).map(|a| a.nonce).unwrap_or(0), 0, "no nonce bump on reject");
         assert_eq!(bal(&state, 1), 1_000, "no money moved");
         assert!(state.job_lifecycles.is_empty() && state.escrow_by_job.is_empty());
+        assert_eq!(state.compute_state_root(), root, "P1 rollback: rejected block leaves no trace");
+        // Inside a Batch: same reject (shared apply_claim_job).
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, TxKind::Batch {
+                operations: vec![TxKind::ClaimJob { job_id: [9u8; 32] }] })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown or expired job id"), "batch got: {err}");
     }
 
     #[test]
@@ -7865,12 +8169,13 @@ mod tests {
 
     #[test]
     fn revert_refuses_blocks_carrying_the_new_pouw_kinds() {
-        // Guard 2 (tx-kind scan) extended for B2–B4: kinds that CAN apply while leaving the
-        // maps empty (legacy-accept ClaimJob, CompleteJob no-op) must still refuse revert.
+        // Guard 2 (tx-kind scan): a PoUW-consensus kind that CAN apply while leaving the maps empty
+        // must still refuse revert. Post-flip, ClaimJob/CompleteJob unknown ids REJECT at apply
+        // (M2/B5) — see below — so the applies-but-leaves-maps-empty case is exercised by
+        // WithdrawUnbonded (a no-op when there is no unbonding stake).
         for kind in [
-            TxKind::ClaimJob { job_id: [9u8; 32] },
-            TxKind::CompleteJob { job_id: [9u8; 32], result_hash: [1u8; 32] },
-            TxKind::Batch { operations: vec![TxKind::ClaimJob { job_id: [9u8; 32] }] },
+            TxKind::WithdrawUnbonded,
+            TxKind::Batch { operations: vec![TxKind::WithdrawUnbonded] },
         ] {
             let mut state = ChainState::new();
             state.apply_block(&genesis_block()).unwrap();
@@ -7883,12 +8188,37 @@ mod tests {
             assert!(
                 state.escrow_by_job.is_empty()
                     && state.job_lifecycles.is_empty()
+                    && state.bonded_stake.is_empty()
+                    && state.unbonding_stake.is_empty()
                     && state.pending_jobs.is_empty(),
                 "precondition: maps empty ⇒ this exercises guard 2, not guard 1"
             );
             let err = state.revert_block(1).unwrap_err();
             assert!(err.to_string().contains("consensus maps"), "kind {kind:?}: got {err}");
         }
+
+        // Post-flip: an unknown-id ClaimJob / CompleteJob can no longer be applied at all (M2 + B5),
+        // so no accepted block can carry them into an empty-map state to be reverted.
+        for kind in [
+            TxKind::ClaimJob { job_id: [9u8; 32] },
+            TxKind::CompleteJob { job_id: [9u8; 32], result_hash: [1u8; 32] },
+            TxKind::Batch { operations: vec![TxKind::ClaimJob { job_id: [9u8; 32] }] },
+        ] {
+            let mut state = ChainState::new();
+            state.apply_block(&genesis_block()).unwrap();
+            let v = state.accounts.get_or_create(addr(1));
+            v.is_validator = true;
+            v.balance = Amount::from_raw(1_000);
+            let err = state
+                .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, kind.clone())]))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("unknown or expired job id")
+                    || err.to_string().contains("complete: unknown job"),
+                "kind {kind:?} must reject at apply post-flip, got: {err}"
+            );
+        }
+
         // A V2 block leaves pending+escrow non-empty ⇒ refused as well (guard 1 backstop).
         let mut state = ChainState::new();
         state.apply_block(&genesis_block()).unwrap();
@@ -8016,5 +8346,529 @@ mod tests {
         assert_eq!(both.chain.escrowed_for_job(&both.job), 0, "reduced pot drained to exactly 0");
         assert_eq!(both.chain.total_burned, 1_650, "exactly the forfeited bond burned on-chain");
         assert_eq!(both.staging.balance_of(&lpid(12)), 0, "silent committer stays forfeited");
+    }
+
+    // ===========================================================================================
+    // Phase 1.2a — B5 on-chain committee draw, B8 params, C1 restart-determinism, C2/C3 mempool,
+    // M1 fail-hard, C9c genesis defaults.
+    // ===========================================================================================
+
+    /// B5 on-chain driver: fund submitter/executor + 5 bonded verifiers (candidate pool of 5, k=3 ⇒
+    /// a SEED-dependent 3-member committee), then apply real Submit + Claim blocks. `order` fixes the
+    /// bonded_stake INSERTION order so the two-node test can prove HashMap-order independence of the
+    /// draw. Returns (state, job_id): lifecycle AwaitingResult, committee NOT yet drawn.
+    fn onchain_claimed(order: &[u8]) -> (ChainState, [u8; 32]) {
+        let min_bond = StakeParams::default().min_bond;
+        let v_bond = GameParams::default().verifier_bond;
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(MIN_BUDGET);
+        let e = state.accounts.get_or_create(addr(1));
+        e.is_validator = true;
+        e.balance = Amount::from_raw(MIN_BUDGET);
+        for &v in order {
+            let a = state.accounts.get_or_create(addr(v));
+            a.is_validator = true;
+            a.balance = Amount::from_raw(v_bond);
+            state.bonded_stake.insert(addr(v), min_bond);
+        }
+        let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+        let job = submit.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![submit])).unwrap();
+        state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job })]))
+            .unwrap();
+        (state, job)
+    }
+
+    /// A CompleteJob block whose timestamp is overridden to `ts` — perturbs `block.hash()` (⇒ the
+    /// draw seed) without touching the tx set.
+    fn complete_block_ts(state: &ChainState, job: [u8; 32], result: [u8; 32], ts: u64) -> Block {
+        let mut b = block_with(
+            state,
+            state.blocks.height() + 1,
+            vec![unsigned(addr(1), 1, TxKind::CompleteJob { job_id: job, result_hash: result })],
+        );
+        b.header.timestamp = ts;
+        b
+    }
+
+    #[test]
+    fn b5_onchain_two_nodes_same_block_identical_committee_and_root() {
+        // Two independently-built states (DIFFERENT bonded-stake insertion order) apply the SAME
+        // finalized CompleteJob block ⇒ identical drawn committee + identical state root. This is the
+        // fork-safety core: the draw reads only block.hash() + the sorted candidate snapshot +
+        // bonded_stake + genesis k — never HashMap iteration order.
+        let (mut a, ja) = onchain_claimed(&[3, 4, 5, 6, 7]);
+        let (mut b, jb) = onchain_claimed(&[7, 6, 5, 4, 3]);
+        assert_eq!(ja, jb, "same submit tx ⇒ same job id");
+        let cj = complete_block_ts(&a, ja, [7u8; 32], 5000); // ONE block, applied to both
+        a.apply_block(&cj).unwrap();
+        b.apply_block(&cj).unwrap();
+        let ca = a.job_lifecycles.get(&ja).unwrap().to_record().committee;
+        let cb = b.job_lifecycles.get(&jb).unwrap().to_record().committee;
+        assert_eq!(ca.len(), 3, "k=3 drawn from a 5-candidate pool");
+        assert_eq!(ca, cb, "committee is candidate/HashMap-order independent + node-independent");
+        assert_eq!(
+            a.compute_state_root(),
+            b.compute_state_root(),
+            "identical state root (the committee folds into it)"
+        );
+    }
+
+    #[test]
+    fn b5_onchain_committee_is_seed_sensitive_and_folds_into_state_root() {
+        // Vary ONLY the block-hash seed (via timestamp) across otherwise-identical runs. The only
+        // resulting state difference is the drawn committee (same accounts/escrow/pending, executor
+        // nonce bumped identically), so: (a) the committee must actually vary with the seed, and
+        // (b) the state root differs IFF the committee differs — proving the committee is committed
+        // to by the root (the §0 membership-gate fork surface).
+        let mut seen: Vec<(Vec<[u8; 32]>, [u8; 32])> = Vec::new();
+        for ts in 3000u64..3016 {
+            let (mut s, job) = onchain_claimed(&[3, 4, 5, 6, 7]);
+            let cj = complete_block_ts(&s, job, [7u8; 32], ts);
+            s.apply_block(&cj).unwrap();
+            let committee = s.job_lifecycles.get(&job).unwrap().to_record().committee;
+            assert_eq!(committee.len(), 3);
+            seen.push((committee, s.compute_state_root()));
+        }
+        let distinct: HashSet<Vec<[u8; 32]>> = seen.iter().map(|(c, _)| c.clone()).collect();
+        assert!(distinct.len() > 1, "committee must depend on the seed; got {} distinct", distinct.len());
+        for (ca, ra) in &seen {
+            for (cb, rb) in &seen {
+                assert_eq!(ca == cb, ra == rb, "the drawn committee folds injectively into the state root");
+            }
+        }
+    }
+
+    #[test]
+    fn b5_completejob_arm_guards_reject_the_block() {
+        // unknown job id ⇒ reject.
+        let (mut s, _job) = onchain_claimed(&[3, 4, 5, 6, 7]);
+        let err = s.apply_block(&complete_block_ts(&s, [0xABu8; 32], [7u8; 32], 4000)).unwrap_err();
+        assert!(err.to_string().contains("complete: unknown job"), "unknown: {err}");
+
+        // wrong executor: a candidate validator (addr 3), not the executor (addr 1), posts.
+        let (mut s, job) = onchain_claimed(&[3, 4, 5, 6, 7]);
+        let cj = block_with(&s, 3, vec![unsigned(addr(3), 0, TxKind::CompleteJob { job_id: job, result_hash: [7u8; 32] })]);
+        let err = s.apply_block(&cj).unwrap_err();
+        assert!(err.to_string().contains("NotExecutor"), "wrong executor: {err}");
+
+        // wrong phase: a second CompleteJob (the first drew the committee ⇒ Committing).
+        let (mut s, job) = onchain_claimed(&[3, 4, 5, 6, 7]);
+        s.apply_block(&complete_block_ts(&s, job, [7u8; 32], 4001)).unwrap();
+        let cj2 = block_with(&s, 4, vec![unsigned(addr(1), 2, TxKind::CompleteJob { job_id: job, result_hash: [7u8; 32] })]);
+        let err = s.apply_block(&cj2).unwrap_err();
+        assert!(err.to_string().contains("WrongPhase"), "second complete: {err}");
+
+        // zero-from ⇒ reject on the P3 guard.
+        let (mut s, job) = onchain_claimed(&[3, 4, 5, 6, 7]);
+        let cj = block_with(&s, 3, vec![unsigned(addr(0), 0, TxKind::CompleteJob { job_id: job, result_hash: [7u8; 32] })]);
+        let err = s.apply_block(&cj).unwrap_err();
+        assert!(err.to_string().contains("zero address"), "zero from: {err}");
+
+        // past window: unreachable on-chain (P8 timeout-settles the AwaitingResult job at the first
+        // block past result_by, before a late CompleteJob can post), so the guard is exercised
+        // directly via lifecycle_post_result at height > result_by (defense-in-depth).
+        let (mut s, job) = onchain_claimed(&[3, 4, 5, 6, 7]);
+        let rby = s.job_lifecycles.get(&job).unwrap().to_record().deadlines.result_by;
+        assert_eq!(
+            s.lifecycle_post_result(job, ParticipantId(addr(1).0), [7u8; 32], rby + 1),
+            Some(EventResult::Rejected(commputer_pouw_onchain::lifecycle::RejectReason::PastWindow)),
+            "post_result past result_by is PastWindow"
+        );
+    }
+
+    #[test]
+    fn b5_onchain_empty_committee_reaches_conserved_noquorum_refund() {
+        // No bonded verifiers ⇒ empty candidate pool ⇒ empty committee ⇒ NoQuorum ⇒ D2 zero-comp
+        // fallback ⇒ FULL refund, pot → 0, conserved. (The empty committee is deterministic, not an
+        // error.)
+        let mut state = ChainState::new();
+        state.phase_windows = PhaseWindows { result_blocks: 2, commit_blocks: 2, reveal_blocks: 2, claim_blocks: 5 };
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(MIN_BUDGET);
+        let e = state.accounts.get_or_create(addr(1));
+        e.is_validator = true;
+        e.balance = Amount::from_raw(MIN_BUDGET);
+        state.total_emitted = 2 * MIN_BUDGET;
+        let conserved0 = money_conserved(&state);
+
+        let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+        let job = submit.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![submit])).unwrap();
+        // claim at parent height 1 ⇒ result_by 3, commit_by 5, reveal_by 7.
+        state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job })]))
+            .unwrap();
+        assert!(
+            state.job_lifecycles.get(&job).unwrap().to_record().candidates.is_empty(),
+            "no bonded verifiers ⇒ empty candidate pool"
+        );
+        // CompleteJob at parent height 2 ≤ result_by 3 ⇒ post_result ok; the tail draws an EMPTY committee.
+        state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(1), 1, TxKind::CompleteJob { job_id: job, result_hash: [7u8; 32] })]))
+            .unwrap();
+        let rec = state.job_lifecycles.get(&job).unwrap().to_record();
+        assert!(rec.committee.is_empty(), "empty candidate pool ⇒ empty committee");
+        assert_eq!(rec.phase, commputer_pouw_onchain::lifecycle::PhaseRec::Committing);
+
+        // Drive empties past reveal_by 7 ⇒ NoQuorum ⇒ D2 refund.
+        while state.blocks.height() < 8 {
+            let h = state.blocks.height() + 1;
+            state.apply_block(&block_with(&state, h, vec![])).unwrap();
+        }
+        assert!(state.job_lifecycles.is_empty(), "settled + drained");
+        assert_eq!(state.escrowed_for_job(&job), 0, "pot fully drained");
+        assert_eq!(money_conserved(&state), conserved0, "conservation held across the empty-committee round");
+        assert_eq!(bal(&state, 2), MIN_BUDGET, "submitter refunded the budget");
+        assert_eq!(bal(&state, 1), MIN_BUDGET, "executor bond returned (zero-comp NoQuorum fallback)");
+    }
+
+    /// Drive a full Confirmed round (on-chain B5 draw) to REVEALED-but-not-settled, on any backend,
+    /// with NON-DEFAULT game params (worker/verifier split ≠ default) + short windows. Returns job.
+    fn c1_drive_to_revealed(state: &mut ChainState) -> [u8; 32] {
+        let min_bond = StakeParams::default().min_bond;
+        let v_bond = GameParams::default().verifier_bond;
+        let mut game = GameParams::default();
+        game.worker_bps = 8_000;
+        game.verifier_bps = 1_500;
+        game.burn_bps = 500; // sum 10_000, ≠ default 8500/1000/500 ⇒ a DIFFERENT Confirmed split
+        state
+            .set_consensus_params(
+                game,
+                ResolutionParams::default(),
+                PhaseWindows { result_blocks: 2, commit_blocks: 2, reveal_blocks: 2, claim_blocks: 5 },
+                StakeParams::default(),
+            )
+            .unwrap();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(MIN_BUDGET);
+        let e = state.accounts.get_or_create(addr(1));
+        e.is_validator = true;
+        e.balance = Amount::from_raw(MIN_BUDGET);
+        for v in [3u8, 4, 5] {
+            let a = state.accounts.get_or_create(addr(v));
+            a.is_validator = true;
+            a.balance = Amount::from_raw(min_bond + v_bond);
+        }
+        // b1: Bond the 3 verifiers (candidate pool of 3, k=3 ⇒ committee == all 3).
+        let bonds: Vec<Transaction> = [3u8, 4, 5]
+            .iter()
+            .map(|&v| unsigned(addr(v), 0, TxKind::Bond { amount: Amount::from_raw(min_bond) }))
+            .collect();
+        let h = state.blocks.height() + 1;
+        state.apply_block(&block_with(state, h, bonds)).unwrap();
+        // b2: Submit.
+        let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+        let job = submit.hash().0;
+        let h = state.blocks.height() + 1;
+        state.apply_block(&block_with(state, h, vec![submit])).unwrap();
+        // b3: Claim (parent 2 ⇒ result_by 4, commit_by 6, reveal_by 8).
+        let h = state.blocks.height() + 1;
+        state.apply_block(&block_with(state, h, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job })])).unwrap();
+        // b4: CompleteJob (parent 3 ≤ 4) ⇒ on-chain draw ⇒ Committing.
+        let h = state.blocks.height() + 1;
+        state.apply_block(&block_with(state, h, vec![unsigned(addr(1), 1, TxKind::CompleteJob { job_id: job, result_hash: [7u8; 32] })])).unwrap();
+        // b5: Commit all 3 (parent 4 ≤ commit_by 6).
+        let commits: Vec<Transaction> = [3u8, 4, 5]
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let c = make_commitment(&ParticipantId(addr(v).0), &[7u8; 32], &[i as u8; 32], v_bond);
+                unsigned(addr(v), 1, TxKind::Commit { job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond) })
+            })
+            .collect();
+        let h = state.blocks.height() + 1;
+        state.apply_block(&block_with(state, h, commits)).unwrap();
+        // b6, b7 empty (advance past commit_by 6).
+        for _ in 0..2 {
+            let h = state.blocks.height() + 1;
+            state.apply_block(&block_with(state, h, vec![])).unwrap();
+        }
+        // b8: Reveal all 3 (parent 7 > commit_by 6 ⇒ self-advance Revealing; ≤ reveal_by 8).
+        let reveals: Vec<Transaction> = [3u8, 4, 5]
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| unsigned(addr(v), 2, TxKind::Reveal { job_id: job, result_hash: [7u8; 32], salt: [i as u8; 32] }))
+            .collect();
+        let h = state.blocks.height() + 1;
+        state.apply_block(&block_with(state, h, reveals)).unwrap();
+        job
+    }
+
+    /// One empty block past reveal_by ⇒ the P8 driver settles the revealed job (Confirmed).
+    fn c1_settle(state: &mut ChainState) {
+        let h = state.blocks.height() + 1;
+        state.apply_block(&block_with(state, h, vec![])).unwrap();
+    }
+
+    fn c1_nondefault_params() -> (GameParams, ResolutionParams, PhaseWindows, StakeParams) {
+        let mut game = GameParams::default();
+        game.worker_bps = 8_000;
+        game.verifier_bps = 1_500;
+        game.burn_bps = 500;
+        (
+            game,
+            ResolutionParams::default(),
+            PhaseWindows { result_blocks: 2, commit_blocks: 2, reveal_blocks: 2, claim_blocks: 5 },
+            StakeParams::default(),
+        )
+    }
+
+    #[test]
+    fn c1_restart_reinjects_genesis_params_matching_a_never_restarted_node() {
+        // CONTROL: never restarts; the lifecycle keeps its non-default game params through settle.
+        let mut ctrl = ChainState::new();
+        let jc = c1_drive_to_revealed(&mut ctrl);
+        c1_settle(&mut ctrl);
+        assert!(ctrl.job_lifecycles.is_empty(), "control settled");
+        let ctrl_root = ctrl.compute_state_root();
+        let ctrl_conserved = money_conserved(&ctrl);
+        let ctrl_exec_bal = bal(&ctrl, 1);
+
+        // RESTART (with the C1 fix): drive to revealed on a rocks-backed node, DROP, reopen (the
+        // lifecycle is reconstructed with DEFAULT params), re-install the genesis params (C1
+        // re-injection rebuilds every lifecycle), settle ⇒ MUST match the never-restarted control.
+        let dir = tempfile::tempdir().unwrap();
+        let jr = {
+            let mut r = ChainState::open(dir.path()).unwrap();
+            let j = c1_drive_to_revealed(&mut r);
+            r.flush().unwrap();
+            j
+        };
+        assert_eq!(jr, jc, "identical job across backends");
+        let mut r = ChainState::open(dir.path()).unwrap();
+        let (g, rp, pw, st) = c1_nondefault_params();
+        r.set_consensus_params(g, rp, pw, st).unwrap();
+        c1_settle(&mut r);
+        assert!(r.job_lifecycles.is_empty(), "restart settled");
+        assert_eq!(
+            r.compute_state_root(),
+            ctrl_root,
+            "C1: a node that restarted mid-lifecycle settles IDENTICALLY once genesis params are re-injected"
+        );
+        assert_eq!(money_conserved(&r), ctrl_conserved, "conservation across restart");
+        assert_eq!(bal(&r, 1), ctrl_exec_bal);
+
+        // NEGATIVE CONTROL (non-vacuous): reopen but DO NOT re-inject ⇒ the reloaded lifecycle keeps
+        // DEFAULT params ⇒ a DIFFERENT Confirmed split ⇒ a DIFFERENT root. Without C1 this is a fork.
+        let dir2 = tempfile::tempdir().unwrap();
+        {
+            let mut n = ChainState::open(dir2.path()).unwrap();
+            let _ = c1_drive_to_revealed(&mut n);
+            n.flush().unwrap();
+        }
+        let mut n = ChainState::open(dir2.path()).unwrap();
+        c1_settle(&mut n);
+        assert!(n.job_lifecycles.is_empty(), "negative control settled with default params");
+        assert_ne!(
+            n.compute_state_root(),
+            ctrl_root,
+            "without C1 re-injection the reloaded node FORKS (default split ≠ genesis split)"
+        );
+        assert_ne!(bal(&n, 1), ctrl_exec_bal, "the executor's worker payout differs under the default split");
+        assert_eq!(money_conserved(&n), ctrl_conserved, "still conserved — just a divergent (forking) split");
+    }
+
+    #[test]
+    fn c1_reinjected_k_feeds_the_postrestart_committee_draw() {
+        // The C1 fix re-injects the FULL GameParams into reloaded lifecycles — including `k`, which
+        // SIZES the committee (the draw itself, not just the settlement split). With k=2 (default 3)
+        // and 3 eligible candidates the CompleteJob draw picks a 2-member committee. If a node
+        // restarts between ClaimJob and CompleteJob and the re-injection failed to restore k, the
+        // reloaded lifecycle would draw with default k=3 → a 3-member committee → a different state
+        // root = fork on the exact membership gate §0 identifies. This complements the split-only C1
+        // test above by exercising k-through-the-draw.
+        let min_bond = StakeParams::default().min_bond;
+        let v_bond = GameParams::default().verifier_bond;
+        let k2_params = || {
+            let mut g = GameParams::default();
+            g.k = 2;
+            (
+                g,
+                ResolutionParams::default(),
+                PhaseWindows { result_blocks: 2, commit_blocks: 2, reveal_blocks: 2, claim_blocks: 5 },
+                StakeParams::default(),
+            )
+        };
+        // Bond 3 verifiers + Submit + Claim; stop at AwaitingResult (committee NOT yet drawn).
+        let drive_to_claimed = |s: &mut ChainState| -> [u8; 32] {
+            s.apply_block(&genesis_block()).unwrap();
+            s.accounts.get_or_create(addr(2)).balance = Amount::from_raw(MIN_BUDGET);
+            let e = s.accounts.get_or_create(addr(1));
+            e.is_validator = true;
+            e.balance = Amount::from_raw(MIN_BUDGET);
+            for v in [3u8, 4, 5] {
+                let a = s.accounts.get_or_create(addr(v));
+                a.is_validator = true;
+                a.balance = Amount::from_raw(min_bond + v_bond);
+            }
+            let bonds: Vec<Transaction> = [3u8, 4, 5]
+                .iter()
+                .map(|&v| unsigned(addr(v), 0, TxKind::Bond { amount: Amount::from_raw(min_bond) }))
+                .collect();
+            let h = s.blocks.height() + 1;
+            s.apply_block(&block_with(s, h, bonds)).unwrap();
+            let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+            let job = submit.hash().0;
+            let h = s.blocks.height() + 1;
+            s.apply_block(&block_with(s, h, vec![submit])).unwrap();
+            let h = s.blocks.height() + 1;
+            s.apply_block(&block_with(s, h, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job })])).unwrap();
+            job
+        };
+        let complete = |s: &mut ChainState, job: [u8; 32]| {
+            let h = s.blocks.height() + 1;
+            s.apply_block(&block_with(s, h, vec![unsigned(addr(1), 1, TxKind::CompleteJob { job_id: job, result_hash: [7u8; 32] })])).unwrap();
+        };
+
+        // CONTROL: k=2 from genesis; draws a 2-member committee at CompleteJob.
+        let mut ctrl = ChainState::new();
+        let (g, rp, pw, st) = k2_params();
+        ctrl.set_consensus_params(g, rp, pw, st).unwrap();
+        let jc = drive_to_claimed(&mut ctrl);
+        complete(&mut ctrl, jc);
+        assert_eq!(ctrl.job_lifecycles.get(&jc).unwrap().committee().len(), 2, "k=2, 3 candidates ⇒ 2-member committee");
+        let ctrl_root = ctrl.compute_state_root();
+
+        // RESTART before the draw: drive to claimed on rocks, flush, drop; reopen (lifecycle reloaded
+        // with DEFAULT k=3), re-inject k=2, THEN complete ⇒ the draw must use the re-injected k=2.
+        let dir = tempfile::tempdir().unwrap();
+        let job = {
+            let mut r = ChainState::open(dir.path()).unwrap();
+            let (g, rp, pw, st) = k2_params();
+            r.set_consensus_params(g, rp, pw, st).unwrap();
+            let j = drive_to_claimed(&mut r);
+            r.flush().unwrap();
+            j
+        };
+        let mut r = ChainState::open(dir.path()).unwrap();
+        let (g, rp, pw, st) = k2_params();
+        r.set_consensus_params(g, rp, pw, st).unwrap();
+        complete(&mut r, job);
+        assert_eq!(r.job_lifecycles.get(&job).unwrap().committee().len(), 2, "re-injected k=2 sized the post-restart draw");
+        assert_eq!(
+            r.compute_state_root(),
+            ctrl_root,
+            "C1: re-injected k feeds the post-restart draw identically to a never-restarted node",
+        );
+
+        // NEGATIVE CONTROL (non-vacuous): restart but DO NOT re-inject ⇒ reloaded lifecycle keeps
+        // default k=3 ⇒ the draw picks 3 ⇒ a different committee ⇒ a divergent (forking) root.
+        let dir2 = tempfile::tempdir().unwrap();
+        let job2 = {
+            let mut n = ChainState::open(dir2.path()).unwrap();
+            let (g, rp, pw, st) = k2_params();
+            n.set_consensus_params(g, rp, pw, st).unwrap();
+            let j = drive_to_claimed(&mut n);
+            n.flush().unwrap();
+            j
+        };
+        let mut n = ChainState::open(dir2.path()).unwrap();
+        complete(&mut n, job2); // reloaded with default k=3, no re-injection
+        assert_eq!(n.job_lifecycles.get(&job2).unwrap().committee().len(), 3, "without re-injection the draw uses default k=3");
+        assert_ne!(
+            n.compute_state_root(),
+            ctrl_root,
+            "without C1 k re-injection the post-restart draw FORKS (3-member committee ≠ 2)",
+        );
+    }
+
+    #[test]
+    fn c2_c3_select_applicable_txs_keeps_requeues_drops_and_leaves_no_smear() {
+        // A live lifecycle in AwaitingResult (committee not yet drawn).
+        let (mut state, job) = claimed_job_state(None);
+        let v_bond = GameParams::default().verifier_bond;
+        state.accounts.get_mut(&addr(3)).unwrap().balance = Amount::from_raw(v_bond);
+        state.accounts.get_or_create(addr(8)).balance = Amount::from_raw(5_000);
+        let root0 = state.compute_state_root();
+
+        // A clean tx (applies), a junk Commit on an UNKNOWN job (permanently doomed), and a Commit on
+        // the LIVE job that is merely WrongPhase (the committee is not drawn yet — deferred).
+        let clean = unsigned(addr(8), 0, TxKind::Bond { amount: Amount::from_raw(1_000) });
+        let cu = make_commitment(&ParticipantId(addr(3).0), &[7u8; 32], &[0u8; 32], v_bond);
+        let junk_unknown = unsigned(addr(3), 0, TxKind::Commit { job_id: [0xEEu8; 32], commit: cu.commit, bond: Amount::from_raw(v_bond) });
+        let cw = make_commitment(&ParticipantId(addr(3).0), &[7u8; 32], &[0u8; 32], v_bond);
+        let wrong_phase = unsigned(addr(3), 0, TxKind::Commit { job_id: job, commit: cw.commit, bond: Amount::from_raw(v_bond) });
+
+        let (kept, requeue) =
+            state.select_applicable_txs(vec![clean.clone(), junk_unknown.clone(), wrong_phase.clone()]);
+
+        assert_eq!(kept.len(), 1, "only the clean tx applies");
+        assert!(matches!(kept[0].kind, TxKind::Bond { .. }), "the Bond is kept");
+        assert_eq!(requeue.len(), 1, "the WrongPhase Commit on a LIVE job is requeued, not dropped");
+        assert!(
+            matches!(&requeue[0].kind, TxKind::Commit { job_id, .. } if *job_id == job),
+            "requeued the live-job Commit"
+        );
+        // the junk unknown-job Commit is in NEITHER set (permanently doomed ⇒ dropped). (TxKind is
+        // not PartialEq, so match on the unknown job_id.)
+        let is_unknown = |t: &Transaction| matches!(&t.kind, TxKind::Commit { job_id, .. } if *job_id == [0xEEu8; 32]);
+        assert!(!requeue.iter().any(is_unknown) && !kept.iter().any(is_unknown), "unknown-job Commit is dropped");
+        assert_eq!(
+            state.compute_state_root(),
+            root0,
+            "C2: select_applicable_txs restores self fully — post-call root == pre-call root (no smear)"
+        );
+    }
+
+    #[test]
+    fn m1_open_fails_hard_on_corrupt_consensus_row() {
+        // M1 end-to-end: a corrupt consensus CF row makes ChainState::open() FAIL with an actionable
+        // error (not a silent warn-skip that would wedge every future block on the pot guard).
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = ChainState::open(dir.path()).unwrap();
+            s.rocks.as_ref().unwrap().debug_put_corrupt_escrow_row();
+        }
+        let err = ChainState::open(dir.path()).unwrap_err();
+        assert!(
+            matches!(&err, StateError::StorageError(m) if m.contains("corrupt CF_ESCROW")),
+            "open must fail hard on a corrupt consensus row, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn c9c_genesis_default_consensus_params_match_pouw_defaults() {
+        // C9c drift-guard: the core default `ConsensusParamsConfig` converts to EXACTLY the
+        // pouw/pouw-onchain defaults ChainState uses today, so a genesis omitting the section cannot
+        // silently shift consensus params. (1.2a: standalone type; 1.2b embeds it in GenesisConfig.)
+        use commputer_core::genesis::ConsensusParamsConfig;
+        let gcp = genesis_consensus_params(&ConsensusParamsConfig::default());
+        assert_eq!(gcp.stake, StakeParams::default(), "stake params");
+        assert_eq!(gcp.phase_windows, PhaseWindows::default(), "phase windows");
+        assert_eq!(gcp.resolution, ResolutionParams::default(), "resolution params");
+        // GameParams is not Eq — the fingerprint folds every game/capacity/window/fuel field.
+        assert_eq!(
+            gcp.bundle.fingerprint(),
+            commputer_pouw_onchain::consensus_params::ConsensusParams::default().fingerprint(),
+            "the full consensus bundle == the compiled defaults byte-for-byte"
+        );
+        // Spot-check the game fields against a fresh (default) ChainState's game params.
+        let fresh = ChainState::new();
+        assert_eq!(gcp.game.k, fresh.game_params.k);
+        assert_eq!(gcp.game.worker_bps, fresh.game_params.worker_bps);
+        assert_eq!(gcp.game.executor_bond, fresh.game_params.executor_bond);
+        // A JSON object omitting fields still deserializes to the defaults (serde-default at every level).
+        let from_empty: ConsensusParamsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty, ConsensusParamsConfig::default(), "omitted section ⇒ defaults");
+    }
+
+    #[test]
+    fn set_consensus_params_rejects_zero_phase_window() {
+        // C4: a zero (or <1) phase window is rejected — a same-block draw with a zero commit/reveal
+        // window would be instantly swept to NoQuorum.
+        let mut state = ChainState::new();
+        let mut pw = PhaseWindows::default();
+        pw.commit_blocks = 0;
+        let err = state
+            .set_consensus_params(GameParams::default(), ResolutionParams::default(), pw, StakeParams::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("phase windows must be >= 1"), "got: {err}");
+        // A valid (non-zero) window is accepted.
+        assert!(state
+            .set_consensus_params(GameParams::default(), ResolutionParams::default(), PhaseWindows::default(), StakeParams::default())
+            .is_ok());
     }
 }

@@ -484,6 +484,56 @@ impl JobLifecycle {
         EventResult::Accepted
     }
 
+    /// B5 step 1 (CompleteJob tx arm, PARENT height): the executor delivers its result hash —
+    /// validate phase/executor/window and record it. Does NOT draw the committee or advance the
+    /// phase (that is `draw_committee`, run in the block tail with the block-hash seed). Splitting
+    /// `submit_result` this way lets the tx arm anchor the result-window at parent height (matching
+    /// every other tx arm) while the tail draws from the finalized `block.hash()`; re-checking the
+    /// window in `draw_committee` at the APPLIED height (parent+1) would wrongly time out a result
+    /// posted exactly at `result_by`, so the draw is deliberately window-free.
+    pub fn post_result(
+        &mut self,
+        executor: ParticipantId,
+        result_hash: [u8; 32],
+        height: u64,
+    ) -> EventResult {
+        if self.phase != Phase::AwaitingResult {
+            return EventResult::Rejected(RejectReason::WrongPhase);
+        }
+        if executor != self.executor {
+            return EventResult::Rejected(RejectReason::NotExecutor);
+        }
+        if height > self.deadlines.result_by {
+            return EventResult::Rejected(RejectReason::PastWindow);
+        }
+        self.executor_hash = Some(result_hash);
+        EventResult::Accepted
+    }
+
+    /// B5 step 2 (block tail, `block.hash()` seed): draw the committee from the frozen
+    /// `select_committee` and advance AwaitingResult→Committing. Idempotent and window-free — it
+    /// only fires for a job that has posted a result but not yet drawn (guarded on
+    /// phase/executor_hash/empty-committee), so a re-run (a re-org replay, or a second tail pass)
+    /// is a no-op. `seed`/`stake_of` are consensus inputs the chain supplies (seed =
+    /// `hash(block_hash‖job_id)`, `stake_of` = bonded stake); moves no money.
+    pub fn draw_committee(&mut self, seed: [u8; 32], stake_of: &dyn Fn(&ParticipantId) -> u64) {
+        if self.phase != Phase::AwaitingResult
+            || self.executor_hash.is_none()
+            || !self.committee.is_empty()
+        {
+            return; // nothing to draw (wrong phase / no result / already drawn)
+        }
+        self.committee =
+            select_committee(&seed, &self.candidates, &self.executor, self.params.k, stake_of);
+        self.phase = Phase::Committing;
+    }
+
+    /// Whether the executor has posted its result (B5 draw precondition). Read-only accessor for
+    /// the chain's block-tail draw filter (the field is private).
+    pub fn executor_hash_is_set(&self) -> bool {
+        self.executor_hash.is_some()
+    }
+
     /// A committee verifier commits (DA-Available ⇒ they call this; Abstain ⇒ they don't).
     /// Validates phase/window/membership/bond/no-double-commit, then escrows the bond.
     pub fn record_commit(&mut self, l: &mut impl Ledger, c: Commitment, height: u64) -> EventResult {
@@ -1165,6 +1215,115 @@ mod tests {
         assert_eq!(lc2.phase(), lc.phase());
         assert_eq!(lc2.committee(), lc.committee());
         assert_eq!(lc2.expected_escrow(), lc.expected_escrow());
+    }
+
+    #[test]
+    fn post_result_then_draw_committee_matches_submit_result() {
+        // B5: post_result (record only) + draw_committee (block-tail draw) must reproduce exactly
+        // what the monolithic submit_result produces, given the same seed.
+        let (budget, e_bond, v_bond) = min_funding();
+        let seed = [42u8; 32];
+        let stake = |_: &ParticipantId| 1u64;
+
+        let mut a = JobLifecycle::open(
+            [1u8; 32], IDENT, IDENT, IDENT, pid(0), pid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(), cands3(), deadlines(),
+        );
+        assert_eq!(a.submit_result(pid(9), [7u8; 32], seed, 5, &stake), EventResult::Accepted);
+
+        let mut b = JobLifecycle::open(
+            [1u8; 32], IDENT, IDENT, IDENT, pid(0), pid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(), cands3(), deadlines(),
+        );
+        // Draw before a result is a no-op (nothing posted yet).
+        b.draw_committee(seed, &stake);
+        assert_eq!(b.phase(), Phase::AwaitingResult);
+        assert!(b.committee().is_empty());
+        assert_eq!(b.post_result(pid(9), [7u8; 32], 5), EventResult::Accepted);
+        assert!(b.committee().is_empty(), "post_result records only — no draw");
+        assert_eq!(b.phase(), Phase::AwaitingResult);
+        b.draw_committee(seed, &stake);
+
+        assert_eq!(a.phase(), b.phase());
+        assert_eq!(a.committee(), b.committee(), "split path == monolithic submit_result");
+        assert_eq!(b.phase(), Phase::Committing);
+    }
+
+    #[test]
+    fn draw_committee_is_deterministic_and_idempotent() {
+        let (budget, e_bond, v_bond) = min_funding();
+        let stake = |_: &ParticipantId| 1u64;
+        let mk = || {
+            let mut lc = JobLifecycle::open(
+                [1u8; 32], IDENT, IDENT, IDENT, pid(0), pid(9), e_bond, budget, v_bond,
+                GameParams::default(), ResolutionParams::default(),
+                vec![pid(10), pid(11), pid(12), pid(13), pid(14)], deadlines(),
+            );
+            assert_eq!(lc.post_result(pid(9), [7u8; 32], 5), EventResult::Accepted);
+            lc
+        };
+        let mut a = mk();
+        let mut b = mk();
+        a.draw_committee([99u8; 32], &stake);
+        b.draw_committee([99u8; 32], &stake);
+        assert_eq!(a.committee(), b.committee(), "same seed ⇒ identical committee");
+        assert_eq!(a.committee().len(), 3, "k=3 drawn from 5 candidates");
+
+        // Idempotent: a second draw at a DIFFERENT seed cannot re-draw (committee already set).
+        let first = a.committee().to_vec();
+        a.draw_committee([1u8; 32], &stake);
+        assert_eq!(a.committee(), &first[..], "already-drawn committee is frozen");
+
+        // Seed-sensitivity: a different seed on a fresh lifecycle changes the committee.
+        let mut c = mk();
+        c.draw_committee([1u8; 32], &stake);
+        assert_ne!(c.committee(), a.committee(), "different seed ⇒ different committee");
+    }
+
+    #[test]
+    fn draw_committee_undersized_and_empty_pools_are_smaller_not_errors() {
+        let (budget, e_bond, v_bond) = min_funding();
+        let stake = |_: &ParticipantId| 1u64;
+        // Two candidates, k=3 ⇒ a committee of 2 (min(k, pool)), NOT an error.
+        let mut two = JobLifecycle::open(
+            [1u8; 32], IDENT, IDENT, IDENT, pid(0), pid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(),
+            vec![pid(10), pid(11)], deadlines(),
+        );
+        assert_eq!(two.post_result(pid(9), [7u8; 32], 5), EventResult::Accepted);
+        two.draw_committee([5u8; 32], &stake);
+        assert_eq!(two.committee().len(), 2, "undersized pool ⇒ smaller committee");
+        assert_eq!(two.phase(), Phase::Committing);
+
+        // Empty candidate pool ⇒ empty committee, still Committing (settles as NoQuorum later).
+        let mut empty = JobLifecycle::open(
+            [2u8; 32], IDENT, IDENT, IDENT, pid(0), pid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(), vec![], deadlines(),
+        );
+        assert_eq!(empty.post_result(pid(9), [7u8; 32], 5), EventResult::Accepted);
+        empty.draw_committee([5u8; 32], &stake);
+        assert!(empty.committee().is_empty(), "empty pool ⇒ empty committee (no panic)");
+        assert_eq!(empty.phase(), Phase::Committing);
+    }
+
+    #[test]
+    fn post_result_rejects_wrong_executor_wrong_phase_past_window() {
+        let (budget, e_bond, v_bond) = min_funding();
+        let mut lc = JobLifecycle::open(
+            [1u8; 32], IDENT, IDENT, IDENT, pid(0), pid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(), cands3(), deadlines(),
+        );
+        // wrong executor
+        assert_eq!(lc.post_result(pid(8), [7u8; 32], 5), EventResult::Rejected(RejectReason::NotExecutor));
+        // past the result window (deadlines.result_by == 10)
+        assert_eq!(lc.post_result(pid(9), [7u8; 32], 11), EventResult::Rejected(RejectReason::PastWindow));
+        // accepted, then a second post is WrongPhase (still AwaitingResult until draw, but the
+        // executor_hash is set — post_result only fires in AwaitingResult and a re-post is rejected
+        // once the committee is drawn/phase advances)
+        assert_eq!(lc.post_result(pid(9), [7u8; 32], 5), EventResult::Accepted);
+        let stake = |_: &ParticipantId| 1u64;
+        lc.draw_committee([9u8; 32], &stake);
+        assert_eq!(lc.post_result(pid(9), [7u8; 32], 6), EventResult::Rejected(RejectReason::WrongPhase));
     }
 
     #[test]
