@@ -432,3 +432,45 @@ refund; CompleteJob arm guards (unknown/wrong-phase/wrong-executor/past-window/z
 reject-unknown; M1 fail-hard on a corrupt row; C2/C3 select_applicable_txs (junk Commit dropped, no
 producer smear, WrongPhase Commit requeued not dropped); the whole 206-test storage suite + B10 5 terminals +
 core + pouw-onchain stay green; frozen src/staging/pouw byte-identical. Conservation on both ledger backends.
+
+---
+
+# 1.2b POST-BUILD OUTCOME (2026-07-07)
+
+Built + 3-agent verified (conformance APPROVE, bughunt APPROVE, tests green; all findings MINOR). Protected
+diffs minimal: event_loop.rs +~120, main.rs +32, testnet_genesis.rs +1; core/genesis.rs +25, state.rs +61.
+Frozen crate byte-identical. Tests: node crate green, storage 220, core 191(+8+6), pouw-onchain 88.
+
+**Pieces landed:** 1.2-POOL (SubmitJobV2 arm in process_job_tx); 1.2-MEMPOOL (select_applicable_txs call in
+block assembly + requeue + kind-aware INGRESS pre-filter for the 4 PoUW kinds incl. ClaimJob per C7); B7
+capacity admission (producer-side soft, requeue-not-drop); B6 (confirmed already ChainState-inert, comment
+only); B8 field-embed + genesis-params thread + refuse_to_bind HARD gate (anyhow::bail! on invalid) +
+fingerprint log; N2 #[cfg(unix)] on both signal regs (with a #[cfg(not(unix))] NoopSignal so the select!
+arms stay byte-identical).
+
+**Post-verify fixes applied by the orchestrator:**
+- **V1-legacy scheduling regression FIXED (both reviewers, minor):** B7 admission originally deferred legacy
+  V1 SubmitJob too (pending_job_from_tx maps V1+V2). Restricted the B7 call site to SubmitJobV2 ONLY via a
+  local `admission_job` closure, so legacy V1 block-inclusion scheduling is byte-identical to the pre-flip
+  node. pending_job_from_tx (1.2a helper + its test) left unchanged.
+
+**Intentional deviations / deferrals (need founder awareness):**
+- **C6 (B8) — compile-anchored params, genesis.json consensus_params is INERT on the run-path.** Per the
+  orchestrator's pragmatic scoping (no new --genesis CLI/file-load machinery), main.rs threads
+  `default_genesis().consensus_params` (compiled) into set_consensus_params, not an operator-supplied
+  genesis.json. This is consensus-SAFE and MORE deterministic (all nodes on a binary agree); an absent/present
+  genesis.json consensus_params section is byte-identical to today's compiled defaults (drift-guarded by C9c +
+  a new core test). CONSEQUENCE: operators cannot tune consensus params via genesis.json yet — a real
+  file-load (C6's literal requirement) is a deferred refinement. **Flag for founder sign-off** since C6 is a
+  binding amendment; the compile-anchored form is the recommended v1 for a coordinated-upgrade flip.
+- **Requeue coarseness (bughunt, minor, node-local only):** tx_is_phase_deferred requeues any Commit/Reveal/
+  CompleteJob/ClaimJob whose job merely EXISTS (ignores the concrete rejection reason), so a permanently-
+  invalid PoUW tx (non-member Commit, past-window CompleteJob) is retried every block until the lifecycle
+  settles/drains, then dropped. Bounded, no multiplication, mempool-only. Refinement (inspect the StateError
+  variant to drop permanent rejections; bound requeue attempts by TTL/height) deferred.
+- **Head-of-line nonce stranding under sustained job oversupply (bughunt, minor):** a B7-deferred lower-nonce
+  job tx blocks higher-nonce txs from the same sender until admitted. Bounded, only under persistent
+  >available_slots demand (not organic pre-executor-loop per C5). Deferred.
+- **Ingress sequencing (C7, expected):** money-path injection must advance a block between SubmitJobV2 →
+  ClaimJob → CompleteJob → Commit → Reveal (same-mempool-window submit-then-claim is rejected at ingress).
+  The §1.4 multinode/injection harness must sequence block-by-block.

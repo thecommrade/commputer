@@ -201,6 +201,11 @@ pub struct ChainState {
     /// TODO(B8, PROTECTED genesis): populate from `GenesisConfig`; default until then —
     /// all nodes MUST agree or they diverge on deadlines.
     pub phase_windows: PhaseWindows,
+    /// B7 (1.2b, C8): genesis-anchored per-block capacity split. PRODUCER-SIDE ONLY — read during
+    /// block assembly by the capacity scheduler (`admit`); NEVER apply-enforced, NEVER persisted, and
+    /// NEVER folded into the state root (a v1 SOFT schedule, not a consensus rule). Installed once at
+    /// startup by `set_capacity_params` from `GenesisConfig`; default until then.
+    pub capacity_params: commputer_pouw_onchain::capacity::CapacityParams,
     /// PoUW P2: per-job verification lifecycle (`job_id` -> `JobLifecycle`), the multi-block
     /// commit-reveal state machine. Created at `ClaimJob` (AwaitingResult, Phase 1.1 B3),
     /// committee drawn at `CompleteJob` (B5, PROTECTED), fed by `Commit`/`Reveal` (B4),
@@ -284,6 +289,7 @@ impl ChainState {
             game_params: GameParams::default(),
             resolution_params: ResolutionParams::default(),
             phase_windows: PhaseWindows::default(),
+            capacity_params: commputer_pouw_onchain::capacity::CapacityParams::default(),
             job_lifecycles: HashMap::new(),
             pending_jobs: HashMap::new(),
             persisted_escrow_keys: HashSet::new(),
@@ -423,6 +429,7 @@ impl ChainState {
             game_params,
             resolution_params,
             phase_windows: PhaseWindows::default(),
+            capacity_params: commputer_pouw_onchain::capacity::CapacityParams::default(),
             job_lifecycles,
             pending_jobs,
             persisted_escrow_keys,
@@ -3506,6 +3513,23 @@ impl ChainState {
             *life = JobLifecycle::from_record(rec, self.game_params.clone(), self.resolution_params);
         }
         Ok(())
+    }
+
+    /// B7 (1.2b, C8): install the genesis-anchored capacity split. Kept SEPARATE from
+    /// `set_consensus_params` deliberately: capacity is PRODUCER-SIDE scheduling only (read during
+    /// block assembly, never apply-enforced, never state-rooted), so it does not belong on the
+    /// fork-critical param path that re-injects into lifecycles — this keeps the C1 rebuild + C4
+    /// window guard untouched. The node calls this once at startup alongside `set_consensus_params`.
+    pub fn set_capacity_params(
+        &mut self,
+        capacity: commputer_pouw_onchain::capacity::CapacityParams,
+    ) {
+        self.capacity_params = capacity;
+    }
+
+    /// B7: the installed capacity split, read by the producer-side admission scheduler.
+    pub fn capacity_params(&self) -> &commputer_pouw_onchain::capacity::CapacityParams {
+        &self.capacity_params
     }
 
     /// 1.2-MEMPOOL (soundness engine, logic non-protected): from `candidates` (already sig/nonce/
@@ -8870,5 +8894,42 @@ mod tests {
         assert!(state
             .set_consensus_params(GameParams::default(), ResolutionParams::default(), PhaseWindows::default(), StakeParams::default())
             .is_ok());
+    }
+
+    #[test]
+    fn b7_set_capacity_params_stores_and_getter_reads() {
+        // B7 (C8): the producer-side capacity split is installed by `set_capacity_params` and read
+        // back by the getter B7's block-assembly admission uses. Default until set.
+        let mut state = ChainState::new();
+        assert_eq!(
+            state.capacity_params().total_slots,
+            commputer_pouw_onchain::capacity::CapacityParams::default().total_slots,
+            "default until installed"
+        );
+        let mut cap = commputer_pouw_onchain::capacity::CapacityParams::default();
+        cap.total_slots = 42;
+        state.set_capacity_params(cap);
+        assert_eq!(state.capacity_params().total_slots, 42, "getter reads the installed split");
+    }
+
+    #[test]
+    fn b8_refuse_to_bind_gate_accepts_defaults_rejects_invalid() {
+        // B8 (C4): the startup hard gate the node runs in main.rs. The compiled-default genesis params
+        // pass `refuse_to_bind` against the node's compiled WasmLimits; an invalid config (a zero phase
+        // window) FAILS it — proving the node would refuse to start rather than fork on bad params.
+        use commputer_core::genesis::ConsensusParamsConfig;
+        use commputer_pouw::wasm::WasmLimits;
+        let ok = genesis_consensus_params(&ConsensusParamsConfig::default());
+        assert!(
+            ok.bundle.refuse_to_bind(&WasmLimits::default()).is_ok(),
+            "default genesis params must bind"
+        );
+        let mut bad = ConsensusParamsConfig::default();
+        bad.phase_windows.commit_blocks = 0;
+        let gcp = genesis_consensus_params(&bad);
+        assert!(
+            gcp.bundle.refuse_to_bind(&WasmLimits::default()).is_err(),
+            "an invalid (zero-window) genesis must be refused at bind"
+        );
     }
 }

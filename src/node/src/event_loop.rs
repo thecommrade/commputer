@@ -663,9 +663,22 @@ impl EventLoop {
         // Item 22: Job timeout enforcement every 30s.
         let mut job_timeout_interval = time::interval(Duration::from_secs(30));
         // Feature 12: SIGHUP handler for config hot reload.
+        // N2 (C9b): `tokio::signal::unix` is Unix-only. Gate the registration and give non-Unix a no-op
+        // that parks forever, so the `select!` arms below compile on Windows with ZERO Unix change.
+        #[cfg(not(unix))]
+        struct NoopSignal;
+        #[cfg(not(unix))]
+        impl NoopSignal {
+            async fn recv(&mut self) -> Option<()> {
+                std::future::pending::<Option<()>>().await
+            }
+        }
+        #[cfg(unix)]
         let mut sighup = tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::hangup(),
         ).ok();
+        #[cfg(not(unix))]
+        let mut sighup: Option<NoopSignal> = None;
 
         // Feature 11: Connection encryption verification.
         info!("P2P encryption: Noise protocol active");
@@ -677,7 +690,8 @@ impl EventLoop {
         // Item 73: Periodic status line every 60 seconds.
         let mut status_line_interval = time::interval(Duration::from_secs(60));
 
-        // Set up graceful shutdown signal handler.
+        // Set up graceful shutdown signal handler. N2 (C9b): Unix-only; see the SIGHUP gate above.
+        #[cfg(unix)]
         let mut sigterm = match tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
         ) {
@@ -687,6 +701,8 @@ impl EventLoop {
                 None
             }
         };
+        #[cfg(not(unix))]
+        let mut sigterm: Option<NoopSignal> = None;
 
         loop {
             // Take the RPC receiver out to satisfy the borrow checker in select!
@@ -874,7 +890,11 @@ impl EventLoop {
                     self.handle_peer_rotation();
                 }
                 _ = job_timeout_interval.tick() => {
-                    // Item 22: Enforce job timeouts (2 seconds per block).
+                    // Item 22 / B6 (C9a): OBSERVE-ONLY wall-clock tick. It touches ONLY the node-local
+                    // V1 `job_pool` and emits warnings — it must NEVER settle a PoUW lifecycle or mutate
+                    // ChainState. PoUW timeout settlement is 100% in-apply (`settle_due_jobs`, anchored to
+                    // applied height inside the rollback envelope), so it reproduces identically on every
+                    // node and on reorg replay; a wall-clock-driven settlement here would fork.
                     let height = self.state.blocks.height();
                     let penalties = self.job_pool.enforce_timeouts(height, 2);
                     for (job_id, executor) in &penalties {
@@ -2134,6 +2154,25 @@ impl EventLoop {
         {
             return Err("fee below minimum");
         }
+        // 1.2-MEMPOOL ingress pre-filter (C7): a PoUW verification-game tx (Commit/Reveal/CompleteJob/
+        // ClaimJob) whose job_id has NEITHER an open lifecycle NOR a pending record is permanently
+        // doomed at apply (post-flip: unknown job → whole-block reject), so reject it at ingress and
+        // keep the mempool free of doomed PoUW txs. Read-only over committed ChainState → deterministic;
+        // it never rejects legacy kinds (Transfer/Bond/…). A tx whose job EXISTS but is in the wrong
+        // phase is admitted here and requeued later by `select_applicable_txs` (C3).
+        match &tx.kind {
+            commputer_core::transaction::TxKind::Commit { job_id, .. }
+            | commputer_core::transaction::TxKind::Reveal { job_id, .. }
+            | commputer_core::transaction::TxKind::CompleteJob { job_id, .. }
+            | commputer_core::transaction::TxKind::ClaimJob { job_id } => {
+                if !self.state.job_lifecycles.contains_key(job_id)
+                    && !self.state.pending_jobs.contains_key(job_id)
+                {
+                    return Err("pouw tx references unknown job");
+                }
+            }
+            _ => {}
+        }
         // Nonce validation: must match expected next nonce for sender.
         // Account for pending txs already in mempool from the same sender.
         let on_chain_nonce = self.state.accounts
@@ -2241,6 +2280,36 @@ impl EventLoop {
                 if self.job_pool.dispute_job(&jid, tx.from) {
                     info!("Job pool: disputed job {}", hex::encode(&job_id[..8]));
                 }
+            }
+            // 1.2-POOL: mirror the V1 SubmitJob arm for V2 (the only escrowing kind) so executors
+            // can see V2 jobs. Node-local pool only — no consensus effect, cannot fork. `job_id =
+            // PoolJobId(tx.hash().0)` is the SAME id the escrow/pending maps and ClaimJob use (G-A).
+            commputer_core::transaction::TxKind::SubmitJobV2 {
+                program_hash,
+                resources,
+                max_duration_secs,
+                comme_budget,
+                l2_id,
+                ..
+            } => {
+                let tx_hash = tx.hash();
+                let pool_job = PoolJob {
+                    job_id: PoolJobId(tx_hash.0),
+                    submitter: tx.from,
+                    comme_budget: comme_budget.raw(),
+                    cpu_cores: resources.cpu_cores,
+                    gpu_vram_mb: resources.gpu_vram_mb,
+                    ram_mb: resources.ram_mb,
+                    storage_mb: resources.storage_mb,
+                    bandwidth_mbps: resources.bandwidth_mbps,
+                    max_duration_secs: *max_duration_secs,
+                    job_spec_hash: *program_hash, // program_hash is the V2 identity.
+                    status: commputer_storage::job_pool::PoolJobStatus::Pending,
+                    submitted_height: height,
+                    l2_id: l2_id.clone(),
+                };
+                self.job_pool.submit_job(pool_job);
+                info!("Job pool: submitted V2 job {}", hex::encode(&tx_hash.0[..8]));
             }
             _ => {}
         }
@@ -2731,6 +2800,55 @@ impl EventLoop {
         } else {
             candidates
         };
+
+        // B7 (C8): producer-side capacity admission — SOFT scheduling (v1), NOT apply-enforced, so it
+        // cannot fork. Split compute-job txs from the rest, admit via the tested 51/49 scheduler, keep
+        // only admitted job_ids, and REQUEUE (never drop) the deferred job txs. Non-job txs are wholly
+        // untouched (legacy path byte-identical). When there are no job txs this is a pure no-op.
+        let churn = commputer_pouw_onchain::capacity::validator_churn_bps(0, 0, 0); // v1: no churn tracking → 0.
+        // Only the NEW escrow-based SubmitJobV2 jobs are capacity-managed. Legacy V1 SubmitJob bypasses
+        // admission entirely so its block-inclusion scheduling stays byte-identical to the pre-flip node
+        // (pending_job_from_tx maps V1 too, but capacity gating is a G6/flip concept that must not alter
+        // any legacy path).
+        let admission_job = |tx: &Transaction| -> Option<commputer_pouw_onchain::capacity::PendingJob> {
+            if matches!(tx.kind, commputer_core::transaction::TxKind::SubmitJobV2 { .. }) {
+                commputer_storage::state::pending_job_from_tx(tx)
+            } else {
+                None
+            }
+        };
+        let pending: Vec<commputer_pouw_onchain::capacity::PendingJob> =
+            txs.iter().filter_map(admission_job).collect();
+        let txs: Vec<Transaction> = if pending.is_empty() {
+            txs
+        } else {
+            let adm = commputer_pouw_onchain::capacity::admit(
+                self.state.capacity_params(),
+                churn,
+                &pending,
+            );
+            let admitted: HashSet<[u8; 32]> = adm.admitted.into_iter().collect();
+            let mut kept = Vec::with_capacity(txs.len());
+            let mut deferred = Vec::new();
+            for tx in txs {
+                match admission_job(&tx) {
+                    Some(pj) if !admitted.contains(&pj.job_id) => deferred.push(tx),
+                    _ => kept.push(tx), // admitted V2 job OR non-admission tx (incl. legacy V1)
+                }
+            }
+            self.pending_txs.extend(deferred); // requeue non-admitted jobs, like the future-nonce path.
+            kept
+        };
+
+        // 1.2-MEMPOOL (C2/C3): speculative apply — keep only the txs that apply CLEANLY in sequence on
+        // top of current state, so the produced block can never fail apply (which would strand every
+        // node at this height — a zero-cost DoS). `select_applicable_txs` trial-applies on a snapshot
+        // and FULLY restores `self.state` before returning (ChainState is not Clone), so the producer
+        // state root below is byte-identical to a run without this call. Phase/window-deferred txs are
+        // requeued (not dropped); permanently-doomed txs are discarded.
+        let (txs, requeue) = self.state.select_applicable_txs(txs);
+        self.pending_txs.extend(requeue);
+
         let mut block = Block {
             header: BlockHeader {
                 protocol_version: commputer_core::block::CURRENT_PROTOCOL_VERSION,

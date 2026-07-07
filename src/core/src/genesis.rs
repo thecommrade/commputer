@@ -34,6 +34,13 @@ pub struct GenesisConfig {
     /// Genesis timestamp (Item 5). If 0, uses current time on first boot.
     #[serde(default)]
     pub genesis_timestamp: u64,
+    /// B8 (1.2b): genesis-anchored PoUW consensus params. `#[serde(default)]` reproduces the exact
+    /// `pouw`/`pouw-onchain` defaults, so a genesis omitting this section == today's behavior
+    /// byte-identically. The node converts it to the live `ChainState` param structs via the storage
+    /// converter (`genesis_consensus_params`) and installs them with `ChainState::set_consensus_params`
+    /// right after `open()` on the run-path.
+    #[serde(default)]
+    pub consensus_params: ConsensusParamsConfig,
 }
 
 fn default_proof_interval() -> u64 { 300 }
@@ -244,6 +251,7 @@ pub fn default_genesis() -> GenesisConfig {
         block_time_secs: 2,
         emission_decay_rate: 0.0001,
         genesis_timestamp: 1774656000, // 2026-03-28 00:00:00 UTC — testnet epoch
+        consensus_params: ConsensusParamsConfig::default(),
     }
 }
 
@@ -273,6 +281,23 @@ mod tests {
         for (k, v) in &config.channel_floors {
             assert_eq!(parsed.channel_floors.get(k), Some(v));
         }
+        // B8: the embedded consensus params round-trip field-for-field.
+        assert_eq!(parsed.consensus_params, config.consensus_params);
+    }
+
+    #[test]
+    fn genesis_omitting_consensus_params_deserializes_to_defaults() {
+        // B8 continuity: a genesis JSON with no `consensus_params` section must serde-default to the
+        // exact compiled defaults, so an old genesis file keeps today's params byte-identically.
+        let json = r#"{
+            "chain_id": "commputer-testnet-1",
+            "total_supply": 1,
+            "epoch_duration_secs": 60,
+            "emission_base_rate": 1,
+            "emission_floor_rate": 1
+        }"#;
+        let parsed: GenesisConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.consensus_params, ConsensusParamsConfig::default());
     }
 
     #[test]

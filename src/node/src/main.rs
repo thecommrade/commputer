@@ -920,6 +920,38 @@ async fn run_node(
         );
     }
 
+    // B8 (C6): thread the genesis-anchored PoUW consensus params into ChainState. Pragmatic path —
+    // the node builds genesis from the COMPILED `default_genesis()` (identical across every node
+    // running this binary); an absent genesis.json `consensus_params` section == serde defaults ==
+    // today's params byte-identically. Installed once here, right after open()/genesis and before the
+    // event loop settles anything, so a node that restarted mid-lifecycle settles with GENESIS params
+    // (C1 re-injection). refuse_to_bind is the G5/C4 HARD startup gate: a malformed/engine-mismatched
+    // param bundle FAILS the process rather than silently forking against peers.
+    {
+        let gcfg = commputer_core::genesis::default_genesis();
+        let gp = commputer_storage::state::genesis_consensus_params(&gcfg.consensus_params);
+        if let Err(e) = gp
+            .bundle
+            .refuse_to_bind(&commputer_pouw::wasm::WasmLimits::default())
+        {
+            tracing::error!("Genesis PoUW consensus params rejected: {e:?} — refusing to start");
+            anyhow::bail!("refuse_to_bind: invalid genesis consensus params: {e:?}");
+        }
+        info!(
+            "ConsensusParams fingerprint: {}",
+            hex::encode(gp.bundle.fingerprint())
+        );
+        state
+            .set_consensus_params(
+                gp.game.clone(),
+                gp.resolution,
+                gp.phase_windows.clone(),
+                gp.stake.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("set_consensus_params rejected genesis params: {e}"))?;
+        state.set_capacity_params(gp.bundle.capacity);
+    }
+
     // Pre-flight: check NTP sync status.
     {
         let ntp_check = commputer::config_validator::ConfigValidator::check_ntp_status();

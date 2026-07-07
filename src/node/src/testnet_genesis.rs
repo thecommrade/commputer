@@ -47,6 +47,7 @@ pub fn generate_testnet_genesis(num_accounts: usize, output_path: &str) -> Resul
         block_time_secs: 2,
         emission_decay_rate: 0.0001,
         genesis_timestamp: 1647907200, // 2022-03-22 00:00:00 UTC
+        consensus_params: Default::default(), // B8: serde-default == today's compiled params.
     };
 
     let mut accounts = Vec::with_capacity(num_accounts);
