@@ -110,10 +110,16 @@ impl SnowballVoter {
             return false;
         }
 
-        // Find if any choice reached quorum in this sample.
+        // Deterministic quorum winner: among all choices at/above quorum, pick
+        // the highest vote count, breaking ties by BlockHash Ord. The winner
+        // MUST be a pure function of the vote multiset — a HashMap-iteration
+        // pick (`.find`) can select different at-quorum choices on different
+        // nodes from the same votes, letting two honest nodes finalize
+        // different blocks. `max_by` over (count, hash) removes that ambiguity.
         let quorum_choice = responses
             .iter()
-            .find(|&(_, &count)| count >= self.params.quorum)
+            .filter(|&(_, &count)| count >= self.params.quorum)
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
             .map(|(hash, _)| *hash);
 
         match quorum_choice {
@@ -232,5 +238,48 @@ mod tests {
         voter.record_round(&resp_b);
         voter.record_round(&resp_b);
         assert_eq!(voter.preference(), Some(b));
+    }
+
+    #[test]
+    fn deterministic_winner_independent_of_insertion_order() {
+        // Two choices both above quorum with EQUAL counts. The winner must be
+        // identical regardless of the order votes were inserted into the map,
+        // otherwise two honest nodes could finalize different blocks.
+        let params = SnowballParams { sample_size: 10, quorum: 3, decision_threshold: 1 };
+        let a = hash(1);
+        let b = hash(2);
+
+        let mut r1 = HashMap::new();
+        r1.insert(a, 4);
+        r1.insert(b, 4);
+
+        let mut r2 = HashMap::new();
+        r2.insert(b, 4);
+        r2.insert(a, 4);
+
+        let mut v1 = SnowballVoter::new(params.clone());
+        let mut v2 = SnowballVoter::new(params.clone());
+        assert!(v1.record_round(&r1));
+        assert!(v2.record_round(&r2));
+
+        assert_eq!(v1.finalized_hash(), v2.finalized_hash());
+        // Tie broken by BlockHash Ord — b > a because b[0]=2 > a[0]=1.
+        assert_eq!(v1.finalized_hash(), Some(b));
+    }
+
+    #[test]
+    fn deterministic_winner_prefers_higher_count_over_hash() {
+        // Higher vote count must win even when its hash sorts lower.
+        let params = SnowballParams { sample_size: 10, quorum: 3, decision_threshold: 1 };
+        let low_hash_more_votes = hash(1);
+        let high_hash_fewer_votes = hash(9);
+
+        let mut r = HashMap::new();
+        r.insert(high_hash_fewer_votes, 3);
+        r.insert(low_hash_more_votes, 5);
+
+        let mut voter = SnowballVoter::new(params);
+        assert!(voter.record_round(&r));
+        assert_eq!(voter.finalized_hash(), Some(low_hash_more_votes));
     }
 }

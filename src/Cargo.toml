@@ -19,10 +19,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/commputer/commputer"
+repository = "https://github.com/thecommrade/commputer"
 description = "A communal supercomputer coordinated by blockchain"
 
 [workspace.dependencies]
@@ -42,7 +42,7 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 
 # Networking
-libp2p = { version = "0.54", features = ["tokio", "gossipsub", "kad", "noise", "tcp", "yamux", "identify", "macros", "quic", "relay", "dcutr", "upnp", "request-response"] }
+libp2p = { version = "0.54", features = ["tokio", "gossipsub", "kad", "noise", "tcp", "yamux", "identify", "macros", "quic", "relay", "dcutr", "upnp", "request-response", "dns"] }
 
 # Storage
 rocksdb = "0.24"

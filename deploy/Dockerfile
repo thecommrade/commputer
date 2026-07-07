@@ -1,5 +1,6 @@
 # Item 97: Docker improvements — healthcheck, volume mounts, env config
-FROM rust:1.83 AS builder
+# rust >= 1.85 required for workspace edition 2024.
+FROM rust:1.88 AS builder
 WORKDIR /build
 COPY src/ ./src/
 WORKDIR /build/src

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Item 93: Linux installer script
-# Usage: curl -sSL https://raw.githubusercontent.com/commputer/commputer/main/scripts/install.sh | bash
+# Usage: curl -sSL https://raw.githubusercontent.com/thecommrade/commputer/main/scripts/install.sh | bash
 
 set -euo pipefail
 
@@ -42,7 +42,7 @@ fi
 echo "Building from source..."
 TEMP_DIR=$(mktemp -d)
 cd "${TEMP_DIR}"
-git clone --depth 1 https://github.com/commputer/commputer.git
+git clone --depth 1 https://github.com/thecommrade/commputer.git
 cd commputer/src
 cargo build --release -p commputer
 

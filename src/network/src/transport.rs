@@ -205,6 +205,10 @@ impl CommpNetwork {
                 },
             )?
             .with_quic()
+            // DNS resolution wraps the TCP+QUIC transports so /dns4/ and /dnsaddr/
+            // multiaddrs (e.g. a future seed.commputer.xyz seed) resolve at all.
+            // Without this, DNS-based multiaddrs are never dialable.
+            .with_dns()?
             .with_relay_client(noise::Config::new, || {
                 let mut cfg = yamux::Config::default();
                 cfg.set_max_num_streams(64);
@@ -313,9 +317,16 @@ impl CommpNetwork {
 }
 
 /// Founder-operated seed nodes. Replace with real addresses at launch.
+///
+/// TODO(seed): add the real seed once the box is provisioned, e.g.
+///   "/dns4/seed.commputer.xyz/tcp/9000"      (DNS — now resolvable via with_dns)
+///   "/dns4/seed.commputer.xyz/udp/9000/quic-v1"
+/// Blocked on the real seed box IP / DNS record. `/dns4/` forms only resolve
+/// because the transport enables `.with_dns()`.
 pub const SEED_NODES: &[&str] = &[
     // Format: /ip4/<IP>/tcp/<PORT>/p2p/<PEER_ID>
     // Or QUIC: /ip4/<IP>/udp/<PORT>/quic-v1/p2p/<PEER_ID>
+    // Or DNS:  /dns4/<HOST>/tcp/<PORT>/p2p/<PEER_ID>
 ];
 
 /// Convert a TCP multiaddr into its QUIC-v1 equivalent.
@@ -834,6 +845,29 @@ mod tests {
         let quic = tcp_to_quic_v1(&tcp);
         assert_eq!(quic, format!("/ip4/127.0.0.1/udp/19001/quic-v1/p2p/{}", peer_id));
         assert!(quic.parse::<Multiaddr>().is_ok(), "expected valid multiaddr, got {}", quic);
+    }
+
+    #[test]
+    fn dns4_multiaddr_parses() {
+        // With `.with_dns()` in the transport chain, /dns4/ seed multiaddrs are
+        // dialable. Confirm the multiaddr form itself is valid so a future
+        // seed.commputer.xyz seed can be listed in SEED_NODES.
+        assert!(
+            "/dns4/seed.commputer.xyz/tcp/9000".parse::<Multiaddr>().is_ok(),
+            "dns4 tcp multiaddr should parse"
+        );
+        assert!(
+            "/dns4/seed.commputer.xyz/udp/9000/quic-v1".parse::<Multiaddr>().is_ok(),
+            "dns4 quic multiaddr should parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_builds_with_dns_transport() {
+        // Outbound-only build exercises the full SwarmBuilder chain including
+        // `.with_dns()`. If DNS transport failed to construct, this would Err.
+        let net = CommpNetwork::new(0);
+        assert!(net.is_ok(), "network with DNS transport should build: {:?}", net.err());
     }
 
     #[test]

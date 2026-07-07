@@ -118,6 +118,14 @@ impl BlockHeader {
     }
 }
 
+/// Enforcement flag for producer signatures. While `false`, unsigned blocks are
+/// accepted for backward compatibility with the pre-signing testnet; the strict
+/// logic is still compiled and unit-tested via
+/// [`Block::verify_producer_signature_strict`]. The founder-gated protected
+/// enforcement batch flips this to `true` at the alpha genesis reset, at which
+/// point unsigned non-genesis blocks are rejected network-wide.
+pub const ENFORCE_PRODUCER_SIGNATURES: bool = false;
+
 /// Maximum number of transactions per block.
 pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 500;
 
@@ -180,12 +188,44 @@ impl Block {
     }
 
     /// Verify the producer's signature using the embedded public key.
-    /// Returns true if the signature is valid and the key matches the producer address.
-    /// Returns true for unsigned blocks (genesis, legacy blocks) to maintain compatibility.
+    ///
+    /// Behaviour is governed by [`ENFORCE_PRODUCER_SIGNATURES`]:
+    /// - while `false` (pre-signing testnet): unsigned blocks are accepted for
+    ///   backward compatibility, signed blocks are still verified;
+    /// - once the protected enforcement batch flips it `true` at the alpha
+    ///   genesis reset: every non-genesis block must carry a valid signature
+    ///   (delegates to [`Block::verify_producer_signature_strict`]).
     pub fn verify_producer_signature(&self) -> bool {
-        // Skip verification for unsigned blocks (genesis, old blocks).
+        if ENFORCE_PRODUCER_SIGNATURES {
+            return self.verify_producer_signature_strict();
+        }
+        // Legacy compat: accept unsigned blocks (genesis, pre-signing testnet).
         if self.header.signature.is_empty() && self.header.producer_public_key.is_empty() {
             return true;
+        }
+        self.header.verify_signature(&self.header.producer_public_key)
+    }
+
+    /// Strict producer-signature check for the post-flip network.
+    ///
+    /// Genesis (height 0) may be unsigned. Every other block MUST carry a
+    /// non-empty signature AND public key whose hash equals the producer
+    /// address (enforced inside [`BlockHeader::verify_signature`]); an unsigned
+    /// non-genesis block is rejected. This closes the forgery hole where an
+    /// empty (sig, key) pair let any peer author a block with an arbitrary
+    /// producer. Always compiled and unit-tested; wired into the live validate
+    /// path only by the founder-gated enforcement batch.
+    pub fn verify_producer_signature_strict(&self) -> bool {
+        if self.header.height == 0
+            && self.header.signature.is_empty()
+            && self.header.producer_public_key.is_empty()
+        {
+            // Genesis is permitted to be unsigned.
+            return true;
+        }
+        // Non-genesis (and any signed genesis) requires a real signature.
+        if self.header.signature.is_empty() || self.header.producer_public_key.is_empty() {
+            return false;
         }
         self.header.verify_signature(&self.header.producer_public_key)
     }
@@ -263,4 +303,73 @@ pub struct EpochSummary {
     pub compliant_count: u64,
     /// Number of nerfed validators.
     pub nerfed_count: u64,
+}
+
+#[cfg(test)]
+mod producer_signature_tests {
+    use super::*;
+    use crate::wallet::Wallet;
+    use crate::signing::sign_block;
+
+    fn unsigned_block(height: u64, producer: Address) -> Block {
+        Block {
+            header: BlockHeader {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                height,
+                parent_hash: BlockHash::GENESIS,
+                tx_root: [0u8; 32],
+                proof_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 1_700_000_000,
+                producer,
+                epoch: 0,
+                producer_public_key: vec![],
+                signature: vec![],
+                checkpoint_hash: None,
+                chain_id: "test".to_string(),
+            },
+            transactions: vec![],
+            proof_summaries: vec![],
+            compliance_summary: None,
+            epoch_summary: None,
+        }
+    }
+
+    #[test]
+    fn strict_rejects_unsigned_nongenesis() {
+        let w = Wallet::generate();
+        let b = unsigned_block(5, *w.address());
+        // The forgery hole: empty (sig, key) at height>0 must be rejected.
+        assert!(!b.verify_producer_signature_strict());
+        // Permissive path still accepts pre-flip — the strict check is INERT.
+        assert!(b.verify_producer_signature());
+    }
+
+    #[test]
+    fn strict_accepts_valid_signature() {
+        let w = Wallet::generate();
+        let mut b = unsigned_block(5, *w.address());
+        sign_block(&mut b, &w);
+        assert!(b.verify_producer_signature_strict());
+        assert!(b.verify_producer_signature());
+    }
+
+    #[test]
+    fn strict_rejects_key_not_matching_producer() {
+        let producer = Wallet::generate();
+        let imposter = Wallet::generate();
+        // Declared producer is `producer`, but `imposter` signs the block.
+        let mut b = unsigned_block(5, *producer.address());
+        sign_block(&mut b, &imposter);
+        // The signature is valid over the bytes, but the embedded key does not
+        // hash to the declared producer address → rejected.
+        assert!(!b.verify_producer_signature_strict());
+    }
+
+    #[test]
+    fn strict_allows_unsigned_genesis() {
+        let w = Wallet::generate();
+        let g = unsigned_block(0, *w.address());
+        assert!(g.verify_producer_signature_strict());
+    }
 }

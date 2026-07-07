@@ -1,4 +1,5 @@
 pub mod snowball;
+pub mod vote_aggregator;
 pub mod dag;
 pub mod epoch;
 pub mod emission;
@@ -18,6 +19,7 @@ pub mod optimistic;
 pub mod config;
 
 pub use snowball::SnowballVoter;
+pub use vote_aggregator::VoteAggregator;
 pub use dag::{Dag, DagVertex};
 pub use epoch::{Epoch, EpochState};
 pub use emission::{EmissionSchedule, ChannelAllocation};

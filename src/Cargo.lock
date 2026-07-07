@@ -644,7 +644,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "commputer"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-consensus"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "borsh",
  "commputer-core",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-da"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "proptest",
  "reed-solomon-erasure",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-desktop"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "axum",
  "commputer-core",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-doctor"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "chrono",
  "clap",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-network"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "async-trait",
  "borsh",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-pouw"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "proptest",
  "rand 0.8.5",
@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-pouw-e2e"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "commputer-da",
  "commputer-pouw",
@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-pouw-onchain"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "borsh",
  "commputer-da",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-proofs"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "blake3",
  "borsh",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-seed-node-kit"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-sim"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "clap",
  "commputer-consensus",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-storage"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "borsh",
  "commputer-core",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "commputer-validator"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "commputer-core",
  "proptest",

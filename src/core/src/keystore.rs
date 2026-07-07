@@ -5,6 +5,7 @@ use argon2::Argon2;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::error::CommpError;
 use crate::wallet::Wallet;
@@ -32,20 +33,25 @@ struct KeystoreFile {
 impl Keystore {
     /// Encrypt `wallet`'s seed phrase with `password` and write to `path`.
     pub fn save(wallet: &Wallet, path: &Path, password: &str) -> Result<(), CommpError> {
+        if password.is_empty() {
+            return Err(CommpError::Crypto("password must not be empty".into()));
+        }
+
         // Random salt and nonce.
         let mut salt = [0u8; 16];
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut salt);
         OsRng.fill_bytes(&mut nonce_bytes);
 
-        // Derive a 32-byte encryption key with Argon2.
-        let mut key_bytes = [0u8; 32];
+        // Derive a 32-byte encryption key with Argon2. Zeroizing scrubs it on EVERY
+        // drop — including the `?` error unwinds below, not just the happy path.
+        let mut key_bytes = zeroize::Zeroizing::new([0u8; 32]);
         Argon2::default()
-            .hash_password_into(password.as_bytes(), &salt, &mut key_bytes)
+            .hash_password_into(password.as_bytes(), &salt, &mut key_bytes[..])
             .map_err(|e| CommpError::Crypto(format!("Argon2 key derivation failed: {e}")))?;
 
         // Encrypt the seed phrase.
-        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        let cipher = Aes256Gcm::new_from_slice(&key_bytes[..])
             .map_err(|e| CommpError::Crypto(format!("AES key init failed: {e}")))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
@@ -62,14 +68,41 @@ impl Keystore {
         let json = serde_json::to_string_pretty(&file)
             .map_err(|e| CommpError::Serialization(e.to_string()))?;
 
-        std::fs::write(path, json)
-            .map_err(|e| CommpError::Storage(format!("failed to write keystore: {e}")))?;
+        // Write owner-only (0600) — the file holds the encrypted seed and must never
+        // be world/group readable. On unix, CREATE with mode 0600 so there is no
+        // world-readable window between write and chmod (TOCTOU); set_permissions
+        // after also fixes a pre-existing file. Mirrors network::transport peer-key handling.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| CommpError::Storage(format!("failed to create keystore: {e}")))?;
+            f.write_all(json.as_bytes())
+                .map_err(|e| CommpError::Storage(format!("failed to write keystore: {e}")))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| CommpError::Storage(format!("failed to set keystore permissions: {e}")))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, json)
+                .map_err(|e| CommpError::Storage(format!("failed to write keystore: {e}")))?;
+        }
 
         Ok(())
     }
 
     /// Read and decrypt a keystore file, returning the recovered `Wallet`.
     pub fn load(path: &Path, password: &str) -> Result<Wallet, CommpError> {
+        if password.is_empty() {
+            return Err(CommpError::Crypto("password must not be empty".into()));
+        }
+
         let json = std::fs::read_to_string(path)
             .map_err(|e| CommpError::Storage(format!("failed to read keystore: {e}")))?;
 
@@ -90,24 +123,35 @@ impl Keystore {
             )));
         }
 
-        // Re-derive the key.
-        let mut key_bytes = [0u8; 32];
+        // Re-derive the key. Zeroizing scrubs it on every drop, incl. the ? unwinds.
+        let mut key_bytes = zeroize::Zeroizing::new([0u8; 32]);
         Argon2::default()
-            .hash_password_into(password.as_bytes(), &salt, &mut key_bytes)
+            .hash_password_into(password.as_bytes(), &salt, &mut key_bytes[..])
             .map_err(|e| CommpError::Crypto(format!("Argon2 key derivation failed: {e}")))?;
 
         // Decrypt.
-        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        let cipher = Aes256Gcm::new_from_slice(&key_bytes[..])
             .map_err(|e| CommpError::Crypto(format!("AES key init failed: {e}")))?;
         let nonce = Nonce::from_slice(&nonce_bytes);
         let plaintext = cipher
             .decrypt(nonce, ciphertext.as_ref())
             .map_err(|_| CommpError::Crypto("decryption failed — wrong password?".into()))?;
 
-        let seed_phrase = String::from_utf8(plaintext)
-            .map_err(|e| CommpError::Crypto(format!("seed phrase is not valid UTF-8: {e}")))?;
+        // `String::from_utf8` moves `plaintext`; on both paths we scrub the
+        // recovered seed bytes so the phrase never lingers in freed memory.
+        let mut seed_phrase = match String::from_utf8(plaintext) {
+            Ok(s) => s,
+            Err(e) => {
+                let mut bytes = e.into_bytes();
+                bytes.zeroize();
+                return Err(CommpError::Crypto("seed phrase is not valid UTF-8".into()));
+            }
+        };
 
-        Wallet::from_seed_phrase(&seed_phrase)
+        let result = Wallet::from_seed_phrase(&seed_phrase);
+        seed_phrase.zeroize();
+
+        result
     }
 }
 
@@ -139,6 +183,39 @@ mod tests {
         let result = Keystore::load(&path, "wrong");
 
         assert!(result.is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn empty_password_rejected_on_save() {
+        let wallet = Wallet::generate();
+        let path = PathBuf::from("/tmp/commputer-test-keystore-empty.json");
+        let result = Keystore::save(&wallet, &path, "");
+        assert!(result.is_err(), "empty password must be rejected");
+        // Nothing should have been written.
+        assert!(!path.exists());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn empty_password_rejected_on_load() {
+        let wallet = Wallet::generate();
+        let path = PathBuf::from("/tmp/commputer-test-keystore-empty-load.json");
+        Keystore::save(&wallet, &path, "pw-123").unwrap();
+        let result = Keystore::load(&path, "");
+        assert!(result.is_err(), "empty password must be rejected on load");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keystore_file_mode_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let wallet = Wallet::generate();
+        let path = PathBuf::from("/tmp/commputer-test-keystore-mode.json");
+        Keystore::save(&wallet, &path, "pw-123").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "keystore must be owner-only (0600)");
         std::fs::remove_file(&path).ok();
     }
 }

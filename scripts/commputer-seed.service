@@ -8,7 +8,10 @@ Wants=network-online.target
 Type=simple
 User=commputer
 Group=commputer
-ExecStart=/home/commputer/.local/bin/commputer run --testnet --port 9000 --rpc-port 9944 --rpc-bind 0.0.0.0 --password ${COMMPUTER_WALLET_PASSWORD}
+# Password is read from the COMMPUTER_WALLET_PASSWORD env var (see EnvironmentFile
+# below), NOT passed on the command line — otherwise it would be visible in
+# /proc/*/cmdline to any local user.
+ExecStart=/home/commputer/.local/bin/commputer run --testnet --port 9000 --rpc-port 9944 --rpc-bind 0.0.0.0
 Restart=always
 RestartSec=5
 Environment=COMMPUTER_WALLET_PASSWORD=

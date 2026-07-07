@@ -1,5 +1,6 @@
 # Stage 1: Build
-FROM rust:1.82-slim AS builder
+# rust >= 1.85 required for workspace edition 2024.
+FROM rust:1.88-slim AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
