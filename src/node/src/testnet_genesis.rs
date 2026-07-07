@@ -48,6 +48,13 @@ pub fn generate_testnet_genesis(num_accounts: usize, output_path: &str) -> Resul
         emission_decay_rate: 0.0001,
         genesis_timestamp: 1647907200, // 2022-03-22 00:00:00 UTC
         consensus_params: Default::default(), // B8: serde-default == today's compiled params.
+        // A-batch item 7: the CORE `GenesisConfig.accounts` (height-0 credits) — empty
+        // here; the alpha-reset faucet funding is added to genesis.json at the reset,
+        // not in this generator. Empty + `skip_serializing_if` keeps the generated
+        // genesis byte-identical to today (no `"accounts":[]` is emitted). NB this is
+        // distinct from `TestnetGenesis.accounts` above — faucet funding goes in THIS
+        // core field, consumed by `apply_genesis_accounts`.
+        accounts: Vec::new(),
     };
 
     let mut accounts = Vec::with_capacity(num_accounts);

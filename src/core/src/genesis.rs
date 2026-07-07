@@ -41,6 +41,21 @@ pub struct GenesisConfig {
     /// right after `open()` on the run-path.
     #[serde(default)]
     pub consensus_params: ConsensusParamsConfig,
+    /// A-batch item 7: height-0 account allocations — `(address_hex, raw_units)`.
+    /// Applied by the storage genesis path (`ChainState::apply_genesis_accounts`),
+    /// which credits each balance AND bumps `total_emitted` by the same amount so
+    /// supply accounting stays conserved. This is the alpha-reset mechanism for
+    /// funding a faucet/treasury account via genesis.json WITHOUT a code change.
+    /// `#[serde(default)]` + `default_genesis()` leaving it EMPTY means a genesis
+    /// omitting the field (i.e. today's genesis.json) is byte-identical to before:
+    /// no credits ⇒ same state root and same `total_emitted`. `skip_serializing_if`
+    /// keeps the *serialized* form byte-identical too (an empty list emits nothing,
+    /// not `"accounts":[]`). NB this is the CORE genesis-funding field consumed by
+    /// `load_genesis` + `apply_genesis_accounts` — distinct from the unrelated
+    /// `TestnetGenesis.accounts` wrapper in node/src/testnet_genesis.rs; faucet/
+    /// treasury funding at the alpha reset goes HERE.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<(String, u64)>,
 }
 
 fn default_proof_interval() -> u64 { 300 }
@@ -252,6 +267,9 @@ pub fn default_genesis() -> GenesisConfig {
         emission_decay_rate: 0.0001,
         genesis_timestamp: 1774656000, // 2026-03-28 00:00:00 UTC — testnet epoch
         consensus_params: ConsensusParamsConfig::default(),
+        // A-batch item 7: no genesis allocations by default — keeps today's
+        // genesis byte-identical (empty ⇒ zero credits ⇒ unchanged state root).
+        accounts: Vec::new(),
     }
 }
 
@@ -304,6 +322,34 @@ mod tests {
     fn default_genesis_has_testnet_chain_id() {
         let config = default_genesis();
         assert_eq!(config.chain_id, TESTNET_CHAIN_ID);
+    }
+
+    /// A-batch item 7 continuity: a genesis JSON omitting `accounts` must
+    /// deserialize to an EMPTY allocation list, so today's genesis.json is
+    /// unchanged (no credits ⇒ same state root downstream). default_genesis()
+    /// likewise carries no allocations.
+    #[test]
+    fn genesis_omitting_accounts_deserializes_to_empty() {
+        let json = r#"{
+            "chain_id": "commputer-testnet-1",
+            "total_supply": 1,
+            "epoch_duration_secs": 60,
+            "emission_base_rate": 1,
+            "emission_floor_rate": 1
+        }"#;
+        let parsed: GenesisConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.accounts.is_empty());
+        assert!(default_genesis().accounts.is_empty());
+    }
+
+    /// A-batch item 7: an explicit `accounts` list round-trips as `(hex, raw)`.
+    #[test]
+    fn genesis_accounts_round_trip() {
+        let mut config = default_genesis();
+        config.accounts = vec![("ab".repeat(32), 12_345), ("cd".repeat(32), 67_890)];
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: GenesisConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.accounts, config.accounts);
     }
 
     #[test]

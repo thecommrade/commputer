@@ -720,6 +720,109 @@ impl ChainState {
         self.total_emitted = self.total_emitted.saturating_add(actual_reward);
     }
 
+    /// A-batch item 7: apply genesis account allocations at height 0.
+    ///
+    /// Credits each `(address_hex, raw_units)` to its account balance AND bumps
+    /// `total_emitted` by the same amount. Because both sides move together, the
+    /// supply invariants are preserved exactly:
+    ///   * circulating (`total_emitted - total_burned`) grows by the credited sum,
+    ///     matching the growth in Σ balances;
+    ///   * `remaining_supply` (`TOTAL_SUPPLY - total_emitted`) shrinks by the sum;
+    ///   * `total_supply` / `TOTAL_SUPPLY` are unchanged.
+    ///
+    /// Determinism: crediting is additive, so the resulting account map and the
+    /// `total_emitted` sum do NOT depend on entry order — two independent builds
+    /// from the same genesis produce the identical state root. Duplicate addresses
+    /// accumulate.
+    ///
+    /// EMPTY = byte-identical: an empty slice performs NO mutation at all (no
+    /// account touched, `total_emitted` untouched), so a genesis that omits
+    /// `accounts` yields the same accounts root and the same `total_emitted` as a
+    /// chain that never called this. This is the continuity guarantee for the
+    /// existing genesis.json.
+    ///
+    /// Fail-closed + all-or-nothing: the full set is validated (hex parse, sum
+    /// overflow, and the supply cap `total_emitted + sum <= TOTAL_SUPPLY`) BEFORE
+    /// any mutation, so a bad entry leaves state untouched and genesis can never
+    /// mint above the fixed cap. Genesis-only: rejects application once the chain
+    /// has advanced past the genesis block (`blocks.height() != 0`).
+    ///
+    /// WIRING (INERT until then): the node calls this ONCE from its genesis path
+    /// at the alpha reset — a PROTECTED `main.rs` edit (D6) — right after the
+    /// height-0 genesis block is applied. No caller exists yet, so this ships with
+    /// zero behavior change; funding an account is a genesis.json edit, not code.
+    pub fn apply_genesis_accounts(
+        &mut self,
+        accounts: &[(String, u64)],
+    ) -> Result<(), StateError> {
+        // EMPTY: no-op. Guarantees byte-identical continuity for today's genesis.
+        if accounts.is_empty() {
+            return Ok(());
+        }
+
+        // Genesis-only: never mint into a chain that has already advanced.
+        let height = self.blocks.height();
+        if height != 0 {
+            return Err(StateError::InvalidBlock(format!(
+                "genesis accounts can only be applied at height 0 (chain is at height {height})"
+            )));
+        }
+        // Idempotency guard: genesis credits are the ONLY thing that can bump
+        // `total_emitted` before the genesis block is applied, so a non-zero value
+        // here means this ran already (or a block was processed). Reject rather than
+        // double-credit — defends the single-call-site D6 contract against re-entry.
+        if self.total_emitted != 0 {
+            return Err(StateError::InvalidBlock(
+                "genesis accounts already applied (total_emitted != 0); refusing to double-credit"
+                    .to_string(),
+            ));
+        }
+
+        // Validate the entire set before mutating (all-or-nothing).
+        let mut parsed: Vec<(Address, u64)> = Vec::with_capacity(accounts.len());
+        let mut sum: u64 = 0;
+        for (addr_hex, raw) in accounts {
+            let addr = Address::from_hex(addr_hex).map_err(|e| {
+                StateError::InvalidBlock(format!(
+                    "genesis accounts: invalid address '{addr_hex}': {e}"
+                ))
+            })?;
+            sum = sum.checked_add(*raw).ok_or_else(|| {
+                StateError::InvalidBlock(
+                    "genesis accounts: allocation sum overflows u64".to_string(),
+                )
+            })?;
+            parsed.push((addr, *raw));
+        }
+
+        // Supply cap: genesis credits are emission and must fit under the fixed
+        // TOTAL_SUPPLY. total_emitted is 0 at a fresh genesis, but fold against the
+        // live value to stay correct regardless.
+        let new_emitted = self.total_emitted.checked_add(sum).ok_or_else(|| {
+            StateError::InvalidBlock("genesis accounts: total_emitted overflow".to_string())
+        })?;
+        if new_emitted > TOTAL_SUPPLY {
+            return Err(StateError::InvalidBlock(format!(
+                "genesis accounts: allocation sum {sum} would push total_emitted \
+                 {new_emitted} above TOTAL_SUPPLY {TOTAL_SUPPLY}"
+            )));
+        }
+
+        // Apply. Balance credit is additive; the sum-vs-cap check above bounds
+        // every per-account total below u64::MAX, so checked_add cannot fail here.
+        for (addr, raw) in parsed {
+            let account = self.accounts.get_or_create(addr);
+            account.balance = account.balance.checked_add(Amount::from_raw(raw)).ok_or_else(|| {
+                StateError::InvalidBlock(format!(
+                    "genesis accounts: balance overflow crediting {}",
+                    hex::encode(addr.0)
+                ))
+            })?;
+        }
+        self.total_emitted = new_emitted;
+        Ok(())
+    }
+
     /// P1+P8 shared core of ALL THREE apply paths (`apply_block` / `apply_block_validated` /
     /// `apply_block_atomic`): apply every transaction, then run the deterministic settlement
     /// driver (`settle_due_jobs`) — and on ANY Err restore the pre-block state before
@@ -4789,6 +4892,133 @@ mod tests {
         let genesis = genesis_block();
         state.apply_block(&genesis).unwrap();
         assert_eq!(state.blocks.height(), 0);
+    }
+
+    // ── A-batch item 7: genesis account allocations ──
+
+    /// (a) EMPTY continuity: applying an empty allocation set must leave BOTH the
+    /// state root AND total_emitted byte-identical to a chain that never called
+    /// apply_genesis_accounts. This is the guarantee that today's genesis.json
+    /// (no `accounts` field) keeps the same genesis hash/state root.
+    #[test]
+    fn genesis_accounts_empty_is_byte_identical() {
+        let mut baseline = ChainState::new();
+        baseline.apply_block(&genesis_block()).unwrap();
+
+        let mut with_empty = ChainState::new();
+        with_empty.apply_block(&genesis_block()).unwrap();
+        with_empty.apply_genesis_accounts(&[]).unwrap();
+
+        assert_eq!(
+            with_empty.total_emitted, baseline.total_emitted,
+            "empty genesis accounts must not change total_emitted"
+        );
+        assert_eq!(
+            with_empty.compute_state_root(), baseline.compute_state_root(),
+            "empty genesis accounts must not change the state root"
+        );
+    }
+
+    /// (b) A funded allocation credits the balance, bumps total_emitted by exactly
+    /// the sum, and is DETERMINISTIC across two independent builds (identical state
+    /// root) regardless of entry order.
+    #[test]
+    fn genesis_accounts_funded_credits_and_is_deterministic() {
+        let a_hex = hex::encode(addr(1).0);
+        let b_hex = hex::encode(addr(2).0);
+        let alloc_a = 700_000_000u64;
+        let alloc_b = 300_000_000u64;
+        let sum = alloc_a + alloc_b;
+
+        let mut s1 = ChainState::new();
+        s1.apply_block(&genesis_block()).unwrap();
+        let emitted_before = s1.total_emitted;
+        s1.apply_genesis_accounts(&[
+            (a_hex.clone(), alloc_a),
+            (b_hex.clone(), alloc_b),
+        ]).unwrap();
+
+        // Balances credited exactly.
+        assert_eq!(s1.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(alloc_a));
+        assert_eq!(s1.accounts.get(&addr(2)).unwrap().balance, Amount::from_raw(alloc_b));
+        // total_emitted increased by exactly the sum.
+        assert_eq!(s1.total_emitted, emitted_before + sum);
+
+        // Independent build with REVERSED entry order must reach the identical
+        // state root (order-independent, deterministic).
+        let mut s2 = ChainState::new();
+        s2.apply_block(&genesis_block()).unwrap();
+        s2.apply_genesis_accounts(&[
+            (b_hex, alloc_b),
+            (a_hex, alloc_a),
+        ]).unwrap();
+        assert_eq!(s2.total_emitted, s1.total_emitted);
+        assert_eq!(
+            s2.compute_state_root(), s1.compute_state_root(),
+            "genesis account application must be order-independent / deterministic"
+        );
+    }
+
+    /// (c) Supply conservation: with the emitted bump, Σ balances still equals
+    /// circulating (total_emitted - total_burned), remaining shrinks by exactly
+    /// the sum, and total_supply/TOTAL_SUPPLY are unchanged.
+    #[test]
+    fn genesis_accounts_conserve_supply() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let remaining_before = state.remaining_supply();
+        let burned_before = state.total_burned;
+        let alloc = 1_234_567_800u64;
+
+        state.apply_genesis_accounts(&[(hex::encode(addr(3).0), alloc)]).unwrap();
+
+        // Σ balances == circulating.
+        let sum_balances: u64 = state.accounts.iter().map(|a| a.balance.raw()).sum();
+        assert_eq!(
+            sum_balances, state.circulating_supply(),
+            "Σ balances must equal circulating supply after a genesis credit"
+        );
+        // circulating == emitted - burned; burned untouched.
+        assert_eq!(state.total_burned, burned_before);
+        assert_eq!(state.circulating_supply(), state.total_emitted - state.total_burned);
+        // remaining shrank by exactly the credited sum.
+        assert_eq!(state.remaining_supply(), remaining_before - alloc);
+        // Fixed cap never exceeded.
+        assert!(state.total_emitted <= TOTAL_SUPPLY);
+    }
+
+    /// Fail-closed: a bad hex address is rejected and NO state is mutated
+    /// (all-or-nothing) — total_emitted and balances stay put.
+    #[test]
+    fn genesis_accounts_reject_bad_address_without_mutation() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let emitted_before = state.total_emitted;
+        let root_before = state.compute_state_root();
+
+        let res = state.apply_genesis_accounts(&[
+            (hex::encode(addr(1).0), 100),
+            ("not-hex".to_string(), 100),
+        ]);
+        assert!(res.is_err(), "invalid hex address must be rejected");
+        assert_eq!(state.total_emitted, emitted_before, "no partial mutation on error");
+        assert_eq!(state.compute_state_root(), root_before, "state root unchanged on error");
+        assert!(state.accounts.get(&addr(1)).is_none(), "no account created on error");
+    }
+
+    /// Fail-closed: an allocation that would push total_emitted above TOTAL_SUPPLY
+    /// is rejected (genesis can never mint above the fixed cap).
+    #[test]
+    fn genesis_accounts_reject_supply_breach() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let res = state.apply_genesis_accounts(&[
+            (hex::encode(addr(1).0), TOTAL_SUPPLY),
+            (hex::encode(addr(2).0), 1),
+        ]);
+        assert!(res.is_err(), "sum above TOTAL_SUPPLY must be rejected");
+        assert_eq!(state.total_emitted, 0);
     }
 
     #[test]

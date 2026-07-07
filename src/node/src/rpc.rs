@@ -717,6 +717,45 @@ pub struct FaucetRequest {
     pub address: String,
 }
 
+/// A-batch item 6: build + sign a faucet Transfer of exactly 1 COMME to `to`,
+/// using `nonce` as the tx nonce. Fee is MINIMUM_FEE because Transfers are not
+/// fee-exempt in the mempool. Signed with `sign_transaction` (no chain_id — the
+/// signature form `tx.verify()` checks), so a faucet tx passes the mempool gate.
+///
+/// INERT SUBSTRATE: this is the money-path builder the D6 faucet dispenser will
+/// call once a faucet wallet is provisioned. It is NOT yet reachable from a
+/// handler — wiring it requires adding `faucet_wallet`/`faucet_next_nonce` fields
+/// to `RpcState`, which forces edits to the RpcState struct literal in the
+/// PROTECTED `main.rs`; that is the founder-gated D6 step at the alpha reset (see
+/// src/staging/docs/real_faucet_blueprint.md). Kept `#[allow(dead_code)]` so the
+/// verified builder ships now with zero new warnings and the D6 protected edit is
+/// minimal. Verified by `build_faucet_transfer_makes_valid_signed_1_comme`.
+#[allow(dead_code)]
+fn build_faucet_transfer(
+    wallet: &commputer_core::wallet::Wallet,
+    to: commputer_core::identity::Address,
+    nonce: u64,
+) -> Transaction {
+    let mut tx = Transaction {
+        from: *wallet.address(),
+        nonce,
+        kind: commputer_core::transaction::TxKind::Transfer {
+            to,
+            // 1 COMME in raw units.
+            amount: commputer_core::token::Amount::from_raw(
+                commputer_core::token::UNITS_PER_COMME,
+            ),
+        },
+        fee: commputer_core::transaction::MINIMUM_FEE,
+        signature: vec![],
+        public_key: vec![],
+        memo: None,
+        timelock: None,
+    };
+    commputer_core::signing::sign_transaction(&mut tx, wallet);
+    tx
+}
+
 /// POST /faucet — dispense testnet COMME.
 async fn faucet(
     State(state): State<Arc<RpcState>>,
@@ -895,7 +934,21 @@ async fn auth_middleware(
             let provided = req.headers()
                 .get("X-API-Key")
                 .and_then(|v| v.to_str().ok());
-            if provided != Some(expected_key.as_str()) {
+            // A-batch item 3: constant-time key comparison. A byte-wise `==` on
+            // the secret leaks its matching prefix through timing; constant_time_eq
+            // compares equal-length inputs without early-exit. (Like the standard
+            // `subtle`/`constant_time_eq`, it does short-circuit on a length
+            // mismatch, so the key *length* is not hidden — negligible for a
+            // high-entropy random key; the prefix-timing-oracle is what matters.)
+            // A missing header (None) is a straight reject (fail-closed).
+            let authorized = match provided {
+                Some(p) => commputer_core::audit::constant_time_eq(
+                    p.as_bytes(),
+                    expected_key.as_bytes(),
+                ),
+                None => false,
+            };
+            if !authorized {
                 return (
                     StatusCode::UNAUTHORIZED,
                     Json(serde_json::json!({"error": "invalid or missing API key"})),
@@ -907,9 +960,16 @@ async fn auth_middleware(
 }
 
 /// Item 58: Security headers middleware.
-/// Item 55: CORS origin is now read from RpcState.cors_origins.
+///
+/// A-batch item 4: CORS headers were removed from here and moved to
+/// `cors_middleware` (installed inside `build_router`). The old code emitted the
+/// raw `cors_origins` string as `Access-Control-Allow-Origin`, which comma-joins
+/// a multi-origin allowlist into a single spec-invalid header; `cors_middleware`
+/// echoes exactly one allowlisted origin (or `*`) and adds an OPTIONS preflight.
+/// State is retained on the signature (unused) so `start_rpc_server`'s
+/// `from_fn_with_state` wiring is untouched.
 async fn security_headers(
-    State(state): State<Arc<RpcState>>,
+    State(_state): State<Arc<RpcState>>,
     req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
@@ -923,20 +983,79 @@ async fn security_headers(
         "Content-Security-Policy",
         "default-src 'self'; script-src 'none'".parse().unwrap(),
     );
-    // Item 55: Configurable CORS origins (default "*" for testnet).
-    let cors_value = state.cors_origins.as_str();
-    headers.insert(
-        "Access-Control-Allow-Origin",
-        cors_value.parse().unwrap_or_else(|_| "*".parse().unwrap()),
-    );
+    response
+}
+
+// ── A-batch item 4: CORS (allowlist echo + OPTIONS preflight) ──
+
+/// Decide the single `Access-Control-Allow-Origin` value to emit for a request.
+///
+/// * Configured allowlist `"*"` (the testnet default) → always `Some("*")`.
+/// * Otherwise the allowlist is a comma-separated set of exact origins: echo the
+///   request `Origin` ONLY when it matches an entry exactly.
+///
+/// Fail-closed: a missing/unmatched `Origin` under a non-wildcard allowlist
+/// returns `None` (no ACAO header emitted). Never comma-joins multiple origins.
+fn cors_allow_origin(cors_origins: &str, request_origin: Option<&str>) -> Option<String> {
+    let allow = cors_origins.trim();
+    if allow == "*" {
+        return Some("*".to_string());
+    }
+    let origin = request_origin?;
+    for entry in allow.split(',') {
+        if entry.trim() == origin {
+            return Some(origin.to_string());
+        }
+    }
+    None
+}
+
+/// Write the CORS response headers. When `allow_origin` is `None`, no
+/// `Access-Control-Allow-Origin` is written (fail-closed).
+fn apply_cors_headers(headers: &mut axum::http::HeaderMap, allow_origin: Option<&str>) {
+    if let Some(origin) = allow_origin
+        && let Ok(v) = origin.parse::<axum::http::HeaderValue>()
+    {
+        headers.insert("Access-Control-Allow-Origin", v);
+        // A per-origin ACAO must not be cached across origins.
+        headers.insert("Vary", axum::http::HeaderValue::from_static("Origin"));
+    }
     headers.insert(
         "Access-Control-Allow-Methods",
-        "GET, POST, OPTIONS".parse().unwrap(),
+        axum::http::HeaderValue::from_static("GET, POST, OPTIONS"),
     );
     headers.insert(
         "Access-Control-Allow-Headers",
-        "Content-Type, X-API-Key".parse().unwrap(),
+        axum::http::HeaderValue::from_static("Content-Type, X-API-Key"),
     );
+}
+
+/// CORS middleware. Installed as the OUTERMOST layer of `build_router`, so an
+/// `OPTIONS` preflight is answered here BEFORE auth/rate-limit run — a browser
+/// preflight carries no credentials and must not be rejected by the admin-key
+/// gate. Non-preflight responses get the echoed ACAO appended on the way out.
+async fn cors_middleware(
+    State(state): State<Arc<RpcState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let request_origin = req.headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let allow_origin = cors_allow_origin(&state.cors_origins, request_origin.as_deref());
+
+    if req.method() == axum::http::Method::OPTIONS {
+        let mut resp = Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(axum::body::Body::empty())
+            .expect("static preflight response is valid");
+        apply_cors_headers(resp.headers_mut(), allow_origin.as_deref());
+        return resp;
+    }
+
+    let mut response = next.run(req).await;
+    apply_cors_headers(response.headers_mut(), allow_origin.as_deref());
     response
 }
 
@@ -950,16 +1069,63 @@ const RATE_LIMIT_MAX: u32 = 100;
 const MAX_RATE_LIMIT_ENTRIES: usize = 100_000;
 const EVICT_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A-batch item 2: trusted-proxy predicate for client-IP derivation. DEFAULT
+/// POLICY: only loopback is trusted — the D3 TLS reverse proxy runs on the same
+/// host as the node, so it reaches the RPC over 127.0.0.1/::1. Forwarding headers
+/// (`X-Forwarded-For` / `CF-Connecting-IP`) are honored ONLY when the socket peer
+/// is trusted; a direct remote peer can never spoof its rate-limit identity via a
+/// header. No config/main.rs change: the trust set is this single source line.
+fn is_trusted_proxy(ip: &std::net::IpAddr) -> bool {
+    ip.is_loopback()
+}
+
+/// A-batch item 2: derive the per-IP rate-limit key from the request. When the
+/// socket peer is a trusted proxy, take the rightmost `X-Forwarded-For` entry
+/// that is itself NOT a trusted proxy (this peels any chained trusted hops so the
+/// real client is used), then fall back to `CF-Connecting-IP`. When the peer is
+/// untrusted, use the socket IP verbatim and IGNORE all forwarding headers. A
+/// request with no determinable socket peer collapses to a shared "unknown"
+/// bucket (fail-closed to shared, never to per-header trust).
+fn rate_limit_client_ip(req: &axum::http::Request<axum::body::Body>) -> String {
+    let Some(socket_ip) = req.extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+    else {
+        return "unknown".to_string();
+    };
+
+    if is_trusted_proxy(&socket_ip) {
+        if let Some(xff) = req.headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+        {
+            for part in xff.split(',').rev() {
+                if let Ok(ip) = part.trim().parse::<std::net::IpAddr>()
+                    && !is_trusted_proxy(&ip)
+                {
+                    return ip.to_string();
+                }
+            }
+        }
+        if let Some(cf) = req.headers()
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            && let Ok(ip) = cf.trim().parse::<std::net::IpAddr>()
+        {
+            return ip.to_string();
+        }
+    }
+
+    socket_ip.to_string()
+}
+
 /// Middleware that enforces per-IP rate limiting: max 100 req/s.
 async fn rate_limit_middleware(
     State(state): State<Arc<RpcState>>,
     req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let ip = req.extensions()
-        .get::<ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let ip = rate_limit_client_ip(&req);
 
     {
         let mut limits = state.rate_limits.lock().await;
@@ -1188,9 +1354,37 @@ async fn get_health_enhanced(
     }))
 }
 
+/// GET /peers/full — A-batch item 5 (D3): UN-redacted peer list including IPs.
+/// ADMIN-ONLY — lives in the keyed admin tier (auth_middleware), so
+/// validator-topology IPs are never exposed on the public surface. The public
+/// /peers route (get_peers) redacts the same field.
+async fn get_peers_full(
+    State(state): State<Arc<RpcState>>,
+) -> Json<Vec<PeerInfo>> {
+    let peers = state.peers.lock().await.clone();
+    Json(peers)
+}
+
 /// Build the axum router (exposed for testing).
+///
+/// A-batch item 5 (D3 public/keyed split). Two route tiers merged into one app:
+///
+/// * PUBLIC — read-only GETs + POST /tx + POST /faucet + the /ws event stream.
+///   Rate-limit layer only; intentionally reachable WITHOUT an API key so a
+///   public testnet is usable behind the D3 TLS reverse proxy.
+/// * ADMIN — operator diagnostics that leak topology/host internals
+///   (/metrics, /metrics/prometheus, /storage/metrics, /traffic,
+///   /network/quality, /compliance, /anti-scale, /peers/full). Rate-limit AND
+///   auth_middleware, so these require the admin key whenever one is configured.
+///
+/// /ws is deliberately PUBLIC: it only streams already-public broadcast events
+/// (the same data the public GET routes expose), so it needs no key.
+///
+/// cors_middleware is applied as the OUTERMOST layer (over the whole merged app)
+/// so OPTIONS preflight is answered before auth/rate-limit.
 pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
-    Router::new()
+    // PUBLIC tier — rate-limited, no auth.
+    let public = Router::new()
         .route("/", get(block_explorer))
         .route(
             "/tx",
@@ -1204,8 +1398,6 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/mempool", get(get_mempool))
         .route("/block/{height}", get(get_block_by_height))
         .route("/receipt/{tx_hash}", get(get_receipt))
-        .route("/metrics", get(get_metrics))
-        .route("/metrics/prometheus", get(get_prometheus_metrics))
         .route("/proofs/status", get(get_proof_status))
         .route("/proofs/history/{address}", get(get_proof_history))
         .route("/proofs/leaderboard", get(get_proof_leaderboard))
@@ -1216,29 +1408,53 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/account/{address}", get(get_account))
         .route("/supply", get(get_supply))
         .route("/capacity", get(get_capacity))
-        .route("/compliance", get(get_compliance))
-        .route("/anti-scale", get(get_anti_scale))
         .route("/network", get(get_network_health))
-        .route("/network/quality", get(get_peer_quality))
-        .route("/storage/metrics", get(get_storage_metrics))
         .route("/ws", get(ws_handler))
         .route("/fee-estimate", get(get_fee_estimate))
-        .route("/traffic", get(get_traffic))
         .route("/rewards/{address}", get(get_pending_rewards))
         .route("/faucet", post(faucet))
         .route("/leaderboard", get(get_leaderboard))
         .route("/stats", get(get_stats_page))
+        .route_layer(middleware::from_fn_with_state(rpc_state.clone(), rate_limit_middleware));
+
+    // ADMIN tier — rate-limited AND key-gated (auth_middleware).
+    let admin = Router::new()
+        .route("/metrics", get(get_metrics))
+        .route("/metrics/prometheus", get(get_prometheus_metrics))
+        .route("/storage/metrics", get(get_storage_metrics))
+        .route("/traffic", get(get_traffic))
+        .route("/network/quality", get(get_peer_quality))
+        .route("/compliance", get(get_compliance))
+        .route("/anti-scale", get(get_anti_scale))
+        .route("/peers/full", get(get_peers_full))
         .route_layer(middleware::from_fn_with_state(rpc_state.clone(), auth_middleware))
-        .route_layer(middleware::from_fn_with_state(rpc_state.clone(), rate_limit_middleware))
+        .route_layer(middleware::from_fn_with_state(rpc_state.clone(), rate_limit_middleware));
+
+    public
+        .merge(admin)
+        .layer(middleware::from_fn_with_state(rpc_state.clone(), cors_middleware))
         .with_state(rpc_state)
 }
 
-/// W5.7 F-4: Deployment-safety gate. Returns `Err` when the RPC server
-/// would be exposed insecurely: bound to a non-loopback address while no
-/// API key is configured (auth disabled). Loopback binds, and any bind with
-/// an API key set, are allowed. An unparseable bind string is treated as
-/// non-loopback (fail-closed). The returned String is a human-readable reason
-/// suitable for logging.
+/// W5.7 F-4: Deployment-safety gate. Returns `Err` when the RPC server would be
+/// exposed insecurely.
+///
+/// A-batch item 5 (D3): under the public/keyed route split the admin diagnostics
+/// tier lives in the SAME listener as the public tier, gated by the admin key.
+/// This guard preserves the F-4 intent — never expose the KEYLESS admin tier on
+/// a public interface — precisely: a non-loopback bind is permitted only when an
+/// admin key is set (admin tier then requires the key; the public read tier is
+/// intentionally open). With no key, only loopback is allowed (there the keyless
+/// admin tier is reachable only from the local host). An unparseable bind string
+/// is treated as non-loopback (fail-closed). The returned String is a
+/// human-readable reason suitable for logging.
+///
+/// OPERATOR CAVEAT (D3): this guard only inspects the node's OWN bind address, not
+/// a reverse proxy in front of it. Under the D3 topology (TLS proxy → loopback RPC),
+/// binding loopback with NO admin key passes this guard, but a public proxy would
+/// then expose the keyless admin tier to the internet. When fronting the node with
+/// a proxy, an admin key MUST be set (or the admin routes withheld at the proxy).
+/// The operator runbook has to state this — the code cannot detect the proxy.
 fn rpc_bind_guard(rpc_bind: &str, api_key_is_set: bool) -> Result<(), String> {
     if api_key_is_set {
         return Ok(());
@@ -1286,7 +1502,15 @@ pub async fn start_rpc_server(
 
     info!("RPC server listening on http://{}", bind_addr);
 
-    if let Err(e) = axum::serve(listener, app).await {
+    // A-batch item 1: inject ConnectInfo<SocketAddr> so the per-request source
+    // address is available in `req.extensions()`. Without this the rate limiter
+    // (rate_limit_middleware) and the auth loopback check see NO ConnectInfo and
+    // every caller collapses into one shared "unknown" bucket. auth_middleware
+    // is unaffected in the secure default (ALLOW_LOOPBACK_BYPASS=false): it never
+    // consults ConnectInfo, and a present ConnectInfo does not weaken it.
+    let make_service =
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    if let Err(e) = axum::serve(listener, make_service).await {
         warn!("RPC server error: {}", e);
     }
 }
@@ -1698,15 +1922,21 @@ mod tests {
     // determinable IP) skipped the X-API-Key check. These tests pin the new
     // policy: a configured key is required for loopback callers too, while the
     // no-key default remains a pure pass-through.
+    //
+    // A-batch item 5 (D3): these probe an ADMIN route (/metrics) rather than
+    // /status. Under the public/keyed split /status is a PUBLIC route (no auth),
+    // so the auth middleware is now only reachable via an admin route. The
+    // security invariants asserted here (loopback bypass closed, fail-closed on
+    // no ConnectInfo, key required) are unchanged — only the probe route moved.
 
     use std::net::SocketAddr;
 
-    /// Helper: a request to GET /status carrying an explicit loopback
-    /// ConnectInfo in its extensions (what the real TCP accept path injects).
-    /// `key`: Some(..) sets the X-API-Key header; None omits it entirely.
-    fn loopback_status_request(key: Option<&str>) -> Request<Body> {
+    /// Helper: a request to GET /metrics (an ADMIN, key-gated route) carrying an
+    /// explicit loopback ConnectInfo in its extensions (what the real TCP accept
+    /// path injects). `key`: Some(..) sets the X-API-Key header; None omits it.
+    fn loopback_admin_request(key: Option<&str>) -> Request<Body> {
         let loopback: SocketAddr = "127.0.0.1:54321".parse().unwrap();
-        let mut builder = Request::builder().method("GET").uri("/status");
+        let mut builder = Request::builder().method("GET").uri("/metrics");
         if let Some(k) = key {
             builder = builder.header("X-API-Key", k);
         }
@@ -1730,7 +1960,7 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(loopback_status_request(None))
+            .oneshot(loopback_admin_request(None))
             .await
             .unwrap();
 
@@ -1753,7 +1983,7 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(loopback_status_request(Some("wrong-key")))
+            .oneshot(loopback_admin_request(Some("wrong-key")))
             .await
             .unwrap();
 
@@ -1775,7 +2005,7 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(loopback_status_request(Some("s3cret-key")))
+            .oneshot(loopback_admin_request(Some("s3cret-key")))
             .await
             .unwrap();
 
@@ -1797,7 +2027,7 @@ mod tests {
         let app = build_router(state);
 
         let resp = app
-            .oneshot(loopback_status_request(None))
+            .oneshot(loopback_admin_request(None))
             .await
             .unwrap();
 
@@ -1820,10 +2050,11 @@ mod tests {
             .api_key = Some("s3cret-key".to_string());
         let app = build_router(state);
 
-        // No ConnectInfo inserted — mirrors the live runtime path.
+        // No ConnectInfo inserted — mirrors the live runtime path. Probes the
+        // admin route (/metrics) since the auth gate now lives there (D3 split).
         let req = Request::builder()
             .method("GET")
-            .uri("/status")
+            .uri("/metrics")
             .body(Body::empty())
             .unwrap();
 
@@ -1850,7 +2081,7 @@ mod tests {
         let remote: SocketAddr = "203.0.113.7:40000".parse().unwrap();
         let mut req = Request::builder()
             .method("GET")
-            .uri("/status")
+            .uri("/metrics")
             .body(Body::empty())
             .unwrap();
         req.extensions_mut().insert(ConnectInfo(remote));
@@ -1861,5 +2092,311 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "non-loopback caller with no key MUST be rejected when a key is configured"
         );
+    }
+
+    // ── A-batch item 5 (D3 public/keyed split) tests ──
+
+    /// PUBLIC route: /status must be reachable with NO key even when an admin key
+    /// IS configured. This is the whole point of the split — the public read tier
+    /// stays open behind the D3 proxy while admin diagnostics require the key.
+    #[tokio::test]
+    async fn d3_public_status_open_without_key_when_key_set() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "public /status MUST stay open without a key even when an admin key is set"
+        );
+    }
+
+    /// ADMIN route: /metrics must be rejected (401) without the key when a key is
+    /// configured.
+    #[tokio::test]
+    async fn d3_admin_metrics_requires_key() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "admin /metrics MUST require the key when one is configured"
+        );
+    }
+
+    /// ADMIN route: /metrics returns 200 with the correct key.
+    #[tokio::test]
+    async fn d3_admin_metrics_accepts_correct_key() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .header("X-API-Key", "s3cret-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "admin /metrics MUST be reachable with the correct key"
+        );
+    }
+
+    /// ADMIN /peers/full is key-gated AND returns the UN-redacted IP (the public
+    /// /peers strips it). Pins that the split did not accidentally expose the
+    /// admin route, and that it truly serves the sensitive field once authorized.
+    #[tokio::test]
+    async fn d3_peers_full_admin_gated_and_returns_ip() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        {
+            let mut peers = state.peers.lock().await;
+            peers.push(PeerInfo {
+                peer_id: "12D3KooWFullPeer".into(),
+                ip: Some("198.51.100.7".into()),
+                validator_address: Some("cd".repeat(32)),
+                compliance_status: Some("Compliant".into()),
+                last_seen: None,
+            });
+        }
+        let app = build_router(state);
+
+        // Without a key: 401.
+        let unauth = Request::builder()
+            .method("GET")
+            .uri("/peers/full")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(unauth).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "/peers/full MUST be key-gated"
+        );
+
+        // With the key: 200 and the IP is present (un-redacted).
+        let authed = Request::builder()
+            .method("GET")
+            .uri("/peers/full")
+            .header("X-API-Key", "s3cret-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(authed).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let returned: Vec<PeerInfo> = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(returned.len(), 1);
+        assert_eq!(
+            returned[0].ip.as_deref(),
+            Some("198.51.100.7"),
+            "/peers/full MUST return the un-redacted IP once authorized"
+        );
+    }
+
+    // ── A-batch item 2 (proxy-aware client IP) tests ──
+
+    /// A trusted proxy (loopback socket peer) → the rightmost non-trusted
+    /// X-Forwarded-For entry is used as the rate-limit identity.
+    #[tokio::test]
+    async fn rate_limit_client_ip_trusts_xff_from_loopback() {
+        let loopback: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            // client, then a chained trusted (loopback) hop on the right; the
+            // rightmost NON-trusted entry (the real client) must win.
+            .header("x-forwarded-for", "203.0.113.9, 127.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback));
+        assert_eq!(rate_limit_client_ip(&req), "203.0.113.9");
+    }
+
+    /// CF-Connecting-IP is honored from a trusted proxy when no usable XFF entry
+    /// exists.
+    #[tokio::test]
+    async fn rate_limit_client_ip_uses_cf_header_from_loopback() {
+        let loopback: SocketAddr = "[::1]:9999".parse().unwrap();
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("cf-connecting-ip", "203.0.113.55")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback));
+        assert_eq!(rate_limit_client_ip(&req), "203.0.113.55");
+    }
+
+    /// A NON-trusted (remote) socket peer → forwarding headers are IGNORED and
+    /// the socket IP is used. A remote client cannot spoof its rate-limit bucket.
+    #[tokio::test]
+    async fn rate_limit_client_ip_ignores_xff_from_remote() {
+        let remote: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("x-forwarded-for", "10.0.0.1")
+            .header("cf-connecting-ip", "10.0.0.2")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(remote));
+        assert_eq!(
+            rate_limit_client_ip(&req),
+            "203.0.113.7",
+            "forwarding headers from a non-trusted peer MUST be ignored"
+        );
+    }
+
+    /// No ConnectInfo → single shared "unknown" bucket (fail-closed to shared).
+    #[tokio::test]
+    async fn rate_limit_client_ip_unknown_without_connect_info() {
+        let req = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("x-forwarded-for", "10.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(rate_limit_client_ip(&req), "unknown");
+    }
+
+    // ── A-batch item 4 (CORS allowlist + preflight) tests ──
+
+    #[test]
+    fn cors_allow_origin_wildcard_and_allowlist() {
+        // Wildcard: always "*", regardless of request Origin.
+        assert_eq!(cors_allow_origin("*", None).as_deref(), Some("*"));
+        assert_eq!(cors_allow_origin("*", Some("https://x.example")).as_deref(), Some("*"));
+
+        // Multi-origin allowlist: echo only an exact match; fail-closed otherwise.
+        let allow = "https://a.example, https://b.example";
+        assert_eq!(cors_allow_origin(allow, Some("https://a.example")).as_deref(), Some("https://a.example"));
+        assert_eq!(cors_allow_origin(allow, Some("https://b.example")).as_deref(), Some("https://b.example"));
+        assert_eq!(cors_allow_origin(allow, Some("https://evil.example")), None);
+        // No Origin header under a non-wildcard allowlist → no ACAO.
+        assert_eq!(cors_allow_origin(allow, None), None);
+    }
+
+    /// OPTIONS preflight is answered with 204 and CORS headers, WITHOUT a key,
+    /// even when an admin key is configured (browsers preflight w/o credentials).
+    #[tokio::test]
+    async fn cors_preflight_returns_204_with_headers() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        // Default cors_origins is "*".
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/metrics") // even an admin path preflights without the key
+            .header("origin", "https://app.example")
+            .header("access-control-request-method", "GET")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").map(|v| v.to_str().unwrap()),
+            Some("*"),
+            "wildcard testnet default must echo * on preflight"
+        );
+        assert!(resp.headers().get("access-control-allow-methods").is_some());
+    }
+
+    /// Non-wildcard allowlist: an allowed Origin is echoed; a disallowed Origin
+    /// gets NO Access-Control-Allow-Origin header (fail-closed).
+    #[tokio::test]
+    async fn cors_allowlist_echoes_allowed_and_omits_disallowed() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .cors_origins = "https://allowed.example".to_string();
+        let app = build_router(state);
+
+        // Allowed origin → echoed exactly (never comma-joined).
+        let allowed = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("origin", "https://allowed.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(allowed).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").map(|v| v.to_str().unwrap()),
+            Some("https://allowed.example"),
+        );
+
+        // Disallowed origin → no ACAO header at all.
+        let disallowed = Request::builder()
+            .method("GET")
+            .uri("/status")
+            .header("origin", "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(disallowed).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "a disallowed origin MUST NOT receive an Access-Control-Allow-Origin header"
+        );
+    }
+
+    // ── A-batch item 6 (faucet money-path builder) test ──
+
+    /// The inert faucet substrate builds a valid, signed 1-COMME Transfer with the
+    /// requested nonce, MINIMUM_FEE, and correct recipient. Verifies the exact
+    /// building block the D6 dispenser will queue once a faucet wallet is wired.
+    #[test]
+    fn build_faucet_transfer_makes_valid_signed_1_comme() {
+        let faucet = Wallet::generate();
+        let recipient = Address([9u8; 32]);
+        let tx = build_faucet_transfer(&faucet, recipient, 7);
+
+        assert!(tx.verify(), "faucet tx must carry a valid signature");
+        assert_eq!(tx.from, *faucet.address());
+        assert_eq!(tx.nonce, 7);
+        assert!(
+            tx.fee >= commputer_core::transaction::MINIMUM_FEE,
+            "Transfer is not fee-exempt; fee must cover MINIMUM_FEE"
+        );
+        match tx.kind {
+            TxKind::Transfer { to, amount } => {
+                assert_eq!(to, recipient);
+                assert_eq!(
+                    amount.raw(),
+                    commputer_core::token::UNITS_PER_COMME,
+                    "faucet dispenses exactly 1 COMME"
+                );
+            }
+            other => panic!("expected Transfer, got {:?}", other),
+        }
     }
 }
