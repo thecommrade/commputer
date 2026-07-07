@@ -6,7 +6,7 @@ use commputer_core::block::{Block, BlockHash};
 use commputer_core::identity::Address;
 use tracing::info;
 use crate::account::Account;
-use crate::state::UnbondingChunk;
+use crate::state::{PendingJobRecord, UnbondingChunk};
 use commputer_pouw_onchain::lifecycle::JobLifecycleRecord;
 
 const CF_BLOCKS: &str = "blocks";
@@ -23,6 +23,10 @@ const CF_UNBONDING: &str = "unbonding_stake";
 // PoUW P2 (B1b): dedicated CF for the per-job verification lifecycle (borsh JobLifecycleRecord DTO
 // value per raw 32-byte job_id key). Auto-created on existing DBs (create_missing_column_families).
 const CF_LIFECYCLE: &str = "job_lifecycles";
+// Phase 1.1 (B2/G-B): the 5th consensus map — submitted-but-unclaimed jobs (borsh PendingJobRecord
+// value per raw 32-byte job_id key). Carries (submitter, budget, program identity, claim deadline)
+// from SubmitJobV2 to ClaimJob. Auto-created on existing DBs.
+const CF_PENDING: &str = "pending_jobs";
 
 pub const META_TOTAL_EMITTED: &str = "total_emitted";
 pub const META_TOTAL_BURNED: &str = "total_burned";
@@ -72,7 +76,7 @@ impl RocksStore {
 
         let cf_names = [
             CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
-            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE,
+            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING,
         ];
         let cfs: Vec<ColumnFamilyDescriptor> = cf_names
             .iter()
@@ -375,7 +379,7 @@ impl RocksStore {
         let mut batch = rocksdb::WriteBatch::default();
         for cf_name in &[
             CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
-            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE,
+            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING,
         ] {
             let cf = self.cf(cf_name);
             batch.delete_range_cf(&cf, range_start, range_end);
@@ -565,7 +569,54 @@ impl RocksStore {
         batch.delete_cf(&cf, job_id);
     }
 
-    /// Wipe ONLY the four PoUW consensus-map CFs (standalone commit). `try_reorg` uses the
+    // Phase 1.1 (B2/G-B): pending-job persistence (borsh PendingJobRecord per raw 32-byte job_id).
+    pub fn put_pending(&self, job_id: &[u8; 32], rec: &PendingJobRecord) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_PENDING);
+        let encoded = borsh::to_vec(rec).expect("pending record borsh serialization should not fail");
+        self.db.put_cf(&cf, job_id, &encoded)
+    }
+    pub fn delete_pending(&self, job_id: &[u8; 32]) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_PENDING);
+        self.db.delete_cf(&cf, job_id)
+    }
+    pub fn all_pending(&self) -> HashMap<[u8; 32], PendingJobRecord> {
+        let cf = self.cf(CF_PENDING);
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let mut map = HashMap::new();
+        for item in iter {
+            match item {
+                Ok((key, value)) if key.len() == 32 => {
+                    match borsh::from_slice::<PendingJobRecord>(&value) {
+                        Ok(rec) => {
+                            let mut k = [0u8; 32];
+                            k.copy_from_slice(&key);
+                            map.insert(k, rec);
+                        }
+                        Err(e) => tracing::warn!(
+                            "skipping un-decodable CF_PENDING row — consensus state may be corrupt: {e}"
+                        ),
+                    }
+                }
+                Ok((key, _)) => tracing::warn!(
+                    "skipping malformed CF_PENDING row (key {}B) — consensus state may be corrupt",
+                    key.len()
+                ),
+                Err(e) => tracing::warn!("CF_PENDING iterator error: {e}"),
+            }
+        }
+        map
+    }
+    pub fn batch_put_pending(&self, batch: &mut WriteBatch, job_id: &[u8; 32], rec: &PendingJobRecord) {
+        let cf = self.cf(CF_PENDING);
+        let encoded = borsh::to_vec(rec).expect("pending record borsh serialization should not fail");
+        batch.put_cf(&cf, job_id, &encoded);
+    }
+    pub fn batch_delete_pending(&self, batch: &mut WriteBatch, job_id: &[u8; 32]) {
+        let cf = self.cf(CF_PENDING);
+        batch.delete_cf(&cf, job_id);
+    }
+
+    /// Wipe ONLY the five PoUW consensus-map CFs (standalone commit). `try_reorg` uses the
     /// batch variant below so its clear+rewrite is a single atomic WriteBatch.
     pub fn clear_consensus_maps(&self) -> Result<(), rocksdb::Error> {
         let mut batch = WriteBatch::default();
@@ -583,12 +634,12 @@ impl RocksStore {
         batch.delete_range_cf(&cf, range_start, range_end);
     }
 
-    /// Append full-range deletes of all four consensus-map CFs to `batch` (same atomicity
+    /// Append full-range deletes of all five consensus-map CFs to `batch` (same atomicity
     /// contract as `batch_clear_accounts`).
     pub fn batch_clear_consensus_maps(&self, batch: &mut WriteBatch) {
         let range_start: &[u8] = &[];
         let range_end: &[u8] = &[0xFF; 128];
-        for cf_name in &[CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE] {
+        for cf_name in &[CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING] {
             let cf = self.cf(cf_name);
             batch.delete_range_cf(&cf, range_start, range_end);
         }
@@ -601,7 +652,7 @@ impl RocksStore {
         let mut total: u64 = 0;
         for cf_name in &[
             CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
-            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE,
+            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING,
         ] {
             if let Some(cf) = self.db.cf_handle(cf_name)
                 && let Ok(Some(size_str)) = self.db.property_value_cf(&cf, "rocksdb.estimate-live-data-size")

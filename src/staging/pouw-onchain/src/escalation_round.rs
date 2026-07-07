@@ -594,7 +594,7 @@ mod tests {
         // --- Primary round (P2a): 3 verifiers reveal a 3-way split ⇒ Escalate. ---
         let stake = |_: &ParticipantId| 1u64;
         let mut lc = JobLifecycle::open(
-            job, pid(0), pid(9), e_bond, budget, v_bond,
+            job, [0xAB; 32], [0xAB; 32], [0xAB; 32], pid(0), pid(9), e_bond, budget, v_bond,
             GameParams::default(), ResolutionParams::default(), primary_committee.clone(),
             PhaseDeadlines { result_by: 10, commit_by: 20, reveal_by: 30 },
         );

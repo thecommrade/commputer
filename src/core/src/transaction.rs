@@ -114,9 +114,11 @@ pub enum TxKind {
     /// PoUW P0 / G3: the on-chain job format with the linchpin identity —
     /// `program_hash = sha256(wasm)`, binary `input_hash`, and `da_root` (DA-sampling anchor) —
     /// replacing the opaque `job_spec_hash`. Enables enforced deterministic execution
-    /// (`exec_adapter`) + DA sampling. Economically mirrors `SubmitJob` at P0 (burns comme_budget at
-    /// submit); P1 converts V2 settlement to escrow-and-split. The legacy `SubmitJob` stays valid and
-    /// drains at the migration height (open-Q#11 tx-format versioning).
+    /// (`exec_adapter`) + DA sampling. Phase 1.1 (B2): `comme_budget` is ESCROWED into the
+    /// per-job pot at submit (HELD in circulating supply, not burned — `is_burn` is false and
+    /// `burn_amount` is zero for V2); settlement pays/refunds/burns slices of the pot per the
+    /// verification verdict. The legacy `SubmitJob` keeps burn-at-submit and drains at the
+    /// migration height (open-Q#11 tx-format versioning).
     SubmitJobV2 {
         program_hash: [u8; 32],
         input_hash: [u8; 32],
@@ -254,16 +256,16 @@ impl Transaction {
         TxHash(out)
     }
 
-    /// Whether this transaction burns $COMME.
+    /// Whether this transaction burns $COMME. Phase 1.1 (B2): `SubmitJobV2` ESCROWS its budget
+    /// (held, not burned) so it is NOT a burn; the legacy `SubmitJob` still burns at submit.
     pub fn is_burn(&self) -> bool {
         match &self.kind {
             TxKind::BurstCompute { .. }
             | TxKind::MilestoneBurn { .. }
             | TxKind::CharitableDonation { .. }
-            | TxKind::SubmitJob { .. }
-            | TxKind::SubmitJobV2 { .. } => true,
+            | TxKind::SubmitJob { .. } => true,
             TxKind::Batch { operations } => operations.iter().any(|op| matches!(op,
-                TxKind::BurstCompute { .. } | TxKind::MilestoneBurn { .. } | TxKind::CharitableDonation { .. } | TxKind::SubmitJob { .. } | TxKind::SubmitJobV2 { .. }
+                TxKind::BurstCompute { .. } | TxKind::MilestoneBurn { .. } | TxKind::CharitableDonation { .. } | TxKind::SubmitJob { .. }
             )),
             _ => false,
         }
@@ -301,14 +303,15 @@ impl Transaction {
         vk.verify(&bytes, &sig).is_ok()
     }
 
-    /// The amount of $COMME burned by this transaction, if any.
+    /// The amount of $COMME burned by this transaction, if any. Phase 1.1 (B2): `SubmitJobV2`
+    /// escrows (never burns) its budget, so it contributes ZERO here — `revert_block`'s burn
+    /// reversal and every other caller must not count escrowed value as burned.
     pub fn burn_amount(&self) -> Amount {
         match &self.kind {
             TxKind::BurstCompute { burn_amount, .. } => *burn_amount,
             TxKind::MilestoneBurn { burn_amount, .. } => *burn_amount,
             TxKind::CharitableDonation { burn_amount, .. } => *burn_amount,
             TxKind::SubmitJob { comme_budget, .. } => *comme_budget,
-            TxKind::SubmitJobV2 { comme_budget, .. } => *comme_budget,
             TxKind::Batch { operations } => {
                 let mut total = Amount::ZERO;
                 for op in operations {
@@ -318,8 +321,7 @@ impl Transaction {
                         | TxKind::CharitableDonation { burn_amount, .. } => {
                             total = total.checked_add(*burn_amount).unwrap_or(total);
                         }
-                        TxKind::SubmitJob { comme_budget, .. }
-                        | TxKind::SubmitJobV2 { comme_budget, .. } => {
+                        TxKind::SubmitJob { comme_budget, .. } => {
                             total = total.checked_add(*comme_budget).unwrap_or(total);
                         }
                         _ => {}
@@ -540,6 +542,51 @@ mod tests {
     fn validate_shape_rejects_bad_keyrotation_pubkey_len() {
         let tx = shell_tx(TxKind::KeyRotation { new_public_key: vec![0u8; 33] });
         assert_eq!(tx.validate_shape(), Err("new_public_key must be 32 bytes"));
+    }
+
+    /// A shell SubmitJobV2 carrying `budget` (only the fields is_burn/burn_amount look at matter).
+    fn v2_kind(budget: u64) -> TxKind {
+        TxKind::SubmitJobV2 {
+            program_hash: [1u8; 32],
+            input_hash: [2u8; 32],
+            da_root: [3u8; 32],
+            resources: crate::compute::ResourceRequirements::cpu_only(1, 64),
+            max_duration_secs: 60,
+            comme_budget: Amount::from_raw(budget),
+            l2_id: None,
+        }
+    }
+
+    /// Phase 1.1 (B2) pins: V1 still burns its budget; V2 ESCROWS (is_burn false, burn_amount
+    /// ZERO) — top-level and inside a Batch; BurstCompute unchanged.
+    #[test]
+    fn is_burn_and_burn_amount_v1_burns_v2_escrows() {
+        let v1 = shell_tx(TxKind::SubmitJob {
+            job_spec_hash: [0u8; 32],
+            resources: crate::compute::ResourceRequirements::cpu_only(1, 64),
+            max_duration_secs: 60,
+            comme_budget: Amount::from_raw(5_000_000),
+            l2_id: None,
+        });
+        assert!(v1.is_burn(), "legacy SubmitJob still burns at submit");
+        assert_eq!(v1.burn_amount(), Amount::from_raw(5_000_000));
+
+        let v2 = shell_tx(v2_kind(5_000_000));
+        assert!(!v2.is_burn(), "SubmitJobV2 escrows — NOT a burn (B2)");
+        assert_eq!(v2.burn_amount(), Amount::ZERO, "escrowed budget is held, not burned");
+
+        let batch_v2 = shell_tx(TxKind::Batch { operations: vec![v2_kind(5_000_000)] });
+        assert!(!batch_v2.is_burn(), "V2 inside a Batch is not a burn either");
+        assert_eq!(batch_v2.burn_amount(), Amount::ZERO);
+
+        // BurstCompute is untouched by the flip.
+        let burst = shell_tx(TxKind::BurstCompute {
+            channel: ResourceChannel::Processing,
+            burn_amount: Amount::from_raw(7),
+            job_hash: [0u8; 32],
+        });
+        assert!(burst.is_burn());
+        assert_eq!(burst.burn_amount(), Amount::from_raw(7));
     }
 
     #[test]

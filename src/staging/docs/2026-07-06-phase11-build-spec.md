@@ -493,3 +493,41 @@ settle heights → same root; reorg replay reproduces), P9 DTO roundtrip with id
 5-section-root pin, expiry-refund path. The two P6 inversions replace their old pins. Everything else in
 the 158-test storage suite, B10's 5 terminals, N1 bond suite, core tx tests (minus is_burn changes,
 which get updated pins), pouw-onchain suites must stay green; frozen pouw crate byte-identical.
+
+---
+
+# POST-BUILD VERIFY OUTCOME (2026-07-06)
+
+Build landed; 3-agent verify (conformance APPROVE, bughunt FIX_REQUIRED, independent tests all green +
+frozen crate byte-identical). Storage 158→206, core 205, pouw-onchain 84, pouw(frozen) 53.
+
+**MAJOR (fixed):** P1 rocks-backed rollback reloaded pre-block state from the CFs, silently rewinding
+out-of-band mutations applied in memory since the last block (the epoch tick's `current_epoch` bump +
+per-account uptime pokes, peer-disconnect grace drains) — those ride the NEXT block's persist, so a disk
+reload on a rejected block would rewind them while the event loop's companion epoch state stayed
+advanced (a mixed state no crash produces → account-root divergence from honest peers). FIX:
+`capture_pre_block` now ALWAYS takes the memory snapshot (dropped the `PreBlock::Rocks` variant +
+`reload_consensus_state_from_rocks`); restores exact pre-block memory incl. the dirty/removed journals.
+Cost = O(accounts+maps) clone per block, trivial at testnet scale. New test
+`p1_rollback_preserves_out_of_band_mutations_on_a_rocks_node` (would fail under the old reload path).
+
+**MINOR (documented, deferred — no code change):**
+- (M1) Undecodable consensus-map CF rows are warn-skipped at `open()` (pre-existing pattern) but now a
+  pot/pending/lifecycle mismatch makes the P8 driver's pot guard reject EVERY subsequent block forever
+  (clean rollback each time, no smear — a fail-STOP, not corruption, but surfaced only as a startup warn
+  line). Disk corruption already means the node must resync; step 1.0's fresh-data-dir deployment
+  assumption (A8) covers it. FOLLOW-UP for the flip's hardening pass: make `open()` fail hard (or
+  cross-check key consistency and refuse to start) on any undecodable consensus-map row, converting a
+  mystifying runtime halt into an actionable startup error.
+- (M2) Expire-then-claim races degrade to the legacy no-op accept (the P8 driver expires a pending job at
+  the first block past `claim_by`, and txs run before the driver, so a late ClaimJob either still sees the
+  record — guard can't fire — or falls through to the silent legacy accept). No money at risk
+  (deterministic; the refund already ran), but a post-expiry claim is an indistinguishable no-op to
+  wallets. The `claim past window` guard is therefore defense-in-depth-only (its test injects state to
+  reach it). FOLLOW-UP (founder call, belongs with the PROTECTED consensus-format bundle since Commit/
+  Reveal unknown-id already flipped accept→reject): reject ClaimJob for ids absent from `pending_jobs`
+  once V1 pool jobs drain, or emit a distinct no-op receipt.
+
+Both follow-ups are recorded in THE MAP for the Phase 1.2 PROTECTED pass. Everything money-bearing is
+CONFIRMED conserved on both ledger backends across all five terminals incl. the zero-comp fallback and
+forfeiture variants.

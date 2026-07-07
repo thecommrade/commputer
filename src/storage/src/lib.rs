@@ -17,5 +17,6 @@ pub use rocks::RocksStore;
 pub use state::{
     ChainState, StateDiff, AccountDiff, WillEvent, WillEventType,
     RetentionPolicy, StorageMetrics, ValidatorPerformance,
+    PendingJobRecord, pending_job_from_tx,
 };
 pub use traits::Storage;

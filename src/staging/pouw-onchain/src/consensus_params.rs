@@ -28,11 +28,16 @@ pub struct PhaseWindows {
     pub result_blocks: u64,
     pub commit_blocks: u64,
     pub reveal_blocks: u64,
+    /// G-E (Phase 1.1): how long a `SubmitJobV2` pending job may sit unclaimed —
+    /// `claim_by = submit_height + claim_blocks`; past it the pot refunds to the submitter
+    /// (`expire_pending_job`). Anchored at SUBMIT height; the other three windows anchor the
+    /// per-job `PhaseDeadlines` at CLAIM height.
+    pub claim_blocks: u64,
 }
 
 impl Default for PhaseWindows {
     fn default() -> Self {
-        Self { result_blocks: 10, commit_blocks: 10, reveal_blocks: 10 }
+        Self { result_blocks: 10, commit_blocks: 10, reveal_blocks: 10, claim_blocks: 10 }
     }
 }
 
@@ -130,6 +135,7 @@ impl ConsensusParams {
         h.update(self.phase_windows.result_blocks.to_le_bytes());
         h.update(self.phase_windows.commit_blocks.to_le_bytes());
         h.update(self.phase_windows.reveal_blocks.to_le_bytes());
+        h.update(self.phase_windows.claim_blocks.to_le_bytes());
         let c = &self.capacity;
         h.update(c.total_slots.to_le_bytes());
         h.update(c.flagship_reserve_bps.to_le_bytes());
@@ -174,6 +180,7 @@ impl ConsensusParams {
         if w.result_blocks == 0 { return Err(ParamError::ZeroPhaseWindow("result")); }
         if w.commit_blocks == 0 { return Err(ParamError::ZeroPhaseWindow("commit")); }
         if w.reveal_blocks == 0 { return Err(ParamError::ZeroPhaseWindow("reveal")); }
+        if w.claim_blocks == 0 { return Err(ParamError::ZeroPhaseWindow("claim")); }
         if self.min_fuel_cap == 0 || self.min_fuel_cap > self.wasm_limits.fuel {
             return Err(ParamError::FuelCapBand { min: self.min_fuel_cap, max: self.wasm_limits.fuel });
         }
@@ -235,6 +242,7 @@ mod tests {
         assert_eq!(cp.min_fuel_cap, 1_000_000);
         assert_eq!(cp.wasm_limits.fuel, 100_000_000);
         assert_eq!(cp.phase_windows, PhaseWindows::default());
+        assert_eq!(cp.phase_windows.claim_blocks, 10, "G-E default claim window");
     }
 
     #[test]
@@ -248,6 +256,8 @@ mod tests {
         assert_ne!(b.fingerprint(), base.fingerprint(), "resolution field");
         let mut c = base.clone(); c.phase_windows.commit_blocks += 1;
         assert_ne!(c.fingerprint(), base.fingerprint(), "phase window");
+        let mut cb = base.clone(); cb.phase_windows.claim_blocks += 1;
+        assert_ne!(cb.fingerprint(), base.fingerprint(), "claim window (G-E)");
         let mut d = base.clone(); d.capacity.total_slots += 1;
         assert_ne!(d.fingerprint(), base.fingerprint(), "capacity field");
         let mut e = base.clone(); e.chunking.chunk_size += 1;
@@ -283,6 +293,9 @@ mod tests {
         // zero phase window
         let mut d = ConsensusParams::default(); d.phase_windows.commit_blocks = 0;
         assert_eq!(d.validate(), Err(ParamError::ZeroPhaseWindow("commit")));
+        // zero claim window (G-E)
+        let mut dc = ConsensusParams::default(); dc.phase_windows.claim_blocks = 0;
+        assert_eq!(dc.validate(), Err(ParamError::ZeroPhaseWindow("claim")));
         // min_fuel_cap above the wasm fuel cap
         let mut e = ConsensusParams::default(); e.min_fuel_cap = e.wasm_limits.fuel + 1;
         assert!(matches!(e.validate(), Err(ParamError::FuelCapBand { .. })));

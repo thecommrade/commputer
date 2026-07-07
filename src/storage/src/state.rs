@@ -9,13 +9,14 @@ use commputer_core::identity::Address;
 use commputer_core::token::{Amount, TOTAL_SUPPLY};
 use commputer_core::transaction::{TxKind, Transaction};
 use commputer_core::compliance::{ComplianceStatus, NerfRate};
-use commputer_pouw_onchain::lifecycle::{JobLifecycle, EventResult, Terminal, Phase};
+use commputer_pouw_onchain::lifecycle::{JobLifecycle, EventResult, Terminal, Phase, PhaseDeadlines};
 use commputer_pouw_onchain::escrow_ledger::Ledger;
-use commputer_pouw::oracle::{ChainHooks, EquivalenceOracle};
+use commputer_pouw_onchain::consensus_params::PhaseWindows;
+use commputer_pouw::oracle::{ByteEq, ChainHooks, EquivalenceOracle};
 use commputer_pouw::ids::ParticipantId;
-use commputer_pouw::job::{Commitment, Reveal};
+use commputer_pouw::job::{Commitment, Reveal, SettlementOutcome};
 use commputer_pouw::params::GameParams;
-use commputer_pouw_onchain::settlement_resolution::ResolutionParams;
+use commputer_pouw_onchain::settlement_resolution::{resolve_escalation_fallback, ResolutionParams};
 use ed25519_dalek::Verifier;
 use tracing::{info, warn};
 use crate::account::{Account, AccountStore};
@@ -162,9 +163,11 @@ pub struct ChainState {
     /// PoUW P1: $COMME escrowed per live compute job (`job_id` -> raw units). The sum
     /// (`total_escrowed`) is part of circulating supply — escrowed value is HELD, not burned —
     /// so `total_burned` MUST NOT move when a budget is escrowed; only a resolver's burn slice
-    /// at settlement increments it. Empty until the `SubmitJobV2` burn->escrow flip lands (P2).
+    /// at settlement increments it. LIVE since Phase 1.1 (B2): `SubmitJobV2` escrows its
+    /// budget here; `ClaimJob` adds the executor bond; `Commit` adds verifier bonds; the
+    /// settle/expiry drivers drain it.
     ///
-    /// PERSISTENCE (P2 step 1.0, complete — applies to all FOUR consensus maps): every
+    /// PERSISTENCE (P2 step 1.0, complete — applies to all FIVE consensus maps): every
     /// `apply_*` commits block + meta + dirty accounts + map deltas in ONE WriteBatch
     /// (`persist_applied_block`); entries removed in-memory are CF-deleted via the
     /// persisted-key mirrors; loaded in `open()`; folded into `compute_state_root` (Policy B).
@@ -193,14 +196,25 @@ pub struct ChainState {
     /// default until then.
     pub game_params: GameParams,
     pub resolution_params: ResolutionParams,
+    /// Phase 1.1 (G-E): genesis-anchored phase windows (result/commit/reveal window lengths,
+    /// anchored at CLAIM height, plus the `claim_blocks` submit-anchored claim window).
+    /// TODO(B8, PROTECTED genesis): populate from `GenesisConfig`; default until then —
+    /// all nodes MUST agree or they diverge on deadlines.
+    pub phase_windows: PhaseWindows,
     /// PoUW P2: per-job verification lifecycle (`job_id` -> `JobLifecycle`), the multi-block
-    /// commit-reveal state machine. Created at `ClaimJob` (AwaitingResult), committee drawn at
-    /// `CompleteJob`, fed by `Commit`/`Reveal`, advanced/settled by block height. Its money moves
-    /// run against `ChainState` via the §3 `Ledger` trait. Empty until the committee-draw wiring
-    /// (event_loop.rs) is live. Persisted per-block as borsh `JobLifecycleRecord` DTOs
-    /// (CF_LIFECYCLE) and folded into the state root; params re-injected on load (see the B1b
-    /// note on `game_params` above).
+    /// commit-reveal state machine. Created at `ClaimJob` (AwaitingResult, Phase 1.1 B3),
+    /// committee drawn at `CompleteJob` (B5, PROTECTED), fed by `Commit`/`Reveal` (B4),
+    /// advanced/settled by block height (`settle_due_jobs`, P8). Its money moves run against
+    /// `ChainState` via the §3 `Ledger` trait. Persisted per-block as borsh `JobLifecycleRecord`
+    /// DTOs (CF_LIFECYCLE) and folded into the state root; params re-injected on load (see the
+    /// B1b note on `game_params` above).
     pub job_lifecycles: HashMap<[u8; 32], JobLifecycle>,
+    /// Phase 1.1 (B2/G-B): the 5th consensus map — submitted-but-unclaimed jobs
+    /// (`job_id` -> `PendingJobRecord`). Written by `SubmitJobV2` (which also escrows the
+    /// budget), consumed by `ClaimJob` (B3, opens the lifecycle) or refunded by
+    /// `expire_pending_job` once `claim_by` passes. Persisted per-block (CF_PENDING) and folded
+    /// into the state root exactly like the other four maps.
+    pub pending_jobs: HashMap<[u8; 32], PendingJobRecord>,
     // Node-local mirrors of the keys currently persisted in each consensus-map CF (never
     // state-rooted, never serialized). Each persist computes `mirror − current_keys` to
     // CF-delete removed entries, then re-puts every live entry full-value; the mirror advances
@@ -212,6 +226,7 @@ pub struct ChainState {
     persisted_bonded_keys: HashSet<Address>,
     persisted_unbonding_keys: HashSet<Address>,
     persisted_lifecycle_keys: HashSet<[u8; 32]>,
+    persisted_pending_keys: HashSet<[u8; 32]>,
 }
 
 // Manual Debug impl since RocksStore doesn't derive Debug.
@@ -234,6 +249,7 @@ impl std::fmt::Debug for ChainState {
             .field("bonded_stake", &self.bonded_stake.len())
             .field("unbonding_stake", &self.unbonding_stake.len())
             .field("job_lifecycles", &self.job_lifecycles.len())
+            .field("pending_jobs", &self.pending_jobs.len())
             .finish()
     }
 }
@@ -267,11 +283,14 @@ impl ChainState {
             stake_params: StakeParams::default(),
             game_params: GameParams::default(),
             resolution_params: ResolutionParams::default(),
+            phase_windows: PhaseWindows::default(),
             job_lifecycles: HashMap::new(),
+            pending_jobs: HashMap::new(),
             persisted_escrow_keys: HashSet::new(),
             persisted_bonded_keys: HashSet::new(),
             persisted_unbonding_keys: HashSet::new(),
             persisted_lifecycle_keys: HashSet::new(),
+            persisted_pending_keys: HashSet::new(),
         }
     }
 
@@ -331,10 +350,12 @@ impl ChainState {
             blocks.put(block);
         }
 
-        // PoUW P2 (B1a): load the persisted consensus money/stake maps (empty until the live flip).
+        // PoUW P2 (B1a): load the persisted consensus money/stake maps.
         let escrow_by_job = rocks.all_escrow();
         let bonded_stake = rocks.all_bonded();
         let unbonding_stake = rocks.all_unbonding();
+        // Phase 1.1 (B2/G-B): the 5th map — submitted-but-unclaimed jobs.
+        let pending_jobs = rocks.all_pending();
 
         // PoUW P2 (B1b): load persisted job_lifecycles. GameParams/ResolutionParams are genesis-anchored
         // (identical for every job) so they are NOT persisted per-job — reconstruct + re-inject them.
@@ -357,6 +378,7 @@ impl ChainState {
         let persisted_bonded_keys: HashSet<Address> = bonded_stake.keys().copied().collect();
         let persisted_unbonding_keys: HashSet<Address> = unbonding_stake.keys().copied().collect();
         let persisted_lifecycle_keys: HashSet<[u8; 32]> = job_lifecycles.keys().copied().collect();
+        let persisted_pending_keys: HashSet<[u8; 32]> = pending_jobs.keys().copied().collect();
 
         let account_count = accounts.len();
         let block_count = blocks.len();
@@ -364,9 +386,10 @@ impl ChainState {
 
         info!(
             "Loaded state from disk: {} blocks (height {}), {} accounts, epoch {}; \
-             escrow_pots={}, bonded={}, unbonding={}, lifecycles={}",
+             escrow_pots={}, bonded={}, unbonding={}, lifecycles={}, pending_jobs={}",
             block_count, height, account_count, current_epoch,
             escrow_by_job.len(), bonded_stake.len(), unbonding_stake.len(), job_lifecycles.len(),
+            pending_jobs.len(),
         );
 
         Ok(Self {
@@ -391,11 +414,14 @@ impl ChainState {
             stake_params: StakeParams::default(),
             game_params,
             resolution_params,
+            phase_windows: PhaseWindows::default(),
             job_lifecycles,
+            pending_jobs,
             persisted_escrow_keys,
             persisted_bonded_keys,
             persisted_unbonding_keys,
             persisted_lifecycle_keys,
+            persisted_pending_keys,
         })
     }
 
@@ -486,6 +512,19 @@ impl ChainState {
             })
         }).collect();
 
+        // Phase 1.1 (B2): pending_jobs (debug-only; the authoritative commitment is `state_root`).
+        let mut pending: Vec<(&[u8; 32], &PendingJobRecord)> = self.pending_jobs.iter().collect();
+        pending.sort_by(|a, b| a.0.cmp(b.0));
+        let pending_json: Vec<serde_json::Value> = pending.iter().map(|(id, r)| {
+            serde_json::json!({
+                "job_id": hex::encode(id),
+                "submitter": hex::encode(r.submitter),
+                "budget": r.budget,
+                "submitted_height": r.submitted_height,
+                "claim_by": r.claim_by,
+            })
+        }).collect();
+
         serde_json::json!({
             "height": self.blocks.height(),
             "total_emitted": self.total_emitted,
@@ -497,6 +536,7 @@ impl ChainState {
             "bonded_stake": bonded_json,
             "unbonding_stake": unbonding_json,
             "job_lifecycles": lifecycles_json,
+            "pending_jobs": pending_json,
         })
     }
 
@@ -514,18 +554,20 @@ impl ChainState {
     /// Compute the state root.
     ///
     /// PoUW P2 (B1a) — POLICY B (zero consensus change until the money path goes live): while all
-    /// three consensus maps are empty (the case today, until the live-enablement flip), this returns
-    /// the accounts-only root BYTE-IDENTICAL to before B1a. Once any map is non-empty, the root folds
-    /// the accounts root + the three maps (each iterated in SORTED key order — HashMap iteration is
-    /// nondeterministic — and length-prefixed so the encoding is injective across map boundaries). The
-    /// format change is thus deferred to the same moment the txs go live (a coordinated consensus
-    /// change), not introduced now.
+    /// FIVE consensus maps are empty (a chain that has never seen a PoUW tx), this returns
+    /// the accounts-only root BYTE-IDENTICAL to before B1a. Once ANY map is non-empty, the root
+    /// folds the accounts root + ALL FIVE maps (each iterated in SORTED key order — HashMap
+    /// iteration is nondeterministic — and length-prefixed so the encoding is injective across
+    /// map boundaries); the first Bond tx alone flips a chain to the 5-section format (the
+    /// early-return is all-or-nothing — P10a). The format change thus lands with the same
+    /// coordinated flip that makes the maps fillable.
     pub fn compute_state_root(&self) -> [u8; 32] {
         let accounts_root = self.accounts.compute_state_root();
         if self.escrow_by_job.is_empty()
             && self.bonded_stake.is_empty()
             && self.unbonding_stake.is_empty()
             && self.job_lifecycles.is_empty()
+            && self.pending_jobs.is_empty()
         {
             return accounts_root;
         }
@@ -570,9 +612,9 @@ impl ChainState {
         // job_lifecycles: sorted by job_id, length-prefixed; value = borsh(JobLifecycleRecord). The DTO
         // holds only Vec/Option/primitive fields (NO HashMap/HashSet) ⇒ borsh is canonical, Vec order is
         // the chain's append order (consensus-deterministic) ⇒ the fold is injective + deterministic
-        // across nodes. Per-entry blob length-prefixed (LE) so the encoding stays injective. B1b
-        // FINALIZES the Policy-B fold to four sections; while ALL four maps are empty (the case until the
-        // coordinated live flip) the root stays the pre-B1a accounts-only root byte-for-byte.
+        // across nodes. Per-entry blob length-prefixed (LE) so the encoding stays injective. Phase 1.1
+        // extends the Policy-B fold to FIVE sections (pending_jobs below); while ALL five maps are empty
+        // the root stays the pre-B1a accounts-only root byte-for-byte.
         let mut lifecycles: Vec<(&[u8; 32], &JobLifecycle)> = self.job_lifecycles.iter().collect();
         lifecycles.sort_by(|a, b| a.0.cmp(b.0));
         h.update((lifecycles.len() as u64).to_le_bytes());
@@ -580,6 +622,21 @@ impl ChainState {
             h.update(job_id);
             let blob = borsh::to_vec(&lc.to_record())
                 .expect("lifecycle record borsh serialization should not fail");
+            h.update((blob.len() as u64).to_le_bytes());
+            h.update(&blob);
+        }
+
+        // pending_jobs (Phase 1.1 / B2): sorted by job_id, length-prefixed; value =
+        // borsh(PendingJobRecord) (all fixed-size fields ⇒ canonical encoding), per-entry blob
+        // length-prefixed (LE) — the CF_LIFECYCLE fold pattern. This is the FIFTH and final
+        // Policy-B section.
+        let mut pending: Vec<(&[u8; 32], &PendingJobRecord)> = self.pending_jobs.iter().collect();
+        pending.sort_by(|a, b| a.0.cmp(b.0));
+        h.update((pending.len() as u64).to_le_bytes());
+        for (job_id, rec) in pending {
+            h.update(job_id);
+            let blob = borsh::to_vec(rec)
+                .expect("pending record borsh serialization should not fail");
             h.update((blob.len() as u64).to_le_bytes());
             h.update(&blob);
         }
@@ -648,6 +705,128 @@ impl ChainState {
         self.total_emitted = self.total_emitted.saturating_add(actual_reward);
     }
 
+    /// P1+P8 shared core of ALL THREE apply paths (`apply_block` / `apply_block_validated` /
+    /// `apply_block_atomic`): apply every transaction, then run the deterministic settlement
+    /// driver (`settle_due_jobs`) — and on ANY Err restore the pre-block state before
+    /// propagating it.
+    ///
+    /// P1 BLOCKER FIX: without this, a block rejected at tx *i* left txs `<i` (and the fee of
+    /// tx *i*) applied in memory; under step 1.0 those smeared accounts stayed in the dirty
+    /// journal and smeared maps stayed live, so the NEXT successful block's
+    /// `persist_applied_block` wrote them into the CFs and the state root — a malicious block
+    /// fed to a subset of nodes forked honest nodes persistently. Rollback semantics:
+    /// - rocks-backed: reload accounts + all five consensus maps + meta counters from the CFs
+    ///   (disk == post-last-good-block by step 1.0's per-block-batch guarantee) and re-run
+    ///   `open()`'s hygiene (clean journals, mirrors == CF key sets). Out-of-band mutations
+    ///   not yet swept by a block (grace drains, epoch bump) are rewound too — identical to
+    ///   what a crash-restart would lose; accepted.
+    /// - memory-only (tests + try_reorg's rocks-detached replay): restore the pre-block
+    ///   snapshot taken at entry (there is no disk copy to reload).
+    fn apply_txs_with_rollback(&mut self, block: &Block) -> Result<(), StateError> {
+        let snap = self.capture_pre_block();
+        let applied: Result<(), StateError> = (|| {
+            for tx in &block.transactions {
+                self.apply_transaction(tx)?;
+            }
+            // P8: the deterministic in-apply settlement driver — runs INSIDE the rollback
+            // envelope (its guards are unreachable by construction, but if one ever fires the
+            // block is rejected without smear) and BEFORE the block is stored/persisted, so
+            // every settlement/expiry mutation rides this block's WriteBatch.
+            self.settle_due_jobs(block.height())
+        })();
+        if let Err(e) = applied {
+            self.rollback_to_pre_block(snap);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// P1: snapshot everything `apply_transaction` + `settle_due_jobs` can mutate, so a failed
+    /// block can be rolled back exactly. Taken unconditionally (rocks-backed too): reloading
+    /// from the CFs would restore only the last *persisted* state and silently rewind
+    /// out-of-band mutations applied in memory since the last block (the epoch tick's
+    /// `current_epoch` bump + per-account uptime pokes, peer-disconnect grace drains) — those
+    /// ride the NEXT block's persist, so they are live-in-memory-but-not-yet-on-disk during a
+    /// block apply. A disk reload would rewind them while the event loop's companion epoch
+    /// state stayed advanced — a mixed state no crash-restart can produce, diverging this node's
+    /// account roots from peers that never saw the rejected block. The memory snapshot restores
+    /// the exact pre-block state (including the dirty/removed journals), so no such divergence is
+    /// possible. Cost is an O(accounts + maps) clone per block — trivial at testnet scale.
+    fn capture_pre_block(&self) -> Box<BlockSnapshot> {
+        Box::new(BlockSnapshot {
+            accounts: self.accounts.clone(), // carries the pre-block dirty/removed journals too
+            escrow_by_job: self.escrow_by_job.clone(),
+            bonded_stake: self.bonded_stake.clone(),
+            unbonding_stake: self.unbonding_stake.clone(),
+            job_lifecycles: self.job_lifecycles.clone(),
+            pending_jobs: self.pending_jobs.clone(),
+            total_emitted: self.total_emitted,
+            total_burned: self.total_burned,
+            current_epoch: self.current_epoch,
+            nerf_rate: self.nerf_rate,
+        })
+    }
+
+    /// P1: restore the pre-block state after a failed apply. Mirrors advance only at persist
+    /// (which never ran for the rejected block), so there is nothing there to restore.
+    fn rollback_to_pre_block(&mut self, snap: Box<BlockSnapshot>) {
+        self.accounts = snap.accounts;
+        self.escrow_by_job = snap.escrow_by_job;
+        self.bonded_stake = snap.bonded_stake;
+        self.unbonding_stake = snap.unbonding_stake;
+        self.job_lifecycles = snap.job_lifecycles;
+        self.pending_jobs = snap.pending_jobs;
+        self.total_emitted = snap.total_emitted;
+        self.total_burned = snap.total_burned;
+        self.current_epoch = snap.current_epoch;
+        self.nerf_rate = snap.nerf_rate;
+    }
+
+    /// P8: the deterministic in-apply settlement driver. Called from the shared tail of all
+    /// three apply paths with the APPLIED block's height — never from a wall-clock tick
+    /// (out-of-band settlement lands at different heights on different nodes ⇒ per-height
+    /// state-root divergence ⇒ fork; B6's PROTECTED tick becomes observe/log-only).
+    ///
+    /// Iterates due jobs in SORTED job-key order (HashMap order must never reach consensus
+    /// state):
+    /// 1. pending jobs past `claim_by` → `expire_pending_job` (full budget refund);
+    /// 2. every lifecycle: `advance` (idempotent, money-free height transition), then
+    ///    `should_settle` → `lifecycle_settle_and_drain`. A cached-but-undrained terminal
+    ///    (`is_settled`, unreachable outside tests) is drained too, so nothing can strand.
+    ///
+    /// try_reorg's replay reproduces identical settle heights by construction (same tail).
+    fn settle_due_jobs(&mut self, height: u64) -> Result<(), StateError> {
+        // The consensus equivalence oracle is PINNED to byte-equality: a future oracle change
+        // must enter ConsensusParams::fingerprint before becoming configurable.
+        const SETTLE_ORACLE: ByteEq = ByteEq;
+
+        let mut due_pending: Vec<[u8; 32]> = self
+            .pending_jobs
+            .iter()
+            .filter(|(_, r)| height > r.claim_by)
+            .map(|(k, _)| *k)
+            .collect();
+        due_pending.sort_unstable();
+        for job_id in due_pending {
+            self.expire_pending_job(job_id, height)?;
+        }
+
+        let mut jobs: Vec<[u8; 32]> = self.job_lifecycles.keys().copied().collect();
+        jobs.sort_unstable();
+        for job_id in jobs {
+            self.lifecycle_advance(job_id, height);
+            let due = self
+                .job_lifecycles
+                .get(&job_id)
+                .map(|l| l.should_settle(height) || l.is_settled())
+                .unwrap_or(false);
+            if due {
+                self.lifecycle_settle_and_drain(job_id, &SETTLE_ORACLE)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn apply_block(&mut self, block: &Block) -> Result<(), StateError> {
         // Verify block connects to current chain.
         if block.height() > 0 {
@@ -692,10 +871,9 @@ impl ChainState {
                 }
         }
 
-        // Process transactions — if any fail, no state has been mutated yet.
-        for tx in &block.transactions {
-            self.apply_transaction(tx)?;
-        }
+        // Process transactions + run the P8 settlement driver, with P1 rollback-on-Err:
+        // a rejected block leaves NO smear (accounts/maps/meta restored to pre-block state).
+        self.apply_txs_with_rollback(block)?;
 
         // Credit per-block reward AFTER all transactions succeed (atomicity).
         // Moving this here ensures that if any transaction fails, the producer
@@ -785,13 +963,17 @@ impl ChainState {
             }
         }
 
-        // Process transactions and generate receipts.
-        // NOTE: credit_block_reward is intentionally called AFTER this loop so
-        // that if any transaction fails, total_emitted and producer balance are
-        // never mutated (atomicity guarantee).
+        // Process transactions + run the P8 settlement driver, with P1 rollback-on-Err:
+        // a rejected block leaves NO smear (accounts/maps/meta restored to pre-block state).
+        // NOTE: credit_block_reward is intentionally called AFTER this so that if any
+        // transaction fails, total_emitted and producer balance are never mutated.
+        self.apply_txs_with_rollback(block)?;
+
+        // Generate receipts + history ONLY for an accepted block (P1: a rejected block must
+        // leave no trace — receipts for its prefix would claim success for txs that never
+        // landed).
         let block_hash = block.hash();
         for (i, tx) in block.transactions.iter().enumerate() {
-            self.apply_transaction(tx)?;
             let tx_hash = tx.hash();
             self.receipts.insert(TxReceipt {
                 tx_hash,
@@ -1098,10 +1280,8 @@ impl ChainState {
                 sender.nonce += 1;
             }
 
-            // SubmitJob (legacy) + SubmitJobV2 (PoUW P0/G3) share identical economics at P0:
-            // verify budget >= min and burn comme_budget at submit. (P1 converts V2 to escrow.)
-            TxKind::SubmitJob { comme_budget, .. }
-            | TxKind::SubmitJobV2 { comme_budget, .. } => {
+            // SubmitJob (legacy) keeps burn-at-submit byte-for-byte; SubmitJobV2 escrows (B2).
+            TxKind::SubmitJob { comme_budget, .. } => {
                 // Feature 52: Submit a compute job — verify budget and burn.
                 if comme_budget.raw() < commputer_core::compute::MIN_JOB_BUDGET {
                     return Err(StateError::InvalidBlock(format!(
@@ -1120,14 +1300,65 @@ impl ChainState {
                 self.total_burned = self.total_burned.saturating_add(comme_budget.raw());
             }
 
-            TxKind::ClaimJob { .. } => {
-                // Feature 53: Validator claims a pending compute job.
-                if !sender.is_validator {
+            // Phase 1.1 (B2): SubmitJobV2 ESCROWS the budget into a per-job pot — HELD in
+            // circulating supply, `total_burned` NOT touched (only a settlement resolver's
+            // burn slice moves it). Every Err fires before any mutation of this arm except
+            // `escrow_into_job`, which itself validates pot-overflow then balance BEFORE
+            // mutating — no partial state; a failed tx rejects the whole block (G-H) and P1
+            // rollback wipes any earlier-tx smear.
+            // BORROW NOTE: the outer `sender` borrow is NOT used here (NLL — the Bond-arm
+            // pattern); nonce via a fresh get_or_create AFTER all fallible ops.
+            TxKind::SubmitJobV2 { program_hash, input_hash, da_root, comme_budget, .. } => {
+                // P3: zero-from txs skip signature verification entirely — the keyless zero
+                // address must never own a pot/pending record.
+                if tx.from.is_zero() {
                     return Err(StateError::InvalidBlock(
-                        "only validators can claim compute jobs".into(),
+                        "zero address cannot submit compute jobs".into(),
                     ));
                 }
-                sender.nonce += 1;
+                if comme_budget.raw() < commputer_core::compute::MIN_JOB_BUDGET {
+                    return Err(StateError::InvalidBlock(format!(
+                        "compute job budget {} below minimum {}",
+                        comme_budget.raw(),
+                        commputer_core::compute::MIN_JOB_BUDGET
+                    )));
+                }
+                // G-A: on-chain job identity = the tx hash (matches the node pool's PoolJobId
+                // convention; nonce inside the hash ⇒ per-tx unique). KNOWN fund-safe griefing
+                // vector (P10c): memo/timelock sit outside the SIGNED payload but inside the
+                // hash, so a relayer can shift the job_id pre-inclusion — the escrow stays
+                // recoverable via `expire_pending_job`'s refund; the signed-payload id +
+                // PROTECTED PoolJobId change is a flip-notes follow-up.
+                let job_id = tx.hash().0;
+                // Defense-in-depth duplicate guard (a distinct colliding tx = SHA-256
+                // collision; a literal re-broadcast already fails the nonce check).
+                if self.pending_jobs.contains_key(&job_id)
+                    || self.escrow_by_job.contains_key(&job_id)
+                    || self.job_lifecycles.contains_key(&job_id)
+                {
+                    return Err(StateError::InvalidBlock("duplicate job id".into()));
+                }
+                // Balance check + move balance→pot in one audited primitive (no partial state
+                // on Err): InsufficientBalance rejects the block.
+                self.escrow_into_job(&tx.from, job_id, comme_budget.raw())?;
+                let h = self.blocks.height(); // G-F: parent height during apply
+                self.pending_jobs.insert(job_id, PendingJobRecord {
+                    submitter: tx.from.0,
+                    budget: comme_budget.raw(),
+                    program_hash: *program_hash,
+                    input_hash: *input_hash,
+                    da_root: *da_root,
+                    submitted_height: h,
+                    claim_by: h.saturating_add(self.phase_windows.claim_blocks),
+                });
+                self.accounts.get_or_create(tx.from).nonce += 1; // AFTER all fallible ops
+            }
+
+            TxKind::ClaimJob { job_id } => {
+                // Phase 1.1 (B3): full claim semantics (validator gate + lifecycle open for a
+                // pending V2 job; legacy accept for unknown/V1 ids) — shared with the Batch arm.
+                self.apply_claim_job(tx.from, *job_id)?;
+                self.accounts.get_or_create(tx.from).nonce += 1;
             }
 
             TxKind::CompleteJob { .. } => {
@@ -1145,29 +1376,21 @@ impl ChainState {
                 sender.nonce += 1;
             }
 
-            TxKind::Commit { .. } => {
-                // PoUW P2 / G2: a committee verifier commits H(result_hash‖salt‖verifier) + a bond.
-                // INERT until the committee draw (event_loop, PROTECTED) creates the job's
-                // JobLifecycle and this routes to record_commit (which escrows the bond). Until
-                // then there is no lifecycle to record into, so accept + bump nonce only — the
-                // bond is NOT escrowed, so it cannot strand. Committee members are validators.
-                if !sender.is_validator {
-                    return Err(StateError::InvalidBlock(
-                        "only validators can commit to compute jobs".into(),
-                    ));
-                }
-                sender.nonce += 1;
+            TxKind::Commit { job_id, commit, bond } => {
+                // Phase 1.1 (B4): route to JobLifecycle::record_commit via the shared helper —
+                // record_commit itself escrows the bond through the ChainLedger (NO
+                // escrow_into_job here: adding one would double-escrow). Unknown job / wrong
+                // phase / non-member ⇒ Err ⇒ block rejected (closes the inert-Commit spam
+                // window; pre-B5 no Commit can appear in any valid block at all).
+                self.apply_commit(tx.from, *job_id, *commit, bond.raw())?;
+                self.accounts.get_or_create(tx.from).nonce += 1;
             }
 
-            TxKind::Reveal { .. } => {
-                // PoUW P2 / G2: a committee verifier reveals (result_hash, salt) opening its Commit.
-                // INERT until wired to JobLifecycle::record_reveal — accept + bump nonce only.
-                if !sender.is_validator {
-                    return Err(StateError::InvalidBlock(
-                        "only validators can reveal compute job results".into(),
-                    ));
-                }
-                sender.nonce += 1;
+            TxKind::Reveal { job_id, result_hash, salt } => {
+                // Phase 1.1 (B4): route to JobLifecycle::record_reveal via the shared helper
+                // (which self-advances Committing→Revealing by height first — no money move).
+                self.apply_reveal(tx.from, *job_id, *result_hash, *salt)?;
+                self.accounts.get_or_create(tx.from).nonce += 1;
             }
 
             TxKind::MiningReward { to, amount, .. } => {
@@ -1204,17 +1427,28 @@ impl ChainState {
                 // non-validator's bond simply sits inert and can never cause an unqualified draw.
                 // InsufficientBalance/Overflow => `?` returns BEFORE the nonce bump, so an invalid
                 // tx rejects the whole block atomically (mirrors the SubmitJobV2 path).
+                // P3: zero-from txs skip signature verification — a funded zero address must
+                // never become bonded stake (a keyless committee candidate anyone can puppet).
+                if tx.from.is_zero() {
+                    return Err(StateError::InvalidBlock("zero address cannot bond stake".into()));
+                }
                 self.bond(&tx.from, amount.raw())?;
                 self.accounts.get_or_create(tx.from).nonce += 1;
             }
 
             TxKind::RequestUnbond { amount } => {
+                if tx.from.is_zero() {
+                    return Err(StateError::InvalidBlock("zero address cannot unbond stake".into()));
+                }
                 let now = self.blocks.height();
                 self.request_unbond(&tx.from, amount.raw(), now)?;
                 self.accounts.get_or_create(tx.from).nonce += 1;
             }
 
             TxKind::WithdrawUnbonded => {
+                if tx.from.is_zero() {
+                    return Err(StateError::InvalidBlock("zero address cannot withdraw stake".into()));
+                }
                 let now = self.blocks.height();
                 let _ = self.withdraw_unbonded(&tx.from, now); // saturating; never errors
                 self.accounts.get_or_create(tx.from).nonce += 1;
@@ -1263,9 +1497,8 @@ impl ChainState {
                     .ok_or(StateError::Overflow)?;
                 self.total_burned = self.total_burned.saturating_add(burn_amount.raw());
             }
-            TxKind::SubmitJob { comme_budget, .. }
-            | TxKind::SubmitJobV2 { comme_budget, .. } => {
-                // Feature 52: SubmitJob/V2 in batch — verify budget and burn (V2 mirrors V1 at P0).
+            TxKind::SubmitJob { comme_budget, .. } => {
+                // Feature 52: legacy SubmitJob in batch — verify budget and burn (unchanged).
                 if comme_budget.raw() < commputer_core::compute::MIN_JOB_BUDGET {
                     return Err(StateError::InvalidBlock(format!(
                         "compute job budget {} below minimum {}",
@@ -1281,14 +1514,17 @@ impl ChainState {
                     .ok_or(StateError::InsufficientBalance)?;
                 self.total_burned = self.total_burned.saturating_add(comme_budget.raw());
             }
-            TxKind::ClaimJob { .. } => {
-                // Feature 53: ClaimJob in batch — verify validator.
-                let sender = self.accounts.get_or_create(from);
-                if !sender.is_validator {
-                    return Err(StateError::InvalidBlock(
-                        "only validators can claim compute jobs".into(),
-                    ));
-                }
+            TxKind::SubmitJobV2 { .. } => {
+                // G-C: no unique per-op job id exists inside a batch (one tx hash, nonce
+                // bumped once), so batched V2 escrow jobs are rejected outright.
+                return Err(StateError::InvalidBlock(
+                    "SubmitJobV2 not allowed in Batch".into(),
+                ));
+            }
+            TxKind::ClaimJob { job_id } => {
+                // Phase 1.1 (B3): identical semantics to the top-level arm (shared helper);
+                // the outer Batch arm bumps the nonce once.
+                self.apply_claim_job(from, *job_id)?;
             }
             TxKind::CompleteJob { .. } => {
                 // Feature 54: CompleteJob in batch — no-op beyond nonce (handled at batch level).
@@ -1302,36 +1538,35 @@ impl ChainState {
                     ));
                 }
             }
-            TxKind::Commit { .. } => {
-                // PoUW P2 / G2: Commit in batch — verify validator (INERT until lifecycle wiring).
-                let sender = self.accounts.get_or_create(from);
-                if !sender.is_validator {
-                    return Err(StateError::InvalidBlock(
-                        "only validators can commit to compute jobs".into(),
-                    ));
-                }
+            TxKind::Commit { job_id, commit, bond } => {
+                // Phase 1.1 (B4): identical semantics to the top-level arm (shared helper).
+                self.apply_commit(from, *job_id, *commit, bond.raw())?;
             }
-            TxKind::Reveal { .. } => {
-                // PoUW P2 / G2: Reveal in batch — verify validator (INERT until lifecycle wiring).
-                let sender = self.accounts.get_or_create(from);
-                if !sender.is_validator {
-                    return Err(StateError::InvalidBlock(
-                        "only validators can reveal compute job results".into(),
-                    ));
-                }
+            TxKind::Reveal { job_id, result_hash, salt } => {
+                // Phase 1.1 (B4): identical semantics to the top-level arm (shared helper).
+                self.apply_reveal(from, *job_id, *result_hash, *salt)?;
             }
             // PoUW P2 / G4: bonded-stake ops inside a batch. `from` is the owned Copy param and no
             // outer `sender` borrow is held here, so the &mut self stake methods are unobstructed.
             // No per-op nonce/fee: the outer Batch arm bumps nonce once; the fee is burned once in
-            // apply_transaction before the match.
+            // apply_transaction before the match. P3: zero-from guarded like the top-level arms.
             TxKind::Bond { amount } => {
+                if from.is_zero() {
+                    return Err(StateError::InvalidBlock("zero address cannot bond stake".into()));
+                }
                 self.bond(&from, amount.raw())?;
             }
             TxKind::RequestUnbond { amount } => {
+                if from.is_zero() {
+                    return Err(StateError::InvalidBlock("zero address cannot unbond stake".into()));
+                }
                 let now = self.blocks.height();
                 self.request_unbond(&from, amount.raw(), now)?;
             }
             TxKind::WithdrawUnbonded => {
+                if from.is_zero() {
+                    return Err(StateError::InvalidBlock("zero address cannot withdraw stake".into()));
+                }
                 let now = self.blocks.height();
                 let _ = self.withdraw_unbonded(&from, now);
             }
@@ -1345,6 +1580,195 @@ impl ChainState {
         Ok(())
     }
 
+    /// B3: full ClaimJob semantics, shared by the top-level and Batch arms (the caller bumps
+    /// the nonce). Returns Ok(()) on both the V2-open path and the legacy path.
+    fn apply_claim_job(&mut self, from: Address, job_id: [u8; 32]) -> Result<(), StateError> {
+        // P3: zero-from txs skip signature verification — the keyless zero address must never
+        // become an executor holding a bond.
+        if from.is_zero() {
+            return Err(StateError::InvalidBlock(
+                "zero address cannot claim compute jobs".into(),
+            ));
+        }
+        // Guard order matters: lifecycle-exists FIRST so a double-claim can never fall through
+        // to the legacy no-op accept.
+        if self.job_lifecycles.contains_key(&job_id) {
+            return Err(StateError::InvalidBlock("job already claimed".into()));
+        }
+        // Validator gate KEPT (legacy Feature-53 semantics + patch-spec §4 keeps tx-level gates).
+        let is_validator = self.accounts.get(&from).map(|a| a.is_validator).unwrap_or(false);
+        if !is_validator {
+            return Err(StateError::InvalidBlock(
+                "only validators can claim compute jobs".into(),
+            ));
+        }
+        let Some(rec) = self.pending_jobs.get(&job_id).copied() else {
+            return Ok(()); // legacy path: V1 pool job / unknown id — accept, no money (unchanged)
+        };
+        let height = self.blocks.height(); // G-F: parent height during apply
+        if height > rec.claim_by {
+            return Err(StateError::InvalidBlock("claim window expired".into()));
+        }
+        // Executor bond: deterministic v1 rule (G-D) — the parent-spec `Be >= B` floor with the
+        // genesis-anchored flat knob as the minimum.
+        let e_bond = rec.budget.max(self.game_params.executor_bond);
+        // Pot sanity (defense-in-depth; B2 guarantees this): the pot must hold exactly the budget.
+        if self.escrowed_for_job(&job_id) != rec.budget {
+            return Err(StateError::InvalidBlock("job pot != pending budget".into()));
+        }
+        // Candidate snapshot (G-G): deterministic filter over finalized on-chain state ONLY,
+        // sorted by address bytes (HashMap/AccountStore iteration order must never reach
+        // consensus state — the candidates Vec is in the persisted DTO and the state root).
+        // P3: the zero address is excluded even if someone manufactures flags/stake for it.
+        let min_bond = self.stake_params.min_bond;
+        let mut candidates: Vec<ParticipantId> = self
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.is_validator
+                    && a.compliance == ComplianceStatus::Compliant
+                    && a.address != from
+                    && !a.address.is_zero()
+                    && self.bonded_stake.get(&a.address).copied().unwrap_or(0) >= min_bond
+            })
+            .map(|a| ParticipantId(a.address.0))
+            .collect();
+        candidates.sort_by(|x, y| x.0.cmp(&y.0));
+        // Escrow the executor bond (balance→pot; InsufficientBalance rejects the block — no
+        // partial state within this op, and P1 rollback covers the block).
+        self.escrow_into_job(&from, job_id, e_bond)?;
+        // Per-job deadlines anchored at CLAIM height (G-E windows).
+        let result_by = height.saturating_add(self.phase_windows.result_blocks);
+        let commit_by = result_by.saturating_add(self.phase_windows.commit_blocks);
+        let reveal_by = commit_by.saturating_add(self.phase_windows.reveal_blocks);
+        let deadlines = PhaseDeadlines { result_by, commit_by, reveal_by };
+        // Pot after open = budget + e_bond = expected_escrow() with zero commitments — the P1
+        // precondition documented at JobLifecycle::open holds by construction.
+        let lc = JobLifecycle::open(
+            job_id,
+            rec.program_hash,
+            rec.input_hash,
+            rec.da_root,
+            ParticipantId(rec.submitter),
+            ParticipantId(from.0),
+            e_bond,
+            rec.budget,
+            self.game_params.verifier_bond,
+            self.game_params.clone(),
+            self.resolution_params,
+            candidates,
+            deadlines,
+        );
+        self.job_lifecycles.insert(job_id, lc);
+        self.pending_jobs.remove(&job_id);
+        Ok(())
+    }
+
+    /// B4: full Commit semantics, shared by the top-level and Batch arms (the caller bumps the
+    /// nonce). `record_commit` escrows the bond itself through the ChainLedger — NO
+    /// `escrow_into_job` here (it would double-escrow).
+    fn apply_commit(
+        &mut self,
+        from: Address,
+        job_id: [u8; 32],
+        commit: [u8; 32],
+        bond: u64,
+    ) -> Result<(), StateError> {
+        // P3: zero-from txs skip signature verification — never let the keyless zero address
+        // hold a committee bond.
+        if from.is_zero() {
+            return Err(StateError::InvalidBlock(
+                "zero address cannot commit to compute jobs".into(),
+            ));
+        }
+        // Validators-only gate KEPT (patch-spec §4). It is not the security boundary —
+        // committee membership inside record_commit is — but it is deterministic and cheap.
+        let is_validator = self.accounts.get(&from).map(|a| a.is_validator).unwrap_or(false);
+        if !is_validator {
+            return Err(StateError::InvalidBlock(
+                "only validators can commit to compute jobs".into(),
+            ));
+        }
+        let height = self.blocks.height(); // G-F
+        // Verifier is ALWAYS the tx sender — no spoofing surface.
+        let c = Commitment { verifier: ParticipantId(from.0), commit, bond };
+        match self.lifecycle_record_commit(job_id, c, height)? {
+            Some(EventResult::Accepted) => Ok(()),
+            Some(EventResult::Rejected(r)) => Err(StateError::InvalidBlock(format!(
+                "commit rejected: {r:?}"
+            ))),
+            None => Err(StateError::InvalidBlock("commit: unknown job".into())),
+        }
+    }
+
+    /// B4: full Reveal semantics, shared by the top-level and Batch arms (the caller bumps the
+    /// nonce). No money moves on a reveal.
+    fn apply_reveal(
+        &mut self,
+        from: Address,
+        job_id: [u8; 32],
+        result_hash: [u8; 32],
+        salt: [u8; 32],
+    ) -> Result<(), StateError> {
+        if from.is_zero() {
+            return Err(StateError::InvalidBlock(
+                "zero address cannot reveal compute job results".into(),
+            ));
+        }
+        let is_validator = self.accounts.get(&from).map(|a| a.is_validator).unwrap_or(false);
+        if !is_validator {
+            return Err(StateError::InvalidBlock(
+                "only validators can reveal compute job results".into(),
+            ));
+        }
+        let height = self.blocks.height(); // G-F
+        // Deliberate addition vs patch-spec §4: drive the height-based Committing→Revealing
+        // transition on the tx path (advance is idempotent + money-free), so a reveal after
+        // commit_by does not depend on the P8 driver having run at this exact height.
+        // Deterministic: a pure function of consensus state + parent height.
+        self.lifecycle_advance(job_id, height);
+        let r = Reveal { verifier: ParticipantId(from.0), result_hash, salt };
+        match self.lifecycle_record_reveal(job_id, r, height) {
+            Some(EventResult::Accepted) => Ok(()),
+            Some(EventResult::Rejected(rr)) => Err(StateError::InvalidBlock(format!(
+                "reveal rejected: {rr:?}"
+            ))),
+            None => Err(StateError::InvalidBlock("reveal: unknown job".into())),
+        }
+    }
+
+    /// Phase 1.1: refund a pending job whose claim window has passed — full budget back to the
+    /// submitter (no-fault: nobody claimed; the tx fee already paid was the anti-spam cost;
+    /// the *voluntary* 2%-burn `resolve_cancel` needs a CancelJob TxKind and stays a
+    /// follow-on). `Ok(None)` if the job is not pending or not yet due. Driven by
+    /// `settle_due_jobs` (P8) so unclaimed pots cannot strand.
+    pub fn expire_pending_job(
+        &mut self,
+        job_id: [u8; 32],
+        height: u64,
+    ) -> Result<Option<SettlementOutcome>, StateError> {
+        let Some(rec) = self.pending_jobs.get(&job_id).copied() else {
+            return Ok(None);
+        };
+        if height <= rec.claim_by {
+            return Ok(None);
+        }
+        // Pre-validate the pot == the exact sum the refund moves (P1 caller-contract).
+        let pot = self.escrowed_for_job(&job_id);
+        if pot != rec.budget {
+            return Err(StateError::InvalidBlock(format!(
+                "pending pot {pot} != budget {}; refusing to expire",
+                rec.budget
+            )));
+        }
+        self.pay_from_job(job_id, &Address(rec.submitter), rec.budget)?;
+        self.pending_jobs.remove(&job_id);
+        Ok(Some(SettlementOutcome {
+            submitter_refunded: rec.budget,
+            ..Default::default()
+        }))
+    }
+
     /// Record emission for an epoch (mining rewards distributed to validators).
     pub fn emit(&mut self, amount: u64) {
         self.total_emitted = self.total_emitted.saturating_add(amount);
@@ -1354,10 +1778,11 @@ impl ChainState {
     /// Uses the StateDiff recorded during apply_block. Can only revert the tip.
     ///
     /// FAIL-SAFE: the StateDiff restores balance+nonce only — it CANNOT roll back the PoUW
-    /// consensus maps (escrow pots, bonded/unbonding stake, lifecycles mutate with full-value
-    /// semantics and no before-image exists). Any block that could have touched them is
-    /// refused: guard 1 (maps non-empty) backstops guard 2 (tx-kind scan), which will go stale
-    /// as B2–B4 add map-touching kinds.
+    /// consensus maps (escrow pots, bonded/unbonding stake, lifecycles/pending jobs mutate
+    /// with full-value semantics and no before-image exists). Any block that could have
+    /// touched them is refused: guard 1 (maps non-empty) backstops guard 2 (tx-kind scan,
+    /// extended for B2–B4 in Phase 1.1). Fork recovery past a PoUW-active block is
+    /// `try_reorg` (full replay) or `reset_to_genesis` + resync.
     pub fn revert_block(&mut self, height: u64) -> Result<(), StateError> {
         if height != self.blocks.height() {
             return Err(StateError::InvalidBlock(format!(
@@ -1378,6 +1803,7 @@ impl ChainState {
             || !self.bonded_stake.is_empty()
             || !self.unbonding_stake.is_empty()
             || !self.job_lifecycles.is_empty()
+            || !self.pending_jobs.is_empty()
         {
             return Err(StateError::InvalidBlock(REVERT_REFUSAL.into()));
         }
@@ -1589,8 +2015,9 @@ impl ChainState {
     // ── Feature 190: Atomic state updates ──
 
     /// Apply a block atomically using RocksDB WriteBatch.
-    /// If any transaction fails, no changes are committed to RocksDB.
-    /// In-memory state is still updated (for non-persistent mode, this is the same as apply_block).
+    /// If any transaction fails, no changes are committed to RocksDB AND (P1) the in-memory
+    /// state is rolled back to its pre-block value — all three apply paths share the same
+    /// rollback-on-Err core.
     pub fn apply_block_atomic(&mut self, block: &Block) -> Result<(), StateError> {
         // Verify block connects to current chain.
         if block.height() > 0 {
@@ -1621,12 +2048,10 @@ impl ChainState {
                 }
         }
 
-        // Process all transactions. If any fails, we return error
-        // without committing to RocksDB (in-memory changes from earlier txs
-        // in this block are lost on error — caller should handle rollback).
-        for tx in &block.transactions {
-            self.apply_transaction(tx)?;
-        }
+        // Process all transactions + run the P8 settlement driver. P1: on any Err the
+        // pre-block state is restored (rocks: reload from CFs; memory: snapshot) — nothing
+        // is committed to RocksDB and the in-memory state carries no smear.
+        self.apply_txs_with_rollback(block)?;
 
         // Build state diff.
         let mut diff = StateDiff::default();
@@ -1940,6 +2365,7 @@ impl ChainState {
             self.persisted_bonded_keys.clone(),
             self.persisted_unbonding_keys.clone(),
             self.persisted_lifecycle_keys.clone(),
+            self.persisted_pending_keys.clone(),
         );
 
         // Reset state.
@@ -1951,6 +2377,7 @@ impl ChainState {
         self.bonded_stake.clear();
         self.unbonding_stake.clear();
         self.job_lifecycles.clear();
+        self.pending_jobs.clear();
         self.cumulative_score = 0;
         self.state_diffs.clear();
 
@@ -1974,6 +2401,7 @@ impl ChainState {
                 self.persisted_bonded_keys,
                 self.persisted_unbonding_keys,
                 self.persisted_lifecycle_keys,
+                self.persisted_pending_keys,
             ) = saved_mirrors;
             return Err(e);
         }
@@ -2022,6 +2450,7 @@ impl ChainState {
                     self.persisted_bonded_keys,
                     self.persisted_unbonding_keys,
                     self.persisted_lifecycle_keys,
+                    self.persisted_pending_keys,
                 ) = saved_mirrors;
                 return Err(StateError::StorageError(e.to_string()));
             }
@@ -2093,7 +2522,7 @@ impl ChainState {
         Ok(())
     }
 
-    /// Append the four consensus maps' CF deltas to `batch`: delete every persisted key that
+    /// Append the five consensus maps' CF deltas to `batch`: delete every persisted key that
     /// no longer exists in memory (`mirror − current`), then re-put every live entry
     /// FULL-VALUE — lifecycles mutate internally without key churn, so key-level tracking
     /// alone cannot suffice, and a value re-put is O(map size), trivial at testnet scale
@@ -2127,9 +2556,15 @@ impl ChainState {
         for (job_id, lc) in &self.job_lifecycles {
             rocks.batch_put_lifecycle(batch, job_id, &lc.to_record());
         }
+        for job_id in stale_keys(&self.persisted_pending_keys, &self.pending_jobs) {
+            rocks.batch_delete_pending(batch, job_id);
+        }
+        for (job_id, rec) in &self.pending_jobs {
+            rocks.batch_put_pending(batch, job_id, rec);
+        }
     }
 
-    /// Advance all four persisted-key mirrors to the maps' current key sets. Call ONLY after
+    /// Advance all five persisted-key mirrors to the maps' current key sets. Call ONLY after
     /// a successful CF write — on failure the stale mirror recomputes a superset of deletes at
     /// the next attempt (deleting an absent key is a RocksDB no-op, so over-deleting is safe).
     fn commit_map_mirrors(&mut self) {
@@ -2137,6 +2572,7 @@ impl ChainState {
         self.persisted_bonded_keys = self.bonded_stake.keys().copied().collect();
         self.persisted_unbonding_keys = self.unbonding_stake.keys().copied().collect();
         self.persisted_lifecycle_keys = self.job_lifecycles.keys().copied().collect();
+        self.persisted_pending_keys = self.pending_jobs.keys().copied().collect();
     }
 
     /// Persist all meta counters to RocksDB.
@@ -2189,10 +2625,11 @@ impl ChainState {
         Ok(())
     }
 
-    /// PoUW P2: reconciling flush of the FOUR consensus maps (escrow_by_job / bonded_stake /
-    /// unbonding_stake / job_lifecycles) — deletes CF rows for keys removed in-memory (via the
-    /// persisted-key mirrors), then re-puts every live entry, in one WriteBatch. Safe to call
-    /// at any time; kept as the shutdown-tail sweeper behind the per-block batch.
+    /// PoUW P2: reconciling flush of the FIVE consensus maps (escrow_by_job / bonded_stake /
+    /// unbonding_stake / job_lifecycles / pending_jobs) — deletes CF rows for keys removed
+    /// in-memory (via the persisted-key mirrors), then re-puts every live entry, in one
+    /// WriteBatch. Safe to call at any time; kept as the shutdown-tail sweeper behind the
+    /// per-block batch.
     fn flush_consensus_maps(&mut self) -> Result<(), StateError> {
         let Some(rocks) = self.rocks.as_ref() else { return Ok(()) };
         let mut batch = rocks.new_write_batch();
@@ -2219,6 +2656,7 @@ impl ChainState {
         self.bonded_stake.clear();
         self.unbonding_stake.clear();
         self.job_lifecycles.clear();
+        self.pending_jobs.clear();
         self.nerf_rate = NerfRate::INITIAL;
         self.current_epoch = 0;
         self.receipts = ReceiptStore::new();
@@ -2241,10 +2679,27 @@ impl ChainState {
         self.persisted_bonded_keys.clear();
         self.persisted_unbonding_keys.clear();
         self.persisted_lifecycle_keys.clear();
+        self.persisted_pending_keys.clear();
 
         info!("Chain state reset to genesis complete");
         Ok(())
     }
+}
+
+/// P1: the pre-block snapshot — everything `apply_transaction` + `settle_due_jobs` can mutate.
+/// Genesis-anchored params (stake/game/resolution/phase_windows) are never mutated at apply, so
+/// they are not captured.
+struct BlockSnapshot {
+    accounts: AccountStore,
+    escrow_by_job: HashMap<[u8; 32], u64>,
+    bonded_stake: HashMap<Address, u64>,
+    unbonding_stake: HashMap<Address, Vec<UnbondingChunk>>,
+    job_lifecycles: HashMap<[u8; 32], JobLifecycle>,
+    pending_jobs: HashMap<[u8; 32], PendingJobRecord>,
+    total_emitted: u64,
+    total_burned: u64,
+    current_epoch: u64,
+    nerf_rate: NerfRate,
 }
 
 /// Keys present in the persisted-key `mirror` but absent from the live `current` map — the CF
@@ -2261,14 +2716,21 @@ where
 }
 
 /// Whether `tx` (including ops nested in a `Batch`) is of a kind that mutates the PoUW
-/// consensus maps. Used by `revert_block`'s guard 2. Extend with
-/// `SubmitJobV2`/`ClaimJob`/`Commit`/`Reveal`/`CompleteJob` at the B2–B4 live flip — until
-/// then those kinds move no map state, and guard 1 (maps non-empty) makes any staleness here
-/// fail-safe rather than unsound.
+/// consensus maps. Used by `revert_block`'s guard 2. Phase 1.1 (B2–B4) added the job kinds:
+/// `SubmitJobV2` (escrow + pending), `ClaimJob`/`Commit`/`Reveal` (lifecycle + escrow), and
+/// `CompleteJob` (B5 will make it draw the committee — over-approximating now is the
+/// fail-safe direction; guard 1 (maps non-empty) backstops any future staleness).
 fn tx_touches_consensus_maps(tx: &Transaction) -> bool {
     fn kind_touches(kind: &TxKind) -> bool {
         match kind {
-            TxKind::Bond { .. } | TxKind::RequestUnbond { .. } | TxKind::WithdrawUnbonded => true,
+            TxKind::Bond { .. }
+            | TxKind::RequestUnbond { .. }
+            | TxKind::WithdrawUnbonded
+            | TxKind::SubmitJobV2 { .. }
+            | TxKind::ClaimJob { .. }
+            | TxKind::Commit { .. }
+            | TxKind::Reveal { .. }
+            | TxKind::CompleteJob { .. } => true,
             TxKind::Batch { operations } => operations.iter().any(kind_touches),
             _ => false,
         }
@@ -2276,17 +2738,44 @@ fn tx_touches_consensus_maps(tx: &Transaction) -> bool {
     kind_touches(&tx.kind)
 }
 
+/// §10 glue for PROTECTED B7 (block-assembly capacity admission). Pure mapping per the
+/// patch-spec §8: `job_id = tx.hash().0` (G-A — the SAME id the escrow/pending maps use),
+/// flagship by `l2_id`, priority = fee — delegating to the existing
+/// `capacity::pending_job_from_fields` (P5: `validator_churn_bps` already exists in
+/// capacity.rs; nothing is redefined here). Batch returns `None`: batched V2 is rejected at
+/// apply (G-C) and batched V1 jobs are not pool-visible (`process_job_tx` does not unpack
+/// Batch). Lives in storage (not pouw-onchain) because pouw-onchain deliberately has no
+/// `commputer-core` dependency; `node` depends on `storage`, so B7's call site reaches it.
+pub fn pending_job_from_tx(
+    tx: &Transaction,
+) -> Option<commputer_pouw_onchain::capacity::PendingJob> {
+    match &tx.kind {
+        TxKind::SubmitJob { l2_id, .. } | TxKind::SubmitJobV2 { l2_id, .. } => Some(
+            commputer_pouw_onchain::capacity::pending_job_from_fields(
+                commputer_pouw_onchain::capacity::PendingJobFields {
+                    job_id: tx.hash().0,
+                    is_flagship: l2_id
+                        .as_deref()
+                        .map(commputer_core::l2::is_flagship)
+                        .unwrap_or(false),
+                    fee: tx.fee,
+                },
+            ),
+        ),
+        _ => None,
+    }
+}
+
 // ===================================================================================
 // PoUW P1 — per-job escrow foundation (the on-chain analog of the staging
 // `commputer-pouw-onchain::escrow_ledger::EscrowLedger`).
 //
 // These are the conservation-preserving primitives every terminal settlement resolver
-// (`resolve_confirmed`/`disputed`/`cancel`/`timeout`/`unavailable`) will call once the
-// committee/verdict DATA exists on-chain (P2). They are wired but NOT yet exercised by the
-// live tx path: `SubmitJobV2` still burns at submit (see the `SubmitJob`/`SubmitJobV2` apply
-// arm) — flipping it to `escrow_into_job` is the P2 change, because draining a pot needs the
-// committee/verdict a P2 commit-reveal round produces. Adding escrow-in without a drain would
-// strand budgets, so the flip is deliberately deferred.
+// (`resolve_confirmed`/`disputed`/`cancel`/`timeout`/`unavailable`/`escalation_fallback`)
+// calls when a job reaches a terminal. LIVE since Phase 1.1: `SubmitJobV2` escrows at submit
+// (B2), `ClaimJob`/`Commit` escrow bonds (B3/B4), and the deterministic in-apply driver
+// (`settle_due_jobs`, P8) drains every pot at its terminal or expiry — escrow-in and drain
+// landed together, so no budget can strand.
 //
 // CONSERVATION (the invariant these maintain):
 //   `sum(account balances) + total_escrowed()` is UNCHANGED by `escrow_into_job`/`pay_from_job`
@@ -2409,6 +2898,30 @@ impl Default for StakeParams {
 pub struct UnbondingChunk {
     amount: u64,
     matures_at: u64, // block height at/after which this chunk is withdrawable
+}
+
+/// Phase 1.1 (B2/G-B): a submitted-but-unclaimed compute job — what `ClaimJob` needs
+/// (submitter, budget, program identity, claim deadline) that its TxKind does not carry.
+/// Written by the `SubmitJobV2` apply arm alongside the budget escrow; removed at `ClaimJob`
+/// (lifecycle opens) or at `expire_pending_job` (full refund past `claim_by`).
+/// Borsh-serialized for RocksDB persistence AND folded into the state root — all fixed-size
+/// fields ⇒ canonical encoding; treat the field layout as a STABLE on-disk schema (same
+/// warning as `UnbondingChunk`). `l2_id`/fee/resources deliberately excluded: B7 admission
+/// runs mempool-side pre-block; execution metadata lives in tx history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct PendingJobRecord {
+    /// `Address` bytes of the submitter (escrow refund target).
+    pub submitter: [u8; 32],
+    /// Raw units — equals the job's escrow pot between submit and claim.
+    pub budget: u64,
+    /// `sha256(wasm)` — the linchpin program identity (P9: carried into the lifecycle).
+    pub program_hash: [u8; 32],
+    pub input_hash: [u8; 32],
+    /// DA-sampling anchor.
+    pub da_root: [u8; 32],
+    pub submitted_height: u64,
+    /// `submitted_height + phase_windows.claim_blocks` (anchored at submit).
+    pub claim_by: u64,
 }
 
 // ===================================================================================
@@ -2701,6 +3214,15 @@ impl ChainState {
             Some(l) => l,
             None => return Ok(None),
         };
+        // P2: cached-terminal short-circuit BEFORE the pot pre-validation. After the first
+        // settle the pot no longer equals expected_escrow() — expected_escrow sums ALL bonds
+        // incl. non-revealers, but settle already burned the forfeited ones (and on
+        // Confirmed/Disputed/Timeout drained the pot entirely) — so re-validating on re-entry
+        // would Err forever and strand an Escalate pot. The cached path moves no money.
+        if let Some(t) = life.settled_terminal() {
+            self.job_lifecycles.insert(job_id, life);
+            return Ok(Some(t));
+        }
         // Pre-validate the pot (P1 caller-contract) so a malformed pot REJECTS the terminal tx instead
         // of panicking the ledger mid-settle. After this guard every pay/burn in settle is covered by
         // the pot, so the ChainLedger .expect()s cannot fire — which also keeps the borrow dance
@@ -2717,6 +3239,44 @@ impl ChainState {
         let terminal = life.settle(&mut view, eq);
         self.job_lifecycles.insert(job_id, life);
         Ok(Some(terminal))
+    }
+
+    /// Phase 1.1 (D2): settle + drain — the P8-driver (and future B6) entry point.
+    /// Confirmed/Disputed/TimedOut drain the pot via settle itself; Escalate settles via the
+    /// zero-comp fallback resolver (`resolve_escalation_fallback`, D2-FINAL). The lifecycle is
+    /// REMOVED on success ⇒ at-most-once settlement by construction (a second call hits
+    /// `Ok(None)` and moves no money).
+    pub fn lifecycle_settle_and_drain(
+        &mut self,
+        job_id: [u8; 32],
+        eq: &dyn EquivalenceOracle,
+    ) -> Result<Option<(Terminal, Option<SettlementOutcome>)>, StateError> {
+        let Some(terminal) = self.lifecycle_settle(job_id, eq)? else {
+            return Ok(None);
+        };
+        let fb = if let Terminal::Escalate(h) = &terminal {
+            // Pre-validate the pot == the exact sum the fallback will move (defensive:
+            // provably equal after settle, but the ChainLedger .expect()s must stay
+            // unreachable). On Err the lifecycle was already re-inserted by lifecycle_settle
+            // with its terminal cached, so a retry is idempotent.
+            let expected = h
+                .budget
+                .saturating_add(h.executor_bond)
+                .saturating_add(h.committee_bonds.iter().sum::<u64>());
+            let actual = self.escrowed_for_job(&job_id);
+            if actual != expected {
+                return Err(StateError::InvalidBlock(format!(
+                    "escalate pot {actual} != expected {expected}; refusing fallback"
+                )));
+            }
+            let h = h.clone();
+            let mut view = ChainLedger::new(self);
+            Some(resolve_escalation_fallback(&mut view, job_id, &h))
+        } else {
+            None
+        };
+        self.job_lifecycles.remove(&job_id); // drain (the pot is 0 on every path here)
+        Ok(Some((terminal, fb)))
     }
 }
 
@@ -2779,6 +3339,8 @@ mod tests {
     fn lpaddr(n: u8) -> Address {
         Address([n; 32])
     }
+    /// P9 identity placeholder for direct test opens (identity is opaque to the game logic).
+    const IDENT: [u8; 32] = [0xAB; 32];
     fn fuel_mins() -> (u64, u64, u64) {
         let p = GameParams::default();
         let f = 100_000_000u64;
@@ -3156,7 +3718,10 @@ mod tests {
     }
 
     #[test]
-    fn commit_from_validator_is_inert_accepted() {
+    fn commit_unknown_job_rejects_block_with_zero_money_delta() {
+        // P6 inversion of the pre-flip inert pin: B4 routes Commit to the lifecycle, so a
+        // Commit against an UNKNOWN job now rejects the whole block — closing the inert-Commit
+        // spam window — and P1 rollback leaves the state (root included) untouched.
         let mut state = ChainState::new();
         state.apply_block(&genesis_block()).unwrap();
         let v = state.accounts.get_or_create(addr(1));
@@ -3165,25 +3730,38 @@ mod tests {
         state.total_emitted = Amount::from_comme(10).raw();
         let burned_before = state.total_burned;
         let bal_before = state.accounts.get(&addr(1)).unwrap().balance;
+        let root_before = state.compute_state_root();
 
         let commit = TxKind::Commit { job_id: [7u8; 32], commit: [2u8; 32], bond: Amount::from_raw(1_000) };
-        state.apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, commit)])).unwrap();
-
-        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 1, "nonce bumped");
-        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, bal_before, "bond NOT escrowed (inert)");
-        assert_eq!(state.total_burned, burned_before, "Commit does not burn");
-        assert_eq!(state.escrowed_for_job(&[7u8; 32]), 0, "no escrow pot created yet");
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, commit)]))
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown job"), "rejects as unknown job, got: {err}");
+        assert_eq!(state.blocks.height(), 0, "rejected block never stored");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 0, "nonce NOT bumped");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, bal_before, "no money moved");
+        assert_eq!(state.total_burned, burned_before, "nothing burned");
+        assert_eq!(state.escrowed_for_job(&[7u8; 32]), 0, "no escrow pot created");
+        assert_eq!(state.compute_state_root(), root_before, "P1 rollback: root unchanged");
     }
 
     #[test]
-    fn reveal_from_validator_is_inert_accepted() {
+    fn reveal_unknown_job_rejects_block_with_zero_money_delta() {
+        // P6 inversion: a Reveal against an unknown job rejects the block; P1 rollback leaves
+        // no trace.
         let mut state = ChainState::new();
         state.apply_block(&genesis_block()).unwrap();
         state.accounts.get_or_create(addr(1)).is_validator = true;
+        let root_before = state.compute_state_root();
 
         let reveal = TxKind::Reveal { job_id: [7u8; 32], result_hash: [3u8; 32], salt: [4u8; 32] };
-        state.apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, reveal)])).unwrap();
-        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 1, "nonce bumped");
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, reveal)]))
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown job"), "rejects as unknown job, got: {err}");
+        assert_eq!(state.blocks.height(), 0, "rejected block never stored");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 0, "nonce NOT bumped");
+        assert_eq!(state.compute_state_root(), root_before, "P1 rollback: root unchanged");
     }
 
     #[test]
@@ -3314,12 +3892,10 @@ mod tests {
 
     #[test]
     fn failing_bond_in_batch_rejects_block_and_conserves() {
-        // NOTE ON ATOMICITY: the non-atomic `apply_block` path (used here and by tests) mutates
-        // `self` in place and does NOT roll back a batch's earlier ops when a later op fails — op1's
-        // Bond is left applied in the in-memory state, but the block is REJECTED (returns Err, is
-        // never stored) and the nonce is NOT bumped, so the chain never advances on it. Callers that
-        // require rollback use `apply_block_atomic`. Crucially, conservation still holds: a partial
-        // Bond only moves value balance->bonded within the same account, minting/burning nothing.
+        // P1 ATOMICITY: every apply path now rolls back the pre-block state on Err — op1's
+        // Bond is UNDONE when op2 fails (pre-P1 it smeared in memory and could reach the CFs
+        // via the next block's batch). The block is REJECTED, the nonce is NOT bumped, and
+        // conservation holds trivially (nothing changed at all).
         let mut state = ChainState::new();
         state.apply_block(&genesis_block()).unwrap();
         state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(1_000);
@@ -3335,6 +3911,9 @@ mod tests {
         assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 0, "nonce not bumped -> chain does not advance");
         assert_eq!(state.blocks.height(), 0, "rejected block was never stored");
         assert_eq!(stake_conserved(&state), before, "no value minted/burned even with partial op");
+        // P1: op1's Bond was rolled back with the block — no smear.
+        assert_eq!(state.bonded_of(&addr(1)), 0, "P1 rollback undid the partial bond");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().balance, Amount::from_raw(1_000));
     }
 
     #[test]
@@ -3380,7 +3959,7 @@ mod tests {
 
         // Open the lifecycle, draw the committee (submit_result), and store it on-chain.
         let mut lc = JobLifecycle::open(
-            job, pid(0), pid(9), e_bond, budget, v_bond,
+            job, IDENT, IDENT, IDENT, pid(0), pid(9), e_bond, budget, v_bond,
             p, ResolutionParams::default(), committee.to_vec(),
             PhaseDeadlines { result_by: 10, commit_by: 20, reveal_by: 30 },
         );
@@ -3454,7 +4033,7 @@ mod tests {
         state.escrow_into_job(&lpaddr(9), job, e_bond).unwrap();
 
         let mut lc = JobLifecycle::open(
-            job, lpid(0), lpid(9), e_bond, budget, v_bond,
+            job, IDENT, IDENT, IDENT, lpid(0), lpid(9), e_bond, budget, v_bond,
             GameParams::default(), ResolutionParams::default(), committee.to_vec(), test_deadlines(),
         );
         let stake = |_: &ParticipantId| 1u64;
@@ -3498,7 +4077,7 @@ mod tests {
 
         // Executor never submits a result. Advance past result_by, then settle → TimedOut.
         let lc = JobLifecycle::open(
-            job, lpid(0), lpid(9), e_bond, budget, v_bond,
+            job, IDENT, IDENT, IDENT, lpid(0), lpid(9), e_bond, budget, v_bond,
             GameParams::default(), ResolutionParams::default(),
             vec![lpid(10), lpid(11), lpid(12)], test_deadlines(),
         );
@@ -3528,7 +4107,7 @@ mod tests {
         state.escrow_into_job(&lpaddr(0), job, budget).unwrap(); // executor bond NOT escrowed → malformed
 
         let lc = JobLifecycle::open(
-            job, lpid(0), lpid(9), e_bond, budget, v_bond,
+            job, IDENT, IDENT, IDENT, lpid(0), lpid(9), e_bond, budget, v_bond,
             GameParams::default(), ResolutionParams::default(),
             vec![lpid(10), lpid(11), lpid(12)], test_deadlines(),
         );
@@ -3609,7 +4188,7 @@ mod tests {
         sl.escrow(lpid(submitter), budget); // submit+claim precondition: budget + exec bond escrowed
         sl.escrow(lpid(executor), e_bond);
         let mut slc = JobLifecycle::open(
-            s.job, lpid(submitter), lpid(executor), e_bond, budget, v_bond,
+            s.job, IDENT, IDENT, IDENT, lpid(submitter), lpid(executor), e_bond, budget, v_bond,
             GameParams::default(), ResolutionParams::default(), cand_pids.clone(), deadlines,
         );
         if let Some(h) = s.executor_result {
@@ -3628,7 +4207,7 @@ mod tests {
         cs.escrow_into_job(&lpaddr(submitter), s.job, budget).unwrap();
         cs.escrow_into_job(&lpaddr(executor), s.job, e_bond).unwrap();
         let mut clc = JobLifecycle::open(
-            s.job, lpid(submitter), lpid(executor), e_bond, budget, v_bond,
+            s.job, IDENT, IDENT, IDENT, lpid(submitter), lpid(executor), e_bond, budget, v_bond,
             GameParams::default(), ResolutionParams::default(), cand_pids.clone(), deadlines,
         );
         if let Some(h) = s.executor_result {
@@ -4218,7 +4797,7 @@ mod tests {
     fn sample_lifecycle(job: [u8; 32], exec_seed: u8) -> JobLifecycle {
         let (budget, e_bond, v_bond) = fuel_mins();
         let mut lc = JobLifecycle::open(
-            job, lpid(0), lpid(9), e_bond, budget, v_bond,
+            job, IDENT, IDENT, IDENT, lpid(0), lpid(9), e_bond, budget, v_bond,
             GameParams::default(), ResolutionParams::default(),
             vec![lpid(10), lpid(11), lpid(12)], test_deadlines(),
         );
@@ -5787,5 +6366,1655 @@ mod tests {
             memo: None,
             timelock: None,
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════
+    // Phase 1.1 — B2/B3/B4 money path + D2 fallback + P1 rollback + P8 driver.
+    // Every driven test moves money exclusively through REAL transactions in REAL blocks
+    // (settlement via the in-apply P8 driver); out-of-band calls appear only where the
+    // wiring is PROTECTED (submit_result — B5) and are flagged as such.
+    // ═══════════════════════════════════════════════════════════════════════════════════
+
+    const MIN_BUDGET: u64 = commputer_core::compute::MIN_JOB_BUDGET;
+
+    /// Phase 1.1 five-bucket conserved quantity:
+    /// spendable + escrowed + active bonded + unbonding cooldown + burned.
+    fn money_conserved(state: &ChainState) -> u64 {
+        sum_balances(state)
+            + state.total_escrowed()
+            + state.total_bonded()
+            + state.total_unbonding()
+            + state.total_burned
+    }
+
+    fn bal(state: &ChainState, n: u8) -> u64 {
+        state.accounts.get(&addr(n)).map(|a| a.balance.raw()).unwrap_or(0)
+    }
+    fn lbal(state: &ChainState, n: u8) -> u64 {
+        state.accounts.get(&lpaddr(n)).map(|a| a.balance.raw()).unwrap_or(0)
+    }
+    fn bps_of(x: u64, bps: u32) -> u64 {
+        x * bps as u64 / 10_000
+    }
+
+    /// A SubmitJobV2 kind carrying `budget` and the canonical test identity hashes.
+    fn v2_kind(budget: u64) -> TxKind {
+        v2_kind_l2(budget, None)
+    }
+    fn v2_kind_l2(budget: u64, l2_id: Option<String>) -> TxKind {
+        TxKind::SubmitJobV2 {
+            program_hash: [0xAA; 32],
+            input_hash: [0xBB; 32],
+            da_root: [0xCC; 32],
+            resources: commputer_core::compute::ResourceRequirements::cpu_only(1, 64),
+            max_duration_secs: 60,
+            comme_budget: Amount::from_raw(budget),
+            l2_id,
+        }
+    }
+    fn v1_kind(budget: u64) -> TxKind {
+        TxKind::SubmitJob {
+            job_spec_hash: [0u8; 32],
+            resources: commputer_core::compute::ResourceRequirements::cpu_only(1, 64),
+            max_duration_secs: 60,
+            comme_budget: Amount::from_raw(budget),
+            l2_id: None,
+        }
+    }
+
+    // --- B2: SubmitJobV2 burn→escrow -----------------------------------------------------
+
+    #[test]
+    fn b2_submit_job_v2_escrows_budget_and_records_pending() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(MIN_BUDGET + 500);
+        state.total_emitted = MIN_BUDGET + 500;
+        let conserved = money_conserved(&state);
+
+        let tx = unsigned_with_fee(addr(1), 0, v2_kind(MIN_BUDGET), 100);
+        let job = tx.hash().0; // G-A: job identity == tx hash
+        state.apply_block(&block_with(&state, 1, vec![tx])).unwrap();
+
+        assert_eq!(state.escrowed_for_job(&job), MIN_BUDGET, "pot == budget");
+        assert_eq!(bal(&state, 1), 400, "balance debited budget + fee");
+        assert_eq!(state.total_burned, 100, "ONLY the fee burned — escrow never moves total_burned");
+        let rec = state.pending_jobs.get(&job).copied().expect("pending record written");
+        assert_eq!(rec.submitter, addr(1).0);
+        assert_eq!(rec.budget, MIN_BUDGET);
+        assert_eq!(rec.program_hash, [0xAA; 32]);
+        assert_eq!(rec.input_hash, [0xBB; 32]);
+        assert_eq!(rec.da_root, [0xCC; 32]);
+        assert_eq!(rec.submitted_height, 0, "G-F: parent height during apply");
+        assert_eq!(rec.claim_by, PhaseWindows::default().claim_blocks, "submit height + claim window");
+        assert!(state.job_lifecycles.is_empty(), "no lifecycle until ClaimJob");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 1);
+        assert_eq!(money_conserved(&state), conserved, "escrow held in circulation");
+    }
+
+    #[test]
+    fn b2_submit_job_v2_below_min_budget_rejects_block() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(MIN_BUDGET);
+        let root = state.compute_state_root();
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, v2_kind(MIN_BUDGET - 1))]))
+            .unwrap_err();
+        assert!(err.to_string().contains("below minimum"), "got: {err}");
+        assert!(state.pending_jobs.is_empty() && state.escrow_by_job.is_empty());
+        assert_eq!(state.compute_state_root(), root, "P1 rollback: no trace");
+    }
+
+    #[test]
+    fn b2_submit_job_v2_insufficient_balance_rejects_block_without_smear() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(MIN_BUDGET - 1);
+        let root = state.compute_state_root();
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, v2_kind(MIN_BUDGET))]))
+            .unwrap_err();
+        assert!(matches!(err, StateError::InsufficientBalance), "got: {err}");
+        assert_eq!(bal(&state, 1), MIN_BUDGET - 1, "balance untouched");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 0, "nonce not bumped");
+        assert!(state.pending_jobs.is_empty() && state.escrow_by_job.is_empty());
+        assert_eq!(state.compute_state_root(), root);
+    }
+
+    #[test]
+    fn b2_submit_job_v2_duplicate_job_id_rejects_block() {
+        // A real duplicate needs a SHA-256 collision (a literal re-broadcast dies on the nonce
+        // check — see the replay test); tamper each guard map ahead of time instead.
+        let tx = unsigned(addr(1), 0, v2_kind(MIN_BUDGET));
+        let job = tx.hash().0;
+        for tamper in 0..3 {
+            let mut state = ChainState::new();
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(MIN_BUDGET);
+            match tamper {
+                0 => {
+                    state.pending_jobs.insert(job, PendingJobRecord {
+                        submitter: [9u8; 32], budget: 1, program_hash: [0u8; 32],
+                        input_hash: [0u8; 32], da_root: [0u8; 32], submitted_height: 0, claim_by: 99,
+                    });
+                }
+                1 => { state.escrow_by_job.insert(job, 1); }
+                _ => { state.job_lifecycles.insert(job, sample_lifecycle(job, 7)); }
+            }
+            let err = state.apply_block(&block_with(&state, 1, vec![tx.clone()])).unwrap_err();
+            assert!(err.to_string().contains("duplicate job id"), "guard {tamper}: got {err}");
+            assert_eq!(bal(&state, 1), MIN_BUDGET, "no money moved on the duplicate");
+        }
+    }
+
+    #[test]
+    fn b2_submit_job_v2_in_batch_rejects_block() {
+        // G-C: no unique per-op job id exists inside a Batch (one tx hash, nonce bumped once).
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(2 * MIN_BUDGET);
+        let root = state.compute_state_root();
+        let batch = TxKind::Batch { operations: vec![v2_kind(MIN_BUDGET)] };
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, batch)]))
+            .unwrap_err();
+        assert!(err.to_string().contains("not allowed in Batch"), "got: {err}");
+        assert!(state.pending_jobs.is_empty() && state.escrow_by_job.is_empty());
+        assert_eq!(state.compute_state_root(), root);
+    }
+
+    #[test]
+    fn b2_submit_job_v1_still_burns_top_level_and_in_batch() {
+        // The legacy path is byte-for-byte untouched: V1 burns at submit, creates NO pot and
+        // NO pending record — top-level and Batch-inner alike.
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(2 * MIN_BUDGET);
+        state.total_emitted = 2 * MIN_BUDGET;
+        let conserved = money_conserved(&state);
+
+        state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, v1_kind(MIN_BUDGET))]))
+            .unwrap();
+        assert_eq!(state.total_burned, MIN_BUDGET, "V1 burns the whole budget at submit");
+
+        let batch = TxKind::Batch { operations: vec![v1_kind(MIN_BUDGET)] };
+        state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(1), 1, batch)]))
+            .unwrap();
+        assert_eq!(state.total_burned, 2 * MIN_BUDGET, "V1-in-Batch burns too");
+        assert_eq!(bal(&state, 1), 0);
+        assert!(state.pending_jobs.is_empty(), "V1 never writes a pending record");
+        assert!(state.escrow_by_job.is_empty(), "V1 never escrows");
+        assert_eq!(money_conserved(&state), conserved, "burns stay inside the invariant");
+    }
+
+    // --- B3: ClaimJob opens the lifecycle -------------------------------------------------
+
+    /// Real-block setup shared by the B3/B4 tests: bonded verifier-validators addr(3)/(4)/(5)
+    /// (the exact candidate set), executor addr(1) (validator, bonded — excluded as `from`),
+    /// submitter addr(2), addr(6) a validator WITHOUT bonded stake (not a candidate ⇒ never a
+    /// committee member), addr(7) bonded but non-compliant (excluded). Block 1 submits the V2
+    /// job, block 2 claims it (deadlines: result_by 11 / commit_by 21 / reveal_by 31; default
+    /// windows). If `result` is given the executor's answer is delivered out-of-band
+    /// (submit_result — the B5 wiring is PROTECTED) and the committee is drawn.
+    fn claimed_job_state(result: Option<[u8; 32]>) -> (ChainState, [u8; 32]) {
+        let v_bond = GameParams::default().verifier_bond;
+        let min_bond = StakeParams::default().min_bond;
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(MIN_BUDGET);
+        let e = state.accounts.get_or_create(addr(1));
+        e.is_validator = true;
+        e.balance = Amount::from_raw(MIN_BUDGET); // e_bond == max(budget, flat 100) == budget
+        state.bonded_stake.insert(addr(1), min_bond);
+        for v in [3u8, 4, 5] {
+            let a = state.accounts.get_or_create(addr(v));
+            a.is_validator = true;
+            a.balance = Amount::from_raw(v_bond);
+            state.bonded_stake.insert(addr(v), min_bond);
+        }
+        let a6 = state.accounts.get_or_create(addr(6));
+        a6.is_validator = true;
+        a6.balance = Amount::from_raw(v_bond);
+        let a7 = state.accounts.get_or_create(addr(7));
+        a7.is_validator = true;
+        a7.compliance = ComplianceStatus::NerfedAdversarial;
+        state.bonded_stake.insert(addr(7), min_bond);
+
+        let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+        let job = submit.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![submit])).unwrap();
+        state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job })]))
+            .unwrap();
+
+        if let Some(r) = result {
+            let stake = |_: &ParticipantId| 1u64;
+            assert_eq!(
+                state.job_lifecycles.get_mut(&job).unwrap().submit_result(
+                    ParticipantId(addr(1).0), r, [42u8; 32], 2, &stake),
+                EventResult::Accepted,
+                "out-of-band result delivery (B5 wiring is PROTECTED)"
+            );
+        }
+        (state, job)
+    }
+
+    #[test]
+    fn b3_claim_opens_lifecycle_escrows_bond_and_snapshots_sorted_candidates() {
+        let (state, job) = claimed_job_state(None);
+
+        assert!(!state.pending_jobs.contains_key(&job), "pending consumed by the claim");
+        assert_eq!(
+            state.escrowed_for_job(&job),
+            2 * MIN_BUDGET,
+            "pot == budget + executor bond (Be = max(budget, flat) = budget)"
+        );
+        assert_eq!(bal(&state, 1), 0, "executor bond debited");
+        let rec = state.job_lifecycles.get(&job).expect("lifecycle open").to_record();
+        assert_eq!(rec.submitter, addr(2).0);
+        assert_eq!(rec.executor, addr(1).0);
+        assert_eq!(rec.budget, MIN_BUDGET);
+        assert_eq!(rec.executor_bond, MIN_BUDGET);
+        assert_eq!(rec.verifier_bond, GameParams::default().verifier_bond);
+        // P9: the program identity travels pending record → lifecycle DTO.
+        assert_eq!(rec.program_hash, [0xAA; 32]);
+        assert_eq!(rec.input_hash, [0xBB; 32]);
+        assert_eq!(rec.da_root, [0xCC; 32]);
+        // G-G: EXACT sorted eligible set — bonded compliant validators, minus the claimer,
+        // minus the unbonded addr(6), minus the non-compliant addr(7).
+        assert_eq!(
+            rec.candidates,
+            vec![addr(3).0, addr(4).0, addr(5).0],
+            "candidate snapshot: exact membership in sorted address order"
+        );
+        // Deadlines anchored at CLAIM height (parent height 1) with the G-E windows.
+        assert_eq!(rec.deadlines.result_by, 1 + PhaseWindows::default().result_blocks);
+        assert_eq!(rec.deadlines.commit_by, rec.deadlines.result_by + PhaseWindows::default().commit_blocks);
+        assert_eq!(rec.deadlines.reveal_by, rec.deadlines.commit_by + PhaseWindows::default().reveal_blocks);
+    }
+
+    #[test]
+    fn b3_claim_from_non_validator_rejects_block() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(2 * MIN_BUDGET);
+        let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+        let job = submit.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![submit])).unwrap();
+        // addr(2) is funded but NOT a validator.
+        let err = state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(2), 1, TxKind::ClaimJob { job_id: job })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("only validators"), "got: {err}");
+        assert!(state.pending_jobs.contains_key(&job), "pending intact");
+        assert_eq!(state.escrowed_for_job(&job), MIN_BUDGET, "pot untouched");
+        assert!(state.job_lifecycles.is_empty());
+    }
+
+    #[test]
+    fn b3_double_claim_rejects_second_tx() {
+        let (mut state, job) = claimed_job_state(None);
+        let pot = state.escrowed_for_job(&job);
+        // addr(3) is a bonded validator — but the job is already claimed.
+        let err = state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(3), 0, TxKind::ClaimJob { job_id: job })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("already claimed"), "got: {err}");
+        assert_eq!(state.escrowed_for_job(&job), pot, "no second bond escrowed");
+        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().executor, addr(1).0);
+    }
+
+    #[test]
+    fn b3_double_claim_within_one_batch_rejects_and_rolls_back() {
+        // The FIRST op opens the lifecycle, the second hits the lifecycle-exists guard ⇒ the
+        // whole block is rejected and P1 rollback erases the first op's open + bond escrow.
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(MIN_BUDGET);
+        let v = state.accounts.get_or_create(addr(3));
+        v.is_validator = true;
+        v.balance = Amount::from_raw(MIN_BUDGET);
+        let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+        let job = submit.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![submit])).unwrap();
+        let root = state.compute_state_root();
+
+        let batch = TxKind::Batch {
+            operations: vec![TxKind::ClaimJob { job_id: job }, TxKind::ClaimJob { job_id: job }],
+        };
+        let err = state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(3), 0, batch)]))
+            .unwrap_err();
+        assert!(err.to_string().contains("already claimed"), "got: {err}");
+        assert!(state.job_lifecycles.is_empty(), "P1 rollback undid the first op's open");
+        assert!(state.pending_jobs.contains_key(&job), "pending restored");
+        assert_eq!(state.escrowed_for_job(&job), MIN_BUDGET, "bond escrow rolled back");
+        assert_eq!(bal(&state, 3), MIN_BUDGET, "claimer refunded by the rollback");
+        assert_eq!(state.compute_state_root(), root);
+    }
+
+    #[test]
+    fn b3_claim_past_window_rejects_block() {
+        // The defense-in-depth guard (the P8 driver normally expires the record first): tamper
+        // in a pending record whose window already closed.
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.apply_block(&block_with(&state, 1, vec![])).unwrap(); // height 1
+        let v = state.accounts.get_or_create(addr(1));
+        v.is_validator = true;
+        v.balance = Amount::from_raw(MIN_BUDGET);
+        let job = [33u8; 32];
+        state.pending_jobs.insert(job, PendingJobRecord {
+            submitter: addr(2).0, budget: MIN_BUDGET, program_hash: [0u8; 32],
+            input_hash: [0u8; 32], da_root: [0u8; 32], submitted_height: 0, claim_by: 0,
+        });
+        state.escrow_by_job.insert(job, MIN_BUDGET);
+        let err = state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("claim window expired"), "got: {err}");
+        assert!(state.job_lifecycles.is_empty());
+        assert_eq!(bal(&state, 1), MIN_BUDGET, "no bond taken");
+    }
+
+    #[test]
+    fn b3_claim_unknown_id_is_legacy_accept_no_money() {
+        // V1 pool jobs / unknown ids keep the legacy accept (nonce only) — unchanged behavior.
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let v = state.accounts.get_or_create(addr(1));
+        v.is_validator = true;
+        v.balance = Amount::from_raw(1_000);
+        state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: [9u8; 32] })]))
+            .unwrap();
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 1, "accepted, nonce bumped");
+        assert_eq!(bal(&state, 1), 1_000, "no money moved");
+        assert!(state.job_lifecycles.is_empty() && state.escrow_by_job.is_empty());
+    }
+
+    #[test]
+    fn b3_claim_insufficient_bond_balance_rejects_without_smear() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(MIN_BUDGET);
+        let v = state.accounts.get_or_create(addr(1));
+        v.is_validator = true;
+        v.balance = Amount::from_raw(MIN_BUDGET - 1); // one short of e_bond
+        let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+        let job = submit.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![submit])).unwrap();
+        let root = state.compute_state_root();
+
+        let err = state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job })]))
+            .unwrap_err();
+        assert!(matches!(err, StateError::InsufficientBalance), "got: {err}");
+        assert_eq!(state.escrowed_for_job(&job), MIN_BUDGET, "pot still == budget only");
+        assert!(state.pending_jobs.contains_key(&job), "pending intact");
+        assert!(state.job_lifecycles.is_empty(), "no half-open lifecycle");
+        assert_eq!(state.compute_state_root(), root, "P1 rollback: no trace");
+    }
+
+    #[test]
+    fn b3_executor_bond_flat_floor_applies_when_above_budget() {
+        // G-D boundary: e_bond = max(budget, game_params.executor_bond).
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.game_params.executor_bond = 3 * MIN_BUDGET; // flat knob ABOVE the budget
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(MIN_BUDGET);
+        let v = state.accounts.get_or_create(addr(1));
+        v.is_validator = true;
+        v.balance = Amount::from_raw(3 * MIN_BUDGET);
+        let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+        let job = submit.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![submit])).unwrap();
+        state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job })]))
+            .unwrap();
+        assert_eq!(state.escrowed_for_job(&job), MIN_BUDGET + 3 * MIN_BUDGET, "budget + flat-floor bond");
+        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().executor_bond, 3 * MIN_BUDGET);
+        assert_eq!(bal(&state, 1), 0);
+    }
+
+    // --- B4: Commit/Reveal route to the lifecycle ------------------------------------------
+
+    #[test]
+    fn b4_commit_on_claimed_job_pre_b5_rejects_wrong_phase() {
+        // The B4-before-B5 crux pinned: without submit_result the phase is AwaitingResult, so
+        // NO Commit can appear in any valid block on this branch — strictly inert-but-strict.
+        let (mut state, job) = claimed_job_state(None);
+        let v_bond = GameParams::default().verifier_bond;
+        let pot = state.escrowed_for_job(&job);
+        let c: Commitment = make_commitment(&ParticipantId(addr(3).0), &[7u8; 32], &[0u8; 32], v_bond);
+        let err = state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(3), 0, TxKind::Commit {
+                job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond) })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("WrongPhase"), "got: {err}");
+        assert_eq!(state.escrowed_for_job(&job), pot, "no bond escrowed");
+        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().commitments.len(), 0);
+    }
+
+    #[test]
+    fn b4_commit_accepts_after_result_and_escrows_bond_exactly_once() {
+        let result = [7u8; 32];
+        let (mut state, job) = claimed_job_state(Some(result));
+        let v_bond = GameParams::default().verifier_bond;
+        // Extra funds so the double-commit below passes the balance pre-check and reaches the
+        // lifecycle's own DoubleCommit rejection (a broke committer dies earlier, on balance).
+        state.accounts.get_mut(&addr(3)).unwrap().balance = Amount::from_raw(2 * v_bond);
+        let pot0 = state.escrowed_for_job(&job);
+        let c: Commitment = make_commitment(&ParticipantId(addr(3).0), &result, &[0u8; 32], v_bond);
+        state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(3), 0, TxKind::Commit {
+                job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond) })]))
+            .unwrap();
+        assert_eq!(
+            state.escrowed_for_job(&job),
+            pot0 + v_bond,
+            "pot grew by EXACTLY one bond — record_commit escrows it, the arm must not double-escrow"
+        );
+        assert_eq!(bal(&state, 3), v_bond, "committer's balance debited by exactly the bond");
+        let rec = state.job_lifecycles.get(&job).unwrap().to_record();
+        assert_eq!(rec.commitments.len(), 1);
+        assert_eq!(state.accounts.get(&addr(3)).unwrap().nonce, 1);
+
+        // Double-commit from the same verifier: rejected, zero delta.
+        let c2: Commitment = make_commitment(&ParticipantId(addr(3).0), &result, &[9u8; 32], v_bond);
+        let err = state
+            .apply_block(&block_with(&state, 4, vec![unsigned(addr(3), 1, TxKind::Commit {
+                job_id: job, commit: c2.commit, bond: Amount::from_raw(v_bond) })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("DoubleCommit"), "got: {err}");
+        assert_eq!(state.escrowed_for_job(&job), pot0 + v_bond, "still exactly one bond");
+    }
+
+    #[test]
+    fn b4_commit_wrong_bond_and_non_member_reject() {
+        let result = [7u8; 32];
+        let (mut state, job) = claimed_job_state(Some(result));
+        let v_bond = GameParams::default().verifier_bond;
+        // Cover the oversized declared bond so the balance pre-check passes and the lifecycle's
+        // WrongBond rejection is what fires.
+        state.accounts.get_mut(&addr(4)).unwrap().balance = Amount::from_raw(2 * v_bond);
+        let pot0 = state.escrowed_for_job(&job);
+
+        // Wrong bond amount (committee member addr(4)).
+        let c: Commitment = make_commitment(&ParticipantId(addr(4).0), &result, &[0u8; 32], v_bond + 1);
+        let err = state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(4), 0, TxKind::Commit {
+                job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond + 1) })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("WrongBond"), "got: {err}");
+
+        // Non-member: addr(6) is a validator but unbonded ⇒ never in the candidate snapshot ⇒
+        // not on the committee. The tx-level validator gate passes; membership rejects.
+        let c6: Commitment = make_commitment(&ParticipantId(addr(6).0), &result, &[0u8; 32], v_bond);
+        let err = state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(6), 0, TxKind::Commit {
+                job_id: job, commit: c6.commit, bond: Amount::from_raw(v_bond) })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("NotCommitteeMember"), "got: {err}");
+
+        assert_eq!(state.escrowed_for_job(&job), pot0, "no rejected commit escrowed anything");
+        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().commitments.len(), 0);
+    }
+
+    #[test]
+    fn b4_batch_double_commit_rejects_whole_block_and_rolls_back_first() {
+        let result = [7u8; 32];
+        let (mut state, job) = claimed_job_state(Some(result));
+        let v_bond = GameParams::default().verifier_bond;
+        // Enough for two bonds: op2 must reach the lifecycle's DoubleCommit (not die on balance).
+        state.accounts.get_mut(&addr(3)).unwrap().balance = Amount::from_raw(2 * v_bond);
+        let pot0 = state.escrowed_for_job(&job);
+        let root = state.compute_state_root();
+        let c: Commitment = make_commitment(&ParticipantId(addr(3).0), &result, &[0u8; 32], v_bond);
+        let op = TxKind::Commit { job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond) };
+        let err = state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(3), 0, TxKind::Batch {
+                operations: vec![op.clone(), op] })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("DoubleCommit"), "got: {err}");
+        // P1 rollback: the FIRST op's accepted escrow is erased with the block.
+        assert_eq!(state.escrowed_for_job(&job), pot0, "first op's bond escrow rolled back");
+        assert_eq!(bal(&state, 3), 2 * v_bond, "committer refunded by the rollback");
+        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().commitments.len(), 0);
+        assert_eq!(state.compute_state_root(), root);
+    }
+
+    #[test]
+    fn b4_committer_balance_below_bond_rejects_block_lifecycle_intact() {
+        let result = [7u8; 32];
+        let (mut state, job) = claimed_job_state(Some(result));
+        let v_bond = GameParams::default().verifier_bond;
+        state.accounts.get_mut(&addr(4)).unwrap().balance = Amount::from_raw(v_bond - 1);
+        let pot0 = state.escrowed_for_job(&job);
+        let c: Commitment = make_commitment(&ParticipantId(addr(4).0), &result, &[0u8; 32], v_bond);
+        let err = state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(4), 0, TxKind::Commit {
+                job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond) })]))
+            .unwrap_err();
+        assert!(matches!(err, StateError::InsufficientBalance), "got: {err}");
+        assert_eq!(state.escrowed_for_job(&job), pot0);
+        let rec = state.job_lifecycles.get(&job).expect("lifecycle intact").to_record();
+        assert_eq!(rec.commitments.len(), 0, "no partial commitment recorded");
+    }
+
+    #[test]
+    fn b4_reveal_self_advances_past_commit_by_and_accepts() {
+        // Pins the arm's built-in lifecycle_advance: build a Committing lifecycle whose commit
+        // window is ALREADY closed and insert it out-of-band AFTER the last block, so the P8
+        // driver has never seen it — the Reveal tx alone must flip Committing→Revealing.
+        let v_bond = GameParams::default().verifier_bond;
+        let (budget, e_bond, _) = fuel_mins();
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.apply_block(&block_with(&state, 1, vec![])).unwrap();
+        state.apply_block(&block_with(&state, 2, vec![])).unwrap(); // parent height for block 3 = 2
+        state.accounts.get_or_create(lpaddr(0)).balance = Amount::from_raw(budget);
+        state.accounts.get_or_create(lpaddr(9)).balance = Amount::from_raw(e_bond);
+        for (n, v) in [(10u8, addr(10)), (11u8, addr(11))] {
+            let a = state.accounts.get_or_create(v);
+            a.is_validator = true;
+            a.balance = Amount::from_raw(v_bond);
+            let _ = n;
+        }
+        let job = [44u8; 32];
+        state.escrow_into_job(&lpaddr(0), job, budget).unwrap();
+        state.escrow_into_job(&lpaddr(9), job, e_bond).unwrap();
+        let mut lc = JobLifecycle::open(
+            job, IDENT, IDENT, IDENT, lpid(0), lpid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(),
+            vec![ParticipantId(addr(10).0), ParticipantId(addr(11).0)],
+            PhaseDeadlines { result_by: 1, commit_by: 1, reveal_by: 30 },
+        );
+        let stake = |_: &ParticipantId| 1u64;
+        assert_eq!(lc.submit_result(lpid(9), [7u8; 32], [42u8; 32], 1, &stake), EventResult::Accepted);
+        state.job_lifecycles.insert(job, lc);
+        for (i, a) in [addr(10), addr(11)].iter().enumerate() {
+            let c = make_commitment(&ParticipantId(a.0), &[7u8; 32], &[i as u8; 32], v_bond);
+            assert_eq!(state.lifecycle_record_commit(job, c, 1).unwrap(), Some(EventResult::Accepted));
+        }
+        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().phase,
+            commputer_pouw_onchain::lifecycle::PhaseRec::Committing, "still Committing pre-block");
+
+        // Block 3: parent height 2 > commit_by 1 — the ARM advances, then records the reveal.
+        state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(10), 0, TxKind::Reveal {
+                job_id: job, result_hash: [7u8; 32], salt: [0u8; 32] })]))
+            .unwrap();
+        let rec = state.job_lifecycles.get(&job).unwrap().to_record();
+        assert_eq!(rec.reveals.len(), 1, "reveal landed without any driver/advance call");
+        assert_eq!(rec.phase, commputer_pouw_onchain::lifecycle::PhaseRec::Revealing);
+
+        // Replay of the same reveal: AlreadyRevealed ⇒ block rejected, zero delta.
+        let err = state
+            .apply_block(&block_with(&state, 4, vec![unsigned(addr(10), 1, TxKind::Reveal {
+                job_id: job, result_hash: [7u8; 32], salt: [0u8; 32] })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("AlreadyRevealed"), "got: {err}");
+        // Mismatched salt from the other committer: RevealMismatch ⇒ rejected.
+        let err = state
+            .apply_block(&block_with(&state, 4, vec![unsigned(addr(11), 0, TxKind::Reveal {
+                job_id: job, result_hash: [7u8; 32], salt: [9u8; 32] })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("RevealMismatch"), "got: {err}");
+        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().reveals.len(), 1);
+    }
+
+    // --- pending-job expiry ------------------------------------------------------------------
+
+    #[test]
+    fn expire_pending_job_refunds_exactly_once() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(MIN_BUDGET);
+        state.total_emitted = MIN_BUDGET;
+        let conserved = money_conserved(&state);
+        let tx = unsigned(addr(1), 0, v2_kind(MIN_BUDGET));
+        let job = tx.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![tx])).unwrap();
+        let claim_by = state.pending_jobs.get(&job).unwrap().claim_by;
+
+        // Not yet due (height == claim_by is still claimable) ⇒ None, nothing moves.
+        assert_eq!(state.expire_pending_job(job, claim_by).unwrap(), None);
+        assert_eq!(state.escrowed_for_job(&job), MIN_BUDGET);
+
+        let out = state.expire_pending_job(job, claim_by + 1).unwrap().expect("due ⇒ refund");
+        assert_eq!(out.submitter_refunded, MIN_BUDGET, "no-fault: FULL refund");
+        assert_eq!(out.burned, 0);
+        assert_eq!(bal(&state, 1), MIN_BUDGET, "budget back with the submitter");
+        assert!(!state.escrow_by_job.contains_key(&job), "empty pot removed");
+        assert!(!state.pending_jobs.contains_key(&job), "record removed");
+        assert_eq!(state.total_burned, 0, "expiry burns nothing");
+        // At-most-once: the record is gone, a second call is a no-op.
+        assert_eq!(state.expire_pending_job(job, claim_by + 2).unwrap(), None);
+        assert_eq!(bal(&state, 1), MIN_BUDGET);
+        assert_eq!(money_conserved(&state), conserved);
+    }
+
+    #[test]
+    fn p8_pending_job_expires_via_the_driver_and_refunds() {
+        let mut state = ChainState::new();
+        state.phase_windows.claim_blocks = 2;
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(MIN_BUDGET);
+        state.total_emitted = MIN_BUDGET;
+        let conserved = money_conserved(&state);
+        let tx = unsigned(addr(1), 0, v2_kind(MIN_BUDGET));
+        let job = tx.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![tx])).unwrap(); // claim_by = 0 + 2
+        state.apply_block(&block_with(&state, 2, vec![])).unwrap(); // 2 > 2 is false: still pending
+        assert!(state.pending_jobs.contains_key(&job), "not yet due");
+        state.apply_block(&block_with(&state, 3, vec![])).unwrap(); // 3 > 2: the driver refunds
+        assert!(state.pending_jobs.is_empty(), "driver expired the unclaimed job");
+        assert_eq!(state.escrowed_for_job(&job), 0);
+        assert_eq!(bal(&state, 1), MIN_BUDGET, "full refund");
+        assert_eq!(state.total_burned, 0);
+        assert_eq!(money_conserved(&state), conserved);
+    }
+
+    // --- D2 fallback + P2 settle re-entry --------------------------------------------------
+
+    /// Out-of-band round at the committee stage: funded lifecycle over `state`, executor claims
+    /// [7;32], each committee member (lpid 10/11/12) commits `hashes[i]` and reveals iff
+    /// `reveal_mask[i]`, advanced past reveal_by — ready to settle. Returns
+    /// (state, job, budget, e_bond, v_bond, conserved0).
+    fn round_ready_state(
+        hashes: [[u8; 32]; 3],
+        reveal_mask: [bool; 3],
+    ) -> (ChainState, [u8; 32], u64, u64, u64, u64) {
+        let (budget, e_bond, v_bond) = fuel_mins();
+        let committee = [lpid(10), lpid(11), lpid(12)];
+        let job = [21u8; 32];
+        let mut state = ChainState::new();
+        state.total_emitted = budget + e_bond + 3 * v_bond;
+        state.accounts.get_or_create(lpaddr(0)).balance = Amount::from_raw(budget);
+        state.accounts.get_or_create(lpaddr(9)).balance = Amount::from_raw(e_bond);
+        for c in 10u8..13 {
+            state.accounts.get_or_create(lpaddr(c)).balance = Amount::from_raw(v_bond);
+        }
+        let conserved = money_conserved(&state);
+        state.escrow_into_job(&lpaddr(0), job, budget).unwrap();
+        state.escrow_into_job(&lpaddr(9), job, e_bond).unwrap();
+        let mut lc = JobLifecycle::open(
+            job, IDENT, IDENT, IDENT, lpid(0), lpid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(), committee.to_vec(), test_deadlines(),
+        );
+        let stake = |_: &ParticipantId| 1u64;
+        assert_eq!(lc.submit_result(lpid(9), [7u8; 32], [42u8; 32], 5, &stake), EventResult::Accepted);
+        state.job_lifecycles.insert(job, lc);
+        for (i, c) in committee.iter().enumerate() {
+            let commit = make_commitment(c, &hashes[i], &[i as u8; 32], v_bond);
+            assert_eq!(state.lifecycle_record_commit(job, commit, 15).unwrap(), Some(EventResult::Accepted));
+        }
+        state.lifecycle_advance(job, 21);
+        for (i, c) in committee.iter().enumerate() {
+            if !reveal_mask[i] {
+                continue;
+            }
+            let r = Reveal { verifier: *c, result_hash: hashes[i], salt: [i as u8; 32] };
+            assert_eq!(state.lifecycle_record_reveal(job, r, 25), Some(EventResult::Accepted));
+        }
+        state.lifecycle_advance(job, 31);
+        (state, job, budget, e_bond, v_bond, conserved)
+    }
+
+    #[test]
+    fn d2_settle_and_drain_confirmed_drains_entry_at_most_once() {
+        // All 3 reveal the executor's hash ⇒ Confirmed; settle itself drains the pot and the
+        // wrapper removes the map entry ⇒ at-most-once by construction.
+        let (mut state, job, _, e_bond, v_bond, conserved) =
+            round_ready_state([[7u8; 32]; 3], [true, true, true]);
+        let (t, fb) = state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().expect("due");
+        match t {
+            Terminal::Confirmed(out) => assert_eq!(out.bonds_returned, e_bond + 3 * v_bond),
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+        assert!(fb.is_none(), "no fallback on Confirmed");
+        assert!(!state.job_lifecycles.contains_key(&job), "entry drained");
+        assert_eq!(state.escrowed_for_job(&job), 0);
+        assert_eq!(money_conserved(&state), conserved);
+        let snap: Vec<u64> = (0..13).map(|n| lbal(&state, n)).collect();
+        assert!(state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().is_none(), "second call: None");
+        assert_eq!((0..13).map(|n| lbal(&state, n)).collect::<Vec<_>>(), snap, "no re-payment");
+    }
+
+    #[test]
+    fn d2_settle_and_drain_timeout_drains_entry() {
+        let (budget, e_bond, v_bond) = fuel_mins();
+        let job = [22u8; 32];
+        let mut state = ChainState::new();
+        state.total_emitted = budget + e_bond;
+        state.accounts.get_or_create(lpaddr(0)).balance = Amount::from_raw(budget);
+        state.accounts.get_or_create(lpaddr(9)).balance = Amount::from_raw(e_bond);
+        let conserved = money_conserved(&state);
+        state.escrow_into_job(&lpaddr(0), job, budget).unwrap();
+        state.escrow_into_job(&lpaddr(9), job, e_bond).unwrap();
+        let lc = JobLifecycle::open(
+            job, IDENT, IDENT, IDENT, lpid(0), lpid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(), vec![lpid(10)], test_deadlines(),
+        );
+        state.job_lifecycles.insert(job, lc); // executor never delivers
+        let (t, fb) = state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().expect("due");
+        assert!(matches!(t, Terminal::TimedOut(_)), "got {t:?}");
+        assert!(fb.is_none());
+        assert!(!state.job_lifecycles.contains_key(&job), "entry drained");
+        assert_eq!(state.escrowed_for_job(&job), 0);
+        assert_eq!(money_conserved(&state), conserved);
+        assert!(state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().is_none());
+    }
+
+    #[test]
+    fn d2_settle_and_drain_escalate_pays_zero_comp_and_drains() {
+        // 3-way split ⇒ NoQuorum ⇒ Escalate ⇒ the D2-FINAL zero-comp fallback: pure refund.
+        let (mut state, job, budget, e_bond, v_bond, conserved) =
+            round_ready_state([[1u8; 32], [2u8; 32], [3u8; 32]], [true, true, true]);
+        let (t, fb) = state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().expect("due");
+        assert!(matches!(t, Terminal::Escalate(_)), "got {t:?}");
+        let fb = fb.expect("Escalate runs the fallback");
+        assert_eq!(fb.worker_paid, 0, "ZERO executor comp (D2-FINAL)");
+        assert_eq!(fb.submitter_refunded, budget, "full budget back");
+        assert_eq!(fb.bonds_returned, e_bond + 3 * v_bond, "every bond back");
+        assert_eq!(fb.burned, 0, "fallback burns nothing");
+        assert_eq!(lbal(&state, 0), budget);
+        assert_eq!(lbal(&state, 9), e_bond, "bond back, NO comp");
+        for c in 10u8..13 {
+            assert_eq!(lbal(&state, c), v_bond, "revealer bond back");
+        }
+        assert_eq!(state.escrowed_for_job(&job), 0, "pot drained to exactly 0");
+        assert!(!state.job_lifecycles.contains_key(&job), "entry drained");
+        assert_eq!(state.total_burned, 0, "total_burned untouched by the fallback");
+        assert_eq!(money_conserved(&state), conserved);
+        assert!(state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().is_none(), "at-most-once");
+    }
+
+    #[test]
+    fn p2_forfeiture_settle_caches_then_drains_without_wedging() {
+        // P2's wedge scenario: 2 reveal a split, 1 stays silent ⇒ settle burns the silent bond
+        // BEFORE the verdict ⇒ the pot no longer equals expected_escrow(). Pre-P2 a re-entry
+        // Err'd forever (pot pre-validation ran before the cached-terminal short-circuit) and
+        // the Escalate pot stranded permanently.
+        let (mut state, job, budget, e_bond, v_bond, conserved) =
+            round_ready_state([[1u8; 32], [2u8; 32], [3u8; 32]], [true, true, false]);
+        let t1 = state.lifecycle_settle(job, &ByteEq).unwrap().expect("lifecycle");
+        assert!(matches!(t1, Terminal::Escalate(_)), "got {t1:?}");
+        assert!(state.job_lifecycles.get(&job).unwrap().is_settled());
+        assert_eq!(state.escrowed_for_job(&job), budget + e_bond + 2 * v_bond, "reduced pot held");
+        assert_eq!(state.total_burned, v_bond, "forfeit burned by the audited settle");
+
+        // P2 pin: re-entry short-circuits to the CACHED terminal — Ok(cached), not Err.
+        let snap: Vec<u64> = (0..13).map(|n| lbal(&state, n)).collect();
+        let t2 = state.lifecycle_settle(job, &ByteEq).unwrap().expect("cached");
+        assert_eq!(t1, t2, "cached terminal returned, no pot re-validation wedge");
+        assert_eq!((0..13).map(|n| lbal(&state, n)).collect::<Vec<_>>(), snap, "cache moves no money");
+
+        // Drain: the fallback pays out exactly the REDUCED pot.
+        let (_, fb) = state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().expect("drains");
+        let fb = fb.expect("fallback ran");
+        assert_eq!(fb.bonds_returned, e_bond + 2 * v_bond, "only the 2 revealers' bonds");
+        assert_eq!(fb.burned, 0, "the forfeit was settle's burn, not the fallback's");
+        assert_eq!(state.escrowed_for_job(&job), 0, "reduced pot drained to exactly 0");
+        assert_eq!(lbal(&state, 12), 0, "silent committer stays forfeited");
+        assert!(state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().is_none(), "at-most-once");
+        assert_eq!(money_conserved(&state), conserved);
+    }
+
+    #[test]
+    fn d2_drain_with_malformed_pot_errs_then_retries_cleanly() {
+        let (mut state, job, _, _, _, _) =
+            round_ready_state([[1u8; 32], [2u8; 32], [3u8; 32]], [true, true, true]);
+        state.lifecycle_settle(job, &ByteEq).unwrap().expect("caches Escalate");
+        let pot = state.escrowed_for_job(&job);
+        state.escrow_by_job.insert(job, pot - 1); // tamper: shrink the pot under the fallback
+        let snap: Vec<u64> = (0..13).map(|n| lbal(&state, n)).collect();
+        let err = state.lifecycle_settle_and_drain(job, &ByteEq).unwrap_err();
+        assert!(err.to_string().contains("escalate pot"), "got: {err}");
+        assert!(state.job_lifecycles.contains_key(&job), "lifecycle kept for retry");
+        assert_eq!((0..13).map(|n| lbal(&state, n)).collect::<Vec<_>>(), snap, "nothing moved on Err");
+        // Repair the pot ⇒ the retry is clean (deterministic re-check, terminal still cached).
+        state.escrow_by_job.insert(job, pot);
+        assert!(state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().is_some());
+        assert_eq!(state.escrowed_for_job(&job), 0);
+    }
+
+    // --- P3: zero-address guards --------------------------------------------------------------
+
+    #[test]
+    fn p3_zero_from_is_rejected_on_every_pouw_money_arm() {
+        // Zero-from txs skip signature verification entirely, so a byzantine producer could
+        // forge them: every money arm must reject the keyless zero address OUTRIGHT — even if
+        // someone manufactured a balance and a validator flag for it.
+        let cases: Vec<TxKind> = vec![
+            v2_kind(MIN_BUDGET),
+            TxKind::ClaimJob { job_id: [7u8; 32] },
+            TxKind::Commit { job_id: [7u8; 32], commit: [1u8; 32], bond: Amount::from_raw(20) },
+            TxKind::Reveal { job_id: [7u8; 32], result_hash: [1u8; 32], salt: [2u8; 32] },
+            TxKind::Bond { amount: Amount::from_raw(10) },
+            TxKind::RequestUnbond { amount: Amount::from_raw(10) },
+            TxKind::WithdrawUnbonded,
+            TxKind::Batch { operations: vec![TxKind::Bond { amount: Amount::from_raw(10) }] },
+            TxKind::Batch { operations: vec![TxKind::ClaimJob { job_id: [7u8; 32] }] },
+            TxKind::Batch { operations: vec![TxKind::Commit {
+                job_id: [7u8; 32], commit: [1u8; 32], bond: Amount::from_raw(20) }] },
+            TxKind::Batch { operations: vec![TxKind::Reveal {
+                job_id: [7u8; 32], result_hash: [1u8; 32], salt: [2u8; 32] }] },
+        ];
+        for kind in cases {
+            let mut state = ChainState::new();
+            state.apply_block(&genesis_block()).unwrap();
+            let z = state.accounts.get_or_create(addr(0)); // addr(0) == the zero address
+            z.balance = Amount::from_raw(10 * MIN_BUDGET);
+            z.is_validator = true;
+            state.total_emitted = 10 * MIN_BUDGET;
+            let root = state.compute_state_root();
+            let err = state
+                .apply_block(&block_with(&state, 1, vec![unsigned(addr(0), 0, kind.clone())]))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("zero address"),
+                "kind {kind:?} must die on the zero-from guard, got: {err}"
+            );
+            assert_eq!(state.compute_state_root(), root, "P1 rollback after the rejection");
+        }
+        // The legitimate protocol path is untouched: a zero-from MiningReward still applies.
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(0), 0, TxKind::MiningReward {
+                to: addr(1), amount: Amount::from_raw(1), epoch: 0 })]))
+            .unwrap();
+    }
+
+    #[test]
+    fn p3_zero_address_never_enters_the_candidate_snapshot() {
+        // Even with a manufactured zero-address validator + bonded stake, the B3 candidate
+        // filter excludes it (a keyless committee seat would be puppetable by anyone).
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let min_bond = StakeParams::default().min_bond;
+        let z = state.accounts.get_or_create(addr(0));
+        z.is_validator = true;
+        z.balance = Amount::from_raw(MIN_BUDGET);
+        state.bonded_stake.insert(addr(0), min_bond); // tampered keyless stake
+        let v3 = state.accounts.get_or_create(addr(3));
+        v3.is_validator = true;
+        state.bonded_stake.insert(addr(3), min_bond);
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(MIN_BUDGET);
+        let e = state.accounts.get_or_create(addr(1));
+        e.is_validator = true;
+        e.balance = Amount::from_raw(MIN_BUDGET);
+
+        let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+        let job = submit.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![submit])).unwrap();
+        state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job })]))
+            .unwrap();
+        assert_eq!(
+            state.job_lifecycles.get(&job).unwrap().to_record().candidates,
+            vec![addr(3).0],
+            "zero address filtered out of the snapshot"
+        );
+    }
+
+    // --- Full driven rounds: conservation at every block, P8 driver settles ---------------------
+
+    /// End-state of one fully tx-driven job round (see `drive_job_round`).
+    struct Driven {
+        state: ChainState,
+        conserved0: u64,
+        budget: u64,
+        e_bond: u64,
+        v_bond: u64,
+        roots: Vec<[u8; 32]>,
+    }
+
+    fn apply_and_check(
+        state: &mut ChainState,
+        txs: Vec<Transaction>,
+        conserved0: u64,
+        roots: &mut Vec<[u8; 32]>,
+    ) {
+        let h = state.blocks.height() + 1;
+        let block = block_with(state, h, txs);
+        state.apply_block(&block).unwrap();
+        assert_eq!(money_conserved(state), conserved0, "money conserved after block {h}");
+        roots.push(state.compute_state_root());
+    }
+
+    /// Drive a COMPLETE job round through real blocks: Bond txs (b1), SubmitJobV2 (b2), ClaimJob
+    /// (b3), Commit txs (b4), Reveal txs (b10), with the P8 in-apply driver advancing phases and
+    /// settling at the deadline heights — settle is never called manually. Shortened windows:
+    /// claim at parent height 2 ⇒ result_by 5 / commit_by 8 / reveal_by 11 ⇒ terminal at block 12
+    /// (block 6 on the timeout path). The out-of-band step is submit_result only (B5 PROTECTED).
+    /// Actors: submitter addr(2), executor addr(1), verifiers addr(3)/(4)/(5); producer is the
+    /// zero address (earns nothing) and every fee is 0 ⇒ `money_conserved` must hold EXACTLY
+    /// after every block. `commits`: (verifier, hash, does_reveal).
+    fn drive_job_round(executor_result: Option<[u8; 32]>, commits: &[(u8, [u8; 32], bool)]) -> Driven {
+        let budget = MIN_BUDGET;
+        let v_bond = GameParams::default().verifier_bond;
+        let min_bond = StakeParams::default().min_bond;
+        let mut state = ChainState::new();
+        state.phase_windows = PhaseWindows {
+            result_blocks: 3, commit_blocks: 3, reveal_blocks: 3, claim_blocks: 5,
+        };
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(budget);
+        let e = state.accounts.get_or_create(addr(1));
+        e.is_validator = true;
+        e.balance = Amount::from_raw(budget); // e_bond == max(budget, flat 100) == budget
+        for v in [3u8, 4, 5] {
+            let a = state.accounts.get_or_create(addr(v));
+            a.is_validator = true;
+            a.balance = Amount::from_raw(min_bond + v_bond);
+        }
+        state.total_emitted = 2 * budget + 3 * (min_bond + v_bond);
+        let conserved0 = money_conserved(&state);
+        let mut roots = Vec::new();
+
+        // b1: the verifiers bond to committee eligibility — REAL Bond txs (N1 kinds).
+        let bonds: Vec<Transaction> = [3u8, 4, 5]
+            .iter()
+            .map(|&v| unsigned(addr(v), 0, TxKind::Bond { amount: Amount::from_raw(min_bond) }))
+            .collect();
+        apply_and_check(&mut state, bonds, conserved0, &mut roots);
+
+        // b2: SubmitJobV2 escrows the budget (job_id == tx hash; claim_by = 1 + 5).
+        let submit = unsigned(addr(2), 0, v2_kind(budget));
+        let job = submit.hash().0;
+        apply_and_check(&mut state, vec![submit], conserved0, &mut roots);
+
+        // b3: ClaimJob opens the lifecycle (parent height 2 ⇒ deadlines 5/8/11).
+        apply_and_check(
+            &mut state,
+            vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job })],
+            conserved0,
+            &mut roots,
+        );
+
+        if let Some(hash) = executor_result {
+            // Result delivery is the PROTECTED B5 wiring — out-of-band here, swept by b4.
+            let stake = |_: &ParticipantId| 1u64;
+            assert_eq!(
+                state.job_lifecycles.get_mut(&job).unwrap().submit_result(
+                    ParticipantId(addr(1).0), hash, [42u8; 32], 3, &stake),
+                EventResult::Accepted
+            );
+            // b4: Commit txs from the drawn committee (== the 3 bonded verifiers, k = 3).
+            let commit_txs: Vec<Transaction> = commits
+                .iter()
+                .enumerate()
+                .map(|(i, &(v, h, _))| {
+                    let c: Commitment =
+                        make_commitment(&ParticipantId(addr(v).0), &h, &[i as u8; 32], v_bond);
+                    unsigned(addr(v), 1, TxKind::Commit {
+                        job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond),
+                    })
+                })
+                .collect();
+            apply_and_check(&mut state, commit_txs, conserved0, &mut roots);
+            // b5–b9 empty: the driver flips Committing→Revealing at block 9 (9 > commit_by 8).
+            while state.blocks.height() < 9 {
+                apply_and_check(&mut state, vec![], conserved0, &mut roots);
+            }
+            // b10: Reveal txs (parent height 9 ≤ reveal_by 11).
+            let reveal_txs: Vec<Transaction> = commits
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.2)
+                .map(|(i, &(v, h, _))| unsigned(addr(v), 2, TxKind::Reveal {
+                    job_id: job, result_hash: h, salt: [i as u8; 32],
+                }))
+                .collect();
+            apply_and_check(&mut state, reveal_txs, conserved0, &mut roots);
+        }
+
+        // Empty blocks past the settle height — the driver terminates the job on its own.
+        while state.blocks.height() < 13 {
+            apply_and_check(&mut state, vec![], conserved0, &mut roots);
+        }
+        assert!(state.job_lifecycles.is_empty(), "P8 driver settled + drained the lifecycle");
+        assert!(state.pending_jobs.is_empty(), "no pending record left behind");
+        assert_eq!(state.escrowed_for_job(&job), 0, "pot fully drained at the terminal");
+
+        // At-most-once: one more block moves NO money for any actor.
+        let snap: Vec<u64> = [1u8, 2, 3, 4, 5].iter().map(|&n| bal(&state, n)).collect();
+        let burned = state.total_burned;
+        apply_and_check(&mut state, vec![], conserved0, &mut roots);
+        assert_eq!(
+            [1u8, 2, 3, 4, 5].iter().map(|&n| bal(&state, n)).collect::<Vec<u64>>(),
+            snap,
+            "settlement is at-most-once"
+        );
+        assert_eq!(state.total_burned, burned);
+
+        Driven { state, conserved0, budget, e_bond: budget, v_bond, roots }
+    }
+
+    #[test]
+    fn driven_confirmed_pays_the_audited_split_through_real_blocks() {
+        let r = [7u8; 32];
+        let d = drive_job_round(Some(r), &[(3, r, true), (4, r, true), (5, r, true)]);
+        let share = bps_of(d.budget, 1_000) / 3; // 10% pool, even split; remainder burned
+        assert_eq!(bal(&d.state, 1), bps_of(d.budget, 8_500) + d.e_bond, "executor: 85% + bond back");
+        for v in [3u8, 4, 5] {
+            assert_eq!(bal(&d.state, v), d.v_bond + share, "verifier: bond back + pool share");
+        }
+        assert_eq!(bal(&d.state, 2), 0, "submitter spent the whole budget");
+        assert_eq!(
+            d.state.total_burned,
+            d.budget - bps_of(d.budget, 8_500) - 3 * share,
+            "exactly the 5% slice + rounding remainder (fees are zero)"
+        );
+        assert_eq!(money_conserved(&d.state), d.conserved0);
+    }
+
+    #[test]
+    fn driven_disputed_refunds_submitter_and_slashes_executor() {
+        let claimed = [7u8; 32];
+        let correct = [5u8; 32]; // committee proves a different result ⇒ Disputed
+        let d = drive_job_round(Some(claimed), &[(3, correct, true), (4, correct, true), (5, correct, true)]);
+        let bounty_share = bps_of(d.e_bond, 2_000) / 3; // dispute bounty from the slashed bond
+        assert_eq!(bal(&d.state, 2), d.budget, "submitter fully refunded");
+        assert_eq!(bal(&d.state, 1), 0, "executor bond slashed to zero");
+        for v in [3u8, 4, 5] {
+            assert_eq!(bal(&d.state, v), d.v_bond + bounty_share, "honest verifier: bond + bounty");
+        }
+        assert_eq!(d.state.total_burned, d.e_bond - 3 * bounty_share, "non-bounty remainder burned");
+        assert_eq!(money_conserved(&d.state), d.conserved0);
+    }
+
+    #[test]
+    fn driven_timeout_compensates_submitter_and_burns_the_rest() {
+        // Executor claims but never delivers ⇒ the driver settles TimedOut at result_by+1.
+        let d = drive_job_round(None, &[]);
+        let comp = bps_of(d.e_bond, 2_000); // founder rule: 20% of the slashed bond
+        assert_eq!(bal(&d.state, 2), d.budget + comp, "budget refund + 20% bond comp");
+        assert_eq!(bal(&d.state, 1), 0, "executor slashed");
+        for v in [3u8, 4, 5] {
+            assert_eq!(bal(&d.state, v), d.v_bond, "verifiers never engaged — untouched");
+        }
+        assert_eq!(d.state.total_burned, d.e_bond - comp, "80% of the bond burned");
+        assert_eq!(money_conserved(&d.state), d.conserved0);
+    }
+
+    #[test]
+    fn driven_noquorum_fallback_is_pure_refund_zero_comp() {
+        // 3-way split ⇒ NoQuorum ⇒ Escalate ⇒ D2-FINAL zero-comp fallback, all inside the
+        // driver: full budget back, every bond back, NOTHING burned, executor comp ZERO.
+        let d = drive_job_round(
+            Some([7u8; 32]),
+            &[(3, [1u8; 32], true), (4, [2u8; 32], true), (5, [3u8; 32], true)],
+        );
+        assert_eq!(bal(&d.state, 2), d.budget, "full refund");
+        assert_eq!(bal(&d.state, 1), d.e_bond, "bond back, ZERO comp (D2-FINAL)");
+        for v in [3u8, 4, 5] {
+            assert_eq!(bal(&d.state, v), d.v_bond, "revealer bond back");
+        }
+        assert_eq!(d.state.total_burned, 0, "fallback burns nothing");
+        assert_eq!(money_conserved(&d.state), d.conserved0);
+    }
+
+    #[test]
+    fn driven_noquorum_with_forfeiture_burns_only_the_silent_bond() {
+        // 2 distinct reveals (max class 1 < quorum 2) + 1 commit-no-reveal ⇒ the audited settle
+        // burns the silent bond, then the fallback drains the REDUCED pot — P2's wedge
+        // scenario driven end-to-end through real blocks.
+        let d = drive_job_round(
+            Some([7u8; 32]),
+            &[(3, [1u8; 32], true), (4, [2u8; 32], true), (5, [3u8; 32], false)],
+        );
+        assert_eq!(bal(&d.state, 2), d.budget, "full refund");
+        assert_eq!(bal(&d.state, 1), d.e_bond, "bond back, zero comp");
+        assert_eq!(bal(&d.state, 3), d.v_bond);
+        assert_eq!(bal(&d.state, 4), d.v_bond);
+        assert_eq!(bal(&d.state, 5), 0, "silent committer's bond forfeited");
+        assert_eq!(d.state.total_burned, d.v_bond, "exactly the forfeited bond burned");
+        assert_eq!(money_conserved(&d.state), d.conserved0);
+    }
+
+    #[test]
+    fn p8_driver_is_deterministic_across_independent_replays() {
+        // Two nodes applying the SAME blocks must settle at the SAME heights and produce
+        // byte-identical roots at EVERY height (Confirmed-with-forfeiture: the richest path).
+        let r = [7u8; 32];
+        let commits = [(3u8, r, true), (4u8, r, true), (5u8, r, false)];
+        let a = drive_job_round(Some(r), &commits);
+        let b = drive_job_round(Some(r), &commits);
+        assert_eq!(a.roots, b.roots, "per-height roots identical, settle height included (P8)");
+        assert_eq!(a.state.compute_state_root(), b.state.compute_state_root());
+    }
+
+    // --- P1: rollback-on-Err regressions --------------------------------------------------------
+
+    #[test]
+    fn p1_rollback_memory_erases_mid_block_smear() {
+        // tx1 (V2 escrow) succeeds, tx2 fails ⇒ pre-P1 the escrow + tx1's nonce smeared the
+        // in-memory state; now the WHOLE block must leave no trace.
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(MIN_BUDGET);
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(50);
+        state.total_emitted = MIN_BUDGET + 50;
+        let root = state.compute_state_root();
+        let conserved = money_conserved(&state);
+
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![
+                unsigned(addr(1), 0, v2_kind(MIN_BUDGET)),
+                unsigned(addr(2), 0, TxKind::Transfer { to: addr(1), amount: Amount::from_raw(MIN_BUDGET) }),
+            ]))
+            .unwrap_err();
+        assert!(matches!(err, StateError::InsufficientBalance), "got: {err}");
+        assert_eq!(state.blocks.height(), 0, "block rejected");
+        assert_eq!(bal(&state, 1), MIN_BUDGET, "tx1's escrow debit rolled back");
+        assert_eq!(state.accounts.get(&addr(1)).unwrap().nonce, 0, "tx1's nonce rolled back");
+        assert!(state.pending_jobs.is_empty() && state.escrow_by_job.is_empty(), "maps rolled back");
+        assert_eq!(state.compute_state_root(), root, "root byte-identical to pre-block");
+        assert_eq!(money_conserved(&state), conserved);
+    }
+
+    #[test]
+    fn p1_rocks_rollback_matches_node_that_never_saw_the_invalid_block() {
+        // The P1 BLOCKER scenario: pre-P1, a rejected block's smear sat in the dirty journal
+        // and the NEXT good block's persist wrote it into the CFs — forking node A from node B
+        // on disk. Node A sees the malicious block; node B never does; they must stay
+        // byte-identical through the next good block AND across reopen.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let mut a = ChainState::open(dir_a.path()).unwrap();
+        let mut b = ChainState::open(dir_b.path()).unwrap();
+        for s in [&mut a, &mut b] {
+            s.apply_block(&genesis_block()).unwrap();
+            s.accounts.get_or_create(addr(1)).balance = Amount::from_raw(3 * MIN_BUDGET);
+            s.total_emitted = 3 * MIN_BUDGET;
+        }
+        // Common block 1 (sweeps the funding into the CFs on both nodes).
+        let blk1 = block_with(&a, 1, vec![unsigned(addr(1), 0, TxKind::Bond { amount: Amount::from_raw(1_000) })]);
+        a.apply_block(&blk1).unwrap();
+        b.apply_block(&blk1).unwrap();
+        assert_eq!(a.compute_state_root(), b.compute_state_root());
+
+        // Node A alone is fed the malicious block: tx1 escrows a V2 job, tx2 fails.
+        let bad = block_with(&a, 2, vec![
+            unsigned(addr(1), 1, v2_kind(MIN_BUDGET)),
+            unsigned(addr(2), 0, TxKind::Transfer { to: addr(3), amount: Amount::from_raw(MIN_BUDGET) }),
+        ]);
+        assert!(a.apply_block(&bad).is_err());
+        assert_eq!(a.compute_state_root(), b.compute_state_root(), "P1: no in-memory smear on A");
+
+        // Both apply the SAME good block 2 — its persist must write identical CF bytes.
+        let good = block_with(&a, 2, vec![unsigned(addr(1), 1, TxKind::Bond { amount: Amount::from_raw(500) })]);
+        a.apply_block(&good).unwrap();
+        b.apply_block(&good).unwrap();
+        assert_eq!(a.compute_state_root(), b.compute_state_root(), "roots agree after the next block");
+
+        drop(a);
+        drop(b);
+        let ra = ChainState::open(dir_a.path()).unwrap();
+        let rb = ChainState::open(dir_b.path()).unwrap();
+        assert_eq!(
+            ra.compute_state_root(),
+            rb.compute_state_root(),
+            "reopened roots identical — the smear never reached A's CFs"
+        );
+        assert!(ra.pending_jobs.is_empty() && ra.escrow_by_job.is_empty(), "no smeared V2 rows on disk");
+        assert!(ra.accounts.get(&addr(2)).is_none(), "failed tx's account-creation smear not persisted");
+        assert_eq!(
+            ra.accounts.get(&addr(1)).map(|x| x.balance),
+            rb.accounts.get(&addr(1)).map(|x| x.balance),
+        );
+        assert_eq!(ra.bonded_of(&addr(1)), 1_500);
+    }
+
+    #[test]
+    fn p1_rollback_preserves_out_of_band_mutations_on_a_rocks_node() {
+        // The rocks-reload rollback bug: out-of-band mutations applied in memory since the last
+        // block (the event loop's epoch bump + per-account pokes, grace drains) ride the NEXT
+        // block's persist — they are live-in-memory-but-not-on-disk during a block apply. A disk
+        // reload on rollback would rewind them; the memory snapshot must preserve them.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = ChainState::open(dir.path()).unwrap();
+        s.apply_block(&genesis_block()).unwrap();
+        s.accounts.get_or_create(addr(1)).balance = Amount::from_raw(3 * MIN_BUDGET);
+        s.total_emitted = 3 * MIN_BUDGET;
+        let blk1 = block_with(&s, 1, vec![unsigned(addr(1), 0, TxKind::Bond { amount: Amount::from_raw(1_000) })]);
+        s.apply_block(&blk1).unwrap();
+
+        // Out-of-band mutations, exactly as the (PROTECTED) event loop applies them between
+        // blocks: bump the epoch counter and poke an account field. These are dirty-in-memory,
+        // NOT yet persisted — they would ride block 2's persist.
+        s.current_epoch += 1;
+        s.accounts.get_or_create(addr(1)).cumulative_uptime_secs += 3600;
+        let epoch_before = s.current_epoch;
+        let uptime_before = s.accounts.get(&addr(1)).unwrap().cumulative_uptime_secs;
+        let root_before = s.compute_state_root();
+
+        // A malicious block arrives and fails apply (tx2 rejects) — rollback must leave the
+        // out-of-band state intact, not reload it away from disk (disk still holds epoch 0).
+        let bad = block_with(&s, 2, vec![
+            unsigned(addr(1), 1, v2_kind(MIN_BUDGET)),
+            unsigned(addr(2), 0, TxKind::Transfer { to: addr(3), amount: Amount::from_raw(MIN_BUDGET) }),
+        ]);
+        assert!(s.apply_block(&bad).is_err());
+
+        assert_eq!(s.current_epoch, epoch_before, "epoch bump survived the rollback");
+        assert_eq!(
+            s.accounts.get(&addr(1)).unwrap().cumulative_uptime_secs, uptime_before,
+            "out-of-band account poke survived the rollback",
+        );
+        assert_eq!(s.compute_state_root(), root_before, "root unchanged by the rejected block");
+        assert!(s.pending_jobs.is_empty() && s.escrow_by_job.is_empty(), "no V2 smear from tx1");
+
+        // The next good block persists the out-of-band state; reopen proves it reached disk.
+        let good = block_with(&s, 2, vec![unsigned(addr(1), 1, TxKind::Bond { amount: Amount::from_raw(500) })]);
+        s.apply_block(&good).unwrap();
+        drop(s);
+        let re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(re.current_epoch, epoch_before, "out-of-band epoch bump persisted, not lost");
+        assert_eq!(
+            re.accounts.get(&addr(1)).unwrap().cumulative_uptime_secs, uptime_before,
+            "out-of-band account poke persisted across restart",
+        );
+    }
+
+    // --- Crash-persistence across the driven round ----------------------------------------------
+
+    #[test]
+    fn crash_mid_round_recovers_and_completes_the_round() {
+        // The §8 flagship: crash WITHOUT flush right after the Commit block, reopen, finish
+        // Reveal + driver settle — conservation holds end-to-end ACROSS the restart.
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, we, w1, w2) = (Wallet::generate(), Wallet::generate(), Wallet::generate(), Wallet::generate());
+        let (s_addr, e_addr, v1_addr, v2_addr) = (*ws.address(), *we.address(), *w1.address(), *w2.address());
+        let budget = MIN_BUDGET;
+        let v_bond = GameParams::default().verifier_bond;
+        let min_bond = StakeParams::default().min_bond;
+        let result = [7u8; 32];
+        let (job, root, rec, conserved0);
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.phase_windows = PhaseWindows {
+                result_blocks: 3, commit_blocks: 3, reveal_blocks: 3, claim_blocks: 5,
+            };
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(s_addr).balance = Amount::from_raw(budget);
+            let e = state.accounts.get_or_create(e_addr);
+            e.is_validator = true;
+            e.balance = Amount::from_raw(budget);
+            for w_addr in [v1_addr, v2_addr] {
+                let acc = state.accounts.get_or_create(w_addr);
+                acc.is_validator = true;
+                acc.balance = Amount::from_raw(min_bond + v_bond);
+            }
+            state.total_emitted = 2 * budget + 2 * (min_bond + v_bond);
+            conserved0 = money_conserved(&state);
+
+            // b1: bond both verifiers (signed txs through the VALIDATED path).
+            let b1 = validated_block(&state, 1, addr(0), vec![
+                signed_tx(&w1, 0, TxKind::Bond { amount: Amount::from_raw(min_bond) }, 0),
+                signed_tx(&w2, 0, TxKind::Bond { amount: Amount::from_raw(min_bond) }, 0),
+            ]);
+            state.apply_block_validated(&b1).unwrap();
+            // b2: submit (h1 ⇒ claim_by 6); b3: claim (h2 ⇒ result 5 / commit 8 / reveal 11).
+            let submit = signed_tx(&ws, 0, v2_kind(budget), 0);
+            job = submit.hash().0;
+            let b2 = validated_block(&state, 2, addr(0), vec![submit]);
+            state.apply_block_validated(&b2).unwrap();
+            let b3 = validated_block(&state, 3, addr(0),
+                vec![signed_tx(&we, 0, TxKind::ClaimJob { job_id: job }, 0)]);
+            state.apply_block_validated(&b3).unwrap();
+            // Result out-of-band (B5 PROTECTED); committee == both bonded verifiers, quorum 2.
+            let stake = |_: &ParticipantId| 1u64;
+            assert_eq!(
+                state.job_lifecycles.get_mut(&job).unwrap().submit_result(
+                    ParticipantId(e_addr.0), result, [42u8; 32], 3, &stake),
+                EventResult::Accepted
+            );
+            // b4: both verifiers commit — the block's ONE WriteBatch carries lifecycle + pot.
+            let mk = |w: &Wallet, waddr: Address, salt: u8| {
+                let c: Commitment = make_commitment(&ParticipantId(waddr.0), &result, &[salt; 32], v_bond);
+                signed_tx(w, 1, TxKind::Commit {
+                    job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond) }, 0)
+            };
+            let b4 = validated_block(&state, 4, addr(0), vec![mk(&w1, v1_addr, 0), mk(&w2, v2_addr, 1)]);
+            state.apply_block_validated(&b4).unwrap();
+
+            rec = state.job_lifecycles.get(&job).unwrap().to_record();
+            root = state.compute_state_root();
+            // DROP WITHOUT flush() — the per-block WriteBatches alone must carry the round.
+        }
+        let mut re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(re.compute_state_root(), root, "root survives the crash");
+        assert_eq!(re.escrowed_for_job(&job), 2 * budget + 2 * v_bond, "pot: budget + Be + 2 bonds");
+        assert!(re.pending_jobs.is_empty(), "pending consumed by the claim");
+        assert_eq!(re.job_lifecycles.get(&job).map(|l| l.to_record()), Some(rec.clone()),
+            "lifecycle DTO field-identical after reopen");
+        assert_eq!(rec.program_hash, [0xAA; 32], "P9: program identity rode the DTO");
+        assert_eq!(rec.input_hash, [0xBB; 32]);
+        assert_eq!(rec.da_root, [0xCC; 32]);
+        // Mirrors describe CF reality exactly.
+        assert!(re.persisted_lifecycle_keys.contains(&job) && re.persisted_lifecycle_keys.len() == 1);
+        assert!(re.persisted_escrow_keys.contains(&job) && re.persisted_escrow_keys.len() == 1);
+        assert!(re.persisted_pending_keys.is_empty());
+        assert_eq!(re.persisted_bonded_keys.len(), 2);
+        assert_eq!(money_conserved(&re), conserved0, "conservation across the restart");
+
+        // Finish the round post-reopen (deadlines live in the DTO — phase_windows not needed).
+        while re.blocks.height() < 9 {
+            let blk = validated_block(&re, re.blocks.height() + 1, addr(0), vec![]);
+            re.apply_block_validated(&blk).unwrap();
+        }
+        let reveal = |w: &Wallet, salt: u8| signed_tx(w, 2, TxKind::Reveal {
+            job_id: job, result_hash: result, salt: [salt; 32] }, 0);
+        let b10 = validated_block(&re, 10, addr(0), vec![reveal(&w1, 0), reveal(&w2, 1)]);
+        re.apply_block_validated(&b10).unwrap();
+        while re.blocks.height() < 12 {
+            let blk = validated_block(&re, re.blocks.height() + 1, addr(0), vec![]);
+            re.apply_block_validated(&blk).unwrap();
+        }
+        // Driver settled Confirmed at h12 (12 > reveal_by 11): 2-of-2 quorum on `result`.
+        assert!(re.job_lifecycles.is_empty(), "settled + drained after the restart");
+        assert_eq!(re.escrowed_for_job(&job), 0);
+        assert_eq!(
+            re.accounts.get(&e_addr).unwrap().balance.raw(),
+            bps_of(budget, 8_500) + budget,
+            "executor: 85% + bond back"
+        );
+        assert_eq!(money_conserved(&re), conserved0, "conserved end-to-end across the crash");
+    }
+
+    #[test]
+    fn crash_before_claim_preserves_pending_then_expiry_refunds() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Wallet::generate();
+        let s_addr = *ws.address();
+        let (job, claim_by, conserved0);
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.phase_windows.claim_blocks = 2;
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(s_addr).balance = Amount::from_raw(MIN_BUDGET);
+            state.total_emitted = MIN_BUDGET;
+            conserved0 = money_conserved(&state);
+            let submit = signed_tx(&ws, 0, v2_kind(MIN_BUDGET), 0);
+            job = submit.hash().0;
+            let b1 = validated_block(&state, 1, addr(0), vec![submit]);
+            state.apply_block_validated(&b1).unwrap();
+            claim_by = state.pending_jobs.get(&job).unwrap().claim_by;
+            // DROP WITHOUT flush between submit and any claim.
+        }
+        let mut re = ChainState::open(dir.path()).unwrap();
+        let rec = re.pending_jobs.get(&job).copied().expect("pending record survives the crash");
+        assert_eq!(rec.budget, MIN_BUDGET);
+        assert_eq!(rec.claim_by, claim_by);
+        assert_eq!(re.escrowed_for_job(&job), MIN_BUDGET, "pot survives the crash");
+        // claim_by is baked into the record (phase_windows is genesis-anchored, not persisted);
+        // empty blocks past it make the driver refund.
+        while re.blocks.height() <= claim_by {
+            let blk = validated_block(&re, re.blocks.height() + 1, addr(0), vec![]);
+            re.apply_block_validated(&blk).unwrap();
+        }
+        assert!(re.pending_jobs.is_empty(), "driver expired the unclaimed job");
+        assert_eq!(re.escrowed_for_job(&job), 0);
+        assert_eq!(re.accounts.get(&s_addr).unwrap().balance.raw(), MIN_BUDGET, "full refund");
+        assert_eq!(money_conserved(&re), conserved0);
+        // ...and the refund itself is crash-durable.
+        let root = re.compute_state_root();
+        drop(re);
+        let re2 = ChainState::open(dir.path()).unwrap();
+        assert_eq!(re2.compute_state_root(), root);
+        assert!(re2.pending_jobs.is_empty(), "no resurrected pending row");
+    }
+
+    #[test]
+    fn pending_jobs_reset_to_genesis_wipes_cf_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Wallet::generate();
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_block(&genesis_block()).unwrap();
+            state.accounts.get_or_create(*ws.address()).balance = Amount::from_raw(MIN_BUDGET);
+            let b1 = validated_block(&state, 1, addr(0), vec![signed_tx(&ws, 0, v2_kind(MIN_BUDGET), 0)]);
+            state.apply_block_validated(&b1).unwrap();
+            assert_eq!(state.pending_jobs.len(), 1);
+            state.reset_to_genesis().unwrap();
+            assert!(state.pending_jobs.is_empty());
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert!(re.pending_jobs.is_empty(), "CF_PENDING wiped by reset — no resurrection");
+        assert!(re.escrow_by_job.is_empty());
+    }
+
+    #[test]
+    fn reorg_replays_v2_pending_job_and_persists_the_winning_row() {
+        // R9: try_reorg's full replay must reconcile CF_PENDING through the same delta pass —
+        // the losing chain's pending row must die, the winning chain's must survive a restart.
+        let dir = tempfile::tempdir().unwrap();
+        let (root, job_y, job_x);
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            let genesis = genesis_block();
+            state.apply_block(&genesis).unwrap();
+            // Losing chain X: producer addr(1) earns the b1 reward, submits job X in x2.
+            let x1 = raw_block(1, genesis.hash(), addr(1), 2001, vec![]);
+            state.apply_block(&x1).unwrap();
+            let sx = unsigned(addr(1), 0, v2_kind(MIN_BUDGET));
+            job_x = sx.hash().0;
+            let x2 = raw_block(2, x1.hash(), addr(1), 2002, vec![sx]);
+            state.apply_block(&x2).unwrap();
+            assert!(state.pending_jobs.contains_key(&job_x));
+            // Winning chain Y: longer; a different budget ⇒ different tx hash ⇒ different id.
+            let y1 = raw_block(1, genesis.hash(), addr(1), 3001, vec![]);
+            let sy = unsigned(addr(1), 0, v2_kind(MIN_BUDGET + 1));
+            job_y = sy.hash().0;
+            let y2 = raw_block(2, y1.hash(), addr(1), 3002, vec![sy]);
+            let y3 = raw_block(3, y2.hash(), addr(1), 3003, vec![]);
+            state.try_reorg(vec![y1, y2, y3], 1).unwrap();
+
+            assert_ne!(job_x, job_y);
+            assert!(!state.pending_jobs.contains_key(&job_x), "losing-chain pending row gone");
+            assert_eq!(state.pending_jobs.get(&job_y).map(|r| r.budget), Some(MIN_BUDGET + 1));
+            assert_eq!(state.escrowed_for_job(&job_y), MIN_BUDGET + 1);
+            assert_eq!(state.escrowed_for_job(&job_x), 0);
+            root = state.compute_state_root();
+            // DROP WITHOUT flush — the reorg's one-batch reconcile must have covered CF_PENDING.
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert!(!re.pending_jobs.contains_key(&job_x), "losing row did not resurrect from the CF");
+        assert_eq!(re.pending_jobs.get(&job_y).map(|r| r.budget), Some(MIN_BUDGET + 1));
+        assert_eq!(re.escrowed_for_job(&job_y), MIN_BUDGET + 1);
+        assert_eq!(re.compute_state_root(), root, "reorg replay reproduced identical state (P8/R9)");
+    }
+
+    // --- Pins: P10a root sections, revert guards, replay semantics, §10 adapter ---------------
+
+    #[test]
+    fn p10a_root_folds_five_sections_once_any_map_is_nonempty() {
+        // The Policy-B early-return is all-or-nothing: ONE bonded entry flips the whole root to
+        // the 5-section fold (which then INCLUDES the empty pending_jobs section).
+        let mut state = ChainState::new();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(1_000);
+        let accounts_only = state.compute_state_root();
+        state.bonded_stake.insert(addr(1), 500);
+        let bonded_only = state.compute_state_root();
+        assert_ne!(bonded_only, accounts_only, "first Bond flips to the 5-section format (P10a)");
+        // The 5th section is load-bearing: adding a pending entry changes the root...
+        let rec = PendingJobRecord {
+            submitter: [1u8; 32], budget: 5, program_hash: [2u8; 32], input_hash: [3u8; 32],
+            da_root: [4u8; 32], submitted_height: 1, claim_by: 11,
+        };
+        state.pending_jobs.insert([9u8; 32], rec);
+        let with_pending = state.compute_state_root();
+        assert_ne!(with_pending, bonded_only, "pending section is folded");
+        // ...and removing it restores the bonded-only root exactly (same fold, empty section).
+        state.pending_jobs.remove(&[9u8; 32]);
+        assert_eq!(state.compute_state_root(), bonded_only);
+        // A pending-only state activates the fold too.
+        let mut p = ChainState::new();
+        p.accounts.get_or_create(addr(1)).balance = Amount::from_raw(1_000);
+        p.pending_jobs.insert([9u8; 32], rec);
+        assert_ne!(p.compute_state_root(), accounts_only, "pending alone activates the fold");
+    }
+
+    #[test]
+    fn revert_refuses_blocks_carrying_the_new_pouw_kinds() {
+        // Guard 2 (tx-kind scan) extended for B2–B4: kinds that CAN apply while leaving the
+        // maps empty (legacy-accept ClaimJob, CompleteJob no-op) must still refuse revert.
+        for kind in [
+            TxKind::ClaimJob { job_id: [9u8; 32] },
+            TxKind::CompleteJob { job_id: [9u8; 32], result_hash: [1u8; 32] },
+            TxKind::Batch { operations: vec![TxKind::ClaimJob { job_id: [9u8; 32] }] },
+        ] {
+            let mut state = ChainState::new();
+            state.apply_block(&genesis_block()).unwrap();
+            let v = state.accounts.get_or_create(addr(1));
+            v.is_validator = true;
+            v.balance = Amount::from_raw(1_000);
+            state
+                .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, kind.clone())]))
+                .unwrap();
+            assert!(
+                state.escrow_by_job.is_empty()
+                    && state.job_lifecycles.is_empty()
+                    && state.pending_jobs.is_empty(),
+                "precondition: maps empty ⇒ this exercises guard 2, not guard 1"
+            );
+            let err = state.revert_block(1).unwrap_err();
+            assert!(err.to_string().contains("consensus maps"), "kind {kind:?}: got {err}");
+        }
+        // A V2 block leaves pending+escrow non-empty ⇒ refused as well (guard 1 backstop).
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(MIN_BUDGET);
+        state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, v2_kind(MIN_BUDGET))]))
+            .unwrap();
+        let err = state.revert_block(1).unwrap_err();
+        assert!(err.to_string().contains("consensus maps"), "got: {err}");
+    }
+
+    #[test]
+    fn v2_replay_and_same_shape_resubmit_semantics() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_raw(3 * MIN_BUDGET);
+        state.total_emitted = 3 * MIN_BUDGET;
+        let tx0 = unsigned(addr(1), 0, v2_kind(MIN_BUDGET));
+        let job0 = tx0.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![tx0.clone()])).unwrap();
+        // Literal replay: the nonce check rejects the block; zero money delta (P1).
+        let root = state.compute_state_root();
+        let err = state.apply_block(&block_with(&state, 2, vec![tx0])).unwrap_err();
+        assert!(matches!(err, StateError::InvalidNonce { .. }), "got: {err}");
+        assert_eq!(state.compute_state_root(), root, "rejected replay leaves no trace");
+        // Same-shape resubmit at the next nonce: a DISTINCT job with an independent pot.
+        let tx1 = unsigned(addr(1), 1, v2_kind(MIN_BUDGET));
+        let job1 = tx1.hash().0;
+        assert_ne!(job0, job1, "the nonce is inside the hash ⇒ new job id");
+        state.apply_block(&block_with(&state, 2, vec![tx1])).unwrap();
+        assert_eq!(state.escrowed_for_job(&job0), MIN_BUDGET);
+        assert_eq!(state.escrowed_for_job(&job1), MIN_BUDGET);
+        assert_eq!(state.pending_jobs.len(), 2, "two independent pending jobs, two pots");
+    }
+
+    #[test]
+    fn pending_job_from_tx_maps_v1_v2_flagship_and_priority() {
+        use commputer_core::l2::FLAGSHIP_L2_ID;
+        let v2 = unsigned_with_fee(addr(1), 0, v2_kind_l2(MIN_BUDGET, Some(FLAGSHIP_L2_ID.to_string())), 77);
+        let pj = pending_job_from_tx(&v2).expect("V2 maps");
+        assert_eq!(pj.job_id, v2.hash().0, "G-A: the SAME id the escrow/pending maps use");
+        assert!(pj.is_flagship);
+        assert_eq!(pj.priority, 77, "priority == fee");
+        let other = unsigned(addr(1), 0, v2_kind_l2(MIN_BUDGET, Some("some-other-l2".into())));
+        assert!(!pending_job_from_tx(&other).unwrap().is_flagship, "flagship is exact-match only");
+        let none_l2 = unsigned(addr(1), 0, v2_kind(MIN_BUDGET));
+        assert!(!pending_job_from_tx(&none_l2).unwrap().is_flagship, "no l2 ⇒ not flagship");
+        let v1 = unsigned_with_fee(addr(1), 0, v1_kind(MIN_BUDGET), 5);
+        let pj1 = pending_job_from_tx(&v1).expect("V1 maps too (pool-visible legacy jobs)");
+        assert_eq!(pj1.job_id, v1.hash().0);
+        assert_eq!(pj1.priority, 5);
+        let t = unsigned(addr(1), 0, TxKind::Transfer { to: addr(2), amount: Amount::from_raw(50_000) });
+        assert!(pending_job_from_tx(&t).is_none());
+        let b = unsigned(addr(1), 0, TxKind::Batch { operations: vec![v2_kind(MIN_BUDGET)] });
+        assert!(pending_job_from_tx(&b).is_none(), "batched V2 is rejected at apply (G-C)");
+    }
+
+    // --- B10 extension: fallback equivalence on BOTH ledger backends ---------------------------
+
+    #[test]
+    fn equivalence_escalate_fallback_zero_comp_matches() {
+        let result = [7u8; 32];
+        // 3-way split ⇒ both backends terminate Escalate with the pot HELD (proven equal by the
+        // existing NoQuorum case); now apply the SAME D2 fallback to both and prove the drain
+        // is equivalent too.
+        let mut both = run_on_both(&Scenario {
+            job: [6u8; 32],
+            executor_result: Some(result),
+            candidates: vec![10, 11, 12],
+            commits: vec![(10, [1u8; 32], true), (11, [2u8; 32], true), (12, [3u8; 32], true)],
+        });
+        let h = match &both.staging_terminal {
+            Terminal::Escalate(h) => h.clone(),
+            other => panic!("expected Escalate, got {other:?}"),
+        };
+        // Staging side: the resolver, directly on the reference ledger.
+        let s_out = resolve_escalation_fallback(&mut both.staging, both.job, &h);
+        // Chain side: the PRODUCTION entry point — lifecycle_settle_and_drain re-settles to the
+        // CACHED terminal (the P2 short-circuit) then runs the fallback and drains the entry.
+        let (c_term, c_out) = both
+            .chain
+            .lifecycle_settle_and_drain(both.job, &ByteEq)
+            .expect("pot pre-validates")
+            .expect("lifecycle still present");
+        assert!(matches!(c_term, Terminal::Escalate(_)));
+        let c_out = c_out.expect("Escalate runs the fallback");
+        assert_eq!(s_out, c_out, "fallback outcomes field-for-field across backends");
+        assert_eq!(c_out.worker_paid, 0, "ZERO comp (D2-FINAL)");
+        assert_eq!(c_out.burned, 0, "fallback burns nothing");
+        assert!(both.chain.job_lifecycles.is_empty(), "chain side drained");
+        // Full equivalence re-check: per-actor balances, pots (0 == 0), conservation, baselines.
+        assert_equivalent(&both);
+        assert_eq!(both.chain.escrowed_for_job(&both.job), 0);
+        assert_eq!(both.chain.total_burned, 0, "no burn anywhere in the all-reveal fallback");
+    }
+
+    #[test]
+    fn equivalence_escalate_fallback_with_forfeiture_matches() {
+        // P10e: the FORFEITURE variant — the P2 wedge is invisible in the all-reveal scenario.
+        // 2 distinct reveals + 1 silent ⇒ settle burned one bond on BOTH backends before the
+        // handoff; the fallback must drain the REDUCED pot identically.
+        let result = [7u8; 32];
+        let mut both = run_on_both(&Scenario {
+            job: [7u8; 32],
+            executor_result: Some(result),
+            candidates: vec![10, 11, 12],
+            commits: vec![(10, [1u8; 32], true), (11, [2u8; 32], true), (12, [3u8; 32], false)],
+        });
+        let h = match &both.staging_terminal {
+            Terminal::Escalate(h) => h.clone(),
+            other => panic!("expected Escalate, got {other:?}"),
+        };
+        assert_eq!(h.committee_bonds.len(), 2, "only the revealers are handed off");
+        let s_out = resolve_escalation_fallback(&mut both.staging, both.job, &h);
+        let (_, c_out) = both
+            .chain
+            .lifecycle_settle_and_drain(both.job, &ByteEq)
+            .expect("cached-terminal path (P2) — must NOT wedge on the reduced pot")
+            .expect("lifecycle still present");
+        let c_out = c_out.expect("fallback ran");
+        assert_eq!(s_out, c_out, "reduced-pot fallback identical across backends");
+        assert_eq!(c_out.bonds_returned, h.executor_bond + 2 * 1_650);
+        assert_eq!(c_out.burned, 0, "the forfeit was settle's burn, not the fallback's");
+        assert_equivalent(&both);
+        assert_eq!(both.chain.escrowed_for_job(&both.job), 0, "reduced pot drained to exactly 0");
+        assert_eq!(both.chain.total_burned, 1_650, "exactly the forfeited bond burned on-chain");
+        assert_eq!(both.staging.balance_of(&lpid(12)), 0, "silent committer stays forfeited");
     }
 }

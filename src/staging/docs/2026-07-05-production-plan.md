@@ -49,9 +49,12 @@ bonded/unbonding rows resurrect across restarts = value duplication; crash after
   duplicate value).
 - Fix stale in-code comments claiming the maps are "in-memory only".
 
-**1.1 B2–B4 (non-protected state.rs + pouw-onchain + core/transaction.rs, gate-bound — built together,
-committed together). FULL BUILD SPEC: `2026-07-06-phase11-build-spec.md` (reviewed design + binding
-amendments P1–P12 — that doc is authoritative over this summary).**
+**1.1 B2–B4 — ✅ BUILT + VERIFIED 2026-07-06 (branch agent-flip-20260705). Non-protected state.rs +
+pouw-onchain + core/transaction.rs. FULL BUILD SPEC: `2026-07-06-phase11-build-spec.md` (reviewed design
++ amendments P1–P12 + POST-BUILD VERIFY OUTCOME — authoritative). storage 158→206, core 205,
+pouw-onchain 84, frozen crate byte-identical. Two deferred minors (M1 open()-fail-hard-on-corrupt-CF,
+M2 expire-then-claim no-op receipt) rolled into the 1.2 PROTECTED pass. Stays UNMERGED until the whole
+flip lands together per the gate.**
 - B2: SubmitJobV2 burn→escrow (split from the shared SubmitJob arm; V2-in-Batch rejected; job_id =
   tx hash; duplicate-id guard); remove SubmitJobV2 from `is_burn`/`burn_amount`; `total_burned` must
   NOT move on escrow. NEW 5th consensus map `pending_jobs` (submit→claim carrier: submitter, budget,

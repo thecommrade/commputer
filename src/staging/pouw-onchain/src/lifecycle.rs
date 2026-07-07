@@ -160,9 +160,17 @@ pub enum TerminalRec {
 /// Persistable, borsh-canonical mirror of `JobLifecycle`. Omits `params`/`rparams` (genesis-anchored
 /// consensus params re-injected in `from_record`). Treat the field layout as a STABLE on-disk schema:
 /// a reorder/add changes the on-disk bytes AND the state root — version it if the fields ever grow.
+/// (Schema settled 2026-07-06, P9/D8: the record carries the program identity —
+/// program_hash/input_hash/da_root — so the EscalationRound fast-follow and CompleteJob
+/// result-binding need no disk/state-root migration. Nothing was deployed before this revision.)
 #[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct JobLifecycleRecord {
     pub job_id: [u8; 32],
+    /// P9/D8 identity: `sha256(wasm)` — the linchpin program identity.
+    pub program_hash: [u8; 32],
+    pub input_hash: [u8; 32],
+    /// DA-sampling anchor (Merkle-over-Reed-Solomon attestation root).
+    pub da_root: [u8; 32],
     pub submitter: [u8; 32],
     pub executor: [u8; 32],
     pub executor_bond: u64,
@@ -275,8 +283,15 @@ fn terminal_from_rec(t: &TerminalRec) -> Terminal {
 /// One compute job's primary verification round, as a deterministic multi-block state machine.
 /// Holds only plain data; `stake_of`/`eq`/`&mut impl Ledger` are passed to the methods (the ledger is
 /// the `EscrowLedger` reference in tests, `ChainState` on the live node — P2 §3 option B).
+/// `Clone` exists for the chain's P1 pre-block snapshot (rollback-on-Err); cloning never runs game
+/// logic.
+#[derive(Clone)]
 pub struct JobLifecycle {
     job_id: [u8; 32],
+    // P9/D8 program identity, fixed at `open` (from the SubmitJobV2 pending record).
+    program_hash: [u8; 32],
+    input_hash: [u8; 32],
+    da_root: [u8; 32],
     submitter: ParticipantId,
     executor: ParticipantId,
     executor_bond: u64,
@@ -303,6 +318,9 @@ impl JobLifecycle {
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         job_id: [u8; 32],
+        program_hash: [u8; 32],
+        input_hash: [u8; 32],
+        da_root: [u8; 32],
         submitter: ParticipantId,
         executor: ParticipantId,
         executor_bond: u64,
@@ -315,6 +333,9 @@ impl JobLifecycle {
     ) -> Self {
         Self {
             job_id,
+            program_hash,
+            input_hash,
+            da_root,
             submitter,
             executor,
             executor_bond,
@@ -341,6 +362,19 @@ impl JobLifecycle {
         &self.committee
     }
 
+    /// Whether `settle` has already run (the terminal is cached). The chain MUST short-circuit
+    /// on this BEFORE its pot pre-validation: after the first settle the pot no longer equals
+    /// `expected_escrow()` (forfeited bonds were burned), so re-validating would wedge every
+    /// re-entry (P2 amendment, 2026-07-06).
+    pub fn is_settled(&self) -> bool {
+        self.settled.is_some()
+    }
+
+    /// The cached terminal, if `settle` already ran. Moves no money — the safe re-entry surface.
+    pub fn settled_terminal(&self) -> Option<Terminal> {
+        self.settled.clone()
+    }
+
     /// The exact pot the job MUST hold at settlement: budget + executor bond + every committed
     /// verifier bond (revealed or not — a committed-but-unrevealed bond is still escrowed and is burnt
     /// as forfeiture at settle). The chain pre-validates `escrowed_for(job) == expected_escrow()` before
@@ -357,6 +391,9 @@ impl JobLifecycle {
     pub fn to_record(&self) -> JobLifecycleRecord {
         JobLifecycleRecord {
             job_id: self.job_id,
+            program_hash: self.program_hash,
+            input_hash: self.input_hash,
+            da_root: self.da_root,
             submitter: self.submitter.0,
             executor: self.executor.0,
             executor_bond: self.executor_bond,
@@ -383,6 +420,9 @@ impl JobLifecycle {
     pub fn from_record(rec: JobLifecycleRecord, params: GameParams, rparams: ResolutionParams) -> Self {
         Self {
             job_id: rec.job_id,
+            program_hash: rec.program_hash,
+            input_hash: rec.input_hash,
+            da_root: rec.da_root,
             submitter: ParticipantId(rec.submitter),
             executor: ParticipantId(rec.executor),
             executor_bond: rec.executor_bond,
@@ -602,6 +642,9 @@ mod tests {
         PhaseDeadlines { result_by: 10, commit_by: 20, reveal_by: 30 }
     }
 
+    /// P9 identity placeholder for test opens (identity is opaque to the game logic).
+    const IDENT: [u8; 32] = [0xAB; 32];
+
     use commputer_pouw::economics::{budget_min, executor_bond_min, verifier_bond_min};
     use commputer_pouw::commit_reveal::make_commitment;
     use commputer_pouw::oracle::ByteEq;
@@ -643,7 +686,7 @@ mod tests {
     /// Drive a freshly-opened lifecycle to Committing with the committee drawn.
     fn opened_committing(job: [u8; 32], result: [u8; 32], budget: u64, e_bond: u64, v_bond: u64) -> JobLifecycle {
         let mut lc = JobLifecycle::open(
-            job, pid(0), pid(9), e_bond, budget, v_bond,
+            job, IDENT, IDENT, IDENT, pid(0), pid(9), e_bond, budget, v_bond,
             GameParams::default(), ResolutionParams::default(), cands3(), deadlines(),
         );
         let stake = |_: &ParticipantId| 1u64;
@@ -654,7 +697,7 @@ mod tests {
     #[test]
     fn opens_in_awaiting_result_with_no_committee() {
         let lc = JobLifecycle::open(
-            [1u8; 32], pid(0), pid(9), 3960, 3960, 1650,
+            [1u8; 32], IDENT, IDENT, IDENT, pid(0), pid(9), 3960, 3960, 1650,
             GameParams::default(), ResolutionParams::default(),
             vec![pid(10), pid(11), pid(12)], deadlines(),
         );
@@ -666,7 +709,7 @@ mod tests {
     fn should_settle_tracks_phase_windows() {
         // deadlines: result_by 10, commit_by 20, reveal_by 30.
         let mut lc = JobLifecycle::open(
-            [1u8; 32], pid(0), pid(9), 3960, 3960, 1650,
+            [1u8; 32], IDENT, IDENT, IDENT, pid(0), pid(9), 3960, 3960, 1650,
             GameParams::default(), ResolutionParams::default(),
             vec![pid(10), pid(11), pid(12)], deadlines(),
         );
@@ -693,7 +736,7 @@ mod tests {
     #[test]
     fn submit_result_draws_committee_and_advances() {
         let mut lc = JobLifecycle::open(
-            [1u8; 32], pid(0), pid(9), 3960, 3960, 1650,
+            [1u8; 32], IDENT, IDENT, IDENT, pid(0), pid(9), 3960, 3960, 1650,
             GameParams::default(), ResolutionParams::default(),
             vec![pid(10), pid(11), pid(12)], deadlines(),
         );
@@ -707,7 +750,7 @@ mod tests {
 
         // rejections
         let mut lc2 = JobLifecycle::open(
-            [1u8; 32], pid(0), pid(9), 3960, 3960, 1650,
+            [1u8; 32], IDENT, IDENT, IDENT, pid(0), pid(9), 3960, 3960, 1650,
             GameParams::default(), ResolutionParams::default(),
             vec![pid(10), pid(11), pid(12)], deadlines(),
         );
@@ -850,7 +893,7 @@ mod tests {
         let (mut l, total0) = funded(job, budget, e_bond, v_bond, &cands3());
         // open but NO submit_result; advance past result_by, then settle
         let mut lc = JobLifecycle::open(
-            job, pid(0), pid(9), e_bond, budget, v_bond,
+            job, IDENT, IDENT, IDENT, pid(0), pid(9), e_bond, budget, v_bond,
             GameParams::default(), ResolutionParams::default(), cands3(), deadlines(),
         );
         lc.advance(11); // past result_by; stays AwaitingResult (no committee drawn)
@@ -1109,6 +1152,10 @@ mod tests {
         assert!(matches!(lc.settle(&mut l, &ByteEq), Terminal::Confirmed(_)));
 
         let rec = lc.to_record();
+        // P9/D8: the DTO carries the program identity fixed at open.
+        assert_eq!(rec.program_hash, IDENT, "program_hash persisted");
+        assert_eq!(rec.input_hash, IDENT, "input_hash persisted");
+        assert_eq!(rec.da_root, IDENT, "da_root persisted");
         let bytes = borsh::to_vec(&rec).expect("serialize");
         let rec2: JobLifecycleRecord = borsh::from_slice(&bytes).expect("deserialize");
         assert_eq!(rec, rec2, "DTO borsh round-trips");

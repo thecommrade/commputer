@@ -109,6 +109,42 @@ pub fn resolve_unavailable(
     }
 }
 
+/// D2-FINAL (founder, 2026-07-06): the NoQuorum→Escalate fallback terminal, ZERO COMP ALWAYS —
+/// a pure refund/return of the handoff pot. No verdict was reached, so NO party is slashed and
+/// NO party is compensated: the full budget refunds to the submitter, the executor bond returns
+/// intact, and every REVEALER's bond returns (non-revealer bonds were already burned by the
+/// audited primary-round settle BEFORE the verdict branch — lifecycle.rs commit-no-reveal
+/// forfeiture — so they are NOT in the handoff and NOT in the pot). Takes no `ResolutionParams`:
+/// zero comp is a founder decision, not a knob (any comp makes forced-NoQuorum profitable —
+/// 2-of-3 collusion / DA-starvation; matches `resolve_unavailable`'s no-verification-no-pay
+/// precedent). Residual griefing (forcing NoQuorum) is therefore profit-NEUTRAL for the
+/// executor until the real on-chain EscalationRound replaces this fallback post-flip.
+///
+/// Conservation: at `Terminal::Escalate` the pot holds exactly
+/// `budget + executor_bond + Σ committee_bonds` (settle pre-validated the pot, then burned each
+/// non-revealer bond); this pays out that identical sum — pot drained to exactly 0, burns
+/// nothing, `total_supply` unchanged.
+///
+/// Lives here (Ledger-generic, sibling of the five resolvers) so the B10 equivalence tests can
+/// run the SAME code against both backends (staging `EscrowLedger` + the chain's `ChainLedger`).
+pub fn resolve_escalation_fallback(
+    l: &mut impl Ledger,
+    job_id: [u8; 32],
+    h: &crate::lifecycle::EscalationHandoff,
+) -> SettlementOutcome {
+    l.for_job(job_id);
+    l.pay(h.submitter, h.budget);
+    l.pay(h.executor, h.executor_bond); // no-fault: bond intact
+    for (r, b) in h.committee_reveals.iter().zip(&h.committee_bonds) {
+        l.pay(r.verifier, *b);
+    }
+    SettlementOutcome {
+        submitter_refunded: h.budget,
+        bonds_returned: h.executor_bond + h.committee_bonds.iter().sum::<u64>(),
+        ..Default::default() // worker_paid: 0 (zero comp), burned: 0
+    }
+}
+
 /// `Confirmed` verdict (sampled committee): split the budget 85/10/5 and return every
 /// bond. Verdict + committee are on-chain data by settlement time. Delegates the budget
 /// split to the frozen game `settle_confirmed_sampled` (which returns `bonds_returned: 0`),
@@ -400,6 +436,113 @@ mod tests {
         assert_eq!(lb.total_supply(), total0);
         assert_eq!(la.total_escrowed(), 0);
         assert_eq!(lb.total_escrowed(), 0);
+    }
+
+    #[test]
+    fn escalation_fallback_zero_comp_refunds_returns_and_conserves() {
+        // D2-FINAL: pure refund/return — submitter gets exactly the budget (executor comp is
+        // ZERO), executor gets exactly the bond back, each revealer its bond; nothing burned.
+        use commputer_pouw::job::Reveal;
+        use crate::lifecycle::EscalationHandoff;
+        let (budget, e_bond, v_bond) = (3_961u64, 3_960u64, 1_650u64); // budget not divisible by 5
+        let job = [7u8; 32];
+        let (submitter, executor) = (pid(0), pid(9));
+        let revealers = [pid(10), pid(11), pid(12)];
+        let mut l = EscrowLedger::new();
+        let mut parts = vec![(submitter, budget), (executor, e_bond)];
+        for r in &revealers {
+            parts.push((*r, v_bond));
+        }
+        let total0 = fund_pot(&mut l, job, &parts);
+
+        let h = EscalationHandoff {
+            budget,
+            submitter,
+            executor,
+            executor_hash: [7u8; 32],
+            executor_bond: e_bond,
+            committee_reveals: revealers
+                .iter()
+                .enumerate()
+                .map(|(i, v)| Reveal { verifier: *v, result_hash: [i as u8; 32], salt: [i as u8; 32] })
+                .collect(),
+            committee_bonds: vec![v_bond; 3],
+            verifier_bond: v_bond,
+        };
+        let out = resolve_escalation_fallback(&mut l, job, &h);
+
+        assert_eq!(out.worker_paid, 0, "ZERO executor comp (D2-FINAL)");
+        assert_eq!(out.submitter_refunded, budget, "full budget back to the submitter");
+        assert_eq!(out.bonds_returned, e_bond + 3 * v_bond, "every handed-off bond returned");
+        assert_eq!(out.burned, 0, "fallback burns nothing");
+        assert_eq!(l.balance_of(&submitter), budget);
+        assert_eq!(l.balance_of(&executor), e_bond, "bond back, no comp");
+        for r in &revealers {
+            assert_eq!(l.balance_of(r), v_bond, "revealer bond back");
+        }
+        assert_eq!(l.escrowed_for(&job), 0, "pot drained to exactly 0");
+        assert_eq!(l.total_supply(), total0, "supply conserved");
+    }
+
+    #[test]
+    fn escalation_fallback_after_forfeiture_drains_reduced_pot() {
+        // Drive the REAL settle: 3 commit, 2 reveal a split (max class 1 < quorum 2 ⇒ NoQuorum),
+        // 1 never reveals ⇒ its bond is burned by settle BEFORE the handoff. The fallback then
+        // pays out exactly the reduced pot (budget + Be + 2 revealer bonds) — P2's wedge scenario.
+        use crate::lifecycle::{EventResult, JobLifecycle, PhaseDeadlines, Terminal};
+        use commputer_pouw::commit_reveal::make_commitment;
+        use commputer_pouw::job::Reveal;
+        use commputer_pouw::oracle::ByteEq;
+        let p = GameParams::default();
+        let f = 100_000_000u64;
+        let budget = budget_min(f, &p).unwrap();
+        let e_bond = executor_bond_min(f, budget, &p).unwrap();
+        let v_bond = verifier_bond_min(f, &p).unwrap();
+        let job = [8u8; 32];
+        let (submitter, executor) = (pid(0), pid(9));
+        let committee = [pid(10), pid(11), pid(12)];
+        let mut l = EscrowLedger::new();
+        // Escrow only budget + exec bond (the submit+claim precondition); committee members keep
+        // their balances so record_commit itself escrows each bond.
+        for c in &committee {
+            l.credit(*c, v_bond);
+        }
+        let total0 = fund_pot(&mut l, job, &[(submitter, budget), (executor, e_bond)]);
+
+        let mut lc = JobLifecycle::open(
+            job, [0xAB; 32], [0xAB; 32], [0xAB; 32], submitter, executor,
+            e_bond, budget, v_bond, p.clone(), ResolutionParams::default(),
+            committee.to_vec(), PhaseDeadlines { result_by: 10, commit_by: 20, reveal_by: 30 },
+        );
+        let stake = |_: &ParticipantId| 1u64;
+        assert_eq!(lc.submit_result(executor, [7u8; 32], [42u8; 32], 5, &stake), EventResult::Accepted);
+        // pid(10)/pid(11) commit+reveal DISTINCT values; pid(12) commits but never reveals.
+        let hashes = [[1u8; 32], [2u8; 32], [7u8; 32]];
+        for (i, c) in committee.iter().enumerate() {
+            let commit = make_commitment(c, &hashes[i], &[i as u8; 32], v_bond);
+            assert_eq!(lc.record_commit(&mut l, commit, 15), EventResult::Accepted);
+        }
+        lc.advance(21);
+        for (i, c) in committee.iter().take(2).enumerate() {
+            let r = Reveal { verifier: *c, result_hash: hashes[i], salt: [i as u8; 32] };
+            assert_eq!(lc.record_reveal(r, 25), EventResult::Accepted);
+        }
+        lc.advance(31);
+        let h = match lc.settle(&mut l, &ByteEq) {
+            Terminal::Escalate(h) => h,
+            other => panic!("expected Escalate, got {other:?}"),
+        };
+        // settle burned the non-revealer's bond; the pot holds the reduced sum the fallback moves.
+        assert_eq!(l.escrowed_for(&job), budget + e_bond + 2 * v_bond);
+
+        let out = resolve_escalation_fallback(&mut l, job, &h);
+        assert_eq!(out.worker_paid, 0);
+        assert_eq!(out.submitter_refunded, budget);
+        assert_eq!(out.bonds_returned, e_bond + 2 * v_bond, "only the 2 revealers' bonds");
+        assert_eq!(out.burned, 0, "the forfeiture was settle's burn, not the fallback's");
+        assert_eq!(l.escrowed_for(&job), 0, "reduced pot drained to exactly 0");
+        assert_eq!(l.balance_of(&pid(12)), 0, "non-revealer's bond stays forfeited");
+        assert_eq!(l.total_supply(), total0, "supply conserved (forfeit moved to burned)");
     }
 
     /// A resolver asked to move more than the funded pot holds panics (inherits
