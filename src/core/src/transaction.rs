@@ -345,6 +345,14 @@ impl Transaction {
     /// plus borsh framing < 2 KiB → 10 × 2 KiB = 20 KiB. Comfortable margin.
     pub const MAX_MULTISIG_SIGNERS: usize = 16;
 
+    /// SECURITY(F11 ingress): hard cap on `StorageWill.contact_hashes`, mirrored
+    /// at the mempool-admission shape gate so oversized wills are rejected before
+    /// they can bloat RAM. MUST stay equal to the apply-side cap in
+    /// `storage::state::MAX_WILL_CONTACTS` (64) so ingress and apply agree — a
+    /// value ingress accepts must also be accepted at apply and vice-versa.
+    /// 64 distinct notification contacts is far more than any honest will needs.
+    pub const MAX_WILL_CONTACTS: usize = 64;
+
     /// W5.7 F-1: Validate the structural invariants of this transaction
     /// BEFORE any expensive cryptographic work. Cheap, allocation-free,
     /// safe to call from RPC entry, mempool admission, or block apply.
@@ -418,6 +426,15 @@ impl Transaction {
             TxKind::KeyRotation { new_public_key } => {
                 if new_public_key.len() != 32 {
                     return Err("new_public_key must be 32 bytes");
+                }
+            }
+            TxKind::StorageWill { contact_hashes, .. } => {
+                // SECURITY(F11 ingress): reject an oversized contact list at the
+                // shape gate (mempool admission) so it never occupies mempool RAM.
+                // The apply-side cap in storage already closes the consensus path;
+                // this keeps ingress and apply in agreement (see MAX_WILL_CONTACTS).
+                if contact_hashes.len() > Self::MAX_WILL_CONTACTS {
+                    return Err("storage will contact_hashes exceeds MAX_WILL_CONTACTS");
                 }
             }
             _ => {}
@@ -597,5 +614,35 @@ mod tests {
         });
         tx.memo = Some(vec![0u8; Transaction::MAX_MEMO_LENGTH + 1]);
         assert_eq!(tx.validate_shape(), Err("memo exceeds MAX_MEMO_LENGTH"));
+    }
+
+    // --- SECURITY(F11 ingress): StorageWill.contact_hashes cap at shape gate ---
+
+    /// NON-VACUOUS: an over-cap StorageWill is rejected by validate_shape (the
+    /// mempool-admission gate). Pre-fix, validate_kind_shape had no StorageWill
+    /// arm, so this oversized tx was admitted (returned Ok) and could bloat the
+    /// mempool; the new arm rejects it before it occupies RAM.
+    #[test]
+    fn validate_shape_rejects_oversized_storage_will_contacts() {
+        let over = Transaction::MAX_WILL_CONTACTS + 1;
+        let tx = shell_tx(TxKind::StorageWill {
+            contact_hashes: vec![[1u8; 32]; over],
+            options_hash: [0u8; 32],
+        });
+        assert_eq!(
+            tx.validate_shape(),
+            Err("storage will contact_hashes exceeds MAX_WILL_CONTACTS")
+        );
+    }
+
+    /// A StorageWill exactly at the cap is still accepted — the bound never
+    /// rejects a legitimate within-cap will.
+    #[test]
+    fn validate_shape_accepts_max_size_storage_will_contacts() {
+        let tx = shell_tx(TxKind::StorageWill {
+            contact_hashes: vec![[1u8; 32]; Transaction::MAX_WILL_CONTACTS],
+            options_hash: [0u8; 32],
+        });
+        assert_eq!(tx.validate_shape(), Ok(()));
     }
 }

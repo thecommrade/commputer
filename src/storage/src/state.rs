@@ -128,6 +128,14 @@ pub const ARCHIVAL_EPOCH_THRESHOLD: u64 = 1000;
 /// are moved to cold storage (RocksDB only, not in-memory).
 pub const COLD_ACCOUNT_EPOCH_THRESHOLD: u64 = 100;
 
+/// SECURITY(F11/F22): hard cap on `StorageWill.contact_hashes`. `will_contacts` is
+/// persisted per-account and folded into the state root + replicated to every node's
+/// RocksDB, so an unbounded list is permanent on-chain bloat. `validate_shape` (core) has
+/// no StorageWill arm today, so this apply-side cap is the enforced bound on the gossip
+/// path. Generous (a real will names a handful of contacts); a matching `validate_shape`
+/// cap in core/transaction.rs should land alongside this for ingress-side rejection.
+pub const MAX_WILL_CONTACTS: usize = 64;
+
 /// The full chain state — accounts, blocks, supply tracking.
 /// Optionally backed by RocksDB for persistence across restarts. When backed, every applied
 /// block is persisted atomically (state survives a crash without a clean-shutdown flush).
@@ -787,6 +795,15 @@ impl ChainState {
                     "genesis accounts: invalid address '{addr_hex}': {e}"
                 ))
             })?;
+            // SECURITY(F33): never credit the keyless all-zero address at genesis. Balance that
+            // reaches it is spendable by an UNSIGNED zero-from Transfer a producer can inject
+            // (apply_block_validated skips signature checks for zero-from), so a founder typo of
+            // 0x000..0 in genesis.json would mint attacker-drainable funds.
+            if addr.is_zero() {
+                return Err(StateError::InvalidBlock(
+                    "genesis accounts: refusing to credit the zero address".to_string(),
+                ));
+            }
             sum = sum.checked_add(*raw).ok_or_else(|| {
                 StateError::InvalidBlock(
                     "genesis accounts: allocation sum overflows u64".to_string(),
@@ -1091,6 +1108,11 @@ impl ChainState {
         // transaction fails, total_emitted and producer balance are never mutated.
         self.apply_txs_with_rollback(block)?;
 
+        // SECURITY(F25): block.header.state_root is NOT recomputed/compared against post-apply
+        // state here — a peer can forge it. Fix intentionally DEFERRED to founder review (naive
+        // equality risks bricking sync given the producer's pre-reward snapshot convention). See
+        // the security addendum before enabling. TODO(F25).
+
         // Generate receipts + history ONLY for an accepted block (P1: a rejected block must
         // leave no trace — receipts for its prefix would claim success for txs that never
         // landed).
@@ -1197,6 +1219,15 @@ impl ChainState {
 
         match &tx.kind {
             TxKind::Transfer { to, amount } => {
+                // SECURITY(F33): apply_block_validated skips signature verification for zero-from
+                // txs, so without this guard a block producer could inject an UNSIGNED
+                // Transfer{from:zero,..} and drain any balance that reached the keyless zero
+                // address. Mirror the zero-from guards on Bond/SubmitJobV2/etc.
+                if tx.from.is_zero() {
+                    return Err(StateError::InvalidBlock(
+                        "zero address cannot transfer".into(),
+                    ));
+                }
                 // Feature 23: Dust limit — reject transfers below minimum.
                 if amount.raw() < commputer_core::transaction::DUST_LIMIT {
                     return Err(StateError::InvalidBlock(
@@ -1271,14 +1302,63 @@ impl ChainState {
             }
 
             TxKind::MilestoneBurn { burn_amount, .. } => {
+                // SECURITY(F10/F21): previously this bumped consensus `total_burned` with NO
+                // balance debit, NO authorization, and NO nonce consumption — so any funded
+                // account could forge `MilestoneBurn { burn_amount: u64::MAX }` for one min-fee
+                // tx and permanently corrupt circulating_supply (→ emergency-access flip), and
+                // the same tx replayed since the nonce never advanced. Conservation requires
+                // `total_burned` to rise ONLY when real balance leaves circulation. Mirror
+                // BurstCompute: reject zero-from, require + debit the sender's balance, bump nonce.
+                if tx.from.is_zero() {
+                    return Err(StateError::InvalidBlock(
+                        "zero address cannot submit milestone burn".into(),
+                    ));
+                }
+                let sender_balance = sender.balance;
+                if sender_balance.raw() < burn_amount.raw() {
+                    return Err(StateError::InsufficientBalance);
+                }
+                sender.balance = sender_balance.checked_sub(*burn_amount)
+                    .ok_or(StateError::InsufficientBalance)?;
+                sender.total_burned = sender.total_burned.checked_add(*burn_amount)
+                    .ok_or(StateError::Overflow)?;
+                sender.nonce += 1;
                 self.total_burned = self.total_burned.saturating_add(burn_amount.raw());
             }
 
             TxKind::CharitableDonation { burn_amount, .. } => {
+                // SECURITY(F10/F21): same forgeable/replayable burn-accounting corruption as
+                // MilestoneBurn above. Require the burn to actually cost the sender's balance and
+                // consume a nonce so `total_burned` only rises against real removed circulation.
+                if tx.from.is_zero() {
+                    return Err(StateError::InvalidBlock(
+                        "zero address cannot submit charitable donation".into(),
+                    ));
+                }
+                let sender_balance = sender.balance;
+                if sender_balance.raw() < burn_amount.raw() {
+                    return Err(StateError::InsufficientBalance);
+                }
+                sender.balance = sender_balance.checked_sub(*burn_amount)
+                    .ok_or(StateError::InsufficientBalance)?;
+                sender.total_burned = sender.total_burned.checked_add(*burn_amount)
+                    .ok_or(StateError::Overflow)?;
+                sender.nonce += 1;
                 self.total_burned = self.total_burned.saturating_add(burn_amount.raw());
             }
 
             TxKind::StorageWill { contact_hashes, .. } => {
+                // SECURITY(F11/F22): cap contact_hashes so a single will can't bloat permanent,
+                // replicated per-account on-chain state (folded into the state root + persisted to
+                // every node's RocksDB). validate_shape (core) has no StorageWill arm, so this
+                // apply-side cap is the enforced bound on the gossip path (defense in depth).
+                if contact_hashes.len() > MAX_WILL_CONTACTS {
+                    return Err(StateError::InvalidBlock(format!(
+                        "storage will contact_hashes {} exceeds max of {}",
+                        contact_hashes.len(),
+                        MAX_WILL_CONTACTS
+                    )));
+                }
                 sender.will_contacts = contact_hashes.clone();
                 sender.nonce += 1;
             }
@@ -1348,6 +1428,20 @@ impl ChainState {
 
             TxKind::MultiSig { threshold, signers, signatures } => {
                 // Feature 259: M-of-N multi-signature verification.
+                // SECURITY(F3/F6): bound signers/signatures BEFORE the O(signatures×signers)
+                // ed25519 verify loop below. The real N-of-M cap (MAX_MULTISIG_SIGNERS) lives
+                // ONLY in Transaction::validate_shape, which the gossip ingress path never calls —
+                // so an attacker could gossip a self-signed multisig carrying ~thousands of
+                // signers/signatures and freeze the single-threaded event loop for minutes at
+                // trial-apply (chain-halt DoS). This hard cap keeps the loop ≤ MAX_MULTISIG_SIGNERS²
+                // regardless of ingress path (defense in depth).
+                let max_multisig = commputer_core::transaction::Transaction::MAX_MULTISIG_SIGNERS;
+                if signers.len() > max_multisig || signatures.len() > max_multisig {
+                    return Err(StateError::InvalidBlock(format!(
+                        "multisig signer/signature count exceeds max of {}",
+                        max_multisig
+                    )));
+                }
                 if *threshold == 0 || (*threshold as usize) > signers.len() {
                     return Err(StateError::InvalidBlock(
                         "invalid multisig threshold".into(),
@@ -1605,6 +1699,14 @@ impl ChainState {
         op: &TxKind,
         current_epoch: u64,
     ) -> Result<(), StateError> {
+        // SECURITY(F33): the same zero-from drain is reachable through a batched value move
+        // (`Batch{Transfer{..}}` from a zero-from tx skips signature verification). Reject any
+        // batch operation from the keyless zero address — no legitimate op is protocol-issued here.
+        if from.is_zero() {
+            return Err(StateError::InvalidBlock(
+                "zero address cannot execute batch operations".into(),
+            ));
+        }
         match op {
             TxKind::Transfer { to, amount } => {
                 // Feature 23: Dust limit — reject transfers below minimum.
@@ -5854,11 +5956,11 @@ mod tests {
 
         // Verify burn tracked
         assert_eq!(state.total_burned, Amount::from_comme(5).raw());
-        // CharitableDonation is protocol-triggered; it tracks the burn amount
-        // but the actual sell/transfer is handled separately.
-        // The sender's balance is not deducted here (protocol handles that).
+        // SECURITY(F10/F21): the burn must actually cost the sender's balance (conservation:
+        // total_burned only rises when real balance leaves circulation) and consume a nonce.
         let acct = state.accounts.get(&addr(1)).unwrap();
-        assert_eq!(acct.balance, Amount::from_comme(100));
+        assert_eq!(acct.balance, Amount::from_comme(95));
+        assert_eq!(acct.nonce, 1);
     }
 
     // Feature 216: Emergency access test — circulating supply below 1M
@@ -9161,5 +9263,255 @@ mod tests {
             gcp.bundle.refuse_to_bind(&WasmLimits::default()).is_err(),
             "an invalid (zero-window) genesis must be refused at bind"
         );
+    }
+
+    // --- SECURITY(F3/F6): MultiSig size cap at apply -------------------------------
+
+    /// An over-large signers/signatures list is rejected BY THE SIZE GUARD, before the
+    /// O(signatures×signers) ed25519 verify loop can run. NON-VACUOUS: pre-fix the arm had
+    /// no size cap and ran the full loop, returning a "only N valid signatures" error (or
+    /// succeeding) — never "exceeds max".
+    #[test]
+    fn f3_f6_multisig_oversized_rejected_before_verify_loop() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let over = commputer_core::transaction::Transaction::MAX_MULTISIG_SIGNERS + 1;
+        let kind = TxKind::MultiSig {
+            threshold: over as u8,
+            signers: vec![vec![0u8; 32]; over],
+            signatures: vec![vec![0u8; 64]; over],
+        };
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, kind)]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds max"),
+            "size guard must fire before the verify loop, got: {err}"
+        );
+    }
+
+    /// A multisig sized exactly at MAX_MULTISIG_SIGNERS passes the size guard (the bound is
+    /// inclusive/generous) — it fails later on signature validity, NOT on size.
+    #[test]
+    fn f3_f6_multisig_at_max_passes_size_guard() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let at = commputer_core::transaction::Transaction::MAX_MULTISIG_SIGNERS;
+        let kind = TxKind::MultiSig {
+            threshold: 1,
+            signers: vec![vec![0u8; 32]; at],
+            signatures: vec![vec![0u8; 64]; at],
+        };
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, kind)]))
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("exceeds max"),
+            "MAX-sized multisig must clear the size guard, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("valid signature"),
+            "it fails on signature validity instead, got: {err}"
+        );
+    }
+
+    // --- SECURITY(F10/F21): MilestoneBurn / CharitableDonation conservation --------
+
+    /// A MilestoneBurn must actually debit the sender's balance and consume a nonce, so
+    /// `total_burned` only rises against real removed circulation. NON-VACUOUS: pre-fix the
+    /// balance and nonce were untouched.
+    #[test]
+    fn f10_f21_milestone_burn_debits_balance_and_consumes_nonce() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_comme(100);
+        state.total_emitted = Amount::from_comme(100).raw();
+        let circ_before = state.circulating_supply();
+
+        let kind = TxKind::MilestoneBurn {
+            milestone_id: 1,
+            burn_amount: Amount::from_comme(30),
+            description_hash: [0u8; 32],
+        };
+        state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, kind)]))
+            .unwrap();
+
+        let acct = state.accounts.get(&addr(1)).unwrap();
+        assert_eq!(acct.balance, Amount::from_comme(70), "burn debits real balance");
+        assert_eq!(acct.nonce, 1, "nonce consumed (no replay)");
+        assert_eq!(state.total_burned, Amount::from_comme(30).raw());
+        assert_eq!(
+            state.circulating_supply(),
+            circ_before - Amount::from_comme(30).raw(),
+            "conservation: circulation drops by exactly the burned amount"
+        );
+    }
+
+    /// A forged burn larger than the sender's balance must fail InsufficientBalance and NOT
+    /// inflate `total_burned`. NON-VACUOUS: pre-fix `MilestoneBurn { burn_amount: u64::MAX }`
+    /// succeeded and saturated total_burned with no balance backing.
+    #[test]
+    fn f10_f21_forged_milestone_burn_rejected_no_supply_corruption() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(1)).balance = Amount::from_comme(5);
+        state.total_emitted = Amount::from_comme(5).raw();
+
+        let kind = TxKind::MilestoneBurn {
+            milestone_id: 1,
+            burn_amount: Amount::from_raw(u64::MAX),
+            description_hash: [0u8; 32],
+        };
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, kind)]))
+            .unwrap_err();
+        assert!(
+            matches!(err, StateError::InsufficientBalance),
+            "an unbacked burn must be rejected, got: {err}"
+        );
+        assert_eq!(state.total_burned, 0, "total_burned NOT inflated by a forged burn");
+        assert_eq!(
+            state.accounts.get(&addr(1)).unwrap().nonce,
+            0,
+            "rejected tx consumes no nonce"
+        );
+    }
+
+    /// A zero-address (keyless, unsigned) MilestoneBurn must be rejected outright.
+    #[test]
+    fn f10_f21_zero_from_milestone_burn_rejected() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let kind = TxKind::MilestoneBurn {
+            milestone_id: 1,
+            burn_amount: Amount::from_comme(1),
+            description_hash: [0u8; 32],
+        };
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(Address([0u8; 32]), 0, kind)]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("zero address"),
+            "zero-from burn must be rejected, got: {err}"
+        );
+        assert_eq!(state.total_burned, 0);
+    }
+
+    // --- SECURITY(F11/F22): StorageWill.contact_hashes cap ------------------------
+
+    /// An over-large contact_hashes list is rejected at apply; a within-cap one still applies.
+    /// NON-VACUOUS: pre-fix an unbounded list was written verbatim into permanent account state.
+    #[test]
+    fn f11_f22_storage_will_contacts_capped_at_apply() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+
+        let over = MAX_WILL_CONTACTS + 1;
+        let big = TxKind::StorageWill {
+            contact_hashes: vec![[1u8; 32]; over],
+            options_hash: [0u8; 32],
+        };
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, big)]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds max"),
+            "oversized will must be rejected, got: {err}"
+        );
+        assert!(
+            state.accounts.get(&addr(1)).map(|a| a.will_contacts.is_empty()).unwrap_or(true),
+            "rejected will writes nothing"
+        );
+
+        // A will exactly at the cap still applies (generous bound preserved).
+        let ok = TxKind::StorageWill {
+            contact_hashes: vec![[1u8; 32]; MAX_WILL_CONTACTS],
+            options_hash: [0u8; 32],
+        };
+        state
+            .apply_block(&block_with(&state, 1, vec![unsigned(addr(1), 0, ok)]))
+            .unwrap();
+        assert_eq!(
+            state.accounts.get(&addr(1)).unwrap().will_contacts.len(),
+            MAX_WILL_CONTACTS,
+            "within-cap will applied"
+        );
+    }
+
+    // --- SECURITY(F33): zero-address guards --------------------------------------
+
+    /// An UNSIGNED zero-from Transfer (which a producer could inject, since zero-from skips
+    /// signature verification) must not move value. NON-VACUOUS: pre-fix the Transfer arm had
+    /// no zero-from guard and drained the keyless zero address.
+    #[test]
+    fn f33_zero_from_transfer_rejected() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        // Fund the keyless zero address (e.g. mis-sent burn-address funds) and an existing
+        // recipient (so the account-creation-fee path is not what rejects the tx).
+        state.accounts.get_or_create(Address([0u8; 32])).balance = Amount::from_comme(50);
+        state.accounts.get_or_create(addr(9)).balance = Amount::from_comme(1);
+
+        let kind = TxKind::Transfer { to: addr(9), amount: Amount::from_comme(10) };
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(Address([0u8; 32]), 0, kind)]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("zero address cannot transfer"),
+            "zero-from drain must be rejected, got: {err}"
+        );
+        assert_eq!(
+            state.accounts.get(&Address([0u8; 32])).unwrap().balance,
+            Amount::from_comme(50),
+            "zero-address funds unmoved"
+        );
+        assert_eq!(
+            state.accounts.get(&addr(9)).unwrap().balance,
+            Amount::from_comme(1),
+            "recipient not credited"
+        );
+    }
+
+    /// The same drain via a batched value move (`Batch{Transfer{..}}` from zero) is rejected.
+    #[test]
+    fn f33_zero_from_batch_transfer_rejected() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(Address([0u8; 32])).balance = Amount::from_comme(50);
+        state.accounts.get_or_create(addr(9)).balance = Amount::from_comme(1);
+
+        let inner = TxKind::Transfer { to: addr(9), amount: Amount::from_comme(10) };
+        let batch = TxKind::Batch { operations: vec![inner] };
+        let err = state
+            .apply_block(&block_with(&state, 1, vec![unsigned(Address([0u8; 32]), 0, batch)]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("zero address"),
+            "zero-from batch drain must be rejected, got: {err}"
+        );
+        assert_eq!(
+            state.accounts.get(&Address([0u8; 32])).unwrap().balance,
+            Amount::from_comme(50),
+            "zero-address funds unmoved via batch"
+        );
+    }
+
+    /// apply_genesis_accounts must refuse to credit the all-zero address. NON-VACUOUS: pre-fix
+    /// it credited it and bumped total_emitted.
+    #[test]
+    fn f33_genesis_accounts_reject_zero_address() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let root_before = state.compute_state_root();
+
+        let res = state.apply_genesis_accounts(&[(hex::encode([0u8; 32]), 1_000_000)]);
+        assert!(res.is_err(), "genesis must refuse the zero address");
+        assert!(
+            res.unwrap_err().to_string().contains("zero address"),
+            "clear zero-address rejection"
+        );
+        assert_eq!(state.total_emitted, 0, "no mint occurred");
+        assert_eq!(state.compute_state_root(), root_before, "no state mutation on reject");
     }
 }

@@ -2,7 +2,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use bip39::Mnemonic;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 use crate::identity::Address;
 use crate::error::CommpError;
 
@@ -34,9 +34,18 @@ impl Wallet {
     /// The 32-byte signing key is used directly as BIP39 entropy
     /// (256 bits → 24 words).
     pub fn seed_phrase(&self) -> String {
-        let entropy = self.signing_key.to_bytes();
+        // Wrap the raw private-key entropy in `Zeroizing` so the transient
+        // 32-byte copy is scrubbed from the stack when this function returns,
+        // rather than lingering in freed memory (matches the Drop-impl intent).
+        let entropy = Zeroizing::new(self.signing_key.to_bytes());
         // 32 bytes of entropy always produces a valid 24-word mnemonic.
-        Mnemonic::from_entropy(&entropy)
+        //
+        // NOTE: the intermediate `Mnemonic` also encodes this entropy. The
+        // bip39 crate's optional `zeroize` feature is not enabled in this
+        // workspace, so its internal buffer cannot be scrubbed from here; we
+        // keep the `Mnemonic` unnamed so its temporary is dropped as early as
+        // possible (immediately after `to_string()`).
+        Mnemonic::from_entropy(&entropy[..])
             .expect("32-byte entropy is always valid for BIP39")
             .to_string()
     }
@@ -127,6 +136,30 @@ mod tests {
     #[test]
     fn invalid_seed_phrase_returns_error() {
         assert!(Wallet::from_seed_phrase("not a valid seed phrase").is_err());
+    }
+
+    #[test]
+    fn seed_phrase_encodes_exact_signing_key_entropy() {
+        // Guards the `Zeroizing`-wrapped entropy slice conversion in
+        // seed_phrase(): the phrase must encode the full 32-byte signing key
+        // verbatim, so recovering from it must reproduce identical key bytes.
+        let wallet = Wallet::generate();
+        let original_key_bytes = wallet.signing_key.to_bytes();
+        let phrase = wallet.seed_phrase();
+        let recovered = Wallet::from_seed_phrase(&phrase).unwrap();
+        assert_eq!(
+            original_key_bytes,
+            recovered.signing_key.to_bytes(),
+            "seed phrase must round-trip the exact 32-byte signing key"
+        );
+    }
+
+    #[test]
+    fn seed_phrase_is_deterministic() {
+        // Calling seed_phrase() repeatedly must yield the same phrase; the
+        // per-call `Zeroizing` copy must not perturb the produced mnemonic.
+        let wallet = Wallet::generate();
+        assert_eq!(wallet.seed_phrase(), wallet.seed_phrase());
     }
 
     #[test]

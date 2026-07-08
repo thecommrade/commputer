@@ -155,6 +155,41 @@ pub struct CommpBehaviour {
     pub consensus: libp2p::request_response::Behaviour<crate::consensus_protocol::ConsensusCodec>,
 }
 
+/// Write the persistent libp2p identity key to `path`, owner-only (0600) from
+/// the very first byte and refusing to follow a pre-planted symlink.
+///
+/// On unix we open with `create_new(true).mode(0o600)` (O_CREAT|O_EXCL):
+///   - `create_new` fails with `AlreadyExists` if the path already exists OR is
+///     a symlink (POSIX: O_CREAT|O_EXCL on a symlink errors EEXIST regardless of
+///     the link target), giving O_NOFOLLOW semantics. This closes the old
+///     write-then-chmod TOCTOU window where the private key was briefly
+///     world/group-readable, and prevents a pre-planted symlink in the data dir
+///     from redirecting the key write to an attacker-chosen location.
+///   - `mode(0o600)` applies the restrictive permission at creation time, so the
+///     key is never readable by group/other even for an instant.
+///
+/// Mirrors the batch-B `core::keystore` hardening. On non-unix targets we fall
+/// back to a plain write (mode bits are not meaningful there).
+fn write_new_peer_key(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all().ok();
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
 impl CommpNetwork {
     /// Create a new CommpNetwork listening on the given port via TCP and QUIC.
     pub fn new(listen_port: u16) -> Result<Self, Box<dyn std::error::Error>> {
@@ -179,13 +214,7 @@ impl CommpNetwork {
                     std::fs::create_dir_all(parent)?;
                 }
                 let bytes = keypair.to_protobuf_encoding()?;
-                std::fs::write(path, &bytes)?;
-                // Set restrictive permissions on the key file (Unix only).
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-                }
+                write_new_peer_key(path, &bytes)?;
                 info!("Generated and saved new peer identity to {}", path.display());
                 keypair
             }
@@ -879,5 +908,67 @@ mod tests {
         let quic = tcp_to_quic_v1(tcp);
         assert_eq!(quic, "/ip4/127.0.0.1/udp/19001/quic-v1");
         assert!(quic.parse::<Multiaddr>().is_ok(), "expected valid multiaddr, got {}", quic);
+    }
+
+    // -- Peer-key hardening (finding [31]) ----------------------------------
+
+    /// Make a fresh, unique temp directory for a test and return its path.
+    #[cfg(unix)]
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "commp_peerkey_{tag}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_key_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_tmp_dir("perm");
+        let path = dir.join("peer.key");
+        write_new_peer_key(&path, b"super-secret-identity-bytes").unwrap();
+
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, b"super-secret-identity-bytes");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "key must be created owner-only, got {:o}", mode & 0o777);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// NON-VACUOUS: a pre-planted symlink at the key path must NOT be followed.
+    /// The old `std::fs::write(path, ..)` followed the symlink and wrote the
+    /// private key into the attacker-chosen target; `create_new` refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn peer_key_refuses_preplanted_symlink() {
+        let dir = unique_tmp_dir("symlink");
+        let target = dir.join("attacker_target");
+        let key_path = dir.join("peer.key");
+        // Dangling symlink: target does not exist yet, so `path.exists()` on the
+        // symlink is false — exactly the branch the writer takes on a fresh dir.
+        std::os::unix::fs::symlink(&target, &key_path).unwrap();
+
+        let result = write_new_peer_key(&key_path, b"KEYBYTES");
+
+        assert!(
+            result.is_err(),
+            "writing through a pre-planted symlink must fail, but it succeeded"
+        );
+        assert!(
+            !target.exists(),
+            "symlink was followed: the key was written to the attacker target"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

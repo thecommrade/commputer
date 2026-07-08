@@ -42,6 +42,29 @@ pub const MAX_TIMESTAMP_DRIFT_SECS: u64 = 15;
 /// the next-highest CRS validator takes over block production.
 pub const VIEW_CHANGE_TIMEOUT_SECS: u64 = 10;
 
+/// Security bound: how far ahead of the last applied chain tip the consensus
+/// manager will track heights. Remote peers can gossip `BlockCandidate` /
+/// `BlockProposal` / `CheckpointCommitment` messages carrying an arbitrary,
+/// unvalidated `height`. Without a window an attacker floods distinct
+/// far-future heights and grows `heights` (plus each height's voter/candidate
+/// structures), `height_start_time`, `validator_blocks`, and `checkpoint_votes`
+/// without bound → remote OOM. The window is measured relative to `applied_tip`
+/// (updated by `cleanup_below`), so legitimately-close-to-tip candidates are
+/// never dropped — live consensus only ever votes at tip+1. Generous.
+pub const MAX_HEIGHT_WINDOW: u64 = 1024;
+
+/// Security bound: maximum number of distinct candidate blocks retained at a
+/// single height. An attacker can mint many distinct block hashes at one height
+/// by varying producer/timestamp; a real fork has at most one candidate per
+/// validator, so this is far above any legitimate need.
+pub const MAX_CANDIDATES_PER_HEIGHT: usize = 64;
+
+/// Security bound: maximum number of distinct checkpoint validators tracked per
+/// height. `CheckpointCommitment` carries an attacker-chosen `validator`
+/// Address, so without a cap one peer synthesises unbounded addresses per
+/// height. Far above any realistic validator-set size for an alpha testnet.
+pub const MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT: usize = 1024;
+
 /// Feature 121: View change state — tracks when a view change is triggered.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -169,6 +192,10 @@ pub struct ConsensusManager {
     pub last_block_time: HashMap<Address, u64>,
     /// Feature 133: Checkpoint commitments: height -> set of (validator, state_root).
     pub checkpoint_votes: HashMap<u64, HashMap<Address, [u8; 32]>>,
+    /// Security: last applied chain tip, updated by `cleanup_below`. Bounds how
+    /// far ahead of the tip candidate/checkpoint heights may be tracked so a
+    /// remote peer cannot flood arbitrary heights and exhaust memory.
+    applied_tip: u64,
 }
 
 impl ConsensusManager {
@@ -187,6 +214,7 @@ impl ConsensusManager {
             view_changes: Vec::new(),
             last_block_time: HashMap::new(),
             checkpoint_votes: HashMap::new(),
+            applied_tip: 0,
         }
     }
 
@@ -231,6 +259,7 @@ impl ConsensusManager {
             view_changes: Vec::new(),
             last_block_time: HashMap::new(),
             checkpoint_votes: HashMap::new(),
+            applied_tip: 0,
         }
     }
 
@@ -253,6 +282,31 @@ impl ConsensusManager {
         let height = block.height();
         let hash = block.hash();
         let producer = block.header.producer;
+
+        // Security bound (see MAX_HEIGHT_WINDOW): drop candidates whose height is
+        // outside the active window around the applied tip. A remote peer can
+        // gossip empty/unsigned blocks at arbitrary heights; without this, both
+        // `heights` and the per-height `height_start_time` / `validator_blocks`
+        // entries grow without bound → OOM. Heights at/below the applied tip are
+        // already finalized (stale); heights far above it are never legitimately
+        // voted on. Checked BEFORE any map insertion so nothing can grow.
+        if height <= self.applied_tip
+            || height > self.applied_tip.saturating_add(MAX_HEIGHT_WINDOW)
+        {
+            return;
+        }
+
+        // Security bound (see MAX_CANDIDATES_PER_HEIGHT): if this height already
+        // holds the maximum number of distinct candidates and this block is not
+        // one of them, drop it before it can grow validator_blocks / candidates.
+        // A peer cannot mint unbounded hashes (varying producer/timestamp) at one
+        // height; existing candidates are always preserved.
+        if let Some(state) = self.heights.get(&height)
+            && !state.candidates.contains_key(&hash)
+            && state.candidates.len() >= MAX_CANDIDATES_PER_HEIGHT
+        {
+            return;
+        }
 
         // Feature 125: Check for equivocation — only flag blocks received from the
         // network. Local blocks are tracked (for we_produced_at) but don't trigger slashing.
@@ -396,6 +450,14 @@ impl ConsensusManager {
         self.heights.retain(|h, _| *h > applied_height);
         self.height_start_time.retain(|h, _| *h > applied_height);
         self.validator_blocks.retain(|(_, h), _| *h > applied_height);
+        // Security: also prune checkpoint votes for finalized heights. Without
+        // this the attacker-keyed (height, validator) map is never bounded and
+        // grows without limit → OOM.
+        self.checkpoint_votes.retain(|h, _| *h > applied_height);
+        // Security: record the applied tip so add_candidate / record_checkpoint_vote
+        // can bound how far ahead of it they will track heights. Monotonic — the
+        // chain tip only advances.
+        self.applied_tip = self.applied_tip.max(applied_height);
     }
 
     /// Clear all consensus state. Used during chain resync.
@@ -535,7 +597,25 @@ impl ConsensusManager {
         validator: Address,
         state_root: [u8; 32],
     ) {
+        // Security bound (see MAX_HEIGHT_WINDOW): ignore checkpoint votes whose
+        // height is far from the applied tip in either direction. Combined with
+        // the cleanup_below prune this bounds the number of tracked heights;
+        // legitimate recent-past and near-future checkpoints are always in range.
+        if height > self.applied_tip.saturating_add(MAX_HEIGHT_WINDOW)
+            || self.applied_tip > height.saturating_add(MAX_HEIGHT_WINDOW)
+        {
+            return;
+        }
         let votes = self.checkpoint_votes.entry(height).or_default();
+        // Security bound (see MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT): cap distinct
+        // validators per height so a peer cannot synthesise unbounded Addresses
+        // to grow this height's vote set. Updates from already-seen validators
+        // are always accepted.
+        if !votes.contains_key(&validator)
+            && votes.len() >= MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT
+        {
+            return;
+        }
         votes.insert(validator, state_root);
     }
 
@@ -1463,6 +1543,107 @@ mod tests {
         assert!(
             cm.finalized_at_height(1).is_none(),
             "5 rounds should not be enough at production beta=20"
+        );
+    }
+
+    // ---- Security: unbounded-growth bounds (heights / candidates / checkpoints) ----
+
+    #[test]
+    fn far_future_candidate_height_rejected() {
+        let mut cm = ConsensusManager::new();
+        // applied_tip defaults to 0; a candidate far beyond the window must be
+        // dropped so an attacker cannot flood arbitrary heights into `heights`.
+        let far = super::MAX_HEIGHT_WINDOW + 5_000;
+        cm.add_candidate(make_test_block(far));
+        assert!(!cm.has_height(far), "candidate far above the applied tip must not be tracked");
+        // A near-tip candidate is still accepted.
+        cm.add_candidate(make_test_block(1));
+        assert!(cm.has_height(1), "near-tip candidate must be tracked");
+    }
+
+    #[test]
+    fn stale_candidate_height_rejected_after_cleanup() {
+        let mut cm = ConsensusManager::new();
+        cm.add_candidate(make_test_block(5));
+        assert!(cm.has_height(5));
+        // Apply up to height 10 — heights <= 10 are pruned and become stale.
+        cm.cleanup_below(10);
+        assert!(!cm.has_height(5));
+        // A new candidate at/below the applied tip must be rejected.
+        cm.add_candidate(make_test_block(8));
+        assert!(!cm.has_height(8), "candidate at/below applied tip must be rejected");
+        // But a fresh candidate above the tip is accepted.
+        cm.add_candidate(make_test_block(11));
+        assert!(cm.has_height(11));
+    }
+
+    #[test]
+    fn candidates_per_height_capped() {
+        let mut cm = ConsensusManager::new();
+        // Mint many distinct candidate hashes at a single near-tip height by
+        // varying producer + timestamp. Only MAX_CANDIDATES_PER_HEIGHT are kept.
+        let n = super::MAX_CANDIDATES_PER_HEIGHT as u64 + 200;
+        for i in 0..n {
+            let mut a = [0u8; 32];
+            a[0] = (i % 251) as u8;
+            a[1] = (i / 251) as u8;
+            cm.add_candidate(make_test_block_with_timestamp(1, Address(a), 1000 + i));
+        }
+        assert_eq!(
+            cm.candidates_at_height(1),
+            super::MAX_CANDIDATES_PER_HEIGHT,
+            "distinct candidates at one height must be capped"
+        );
+        // validator_blocks for this height must also be bounded by the cap.
+        let vb = cm.validator_blocks.keys().filter(|(_, h)| *h == 1).count();
+        assert!(
+            vb <= super::MAX_CANDIDATES_PER_HEIGHT,
+            "validator_blocks at one height must be bounded, got {vb}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_votes_pruned_on_cleanup() {
+        let mut cm = ConsensusManager::new();
+        cm.record_checkpoint_vote(5, addr(1), [1u8; 32]);
+        cm.record_checkpoint_vote(6, addr(2), [2u8; 32]);
+        assert!(cm.checkpoint_votes.contains_key(&5));
+        // Applying up to height 10 prunes checkpoint votes for finalized heights.
+        cm.cleanup_below(10);
+        assert!(
+            !cm.checkpoint_votes.contains_key(&5),
+            "checkpoint votes for finalized heights must be pruned"
+        );
+        assert!(!cm.checkpoint_votes.contains_key(&6));
+    }
+
+    #[test]
+    fn checkpoint_far_future_height_rejected() {
+        let mut cm = ConsensusManager::new();
+        cm.record_checkpoint_vote(super::MAX_HEIGHT_WINDOW + 10_000, addr(1), [1u8; 32]);
+        assert!(
+            cm.checkpoint_votes.is_empty(),
+            "checkpoint vote far above the tip must be ignored"
+        );
+    }
+
+    #[test]
+    fn checkpoint_validators_per_height_capped() {
+        let mut cm = ConsensusManager::new();
+        // One height, many synthesised validator addresses.
+        let n = super::MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT + 500;
+        for i in 0..n {
+            let mut a = [0u8; 32];
+            a[0] = (i % 251) as u8;
+            a[1] = ((i / 251) % 251) as u8;
+            a[2] = (i / (251 * 251)) as u8;
+            cm.record_checkpoint_vote(1, Address(a), [7u8; 32]);
+        }
+        let tracked = cm.checkpoint_votes.get(&1).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(
+            tracked,
+            super::MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT,
+            "distinct checkpoint validators at one height must be capped"
         );
     }
 }

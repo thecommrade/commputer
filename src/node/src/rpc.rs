@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use axum::{
     Router,
@@ -56,6 +57,23 @@ pub struct ChainStatus {
     pub pending_txs: usize,
 }
 
+/// CANONICAL RPC LOCK ORDER (deadlock safety).
+///
+/// `RpcState` holds many independent `tokio::sync::Mutex` guards. Several public,
+/// unauthenticated handlers acquire two or more of them while holding the first
+/// across the `.await` that acquires the next. If two handlers acquired the same
+/// pair in opposite orders, concurrent requests could deadlock permanently and
+/// wedge the whole RPC surface (every later handler that locks those mutexes then
+/// parks forever). To make that impossible, EVERY handler that needs more than one
+/// of these mutexes MUST acquire them in this fixed order (lower first):
+///
+///   status → metrics → balances → peers → blocks → network_health → chain_health
+///
+/// (Other single-purpose mutexes — mempool, receipts, faucet_claims, rate_limits,
+/// etc. — are only ever held one at a time, so they are exempt.) When adding a new
+/// handler, either follow this order or take one lock, copy out what you need, drop
+/// the guard, then take the next.
+///
 /// Shared state for the RPC server.
 pub struct RpcState {
     /// Channel to send submitted transactions to the event loop.
@@ -444,25 +462,80 @@ async fn get_anti_scale(
 
 // ── Feature 241: WebSocket RPC ──
 
+/// Security: maximum number of concurrent public `/ws` connections. `/ws` is an
+/// unauthenticated route and each upgrade pins a file descriptor + a spawned task
+/// + a broadcast receiver; without a cap a client can open unbounded persistent
+/// connections and exhaust fds/memory. Generous — real dashboards/light-clients
+/// use a handful per host.
+pub const MAX_WS_CONNECTIONS: usize = 512;
+
+/// Security: number of currently-open `/ws` connections (process-global).
+static WS_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII slot for a live `/ws` connection. Reserving one increments the global
+/// counter; dropping it (connection closed, upgrade aborted, or send timeout)
+/// decrements it — so the count stays accurate on every exit path.
+struct WsConnGuard;
+
+impl Drop for WsConnGuard {
+    fn drop(&mut self) {
+        WS_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Try to reserve a `/ws` connection slot. Returns `Some(guard)` when under the
+/// cap (caller proceeds with the upgrade), or `None` when the cap is reached
+/// (caller must reject). The reservation is released when the returned guard is
+/// dropped.
+fn try_reserve_ws_slot() -> Option<WsConnGuard> {
+    let prev = WS_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
+    if prev >= MAX_WS_CONNECTIONS {
+        // Over the cap — undo the reservation and reject.
+        WS_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+        None
+    } else {
+        Some(WsConnGuard)
+    }
+}
+
 /// GET /ws — upgrade to WebSocket for real-time event streaming.
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<RpcState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_ws(socket, state))
+    // Security: cap concurrent public WS connections (fd/memory exhaustion DoS).
+    // The reserved slot is handed to handle_ws, which holds it until the socket
+    // closes; if the upgrade never completes the guard is dropped and the slot
+    // is released.
+    let Some(guard) = try_reserve_ws_slot() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "websocket connection limit reached",
+        )
+            .into_response();
+    };
+    ws.on_upgrade(move |socket| handle_ws(socket, state, guard))
 }
 
-async fn handle_ws(socket: WebSocket, state: Arc<RpcState>) {
+async fn handle_ws(socket: WebSocket, state: Arc<RpcState>, guard: WsConnGuard) {
     use futures::SinkExt as _;
     let (mut sink, _stream) = socket.split();
     let mut rx = state.ws_broadcast.subscribe();
 
-    // Send events to the client until they disconnect.
+    // Send events to the client until they disconnect. `guard` is moved into the
+    // task and released when the loop ends, keeping the concurrent-connection
+    // count accurate.
     tokio::spawn(async move {
+        let _guard = guard;
         while let Ok(msg) = rx.recv().await {
             let text: Message = Message::Text(msg.into());
-            if sink.send(text).await.is_err() {
-                break;
+            // Security: bound how long a single send may block so a client that
+            // completes the upgrade but never reads cannot pin the fd/task
+            // forever (backpressure parks sink.send indefinitely otherwise).
+            match tokio::time::timeout(std::time::Duration::from_secs(30), sink.send(text)).await {
+                Ok(Ok(())) => {}
+                // Send error or slow-consumer timeout — drop the connection.
+                _ => break,
             }
         }
     });
@@ -675,8 +748,9 @@ async fn get_pending_rewards(
     State(state): State<Arc<RpcState>>,
     Path(address): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let balances = state.balances.lock().await;
+    // Canonical lock order (see RpcState): status before balances.
     let status = state.status.lock().await;
+    let balances = state.balances.lock().await;
 
     if let Some(info) = balances.get(&address) {
         if !info.is_validator {
@@ -1204,9 +1278,10 @@ async fn get_validators(
 async fn get_network_info(
     State(state): State<Arc<RpcState>>,
 ) -> Json<serde_json::Value> {
+    // Canonical lock order (see RpcState): status → balances → peers → network_health.
+    let status = state.status.lock().await;
     let balances = state.balances.lock().await;
     let peers = state.peers.lock().await;
-    let status = state.status.lock().await;
     let health = state.network_health.lock().await;
     let uptime = state.start_time.elapsed().as_secs();
 
@@ -1234,8 +1309,9 @@ async fn get_recent_blocks(
         .unwrap_or(10)
         .min(100);
 
-    let blocks = state.blocks.lock().await;
+    // Canonical lock order (see RpcState): status before blocks.
     let status = state.status.lock().await;
+    let blocks = state.blocks.lock().await;
     let height = status.height;
 
     let mut result = Vec::new();
@@ -2398,5 +2474,89 @@ mod tests {
             }
             other => panic!("expected Transfer, got {:?}", other),
         }
+    }
+
+    // ── Security: RPC deadlock safety + WS connection cap ──
+
+    /// Reproduces the lock-order-inversion deadlock between two PUBLIC handlers.
+    ///
+    /// The test holds `status`, then queues `get_stats_page` (acquires status
+    /// first) and `get_network_info` behind it. Pre-fix, `get_network_info`
+    /// grabbed `balances` BEFORE `status`, so after `status` is released it held
+    /// `balances` while waiting for `status` (held by stats), and stats waited for
+    /// `balances` — a permanent cycle. With the canonical order (status before
+    /// balances) both handlers queue on `status` holding nothing and run to
+    /// completion. A deadlock manifests as the timeout firing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rpc_handlers_have_consistent_lock_order_no_deadlock() {
+        let (state, _rx) = make_rpc_state();
+
+        // Hold `status` so both handlers must queue on it (tokio Mutex is FIFO).
+        let status_guard = state.status.lock().await;
+
+        // Queue get_stats_page first (canonical: status → metrics → balances).
+        let sb = state.clone();
+        let b = tokio::spawn(async move {
+            let _ = get_stats_page(State(sb)).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Then get_network_info. Pre-fix it grabs `balances` first and parks on
+        // `status` holding it → the cycle. Post-fix it parks on `status` holding
+        // nothing.
+        let sa = state.clone();
+        let a = tokio::spawn(async move {
+            let _ = get_network_info(State(sa)).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Release status; a single-order implementation runs both to completion.
+        drop(status_guard);
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let _ = a.await;
+            let _ = b.await;
+        })
+        .await;
+        assert!(
+            joined.is_ok(),
+            "RPC handlers deadlocked due to inconsistent lock order"
+        );
+    }
+
+    /// The public `/ws` route caps concurrent connections: reservations succeed up
+    /// to MAX_WS_CONNECTIONS, the next is rejected, and releasing a slot frees one.
+    #[test]
+    fn ws_connection_slots_are_capped() {
+        // No live connections in the test process.
+        WS_CONNECTIONS.store(0, Ordering::SeqCst);
+
+        // Reserve exactly the cap.
+        let mut guards = Vec::new();
+        for _ in 0..MAX_WS_CONNECTIONS {
+            let g = try_reserve_ws_slot();
+            assert!(g.is_some(), "reservation within the cap must succeed");
+            guards.push(g.unwrap());
+        }
+        // One more must be rejected, and the counter must not leak past the cap.
+        assert!(
+            try_reserve_ws_slot().is_none(),
+            "reservation over the cap must be rejected"
+        );
+        assert_eq!(WS_CONNECTIONS.load(Ordering::SeqCst), MAX_WS_CONNECTIONS);
+
+        // Free one slot — a new reservation now succeeds.
+        guards.pop();
+        let g = try_reserve_ws_slot();
+        assert!(
+            g.is_some(),
+            "after releasing a slot a new reservation must succeed"
+        );
+        assert_eq!(WS_CONNECTIONS.load(Ordering::SeqCst), MAX_WS_CONNECTIONS);
+
+        // Clean up so the global counter is left at zero.
+        drop(g);
+        guards.clear();
+        assert_eq!(WS_CONNECTIONS.load(Ordering::SeqCst), 0);
     }
 }
