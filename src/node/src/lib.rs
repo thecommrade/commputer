@@ -9,3 +9,6 @@ pub mod sync_machine;
 pub mod chain_health_monitor;
 pub mod config_validator;
 pub mod kademlia_bootstrap_fix;
+pub mod block_maps;
+pub mod mempool_quota;
+pub mod peer_hash;

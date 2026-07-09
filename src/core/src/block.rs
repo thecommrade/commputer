@@ -87,6 +87,12 @@ impl BlockHeader {
         borsh::BorshSerialize::serialize(&self.producer, &mut bytes).unwrap();
         borsh::BorshSerialize::serialize(&self.epoch, &mut bytes).unwrap();
         borsh::BorshSerialize::serialize(&self.chain_id, &mut bytes).unwrap();
+        // E5: cover checkpoint_hash so a relay cannot strip/alter it on a signed
+        // block. sign_block() and verify_signature() both route through this fn,
+        // so producer and verifier stay consistent; without it a stripped
+        // checkpoint_hash keeps the signature valid while changing the block hash,
+        // manufacturing two validly-signed blocks at one height (equivocation).
+        borsh::BorshSerialize::serialize(&self.checkpoint_hash, &mut bytes).unwrap();
         bytes
     }
 
@@ -341,8 +347,11 @@ mod producer_signature_tests {
         let b = unsigned_block(5, *w.address());
         // The forgery hole: empty (sig, key) at height>0 must be rejected.
         assert!(!b.verify_producer_signature_strict());
-        // Permissive path still accepts pre-flip — the strict check is INERT.
-        assert!(b.verify_producer_signature());
+        // E12: the permissive wrapper now follows the enforcement flag — it
+        // rejects the unsigned non-genesis block once ENFORCE_PRODUCER_SIGNATURES
+        // is true, and accepts it while the flag is false (INERT). Meaningful in
+        // BOTH const states, so it rides the flip in the same commit.
+        assert_eq!(b.verify_producer_signature(), !ENFORCE_PRODUCER_SIGNATURES);
     }
 
     #[test]

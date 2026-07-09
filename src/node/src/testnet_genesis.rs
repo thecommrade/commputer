@@ -75,6 +75,41 @@ pub fn generate_testnet_genesis(num_accounts: usize, output_path: &str) -> Resul
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Slice-4 / E1: alpha-reset faucet allocation (INERT until the founder sets the
+// address at the genesis reset).
+// ---------------------------------------------------------------------------
+
+/// Hex-encoded address of the alpha-testnet faucet, funded at genesis.
+///
+/// `None` here (the shipped default) means NO faucet account is credited, so the
+/// generated genesis stays byte-identical to today. At the alpha reset the founder
+/// generates the faucet wallet OFFLINE (E11) and pastes its 64-hex address here;
+/// `alpha_genesis_accounts()` then emits the single funded entry. The P8 boot
+/// check in `rpc::provision_faucet_from_env` refuses to bind unless this equals
+/// the address derived from `COMMPUTER_FAUCET_SEED`, so the funded/exempted
+/// identity and the live signing wallet can never diverge.
+pub const ALPHA_FAUCET_ADDRESS_HEX: Option<&str> = None;
+
+/// Genesis balance credited to the faucet address, in raw base units.
+/// 100,000 COMME = 100_000 * UNITS_PER_COMME = 1e13 raw units.
+pub const ALPHA_FAUCET_ALLOCATION: u64 = 100_000 * UNITS_PER_COMME;
+
+/// The height-0 credits for the alpha reset: exactly the faucet entry when
+/// `ALPHA_FAUCET_ADDRESS_HEX` is set, or an EMPTY vec otherwise (⇒ a no-op in
+/// `ChainState::apply_genesis_accounts`, keeping today's genesis byte-identical).
+///
+/// Returns `(hex_address, raw_balance)` pairs so it feeds directly into
+/// `state.apply_genesis_accounts(&alpha_genesis_accounts())` — the PROTECTED
+/// `main.rs` call site added at the reset (E1: credited BEFORE `apply_block`).
+/// INERT: nothing calls this until that protected commit lands.
+pub fn alpha_genesis_accounts() -> Vec<(String, u64)> {
+    match ALPHA_FAUCET_ADDRESS_HEX {
+        Some(addr) => vec![(addr.to_string(), ALPHA_FAUCET_ALLOCATION)],
+        None => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +149,20 @@ mod tests {
         assert!(genesis.accounts.is_empty());
 
         std::fs::remove_file(path_str).ok();
+    }
+
+    #[test]
+    fn alpha_faucet_allocation_is_100k_comme() {
+        // 100,000 COMME in raw base units.
+        assert_eq!(ALPHA_FAUCET_ALLOCATION, 100_000 * UNITS_PER_COMME);
+        assert_eq!(ALPHA_FAUCET_ALLOCATION, 10_000_000_000_000); // 1e13 raw units
+    }
+
+    #[test]
+    fn alpha_genesis_accounts_empty_when_address_unset() {
+        // Shipped default: address is None ⇒ no genesis credit ⇒ byte-identical
+        // genesis (apply_genesis_accounts treats an empty slice as a no-op).
+        assert!(ALPHA_FAUCET_ADDRESS_HEX.is_none());
+        assert!(alpha_genesis_accounts().is_empty());
     }
 }

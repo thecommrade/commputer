@@ -7,6 +7,8 @@ use tracing::{info, debug, warn};
 use commputer_core::block::{Block, BlockHash, BlockHeader};
 use commputer_core::identity::Address;
 use commputer_consensus::snowball::{SnowballParams, SnowballVoter};
+use commputer_consensus::VoteAggregator;
+use libp2p::PeerId;
 
 /// Result of a consensus finalization attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,8 +165,13 @@ pub enum ConsensusMessage {
 struct HeightState {
     voter: SnowballVoter,
     candidates: HashMap<BlockHash, Block>,
-    /// Accumulated responses for the current round.
-    round_responses: HashMap<BlockHash, usize>,
+    /// Peer-keyed vote accumulator for the current round. Replaces the raw
+    /// per-hash counter so a single peer counts at most once per
+    /// (height, block_hash) -- this is the ONLY counting path, which keeps the
+    /// Sybil-vulnerable increment unreachable. Reset each round in
+    /// `try_finalize_round`; dies with its height via `take_finalized` /
+    /// `cleanup_below` / `clear` (free lifecycle cleanup).
+    aggregator: VoteAggregator<PeerId>,
     /// Whether the full block proposal has been sent at least once for this height.
     proposal_sent: bool,
 }
@@ -174,7 +181,8 @@ struct HeightState {
 /// Lifecycle per height:
 /// 1. `add_candidate()` registers a block and creates/updates the voter.
 /// 2. `query_preference()` returns what to include in a SnowballQuery.
-/// 3. `record_response()` accumulates peer responses.
+/// 3. `record_peer_response()` accumulates peer responses, keyed by the
+///    authenticated PeerId so each peer counts once per round.
 /// 4. `try_finalize_round()` feeds accumulated responses into the voter.
 /// 5. `take_finalized()` returns the winning block and cleans up.
 pub struct ConsensusManager {
@@ -245,6 +253,11 @@ impl ConsensusManager {
         // (quorum=2) which prevents finalization with 1 vote (quorum_choice = None).
         for state in self.heights.values_mut() {
             state.voter.set_params(self.params.clone());
+            // Keep each aggregator's k (sample bound) in step with the rescaled
+            // network size. A stale small k caps every tally below the new
+            // quorum (e.g. k=1 vs quorum=14 at the 21+ rung) and would deadlock
+            // finalization mid-round. `sample` is the k just chosen above.
+            state.aggregator.set_sample_size(sample);
         }
     }
 
@@ -329,7 +342,7 @@ impl ConsensusManager {
         let state = self.heights.entry(height).or_insert_with(|| HeightState {
             voter: SnowballVoter::new(self.params.clone()),
             candidates: HashMap::new(),
-            round_responses: HashMap::new(),
+            aggregator: VoteAggregator::new(self.params.sample_size),
             proposal_sent: false,
         });
 
@@ -368,13 +381,35 @@ impl ConsensusManager {
         }
     }
 
-    /// Record a peer's response for a given height.
-    pub fn record_response(&mut self, height: u64, preference: BlockHash) {
+    /// Record a peer's response for a given height, attributed to `peer`.
+    /// Routes through the peer-keyed `VoteAggregator`: a repeat vote from the
+    /// same peer for the same (height, preference) is a no-op that returns
+    /// `false`, so single-peer flooding cannot fabricate a quorum. Returns
+    /// `true` when the vote was newly counted this round.
+    pub fn record_peer_response(&mut self, height: u64, preference: BlockHash, peer: PeerId) -> bool {
         if let Some(state) = self.heights.get_mut(&height)
             && !state.voter.is_finalized() {
-                let entry = state.round_responses.entry(preference).or_insert(0);
-                *entry += 1;
+                let newly = state.aggregator.record_vote(height, preference, peer);
+                if !newly {
+                    debug!(
+                        "Deduped duplicate Snowball vote from {} at height {} for {}",
+                        peer, height, preference
+                    );
+                }
+                return newly;
             }
+        false
+    }
+
+    /// Legacy count-based entry point, retained as a LIVE (non-cfg) delegating
+    /// shim so the unmodified event_loop call sites -- and this module's tests --
+    /// compile and behave EXACTLY as before. Attributing each call to a fresh
+    /// random PeerId makes every call a distinct voter, so N calls add N to the
+    /// round tally: the exact pre-dedup semantics. The founder's protected
+    /// stage-1a commit adds `#[cfg(test)]` here in the SAME change that switches
+    /// the feed sites to `record_peer_response`.
+    pub fn record_response(&mut self, height: u64, preference: BlockHash) {
+        self.record_peer_response(height, preference, PeerId::random());
     }
 
     /// Feed accumulated responses into the voter and reset for the next round.
@@ -386,10 +421,16 @@ impl ConsensusManager {
                 return ConsensusRoundResult::NotReady;
             }
 
-            // Try to finalize from accumulated peer votes FIRST.
-            if !state.round_responses.is_empty() {
-                let responses = std::mem::take(&mut state.round_responses);
-                let finalized = state.voter.record_round(&responses);
+            // Try to finalize from accumulated peer votes FIRST. The tally is
+            // peer-deduped and k-sampled by the aggregator. A non-empty tally
+            // CONSUMES the round: reset the aggregator to a fresh one (matching
+            // the old `mem::take` on round_responses, so Snowball's
+            // beta-consecutive-round semantics are preserved) before feeding the
+            // round into the voter.
+            let tally = state.aggregator.tally(height, &mut rand::thread_rng());
+            if !tally.is_empty() {
+                state.aggregator = VoteAggregator::new(self.params.sample_size);
+                let finalized = state.voter.record_round(&tally);
                 if finalized {
                     info!(
                         "Snowball finalized at height {}: {:?}",

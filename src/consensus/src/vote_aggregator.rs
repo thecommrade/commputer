@@ -45,6 +45,16 @@ impl<P: Eq + Hash + Clone> VoteAggregator<P> {
         }
     }
 
+    /// Update k when the network rescales (mirrors `SnowballParams::sample_size`).
+    /// Recorded votes are kept — only the per-tally sampling bound changes.
+    ///
+    /// Called by `ConsensusManager::update_params_for_network_size` as the (1→20)
+    /// peer curve grows: a stale small `k` (e.g. `k=1`) would cap every `tally()`
+    /// below the new quorum and deadlock finalization mid-round.
+    pub fn set_sample_size(&mut self, sample_size: usize) {
+        self.sample_size = sample_size;
+    }
+
     /// Record `peer`'s vote for `block_hash` at `height`.
     ///
     /// Returns `true` if this vote was newly counted, `false` if `peer` had
@@ -189,6 +199,34 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(3);
         let tally = agg.tally(1, &mut rng);
         assert_eq!(tally.get(&hash(1)), Some(&k));
+    }
+
+    #[test]
+    fn set_sample_size_rescales_the_tally_cap_on_existing_votes() {
+        // Simulate the (1→20) network-size rescale: an aggregator starts with a
+        // stale k=1, votes accumulate, then `update_params_for_network_size`
+        // rescales k. The tally cap must track the NEW k over the votes already
+        // recorded — otherwise the stale k=1 caps every tally below quorum and
+        // finalization deadlocks.
+        let mut agg: VoteAggregator<u64> = VoteAggregator::new(1);
+        for p in 0..20u64 {
+            agg.record_vote(3, hash(1), p);
+        }
+        assert_eq!(agg.deduped_count(3, hash(1)), 20);
+
+        // Stale k=1: the tally is pinned at 1, well below a realistic quorum.
+        let mut rng = StdRng::seed_from_u64(9);
+        let stale = agg.tally(3, &mut rng);
+        assert_eq!(stale.get(&hash(1)), Some(&1));
+
+        // Rescale k to 20 (votes are kept). Now the same votes tally to 20,
+        // clearing the quorum the stale k could never reach.
+        agg.set_sample_size(20);
+        assert_eq!(agg.deduped_count(3, hash(1)), 20); // votes untouched
+        let rescaled = agg.tally(3, &mut rng);
+        assert_eq!(rescaled.get(&hash(1)), Some(&20));
+        let quorum = 14usize;
+        assert!(rescaled.get(&hash(1)).copied().unwrap_or(0) >= quorum);
     }
 
     #[test]

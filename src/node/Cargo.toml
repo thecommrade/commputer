@@ -26,6 +26,7 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 hex = "0.4"
+zeroize = "1"
 sha2 = { workspace = true }
 borsh = { workspace = true }
 axum = { workspace = true }

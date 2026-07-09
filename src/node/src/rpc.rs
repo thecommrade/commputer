@@ -830,6 +830,80 @@ fn build_faucet_transfer(
     tx
 }
 
+/// Provision the live testnet faucet from the environment (E10/E11 + P8).
+///
+/// Reads the faucet seed phrase from `COMMPUTER_FAUCET_SEED`, derives the faucet
+/// signing wallet, and computes its next nonce from on-chain state. Security
+/// contract:
+///   * The phrase is `zeroize`d out of memory AND `remove_var`'d from the
+///     environment immediately after use, so it cannot leak to child processes,
+///     a later reader, or a core dump. The phrase (and any error carrying it) is
+///     NEVER logged.
+///   * FAIL-CLOSED (P8): with the env var set, the node refuses to bind unless the
+///     seed is a valid 24-word phrase AND the derived address equals the compiled
+///     `testnet_genesis::ALPHA_FAUCET_ADDRESS_HEX`. This guarantees the funded /
+///     mempool-exempted identity and the live signing wallet are the same key —
+///     a mismatch would strand the nonce counter and brick the faucet.
+///   * With the env var UNSET the faucet is disabled: returns `Ok((None, 0))`.
+///
+/// Returns `(Some(wallet), next_nonce)` when provisioned. INERT until the PROTECTED
+/// `main.rs` boot path calls it and threads the pair into `RpcState`
+/// (`faucet_wallet` / `faucet_next_nonce`) at the alpha reset — those struct fields
+/// and the `/faucet` handler rewire ride the protected commit, not this helper.
+#[allow(dead_code)]
+pub fn provision_faucet_from_env(
+    state: &commputer_storage::state::ChainState,
+) -> anyhow::Result<(Option<commputer_core::wallet::Wallet>, u64)> {
+    use zeroize::Zeroize;
+
+    // Absent env var ⇒ faucet disabled. No phrase to scrub.
+    let mut phrase = match std::env::var("COMMPUTER_FAUCET_SEED") {
+        Ok(p) => p,
+        Err(_) => return Ok((None, 0)),
+    };
+
+    // Remove it from the environment immediately so it cannot leak to child
+    // processes or a later env reader.
+    // SAFETY: invoked once during single-threaded boot, before the RPC/worker
+    // tasks that could race on the environment are spawned (Rust 2024 marks env
+    // mutation `unsafe` solely because of cross-thread data races).
+    unsafe {
+        std::env::remove_var("COMMPUTER_FAUCET_SEED");
+    }
+
+    // Derive the wallet, then scrub the phrase from memory regardless of outcome.
+    // The error path deliberately discards the underlying parse error so the
+    // (possibly phrase-bearing) message never reaches a log.
+    let wallet_result = commputer_core::wallet::Wallet::from_seed_phrase(&phrase);
+    phrase.zeroize();
+
+    let wallet = wallet_result.map_err(|_| {
+        anyhow::anyhow!(
+            "COMMPUTER_FAUCET_SEED is set but is not a valid 24-word seed phrase; refusing to bind"
+        )
+    })?;
+
+    // P8 fail-closed: compiled faucet address MUST equal the derived signing wallet.
+    let derived_hex = hex::encode(wallet.address().0);
+    match crate::testnet_genesis::ALPHA_FAUCET_ADDRESS_HEX {
+        Some(expected) if expected == derived_hex => {}
+        _ => {
+            return Err(anyhow::anyhow!(
+                "COMMPUTER_FAUCET_SEED wallet does not match compiled ALPHA_FAUCET_ADDRESS_HEX; refusing to bind"
+            ));
+        }
+    }
+
+    // Seed the dispenser nonce from on-chain state (0 if the account is unseen).
+    let next_nonce = state
+        .accounts
+        .get(wallet.address())
+        .map(|a| a.nonce)
+        .unwrap_or(0);
+
+    Ok((Some(wallet), next_nonce))
+}
+
 /// POST /faucet — dispense testnet COMME.
 async fn faucet(
     State(state): State<Arc<RpcState>>,

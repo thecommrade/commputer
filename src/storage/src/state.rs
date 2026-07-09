@@ -1089,8 +1089,12 @@ impl ChainState {
         }
 
         // Cryptographically verify all transaction signatures.
-        // Protocol-issued transactions (MiningReward, MilestoneBurn) come from the zero
+        // Genuinely protocol-issued transactions (e.g. MiningReward) come from the zero
         // address and have no signature — skip verification for those.
+        // NOTE(F10/F21 reconcile, f0fdac4): MilestoneBurn/CharitableDonation are NO LONGER
+        // in this zero-from protocol-issuance set. They are user-authorized burns that debit
+        // the sender's balance and consume a nonce, and their apply arms REJECT zero-from
+        // outright — so despite the historical framing they must never be emitted from zero.
         for tx in &block.transactions {
             if tx.from.is_zero() {
                 continue;

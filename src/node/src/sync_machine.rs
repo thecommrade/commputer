@@ -40,6 +40,17 @@ pub const MAX_PEER_FAILURES: u32 = 10;
 /// larger than any honest single-cycle catch-up gap.
 pub const MAX_SYNC_TARGET_GAP: u64 = 100_000;
 
+/// Maximum number of `request_block` calls the out-of-order sync path may issue
+/// in a SINGLE burst when it observes a block whose height is ahead of the tip.
+/// Bounds the gap-request loop in `apply_synced_block` / `try_apply_finalized`
+/// (SECURITY finding [1]): without it, a peer answering with header
+/// `height = u64::MAX` drives ~1.8e19 synchronous `request_block` iterations on
+/// the single-threaded event loop = permanent freeze + outbound amplification.
+/// One burst is bounded to a batch; the loop re-fires on later blocks so a
+/// genuinely far-behind node still catches up across successive ticks.
+/// INERT until the protected event_loop gap-request hunks reference it.
+pub const MAX_SYNC_GAP: u64 = SYNC_BATCH_SIZE;
+
 /// Liveness watchdog bound: the number of consecutive batch failures — while
 /// `Downloading` toward a nonzero target and WITHOUT our height advancing — after
 /// which the machine tears down the current sync attempt and re-queries fresh
