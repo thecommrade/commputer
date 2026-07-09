@@ -7,9 +7,9 @@
 //! WHAT (three concerns):
 //!   1. The shared DA seams — `AttestationSource` (bare on-chain `da_root` -> `DaAttestation`)
 //!      and `BlobFetcher` (a resolved attestation -> reconstructed `program‖input` blob). Both
-//!      are traits so tests inject in-process resolvers/fetchers; the production impls are
-//!      `NoAttestationSource` (resolve -> None -> inert Abstain, open-Q15) and `BridgeBlobFetcher`
-//!      (wraps `BridgeTransport` + drives the frozen `DataAvailability::verify_available`). The
+//!      are traits so tests inject in-process resolvers/fetchers; the production impls live in
+//!      `da_attestation` (`DaBackedAttestationSource` + the generic `BridgeBlobFetcher<T>`), while
+//!      `NoAttestationSource` (resolve -> None -> inert Abstain, open-Q15) is the inert default. The
 //!      verifier loop RE-USES these two traits (it imports them from here).
 //!   2. `ExecutorChainView` — the per-block snapshot the PROTECTED event loop builds from
 //!      `ChainState` (open pending jobs, this node's claims + their execution metadata, address,
@@ -21,7 +21,7 @@
 //!
 //! WHERE THIS IS WIRED IN (later, PROTECTED — NOT wired now; this module is inert):
 //!   * `main.rs` (PROTECTED): `[executor] enabled=false`; when on, spawn `run` on a dedicated OS
-//!     thread with a `BridgeBlobFetcher` + `NoAttestationSource`, the shared actor-tx sender, and a
+//!     thread with a `da_attestation::BridgeBlobFetcher` + `NoAttestationSource`, the shared actor-tx sender, and a
 //!     `std::sync::mpsc::Receiver<ExecutorChainView>`.
 //!   * `event_loop.rs` (PROTECTED): each applied block builds an `ExecutorChainView` from
 //!     `self.state` and `send`s it; the single `emit_actor_tx` sink drains the `TxKind`s, assigns
@@ -36,10 +36,10 @@ use std::collections::{HashMap, HashSet};
 
 use commputer_core::identity::Address;
 use commputer_core::transaction::TxKind;
-use commputer_da::facade::{AvailabilityOutcome, DataAvailability};
 use commputer_da::params::DaAttestation;
 use commputer_pouw::wasm::WasmLimits;
-use commputer_pouw_onchain::da_transport::{BridgeTransport, MonotonicClock};
+use commputer_pouw_onchain::lifecycle::{JobLifecycle, PhaseRec};
+use commputer_storage::state::PendingJobRecord;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::executor_planner::{
@@ -95,61 +95,9 @@ impl<T: BlobFetcher + ?Sized> BlobFetcher for Box<T> {
     }
 }
 
-/// Production [`BlobFetcher`]: drives the frozen `DataAvailability::verify_available` over a
-/// [`BridgeTransport`] (whose `DaCommand`s the PROTECTED event loop services against the libp2p
-/// swarm) + a real monotonic clock. `Available(bytes)` → `Some`, `Abstain` → `None`.
-pub struct BridgeBlobFetcher {
-    bridge: BridgeTransport,
-    /// This node's DA identity — one input to the sampling seed.
-    verifier_id: [u8; 32],
-    retry_window_ticks: u64,
-    max_attempts_per_chunk: u32,
-}
-
-impl BridgeBlobFetcher {
-    pub fn new(bridge: BridgeTransport, verifier_id: [u8; 32]) -> Self {
-        Self {
-            bridge,
-            verifier_id,
-            retry_window_ticks: DEFAULT_DA_RETRY_WINDOW_TICKS,
-            max_attempts_per_chunk: DEFAULT_DA_MAX_ATTEMPTS_PER_CHUNK,
-        }
-    }
-
-    pub fn with_params(
-        bridge: BridgeTransport,
-        verifier_id: [u8; 32],
-        retry_window_ticks: u64,
-        max_attempts_per_chunk: u32,
-    ) -> Self {
-        Self {
-            bridge,
-            verifier_id,
-            retry_window_ticks,
-            max_attempts_per_chunk,
-        }
-    }
-}
-
-impl BlobFetcher for BridgeBlobFetcher {
-    fn fetch_blob(&self, att: &DaAttestation) -> Option<Vec<u8>> {
-        let clock = MonotonicClock::new();
-        let da = DataAvailability {
-            transport: &self.bridge,
-            clock: &clock,
-            retry_window_ticks: self.retry_window_ticks,
-            max_attempts_per_chunk: self.max_attempts_per_chunk,
-        };
-        // The sampling seed (job_id, epoch, verifier_id) only picks WHICH chunks are sampled first;
-        // for a fully-published blob every sampled chunk is present and reconstruction re-binds via
-        // sha256==program_id, so the recovered bytes are seed-independent. Use a stable per-attestation
-        // job seed + this fetcher's DA id.
-        match da.verify_available(att, att.program_id, 0, self.verifier_id) {
-            AvailabilityOutcome::Available(bytes) => Some(bytes),
-            AvailabilityOutcome::Abstain => None,
-        }
-    }
-}
+// The production `BlobFetcher` (and its `AttestationSource` companion) is the generic
+// `da_attestation::BridgeBlobFetcher<T>` / `DaBackedAttestationSource<T>`, which supersedes the
+// concrete fetcher that once lived here; both re-use the two traits above.
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // The per-block view + the loop.
@@ -179,6 +127,80 @@ pub struct ExecutorChainView {
     pub my_address: Address,
     /// Spendable balance of the executor wallet.
     pub my_balance: u64,
+}
+
+/// Map the on-chain lifecycle phase (record form) to the executor loop's [`ClaimPhase`]. The two
+/// enums are 1:1 — a `CompleteJob` is only admissible at `AwaitingResult` (the planner enforces it).
+fn record_phase_to_claim(p: PhaseRec) -> ClaimPhase {
+    match p {
+        PhaseRec::AwaitingResult => ClaimPhase::AwaitingResult,
+        PhaseRec::Committing => ClaimPhase::Committing,
+        PhaseRec::Revealing => ClaimPhase::Revealing,
+        PhaseRec::Settled => ClaimPhase::Settled,
+    }
+}
+
+/// Build the executor's per-block [`ExecutorChainView`] from the just-applied `ChainState` maps.
+/// Called by the PROTECTED event loop each block (with `self.state.pending_jobs`,
+/// `self.state.job_lifecycles`, the wallet address + spendable balance) and `send`s the result to
+/// [`run`]. PURE over its inputs and DETERMINISTIC: no wall-clock, no rng; `open_jobs` and
+/// `my_claims` are sorted by `job_id` so the produced view is byte-stable for a given state.
+///
+/// `open_jobs` mirrors every entry of `pending_jobs` (the unclaimed jobs). `my_claims` is every
+/// lifecycle this node is the executor of (`executor == me`), projected via `JobLifecycle::to_record`
+/// (the inner fields are private) — carrying the execution metadata the loop needs to re-execute a
+/// claim it may no longer remember publishing. `_epoch` is accepted for call-site symmetry with the
+/// verifier tick but is not part of the executor snapshot.
+pub fn build_chain_view(
+    height: u64,
+    _epoch: u64,
+    me: Address,
+    my_balance: u64,
+    pending_jobs: &HashMap<[u8; 32], PendingJobRecord>,
+    job_lifecycles: &HashMap<[u8; 32], JobLifecycle>,
+) -> ExecutorChainView {
+    // Every pending (unclaimed) job → an OpenJob.
+    let mut open_jobs: Vec<OpenJob> = pending_jobs
+        .iter()
+        .map(|(job_id, rec)| OpenJob {
+            job_id: *job_id,
+            budget: rec.budget,
+            program_hash: rec.program_hash,
+            input_hash: rec.input_hash,
+            da_root: rec.da_root,
+            claim_by: rec.claim_by,
+        })
+        .collect();
+    open_jobs.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+
+    // Every lifecycle this node is the executor of → an ExecutorClaimView. `ParticipantId(addr.0)`
+    // is the on-chain identity (state.rs), so the record's `executor` bytes equal `me.0`.
+    let mut my_claims: Vec<ExecutorClaimView> = job_lifecycles
+        .iter()
+        .filter_map(|(job_id, lc)| {
+            let rec = lc.to_record();
+            if rec.executor != me.0 {
+                return None;
+            }
+            Some(ExecutorClaimView {
+                job_id: *job_id,
+                phase: record_phase_to_claim(rec.phase),
+                result_by: rec.deadlines.result_by,
+                program_hash: rec.program_hash,
+                input_hash: rec.input_hash,
+                da_root: rec.da_root,
+            })
+        })
+        .collect();
+    my_claims.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+
+    ExecutorChainView {
+        height,
+        open_jobs,
+        my_claims,
+        my_address: me,
+        my_balance,
+    }
 }
 
 /// Returned when the shared actor-tx receiver is gone (the event loop dropped it) → the loop exits.
@@ -636,5 +658,117 @@ mod tests {
         drop(arx);
         run(cfg(), WasmLimits::default(), FixedBlob(blob), AnyAttestation, rx, atx);
         // returns (does not hang) because the emit failed → LoopGone.
+    }
+
+    // ── build_chain_view (on-chain → snapshot constructor) ──────────────────────────────────────
+    use commputer_pouw::params::GameParams;
+    use commputer_pouw_onchain::lifecycle::{JobLifecycleRecord, PhaseDeadlinesRec};
+    use commputer_pouw_onchain::settlement_resolution::ResolutionParams;
+    use std::collections::HashMap as StdHashMap;
+
+    fn pending(job: u8, budget: u64, claim_by: u64) -> PendingJobRecord {
+        PendingJobRecord {
+            submitter: [0x11; 32],
+            budget,
+            program_hash: [job.wrapping_add(1); 32],
+            input_hash: [job.wrapping_add(2); 32],
+            da_root: [job.wrapping_add(3); 32],
+            submitted_height: 1,
+            claim_by,
+        }
+    }
+
+    fn lifecycle_rec(job: u8, executor: [u8; 32], phase: PhaseRec) -> JobLifecycle {
+        let rec = JobLifecycleRecord {
+            job_id: [job; 32],
+            program_hash: [job.wrapping_add(1); 32],
+            input_hash: [job.wrapping_add(2); 32],
+            da_root: [job.wrapping_add(3); 32],
+            submitter: [0x11; 32],
+            executor,
+            executor_bond: 100,
+            budget: 200,
+            verifier_bond: 20,
+            candidates: vec![],
+            deadlines: PhaseDeadlinesRec { result_by: 500, commit_by: 600, reveal_by: 700 },
+            phase,
+            executor_hash: Some([0x99; 32]),
+            committee: vec![],
+            commitments: vec![],
+            reveals: vec![],
+            settled: None,
+        };
+        JobLifecycle::from_record(rec, GameParams::default(), ResolutionParams::default())
+    }
+
+    /// An open pending job appears in `open_jobs`; a lifecycle I execute appears in `my_claims`;
+    /// a lifecycle someone ELSE executes is excluded. Fields + sort order are checked.
+    #[test]
+    fn build_chain_view_projects_open_jobs_and_my_claims() {
+        let me = Address([0x42; 32]);
+        let other = [0x77u8; 32];
+
+        let mut pending_jobs = StdHashMap::new();
+        pending_jobs.insert([2u8; 32], pending(2, 150, 900));
+        pending_jobs.insert([1u8; 32], pending(1, 100, 800));
+
+        let mut lifecycles = StdHashMap::new();
+        lifecycles.insert([5u8; 32], lifecycle_rec(5, me.0, PhaseRec::Committing));
+        lifecycles.insert([6u8; 32], lifecycle_rec(6, other, PhaseRec::AwaitingResult));
+
+        let view = build_chain_view(123, 4, me, 10_000, &pending_jobs, &lifecycles);
+
+        assert_eq!(view.height, 123);
+        assert_eq!(view.my_address, me);
+        assert_eq!(view.my_balance, 10_000);
+
+        // open_jobs: both pending jobs, sorted by job_id, fields mirrored from PendingJobRecord.
+        assert_eq!(view.open_jobs.len(), 2);
+        assert_eq!(view.open_jobs[0].job_id, [1u8; 32]);
+        assert_eq!(view.open_jobs[0].budget, 100);
+        assert_eq!(view.open_jobs[0].claim_by, 800);
+        assert_eq!(view.open_jobs[0].program_hash, [2u8; 32]); // job 1 → +1
+        assert_eq!(view.open_jobs[0].da_root, [4u8; 32]); // job 1 → +3
+        assert_eq!(view.open_jobs[1].job_id, [2u8; 32]);
+        assert_eq!(view.open_jobs[1].budget, 150);
+
+        // my_claims: ONLY the job I execute, with the mapped phase + result deadline + metadata.
+        assert_eq!(view.my_claims.len(), 1, "the other-executor job is excluded");
+        let c = &view.my_claims[0];
+        assert_eq!(c.job_id, [5u8; 32]);
+        assert_eq!(c.phase, ClaimPhase::Committing);
+        assert_eq!(c.result_by, 500);
+        assert_eq!(c.program_hash, [6u8; 32]); // job 5 → +1
+        assert_eq!(c.input_hash, [7u8; 32]); // job 5 → +2
+        assert_eq!(c.da_root, [8u8; 32]); // job 5 → +3
+    }
+
+    /// The four lifecycle phases map 1:1 to `ClaimPhase`.
+    #[test]
+    fn build_chain_view_maps_all_phases() {
+        let me = Address([0x42; 32]);
+        for (rec_phase, want) in [
+            (PhaseRec::AwaitingResult, ClaimPhase::AwaitingResult),
+            (PhaseRec::Committing, ClaimPhase::Committing),
+            (PhaseRec::Revealing, ClaimPhase::Revealing),
+            (PhaseRec::Settled, ClaimPhase::Settled),
+        ] {
+            let mut lifecycles = StdHashMap::new();
+            lifecycles.insert([1u8; 32], lifecycle_rec(1, me.0, rec_phase));
+            let view = build_chain_view(1, 0, me, 0, &StdHashMap::new(), &lifecycles);
+            assert_eq!(view.my_claims.len(), 1);
+            assert_eq!(view.my_claims[0].phase, want);
+        }
+    }
+
+    /// Empty state → empty view (no panics, both vecs empty).
+    #[test]
+    fn build_chain_view_empty_state_is_empty() {
+        let me = Address([0x42; 32]);
+        let view = build_chain_view(7, 1, me, 500, &StdHashMap::new(), &StdHashMap::new());
+        assert!(view.open_jobs.is_empty());
+        assert!(view.my_claims.is_empty());
+        assert_eq!(view.height, 7);
+        assert_eq!(view.my_balance, 500);
     }
 }

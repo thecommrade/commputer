@@ -137,6 +137,13 @@ pub struct RpcState {
     /// holds this lock across the claim check + build + send so concurrent claims
     /// from one IP cannot bypass the per-epoch limit or desync the nonce.
     pub faucet_next_nonce: Mutex<u64>,
+    /// Track-2 (Phase B): shared DA blob store — the `/submit_job` publisher persists
+    /// coded chunks here (the inbound serve path reads the same store). `None` = DA off.
+    pub da_store: Option<std::sync::Arc<commputer::da_store::DaStore>>,
+    /// Track-2 (Phase B): DA backend command sender (into the event loop's da_command
+    /// drain arm) — `/submit_job` uses it to Advertise the published chunks. `None` = DA off.
+    /// `std::sync::mpsc::Sender<T>` is `Sync` on modern rustc, so no Mutex is needed.
+    pub da_command_tx: Option<std::sync::mpsc::Sender<commputer_pouw_onchain::da_transport::DaCommand>>,
 }
 
 /// Response for a submitted transaction.
@@ -1723,6 +1730,88 @@ async fn get_peers_full(
 /// /ws is deliberately PUBLIC: it only streams already-public broadcast events
 /// (the same data the public GET routes expose), so it needs no key.
 ///
+/// Track-2 (Phase B): POST /submit_job request body.
+#[derive(Debug, Deserialize)]
+pub struct SubmitJobRequest {
+    /// Hex-encoded program (WASM) bytes.
+    pub program_hex: String,
+    /// Hex-encoded input bytes.
+    pub input_hex: String,
+    /// Job budget in raw COMME units.
+    pub budget: u64,
+    /// 24-word BIP39 seed of the submitter wallet. Sensitive — this route is keyed-tier;
+    /// the seed transits to this node only (run behind loopback / TLS).
+    pub submitter_seed: String,
+}
+
+/// POST /submit_job (keyed tier) — publish a job's program‖input blob to DA (persist the coded
+/// chunks + the Q15 attestation, advertise them) and submit a `SubmitJobV2` carrying its `da_root`.
+/// This is the entry point that makes a job's bytes retrievable so executors/verifiers can run it.
+async fn submit_job(
+    State(state): State<Arc<RpcState>>,
+    Json(mut req): Json<SubmitJobRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use zeroize::Zeroize;
+    fn err(code: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
+        (code, Json(serde_json::json!({ "error": msg })))
+    }
+
+    let Some(store) = state.da_store.clone() else {
+        req.submitter_seed.zeroize();
+        return err(StatusCode::SERVICE_UNAVAILABLE, "DA backend not enabled on this node");
+    };
+    let program = match hex::decode(req.program_hex.trim()) {
+        Ok(b) => b,
+        Err(_) => { req.submitter_seed.zeroize(); return err(StatusCode::BAD_REQUEST, "invalid program_hex"); }
+    };
+    let input = match hex::decode(req.input_hex.trim()) {
+        Ok(b) => b,
+        Err(_) => { req.submitter_seed.zeroize(); return err(StatusCode::BAD_REQUEST, "invalid input_hex"); }
+    };
+    let submitter = match commputer_core::wallet::Wallet::from_seed_phrase(req.submitter_seed.trim()) {
+        Ok(w) => w,
+        Err(_) => { req.submitter_seed.zeroize(); return err(StatusCode::BAD_REQUEST, "invalid submitter_seed"); }
+    };
+    req.submitter_seed.zeroize();
+    let budget = req.budget;
+
+    // Submitter's next nonce (best-effort from the balances snapshot; 0 for an unseen account).
+    let addr_hex = hex::encode(submitter.address().0);
+    let nonce = state.balances.lock().await.get(&addr_hex).map(|b| b.nonce).unwrap_or(0);
+
+    // Publish (Reed-Solomon coding + disk writes) OFF the async runtime.
+    let (tx, att) = match tokio::task::spawn_blocking(move || {
+        build_and_publish_job(&store, &program, &input, budget, nonce, &submitter)
+    })
+    .await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return err(StatusCode::BAD_REQUEST, &format!("publish failed: {:?}", e)),
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "publish task failed"),
+    };
+
+    // Advertise every published chunk (+ the Q15 attestation object) so committee members can fetch.
+    if let Some(ref da_tx) = state.da_command_tx {
+        use commputer_pouw_onchain::da_transport::DaCommand;
+        let me = commputer_da::params::ProviderId(att.da_root); // informational; Advertise = local start_providing
+        for ch in commputer::da_publisher::live_chunk_hashes(&att) {
+            let _ = da_tx.send(DaCommand::Advertise { chunk_hash: ch, me });
+        }
+    }
+
+    if state.tx_sender.try_send(tx.clone()).is_err() {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "node busy; retry");
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "accepted": true,
+            "da_root": hex::encode(att.da_root),
+            "tx_hash": hex::encode(tx.hash().0),
+        })),
+    )
+}
+
 /// cors_middleware is applied as the OUTERMOST layer (over the whole merged app)
 /// so OPTIONS preflight is answered before auth/rate-limit.
 pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
@@ -1770,6 +1859,10 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/compliance", get(get_compliance))
         .route("/anti-scale", get(get_anti_scale))
         .route("/peers/full", get(get_peers_full))
+        // Track-2 (Phase B): job submission. KEYED tier — it accepts a submitter seed, so it is
+        // NOT on the public tier (the founder may relax to public / loopback-only per §5). 32 MiB
+        // body limit for the program+input payload.
+        .route("/submit_job", post(submit_job).layer(DefaultBodyLimit::max(32 * 1024 * 1024)))
         .route_layer(middleware::from_fn_with_state(rpc_state.clone(), auth_middleware))
         .route_layer(middleware::from_fn_with_state(rpc_state.clone(), rate_limit_middleware));
 
@@ -1915,6 +2008,8 @@ mod tests {
             capacity: Mutex::new((0, 0, 0, 0)),
             faucet_wallet: None,
             faucet_next_nonce: Mutex::new(0),
+            da_store: None,
+            da_command_tx: None,
         });
         (state, rx)
     }

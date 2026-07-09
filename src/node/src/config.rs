@@ -25,6 +25,12 @@ pub struct NodeConfig {
     pub contribution_percent: u8,
     pub log_level: String,
     pub cors_origins: String,
+    /// Track-2 PoUW executor auto-claim loop (OFF by default).
+    pub executor: ExecutorConfig,
+    /// Track-2 PoUW verifier commit/reveal loop (OFF by default).
+    pub verifier: VerifierConfig,
+    /// Track-2 DA backend — serve/publish coded chunks over /commputer/da/1 (OFF by default).
+    pub da: DaConfig,
 }
 
 impl Default for NodeConfig {
@@ -40,7 +46,55 @@ impl Default for NodeConfig {
             contribution_percent: 100,
             log_level: "info".to_string(),
             cors_origins: "*".to_string(),
+            executor: ExecutorConfig::default(),
+            verifier: VerifierConfig::default(),
+            da: DaConfig::default(),
         }
+    }
+}
+
+/// Track-2 PoUW executor auto-claim loop config (Phase B). OFF by default — a node
+/// with `enabled=false` and `auto_enable_when_bonded=false` never runs the loop and
+/// is byte-identical on-chain to today.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ExecutorConfig {
+    pub enabled: bool,
+    pub auto_enable_when_bonded: bool,
+    pub max_concurrent_claims: usize,
+    pub min_balance_reserve: u64,
+}
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        Self { enabled: false, auto_enable_when_bonded: true, max_concurrent_claims: 4, min_balance_reserve: 0 }
+    }
+}
+
+/// Track-2 PoUW verifier commit/reveal loop config (Phase B). OFF by default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VerifierConfig {
+    pub enabled: bool,
+    pub auto_enable_when_bonded: bool,
+    pub min_balance_reserve: u64,
+}
+impl Default for VerifierConfig {
+    fn default() -> Self {
+        Self { enabled: false, auto_enable_when_bonded: true, min_balance_reserve: 0 }
+    }
+}
+
+/// Track-2 DA backend config (Phase B). OFF by default. `fetch_timeout_ms` bounds
+/// each BridgeTransport DA call (P11) so a loop never blocks unboundedly.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DaConfig {
+    pub enabled: bool,
+    pub fetch_timeout_ms: u64,
+}
+impl Default for DaConfig {
+    fn default() -> Self {
+        Self { enabled: false, fetch_timeout_ms: 5_000 }
     }
 }
 

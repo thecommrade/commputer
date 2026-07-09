@@ -887,7 +887,7 @@ async fn run_node(
     config::ensure_dirs(testnet);
 
     // Item 6: Load config from ~/.commputer/config.toml (CLI flags override).
-    let _node_config = config::NodeConfig::load();
+    let node_config = config::NodeConfig::load();
 
     print_banner();
 
@@ -1157,6 +1157,37 @@ async fn run_node(
     // when the env var is unset (faucet disabled on this node).
     let (faucet_wallet, faucet_next_nonce) = rpc::provision_faucet_from_env(&state)?;
 
+    // ── Track-2 (Phase B): DA backend + PoUW actor loops (all OFF unless config enables) ──
+    // Capture consensus-anchored values BEFORE `state`/`wallet` move into EventLoop::new.
+    let exec_verifier_id: [u8; 32] = wallet.address().0;
+    let executor_bond: u64 = state.game_params.executor_bond;
+    let run_executor = node_config.executor.enabled || node_config.executor.auto_enable_when_bonded;
+    let run_verifier = node_config.verifier.enabled || node_config.verifier.auto_enable_when_bonded;
+    // DA is needed by either loop; open ONE store + ONE command backend (Q14) and pump std→tokio.
+    let da_enabled = node_config.da.enabled || run_executor || run_verifier;
+    let (da_store, da_cmd_tx, da_cmd_tok_rx) = if da_enabled {
+        use commputer_pouw_onchain::da_transport::DaCommand;
+        let store = std::sync::Arc::new(commputer::da_store::DaStore::open(
+            config::data_dir(testnet).join("da_chunks"),
+        )?);
+        let (std_tx, std_rx) = std::sync::mpsc::channel::<DaCommand>();
+        let (tok_tx, tok_rx) = tokio::sync::mpsc::unbounded_channel::<DaCommand>();
+        // The da-cmd-pump bridges the frozen std::mpsc BridgeTransport → the event loop's tokio recv.
+        std::thread::Builder::new()
+            .name("da-cmd-pump".into())
+            .spawn(move || {
+                while let Ok(c) = std_rx.recv() {
+                    if tok_tx.send(c).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn da-cmd-pump");
+        (Some(store), Some(std_tx), Some(tok_rx))
+    } else {
+        (None, None, None)
+    };
+
     let rpc_state = std::sync::Arc::new(rpc::RpcState {
         tx_sender,
         status: tokio::sync::Mutex::new(initial_status),
@@ -1195,12 +1226,81 @@ async fn run_node(
         capacity: tokio::sync::Mutex::new((0, 0, 0, 0)),
         faucet_wallet,
         faucet_next_nonce: tokio::sync::Mutex::new(faucet_next_nonce),
+        da_store: da_store.clone(),
+        da_command_tx: da_cmd_tx.clone(),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).
     let mut event_loop = EventLoop::new(state, wallet, network, hardware);
     event_loop.attach_rpc(tx_receiver, rpc_state.clone());
     event_loop.auto_register_validator(contribution_percent);
+
+    // ── Track-2 (Phase B): hand the DA backend to the swarm-owner + spawn the PoUW loops ──
+    if let (Some(rx), Some(store)) = (da_cmd_tok_rx, da_store.clone()) {
+        event_loop.attach_da(rx, store);
+    }
+    // P4: the ONE shared actor-tx channel — the event loop owns the receiver (sole nonce owner);
+    // both loops clone the sender and emit nonce-free TxKind.
+    let (actor_tx_tx, actor_tx_rx) =
+        tokio::sync::mpsc::unbounded_channel::<commputer_core::transaction::TxKind>();
+    event_loop.attach_actor_tx(actor_tx_rx);
+    let da_timeout = std::time::Duration::from_millis(node_config.da.fetch_timeout_ms); // P11 per-call bound
+
+    // Executor loop on a dedicated OS thread — BridgeTransport blocks on replies the event loop makes,
+    // so it MUST NOT run on the event-loop thread. WasmLimits stay at the compiled default (the single
+    // consensus-anchored source; refuse_to_bind asserts it matches genesis network-wide).
+    if run_executor {
+        if let Some(ref tx) = da_cmd_tx {
+            let (snap_tx, snap_rx) = std::sync::mpsc::channel();
+            event_loop.attach_executor(snap_tx);
+            let cfg = commputer::executor_planner::ExecutorCfg {
+                max_concurrent_claims: node_config.executor.max_concurrent_claims,
+                min_balance_reserve: node_config.executor.min_balance_reserve,
+                executor_bond,
+            };
+            let bridge_att = commputer_pouw_onchain::da_transport::BridgeTransport::with_timeout(tx.clone(), da_timeout);
+            let bridge_fetch = commputer_pouw_onchain::da_transport::BridgeTransport::with_timeout(tx.clone(), da_timeout);
+            let atts = commputer::da_attestation::DaBackedAttestationSource::new(bridge_att);
+            let fetcher = commputer::da_attestation::BridgeBlobFetcher::new(bridge_fetch, exec_verifier_id);
+            let wasm_limits = commputer_pouw::wasm::WasmLimits::default();
+            let act = actor_tx_tx.clone();
+            std::thread::Builder::new()
+                .name("pouw-executor".into())
+                .spawn(move || {
+                    commputer::executor_loop::run(cfg, wasm_limits, fetcher, atts, snap_rx, act);
+                })
+                .expect("spawn pouw-executor");
+        }
+    }
+
+    // Verifier loop on a dedicated OS thread. The closure OWNS the SaltStore (needs 'static); the loop
+    // borrows it &mut. WasmLimits MUST equal the executor's (a divergent limit slashes the honest executor).
+    if run_verifier {
+        if let Some(ref tx) = da_cmd_tx {
+            let (vsnap_tx, vsnap_rx) = std::sync::mpsc::channel();
+            event_loop.verifier_snapshot_tx = Some(vsnap_tx);
+            let bridge_att = commputer_pouw_onchain::da_transport::BridgeTransport::with_timeout(tx.clone(), da_timeout);
+            let bridge_fetch = commputer_pouw_onchain::da_transport::BridgeTransport::with_timeout(tx.clone(), da_timeout);
+            let atts = commputer::da_attestation::DaBackedAttestationSource::new(bridge_att);
+            let fetcher = commputer::da_attestation::BridgeBlobFetcher::new(bridge_fetch, exec_verifier_id);
+            let vcfg = commputer::verifier_planner::VerifierCfg {
+                min_balance_reserve: node_config.verifier.min_balance_reserve,
+            };
+            let wasm_limits = commputer_pouw::wasm::WasmLimits::default();
+            let salt_dir = config::data_dir(testnet);
+            let act = actor_tx_tx.clone();
+            std::thread::Builder::new()
+                .name("pouw-verifier".into())
+                .spawn(move || {
+                    let mut salts = commputer::salt_store::SaltStore::open(salt_dir)
+                        .expect("open verifier salt store");
+                    commputer::verifier_loop::run_verifier_loop(
+                        vsnap_rx, act, fetcher, atts, &mut salts, wasm_limits, vcfg,
+                    );
+                })
+                .expect("spawn pouw-verifier");
+        }
+    }
 
     // Feature 178: Store custom seeds for periodic reconnection.
     // Mark as seed connector if custom seeds were provided — this node

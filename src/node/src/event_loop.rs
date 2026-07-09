@@ -222,6 +222,24 @@ pub struct EventLoop {
     pub peer_last_seen: HashMap<libp2p::PeerId, std::time::Instant>,
     /// Chain health monitor: block freshness, timeout rate, avg block time, active voters.
     pub health_monitor: ChainHealthMonitor,
+    // ── Track-2 (Phase B): all None/parked unless main.rs attaches them → byte-identical on-chain when off ──
+    /// DA backend command receiver (from the std→tokio da-cmd-pump). None = DA off.
+    pub da_command_rx: Option<tokio::sync::mpsc::UnboundedReceiver<commputer_pouw_onchain::da_transport::DaCommand>>,
+    /// Node-local coded-chunk blob store, shared (Arc) with the publish/submit path + inbound serve.
+    pub da_store: Option<Arc<commputer::da_store::DaStore>>,
+    /// In-flight Kademlia get_providers queries → the loop's reply Sender.
+    pub pending_find: HashMap<libp2p::kad::QueryId, std::sync::mpsc::Sender<Vec<commputer_da::params::ProviderId>>>,
+    /// In-flight DA GetChunk requests → the loop's reply Sender.
+    pub pending_fetch: HashMap<libp2p::request_response::OutboundRequestId,
+        std::sync::mpsc::Sender<Option<(Vec<u8>, commputer_da::transport::MerklePath)>>>,
+    /// Reversible ProviderId(tag) → dialable PeerId, populated as providers are discovered.
+    pub da_provider_ids: HashMap<[u8; 32], libp2p::PeerId>,
+    /// Per-block executor snapshot sender (to the off-thread executor loop). None = executor off.
+    pub executor_snapshot_tx: Option<std::sync::mpsc::Sender<commputer::executor_loop::ExecutorChainView>>,
+    /// Per-block verifier snapshot sender (to the off-thread verifier loop). None = verifier off.
+    pub verifier_snapshot_tx: Option<std::sync::mpsc::Sender<commputer::verifier_loop::VerifierTick>>,
+    /// P4: the SINGLE actor-tx receiver — both loops emit nonce-free TxKind here; the event loop is the sole nonce owner.
+    pub actor_tx_rx: Option<tokio::sync::mpsc::UnboundedReceiver<commputer_core::transaction::TxKind>>,
 }
 
 impl EventLoop {
@@ -295,6 +313,15 @@ impl EventLoop {
             last_resync: None,
             peer_last_seen: HashMap::new(),
             health_monitor: ChainHealthMonitor::new(),
+            // Track-2 (Phase B): parked until main.rs attaches them.
+            da_command_rx: None,
+            da_store: None,
+            pending_find: HashMap::new(),
+            pending_fetch: HashMap::new(),
+            da_provider_ids: HashMap::new(),
+            executor_snapshot_tx: None,
+            verifier_snapshot_tx: None,
+            actor_tx_rx: None,
         }
     }
 
@@ -307,6 +334,131 @@ impl EventLoop {
         self.rpc_rx = Some(rx);
         self.rpc_state = Some(state);
         self.update_rpc_status();
+    }
+
+    /// Track-2 (Phase B): attach the DA backend — the command receiver (from the
+    /// std→tokio da-cmd-pump) + the shared blob store. Idempotent-off until called.
+    pub fn attach_da(
+        &mut self,
+        da_command_rx: tokio::sync::mpsc::UnboundedReceiver<commputer_pouw_onchain::da_transport::DaCommand>,
+        da_store: Arc<commputer::da_store::DaStore>,
+    ) {
+        self.da_command_rx = Some(da_command_rx);
+        self.da_store = Some(da_store);
+    }
+
+    /// Track-2 (Phase B, P4): attach the ONE shared actor-tx receiver — both loops
+    /// emit nonce-free TxKind here and the event loop is the sole wallet-nonce owner.
+    pub fn attach_actor_tx(&mut self, rx: tokio::sync::mpsc::UnboundedReceiver<commputer_core::transaction::TxKind>) {
+        self.actor_tx_rx = Some(rx);
+    }
+
+    /// Track-2 (Phase B): attach the executor loop's per-block snapshot sender.
+    pub fn attach_executor(&mut self, snapshot_tx: std::sync::mpsc::Sender<commputer::executor_loop::ExecutorChainView>) {
+        self.executor_snapshot_tx = Some(snapshot_tx);
+    }
+
+    /// P4/P10 (Phase B): the SINGLE actor-tx sink. Both PoUW loops emit nonce-free
+    /// TxKind here; this — the sole wallet-nonce owner — assigns the nonce, signs, and
+    /// admits via the SAME mempool path as an RPC tx (F-3 quota + C7 ingress + dedup).
+    fn emit_actor_tx(&mut self, kind: commputer_core::transaction::TxKind) {
+        use commputer_core::transaction::{Transaction, TxKind, MINIMUM_FEE};
+        let me = *self.wallet.address();
+        // P2: capture a static tag from &kind BEFORE it moves into the literal (TxKind is not Copy).
+        let tag: &'static str = match &kind {
+            TxKind::ClaimJob { .. } => "ClaimJob",
+            TxKind::CompleteJob { .. } => "CompleteJob",
+            TxKind::Commit { .. } => "Commit",
+            TxKind::Reveal { .. } => "Reveal",
+            _ => "actor-tx",
+        };
+        let base = self.state.accounts.get(&me).map(|a| a.nonce).unwrap_or(0);
+        let pending = self.pending_txs.iter().filter(|t| t.from == me).count() as u64;
+        let nonce = base.saturating_add(pending);
+        let mut tx = Transaction {
+            from: me, nonce, kind, fee: MINIMUM_FEE,
+            signature: vec![], public_key: vec![], memo: None, timelock: None,
+        };
+        commputer_core::signing::sign_transaction(&mut tx, &self.wallet);
+        if let Err(reason) = self.validate_tx_for_mempool(&tx) {
+            debug!("actor tx {} rejected pre-mempool: {}", tag, reason);
+            return;
+        }
+        let tx_hash = tx.hash();
+        self.seen_tx_hashes.insert(tx_hash);
+        if let Ok(data) = serde_json::to_vec(&tx) {
+            let _ = self.network.swarm.behaviour_mut().gossipsub
+                .publish(topics::tx_topic(), commputer_network::compress(&data));
+        }
+        self.mempool_added_at.insert(tx_hash, std::time::Instant::now());
+        self.pending_txs.push(tx);
+        self.enforce_mempool_limit();
+        debug!("Emitted actor {} (nonce {})", tag, nonce);
+    }
+
+    /// R2 (Phase B): push an executor snapshot post-apply. Runtime P9 gate — act ONLY
+    /// as a bonded, eligible validator (the "auto-enable when bonded" gate). No-op off.
+    fn push_executor_snapshot(&self) {
+        let Some(ref tx) = self.executor_snapshot_tx else { return };
+        let me = *self.wallet.address();
+        let is_validator = self.state.accounts.get(&me).map(|a| a.is_validator).unwrap_or(false);
+        if !is_validator || !self.state.is_eligible(&me) { return; }
+        let my_balance = self.state.accounts.get(&me).map(|a| a.balance.raw()).unwrap_or(0);
+        let view = commputer::executor_loop::build_chain_view(
+            self.state.blocks.height(), self.state.current_epoch, me, my_balance,
+            &self.state.pending_jobs, &self.state.job_lifecycles,
+        );
+        let _ = tx.send(view);
+    }
+
+    /// R3 (Phase B): push a verifier snapshot post-apply. Same runtime bonded gate.
+    fn push_verifier_snapshot(&self) {
+        let Some(ref tx) = self.verifier_snapshot_tx else { return };
+        let me = *self.wallet.address();
+        let is_validator = self.state.accounts.get(&me).map(|a| a.is_validator).unwrap_or(false);
+        if !is_validator || !self.state.is_eligible(&me) { return; }
+        let my_balance = self.state.accounts.get(&me).map(|a| a.balance.raw()).unwrap_or(0);
+        let tick = commputer::verifier_loop::build_verifier_views(
+            self.state.blocks.height(), me, my_balance, &self.state.job_lifecycles,
+        );
+        let _ = tx.send(tick);
+    }
+
+    /// R1 (Phase B): stable reversible tag PeerId → ProviderId([u8;32]) = sha256(peer.to_bytes()).
+    fn da_provider_tag(peer: &libp2p::PeerId) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(peer.to_bytes()).into()
+    }
+
+    /// R1 (Phase B): service one DaCommand from the off-thread loops. The swarm is
+    /// single-owner (this task), so the loops inject commands + correlate async replies
+    /// via pending_find/pending_fetch. A dropped reply Sender → the frozen bridge
+    /// degrades to Abstain (never a hang).
+    fn handle_da_command(&mut self, cmd: commputer_pouw_onchain::da_transport::DaCommand) {
+        use commputer_pouw_onchain::da_transport::DaCommand;
+        match cmd {
+            DaCommand::Advertise { chunk_hash, .. } => {
+                let key = libp2p::kad::RecordKey::new(&chunk_hash);
+                let _ = self.network.swarm.behaviour_mut().kademlia.start_providing(key);
+            }
+            DaCommand::HasChunk { chunk_hash, reply } => {
+                let has = self.da_store.as_ref().map(|s| s.has(chunk_hash)).unwrap_or(false);
+                let _ = reply.send(has);
+            }
+            DaCommand::FindProviders { chunk_hash, reply } => {
+                let key = libp2p::kad::RecordKey::new(&chunk_hash);
+                let qid = self.network.swarm.behaviour_mut().kademlia.get_providers(key);
+                self.pending_find.insert(qid, reply);
+            }
+            DaCommand::FetchChunk { chunk_hash, from, reply } => {
+                if let Some(peer) = self.da_provider_ids.get(&from.0).copied() {
+                    let req = commputer_network::da_protocol::DaRequest::GetChunk { chunk_hash };
+                    let rid = self.network.swarm.behaviour_mut().da.send_request(&peer, req);
+                    self.pending_fetch.insert(rid, reply);
+                }
+                // else: unknown provider tag → drop reply → facade Abstains (honest).
+            }
+        }
     }
 
     /// Wipe chain state and re-enter sync mode.
@@ -720,6 +872,22 @@ impl EventLoop {
                     std::future::pending::<Option<Transaction>>().await
                 }
             };
+            // Track-2 (Phase B): DA backend commands + the single actor-tx sink.
+            // Both park forever when their channel is unattached → zero cost when off.
+            let da_recv = async {
+                if let Some(ref mut rx) = self.da_command_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending::<Option<commputer_pouw_onchain::da_transport::DaCommand>>().await
+                }
+            };
+            let actor_recv = async {
+                if let Some(ref mut rx) = self.actor_tx_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending::<Option<commputer_core::transaction::TxKind>>().await
+                }
+            };
 
             tokio::select! {
                 swarm_result = std::panic::AssertUnwindSafe(self.network.swarm.select_next_some()).catch_unwind() => {
@@ -740,6 +908,14 @@ impl EventLoop {
                 Some(tx) = rpc_recv => {
                     info!("Received transaction from RPC: {}", hex::encode(tx.hash().0));
                     self.handle_rpc_transaction(tx);
+                }
+                Some(kind) = actor_recv => {
+                    // P4: the single wallet-nonce owner signs + admits the loop's tx.
+                    self.emit_actor_tx(kind);
+                }
+                Some(cmd) = da_recv => {
+                    // R1: service one DA backend command against the swarm.
+                    self.handle_da_command(cmd);
                 }
                 _ = epoch_interval.tick() => {
                     self.handle_epoch_tick();
@@ -1451,8 +1627,30 @@ impl EventLoop {
             SwarmEvent::Behaviour(CommpBehaviourEvent::Kademlia(kad_event)) => {
                 use libp2p::kad;
                 match kad_event {
-                    kad::Event::OutboundQueryProgressed { result, .. } => {
+                    kad::Event::OutboundQueryProgressed { id, result, .. } => {
                         match result {
+                            // R1 (Phase B): DA provider discovery. Tag each PeerId to a reversible
+                            // ProviderId, remember the PeerId so a follow-up FetchChunk can dial it,
+                            // and fulfil the loop's stashed FindProviders reply.
+                            kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { providers, .. })) => {
+                                if let Some(reply) = self.pending_find.remove(&id) {
+                                    let mut out = Vec::with_capacity(providers.len());
+                                    for peer in providers {
+                                        let tag = Self::da_provider_tag(&peer);
+                                        self.da_provider_ids.insert(tag, peer);
+                                        out.push(commputer_da::params::ProviderId(tag));
+                                    }
+                                    let _ = reply.send(out);
+                                }
+                            }
+                            kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. })) => {
+                                if let Some(reply) = self.pending_find.remove(&id) {
+                                    let _ = reply.send(Vec::new());
+                                }
+                            }
+                            kad::QueryResult::GetProviders(Err(_)) => {
+                                self.pending_find.remove(&id); // → the loop's bridge Abstains
+                            }
                             kad::QueryResult::Bootstrap(Ok(result)) => {
                                 debug!("Kademlia bootstrap progress: {} remaining peers", result.num_remaining);
                             }
@@ -1606,6 +1804,48 @@ impl EventLoop {
                         debug!("Sync response to {} failed: {}", peer, error);
                     }
                     RrEvent::ResponseSent { .. } => {}
+                }
+            }
+            // === Track-2 DA request-response protocol (/commputer/da/1) ===
+            SwarmEvent::Behaviour(CommpBehaviourEvent::Da(event)) => {
+                use libp2p::request_response::{Event as RrEvent, Message as RrMessage};
+                use commputer_network::da_protocol::{DaRequest, DaResponse};
+                match event {
+                    RrEvent::Message { peer, message } => match message {
+                        RrMessage::Request { request, channel, .. } => {
+                            let DaRequest::GetChunk { chunk_hash } = request;
+                            // P8: gate the inbound serve on the sync limiter (distinct bucket tag 2)
+                            // so a GetChunk flood can't pin the swarm thread / starve block sync.
+                            let chunk = if self
+                                .sync_rate_limiter
+                                .check(commputer::peer_hash::peer_bucket_tagged(&peer, 2))
+                            {
+                                self.da_store.as_ref().and_then(|s| s.get(chunk_hash).ok().flatten())
+                            } else {
+                                None
+                            };
+                            let _ = self
+                                .network
+                                .swarm
+                                .behaviour_mut()
+                                .da
+                                .send_response(channel, DaResponse::Chunk(chunk));
+                        }
+                        RrMessage::Response { request_id, response } => {
+                            if let Some(reply) = self.pending_fetch.remove(&request_id) {
+                                let DaResponse::Chunk(opt) = response;
+                                let out = opt.and_then(|c| {
+                                    commputer::da_publisher::deserialize_merkle_path(&c.merkle_path)
+                                        .map(|path| (c.bytes, path))
+                                });
+                                let _ = reply.send(out);
+                            }
+                        }
+                    },
+                    RrEvent::OutboundFailure { request_id, .. } => {
+                        self.pending_fetch.remove(&request_id); // → the loop's bridge Abstains
+                    }
+                    RrEvent::InboundFailure { .. } | RrEvent::ResponseSent { .. } => {}
                 }
             }
             // === Consensus request-response protocol ===
@@ -3302,6 +3542,10 @@ impl EventLoop {
                     // Feature 127: Check for orphaned blocks that can now be processed.
                     self.process_orphans(hash);
 
+                    // Track-2 (Phase B): feed the PoUW loops the just-applied state (no-op unless attached + bonded).
+                    self.push_executor_snapshot();
+                    self.push_verifier_snapshot();
+
                     // Prune finalized txs from the local mempool.
                     let block_tx_hashes: HashSet<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
                     self.pending_txs.retain(|tx| !block_tx_hashes.contains(&tx.hash()));
@@ -3407,6 +3651,10 @@ impl EventLoop {
 
                 // Process any orphans that can now be applied.
                 self.process_orphans(hash);
+
+                // Track-2 (Phase B): feed the PoUW loops the just-applied state.
+                self.push_executor_snapshot();
+                self.push_verifier_snapshot();
             }
             Err(e) => {
                 warn!("Sync: failed to apply block {} at height {}: {}", hash, height, e);

@@ -31,6 +31,7 @@ use commputer_core::identity::Address;
 use commputer_core::token::Amount;
 use commputer_core::transaction::TxKind;
 use commputer_pouw::wasm::WasmLimits;
+use commputer_pouw_onchain::lifecycle::{JobLifecycle, PhaseRec};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::executor_loop::{AttestationSource, BlobFetcher};
@@ -80,6 +81,65 @@ pub struct VerifierTick {
     pub committees: Vec<VerifierCommitteeView>,
     pub my_address: Address,
     pub my_balance: u64,
+}
+
+/// Map the on-chain lifecycle phase (record form) to the verifier loop's [`VerifierPhase`]. Only
+/// `Committing`/`Revealing` are actionable for a verifier; everything else (`AwaitingResult` —
+/// committee not yet drawn — and `Settled`) is `Other` (the planner does nothing).
+fn record_phase_to_verifier(p: PhaseRec) -> VerifierPhase {
+    match p {
+        PhaseRec::Committing => VerifierPhase::Committing,
+        PhaseRec::Revealing => VerifierPhase::Revealing,
+        PhaseRec::AwaitingResult | PhaseRec::Settled => VerifierPhase::Other,
+    }
+}
+
+/// Build the verifier's per-block [`VerifierTick`] from the just-applied `job_lifecycles`. Called by
+/// the PROTECTED event loop each block (with `self.state.job_lifecycles`, the wallet address +
+/// spendable balance) and `send`s the result to [`run_verifier_loop`]. PURE + DETERMINISTIC: no
+/// wall-clock, no rng; `committees` is sorted by `job_id` so the tick is byte-stable for a state.
+///
+/// A lifecycle contributes a [`VerifierCommitteeView`] iff this node was drawn onto its committee.
+/// The committee stores each drawn verifier as `ParticipantId(addr.0)` (state.rs `record_commit`),
+/// so membership is `committee.contains(&me.0)`, and `already_committed`/`already_revealed` are the
+/// presence of `me.0` in the record's `commitments`/`reveals` (NOT mere non-emptiness — another
+/// verifier's commit is not ours). `settled` is the terminal cache being populated → salt GC.
+pub fn build_verifier_views(
+    now_height: u64,
+    me: Address,
+    my_balance: u64,
+    job_lifecycles: &HashMap<[u8; 32], JobLifecycle>,
+) -> VerifierTick {
+    let mut committees: Vec<VerifierCommitteeView> = job_lifecycles
+        .iter()
+        .filter_map(|(job_id, lc)| {
+            let rec = lc.to_record();
+            if !rec.committee.contains(&me.0) {
+                return None; // not drawn onto this committee.
+            }
+            Some(VerifierCommitteeView {
+                job_id: *job_id,
+                phase: record_phase_to_verifier(rec.phase),
+                commit_by: rec.deadlines.commit_by,
+                reveal_by: rec.deadlines.reveal_by,
+                verifier_bond: rec.verifier_bond,
+                already_committed: rec.commitments.iter().any(|c| c.verifier == me.0),
+                already_revealed: rec.reveals.iter().any(|r| r.verifier == me.0),
+                program_hash: rec.program_hash,
+                input_hash: rec.input_hash,
+                da_root: rec.da_root,
+                settled: rec.settled.is_some(),
+            })
+        })
+        .collect();
+    committees.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+
+    VerifierTick {
+        now_height,
+        committees,
+        my_address: me,
+        my_balance,
+    }
 }
 
 /// Returned when the shared actor-tx receiver is gone (the event loop dropped it) → the loop exits.
@@ -634,5 +694,151 @@ mod tests {
 
         assert!(salts.get(&[1; 32]).is_none(), "settled → salt GC'd");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── build_verifier_views (on-chain → tick constructor) ──────────────────────────────────────
+    use commputer_pouw::params::GameParams;
+    use commputer_pouw_onchain::lifecycle::{
+        CommitmentRec, JobLifecycleRecord, PhaseDeadlinesRec, RevealRec, SettlementOutcomeRec,
+        TerminalRec,
+    };
+    use commputer_pouw_onchain::settlement_resolution::ResolutionParams;
+    use std::collections::HashMap as StdHashMap;
+
+    fn commit_of(verifier: [u8; 32]) -> CommitmentRec {
+        CommitmentRec { verifier, commit: [0; 32], bond: 20 }
+    }
+    fn reveal_of(verifier: [u8; 32]) -> RevealRec {
+        RevealRec { verifier, result_hash: [0; 32], salt: [0; 32] }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lc_committee(
+        job: u8,
+        committee: Vec<[u8; 32]>,
+        phase: PhaseRec,
+        commitments: Vec<CommitmentRec>,
+        reveals: Vec<RevealRec>,
+        settled: bool,
+    ) -> JobLifecycle {
+        let term = SettlementOutcomeRec {
+            worker_paid: 0,
+            verifiers_paid: 0,
+            burned: 0,
+            submitter_refunded: 0,
+            challenger_paid: 0,
+            panel_paid: 0,
+            bonds_returned: 0,
+            slashed: vec![],
+        };
+        let rec = JobLifecycleRecord {
+            job_id: [job; 32],
+            program_hash: [job.wrapping_add(1); 32],
+            input_hash: [job.wrapping_add(2); 32],
+            da_root: [job.wrapping_add(3); 32],
+            submitter: [0x11; 32],
+            executor: [0x99; 32],
+            executor_bond: 100,
+            budget: 200,
+            verifier_bond: 20,
+            candidates: vec![],
+            deadlines: PhaseDeadlinesRec { result_by: 40, commit_by: 100, reveal_by: 200 },
+            phase,
+            executor_hash: Some([0x88; 32]),
+            committee,
+            commitments,
+            reveals,
+            settled: if settled { Some(TerminalRec::TimedOut(term)) } else { None },
+        };
+        JobLifecycle::from_record(rec, GameParams::default(), ResolutionParams::default())
+    }
+
+    /// Only committees this node was drawn onto appear (sorted by job_id); `already_committed` /
+    /// `already_revealed` reflect MY recorded commit/reveal; deadlines + bond + metadata mirror.
+    #[test]
+    fn build_verifier_views_projects_committees_i_am_on() {
+        let me = Address(ME);
+        let mut lifecycles = StdHashMap::new();
+        // job 1: on committee, committed (not revealed).
+        lifecycles.insert(
+            [1u8; 32],
+            lc_committee(1, vec![ME, [1; 32]], PhaseRec::Committing, vec![commit_of(ME)], vec![], false),
+        );
+        // job 2: NOT on committee → excluded.
+        lifecycles.insert(
+            [2u8; 32],
+            lc_committee(2, vec![[7; 32], [8; 32]], PhaseRec::Committing, vec![], vec![], false),
+        );
+        // job 3: on committee, committed AND revealed, Revealing phase.
+        lifecycles.insert(
+            [3u8; 32],
+            lc_committee(3, vec![ME], PhaseRec::Revealing, vec![commit_of(ME)], vec![reveal_of(ME)], false),
+        );
+
+        let tick = build_verifier_views(55, me, 9_000, &lifecycles);
+        assert_eq!(tick.now_height, 55);
+        assert_eq!(tick.my_address, me);
+        assert_eq!(tick.my_balance, 9_000);
+
+        assert_eq!(tick.committees.len(), 2, "job 2 (not my committee) excluded");
+        let c1 = &tick.committees[0];
+        assert_eq!(c1.job_id, [1u8; 32]);
+        assert_eq!(c1.phase, VerifierPhase::Committing);
+        assert_eq!(c1.commit_by, 100);
+        assert_eq!(c1.reveal_by, 200);
+        assert_eq!(c1.verifier_bond, 20);
+        assert!(c1.already_committed);
+        assert!(!c1.already_revealed);
+        assert_eq!(c1.program_hash, [2u8; 32]); // job 1 → +1
+        assert_eq!(c1.da_root, [4u8; 32]); // job 1 → +3
+        assert!(!c1.settled);
+
+        let c3 = &tick.committees[1];
+        assert_eq!(c3.job_id, [3u8; 32]);
+        assert_eq!(c3.phase, VerifierPhase::Revealing);
+        assert!(c3.already_committed);
+        assert!(c3.already_revealed);
+    }
+
+    /// Non-vacuity for the committer-id check: on the committee, but the only commitment is by a
+    /// DIFFERENT verifier → `already_committed` is false (we key on `me.0`, not mere presence).
+    #[test]
+    fn already_committed_reflects_committer_id_not_presence() {
+        let me = Address(ME);
+        let other = [0x77u8; 32];
+        let mut lifecycles = StdHashMap::new();
+        lifecycles.insert(
+            [1u8; 32],
+            lc_committee(1, vec![ME, other], PhaseRec::Committing, vec![commit_of(other)], vec![], false),
+        );
+        let tick = build_verifier_views(10, me, 1_000, &lifecycles);
+        assert_eq!(tick.committees.len(), 1);
+        assert!(!tick.committees[0].already_committed, "another verifier's commit is not mine");
+        assert!(!tick.committees[0].already_revealed);
+    }
+
+    /// Phase mapping + the `settled` (terminal cached) flag.
+    #[test]
+    fn build_verifier_views_maps_phases_and_settled() {
+        let me = Address(ME);
+        for (rp, want) in [
+            (PhaseRec::Committing, VerifierPhase::Committing),
+            (PhaseRec::Revealing, VerifierPhase::Revealing),
+            (PhaseRec::AwaitingResult, VerifierPhase::Other),
+            (PhaseRec::Settled, VerifierPhase::Other),
+        ] {
+            let mut lifecycles = StdHashMap::new();
+            lifecycles.insert([1u8; 32], lc_committee(1, vec![ME], rp, vec![], vec![], false));
+            let tick = build_verifier_views(1, me, 0, &lifecycles);
+            assert_eq!(tick.committees.len(), 1);
+            assert_eq!(tick.committees[0].phase, want);
+            assert!(!tick.committees[0].settled);
+        }
+        // A settled terminal → `settled == true` (and phase maps to Other).
+        let mut lifecycles = StdHashMap::new();
+        lifecycles.insert([1u8; 32], lc_committee(1, vec![ME], PhaseRec::Settled, vec![], vec![], true));
+        let tick = build_verifier_views(1, me, 0, &lifecycles);
+        assert!(tick.committees[0].settled);
+        assert_eq!(tick.committees[0].phase, VerifierPhase::Other);
     }
 }
