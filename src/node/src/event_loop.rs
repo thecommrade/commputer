@@ -208,6 +208,8 @@ pub struct EventLoop {
     pub sync_machine: commputer::sync_machine::SyncMachine,
     /// Consensus rate limiter -- prevents vote spam and duplicate votes.
     pub consensus_rate_limiter: commputer_network::consensus_rate_limiter::ConsensusRateLimiter,
+    /// Sync-protocol rate limiter -- per-peer token buckets for GetBlock/GetBlocks serving.
+    pub sync_rate_limiter: commputer_network::sync_rate_limiter::SyncRateLimiter,
     /// Peers who have voted for the current consensus height (avoids retry spam).
     pub voted_peers: HashSet<libp2p::PeerId>,
     /// Fork detection circuit breaker.
@@ -285,6 +287,7 @@ impl EventLoop {
             node_state: commputer::node_state::NodeStateMachine::new(),
             sync_machine: commputer::sync_machine::SyncMachine::new(),
             consensus_rate_limiter: commputer_network::consensus_rate_limiter::ConsensusRateLimiter::new(),
+            sync_rate_limiter: commputer_network::sync_rate_limiter::SyncRateLimiter::new(),
             voted_peers: HashSet::new(),
             network_height: 0,
             fork_detector: commputer::fork_detector::ForkDetector::new(),
@@ -574,6 +577,9 @@ impl EventLoop {
             let _ = self.network.swarm.disconnect_peer_id(peer_id);
             // Clean up tracking.
             self.peer_ips.remove(&peer_id);
+            // P3 (§2.2b): drop this peer's decay sample so a departed peer's stale
+            // height can't keep influencing recompute_network_height.
+            self.node_state.forget_peer_height(commputer::peer_hash::peer_bucket(&peer_id));
             if let Some(validator_addr) = self.peer_validators.remove(&peer_id) {
                 self.compliance.deregister_node(&validator_addr);
             }
@@ -778,7 +784,14 @@ impl EventLoop {
                 _ = sync_timer.tick() => {
                     // Feed the node state machine.
                     self.node_state.set_our_height(self.state.blocks.height());
-                    self.node_state.set_network_height(self.network_height);
+                    // P3 (§2.2a): recompute the sync target from the DECAY tracker
+                    // (median of authenticated per-peer samples, floored at our tip)
+                    // instead of re-feeding the monotonic self.network_height. This is
+                    // the switch that lets network_height DECREASE back to reality, so
+                    // a single stale/orphan/poison reading can no longer pin the node
+                    // in Syncing forever. Runs unconditionally every tick (not gated on
+                    // is_active), so a wedged node can always climb back to Active.
+                    self.node_state.recompute_network_height();
 
                     if !self.sync_complete {
                         let our_height = self.state.blocks.height();
@@ -1060,6 +1073,8 @@ impl EventLoop {
                 );
                 let _ = self.network.swarm.disconnect_peer_id(worst_peer);
                 self.peer_ips.remove(&worst_peer);
+                // P3 (§2.2b): drop the rotated-out peer's decay sample.
+                self.node_state.forget_peer_height(commputer::peer_hash::peer_bucket(&worst_peer));
                 self.peer_validators.remove(&worst_peer);
                 self.peer_scores.remove(&worst_peer);
                 self.peer_quality.remove(&worst_peer);
@@ -1245,7 +1260,11 @@ impl EventLoop {
                     // Updated: deserialize as PeerExchangeMessage (replaces NetworkMessage/PeerResponse).
                     // The new format includes addresses of ALL known peers, not just the sender.
                     if let Ok(msg) = serde_json::from_slice::<PeerExchangeMessage>(&data) {
-                        for (peer_str, addrs) in &msg.peers {
+                        // SECURITY(finding [16]): bound inbound work to the same cap the
+                        // send side uses (MAX_PEERS_PER_EXCHANGE). Without it, one message
+                        // forces thousands of base58/multihash/multiaddr parses +
+                        // kademlia.add_address calls (CPU amp + routing-table pollution).
+                        for (peer_str, addrs) in msg.peers.iter().take(MAX_PEERS_PER_EXCHANGE) {
                             // Skip our own entry.
                             if peer_str == "us" {
                                 continue;
@@ -1500,28 +1519,46 @@ impl EventLoop {
                         match message {
                             RrMessage::Request { request, channel, .. } => {
                                 // Peer is requesting blocks from us.
+                                // [27]/E6/E9: gate serving with the per-peer sync rate
+                                // limiter. E9 (P7): key on peer_bucket_tagged over the
+                                // FULL PeerId (the old bytes[..8] fold exposed ~2 key
+                                // bytes = grindable). E6: GetBlock (tag 0) and GetBlocks
+                                // (tag 1) use SEPARATE buckets so batch sync is never
+                                // starved by GetBlock noise. Over-limit → cheap empty
+                                // response, never a ban (a syncing peer is not hostile).
                                 match request {
                                     SyncRequest::GetBlock { height } => {
-                                        let block_bytes = self.state.blocks.get_by_height(height)
-                                            .and_then(|b| serde_json::to_vec(b).ok());
-                                        let resp = SyncResponse::Block(block_bytes);
+                                        let resp = if self.sync_rate_limiter.check(commputer::peer_hash::peer_bucket_tagged(&peer, 0)) {
+                                            let block_bytes = self.state.blocks.get_by_height(height)
+                                                .and_then(|b| serde_json::to_vec(b).ok());
+                                            SyncResponse::Block(block_bytes)
+                                        } else {
+                                            SyncResponse::Block(None)
+                                        };
                                         let _ = self.network.swarm.behaviour_mut().sync
                                             .send_response(channel, resp);
                                     }
                                     SyncRequest::GetBlocks { start, end } => {
-                                        let mut blocks = Vec::new();
-                                        for h in start..=end.min(start + 100) {
-                                            if let Some(b) = self.state.blocks.get_by_height(h) {
-                                                if let Ok(data) = serde_json::to_vec(b) {
-                                                    blocks.push(data);
+                                        let resp = if self.sync_rate_limiter.check(commputer::peer_hash::peer_bucket_tagged(&peer, 1)) {
+                                            let mut blocks = Vec::new();
+                                            // [28]: saturating_add — `start` is attacker-
+                                            // controlled; `start + 100` overflow-panics in debug.
+                                            for h in start..=end.min(start.saturating_add(100)) {
+                                                if let Some(b) = self.state.blocks.get_by_height(h) {
+                                                    if let Ok(data) = serde_json::to_vec(b) {
+                                                        blocks.push(data);
+                                                    }
                                                 }
                                             }
-                                        }
-                                        let resp = SyncResponse::Blocks(blocks);
+                                            SyncResponse::Blocks(blocks)
+                                        } else {
+                                            SyncResponse::Blocks(Vec::new())
+                                        };
                                         let _ = self.network.swarm.behaviour_mut().sync
                                             .send_response(channel, resp);
                                     }
                                     SyncRequest::GetHeight => {
+                                        // Ungated: single scalar, used by the sync height-probe handshake.
                                         let resp = SyncResponse::Height(self.state.blocks.height());
                                         let _ = self.network.swarm.behaviour_mut().sync
                                             .send_response(channel, resp);
@@ -1533,30 +1570,27 @@ impl EventLoop {
                                 match response {
                                     SyncResponse::Block(Some(data)) => {
                                         if let Ok(block) = serde_json::from_slice::<commputer_core::block::Block>(&data) {
-                                            let height = block.height();
-                                            if height > self.network_height {
-                                                self.network_height = height;
-                                            }
-                                            // Synced blocks are already consensus-finalized by the network.
-                                            // Apply directly — don't route through Snowball.
+                                            // SECURITY(net-height §0): do NOT raise network_height from an
+                                            // unvalidated synced-block height field. apply_synced_block
+                                            // validates; the sync target advances only from GetHeight
+                                            // replies (below) and validated consensus blocks.
                                             self.apply_synced_block(block, peer);
                                         }
                                     }
                                     SyncResponse::Blocks(blocks) => {
                                         for data in blocks {
                                             if let Ok(block) = serde_json::from_slice::<commputer_core::block::Block>(&data) {
-                                                let height = block.height();
-                                                if height > self.network_height {
-                                                    self.network_height = height;
-                                                }
                                                 self.apply_synced_block(block, peer);
                                             }
                                         }
                                     }
                                     SyncResponse::Height(h) => {
-                                        if h > self.network_height {
-                                            self.network_height = h;
-                                        }
+                                        // net-height §0: a Height reply to our own GetHeight probe is a
+                                        // trusted channel but the value is still self-reported — clamp to
+                                        // tip + MAX_SYNC_WINDOW so one peer cannot pin an unreachable target.
+                                        self.advance_network_height(h);
+                                        // P3: feed the decay tracker with this authenticated sample.
+                                        self.node_state.record_peer_height(commputer::peer_hash::peer_bucket(&peer), h);
                                         // Feed into sync state machine for height collection.
                                         self.sync_machine.record_height(h);
                                     }
@@ -1587,7 +1621,8 @@ impl EventLoop {
                                     ConsensusRequest::BlockProposal { block_bytes, height } => {
                                         info!("Received BlockProposal at height {} from {}", height, peer);
                                         // Rate limit: reject if this peer is spamming.
-                                        if !self.consensus_rate_limiter.check(peer.to_bytes()[..8].iter().fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64)), height) {
+                                        // SECURITY(E9/[20]): full-PeerId bucket key (was ~16-bit grindable).
+                                        if !self.consensus_rate_limiter.check(commputer::peer_hash::peer_bucket(&peer), height) {
                                             debug!("Rate limited consensus request from {} at height {}", peer, height);
                                             let _ = self.network.swarm.behaviour_mut().consensus.send_response(
                                                 channel, ConsensusResponse::NotReady { height });
@@ -1595,11 +1630,12 @@ impl EventLoop {
                                         }
                                         if let Ok(block) = serde_json::from_slice::<commputer_core::block::Block>(&block_bytes) {
                                             let hash = block.hash();
-                                            if height > self.network_height {
-                                                self.network_height = height;
-                                                self.node_state.set_network_height(height);
-                                            }
+                                            // SECURITY(net-height §0): removed the pre-validation raise AND
+                                            // the direct node_state.set_network_height — advance ONLY after
+                                            // full block validation, clamped to tip + MAX_SYNC_WINDOW.
                                             if !self.state.blocks.contains(&hash) && self.validate_block_from_peer(&block, peer) {
+                                                self.advance_network_height(height);
+                                                self.node_state.record_peer_height(commputer::peer_hash::peer_bucket(&peer), height);
                                                 self.consensus.add_candidate(block);
                                                 self.consensus.try_finalize_round(height, self.peer_ips.len());
                                                 self.try_apply_finalized(height);
@@ -1632,7 +1668,8 @@ impl EventLoop {
                                         }
                                     }
                                     ConsensusRequest::VoteRequest { height, block_hash: _ } => {
-                                        if !self.consensus_rate_limiter.check(peer.to_bytes()[..8].iter().fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64)), height) {
+                                        // SECURITY(E9/[20]): full-PeerId bucket key (was ~16-bit grindable).
+                                        if !self.consensus_rate_limiter.check(commputer::peer_hash::peer_bucket(&peer), height) {
                                             let _ = self.network.swarm.behaviour_mut().consensus.send_response(
                                                 channel, ConsensusResponse::NotReady { height });
                                             return;
@@ -1663,10 +1700,13 @@ impl EventLoop {
                                     ConsensusResponse::Vote { height, preference, accept } => {
                                         info!("Received Vote from {} at height {} (accept={})", peer, height, accept);
                                         if accept {
-                                            self.consensus.record_response(height, BlockHash(preference));
+                                            // Slice 2 (finding [4]): source-attribute the vote to the
+                                            // noise-authenticated rr peer so VoteAggregator dedups by PeerId.
+                                            self.consensus.record_peer_response(height, BlockHash(preference), peer);
                                             self.voted_peers.insert(peer);
-                                            let peer_hash = peer.to_bytes()[..8].iter().fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64));
-                                            self.health_monitor.record_vote(peer_hash);
+                                            // SECURITY(E9/[30]): key the health-monitor voter set on the
+                                            // FULL PeerId bytes (was the same ~16-bit grindable fold).
+                                            self.health_monitor.record_vote(commputer::peer_hash::peer_bucket(&peer));
                                         }
                                     }
                                     ConsensusResponse::NotReady { height } => {
@@ -1701,6 +1741,8 @@ impl EventLoop {
                 }
                 // All connections to this peer are gone. Clean up peer tracking.
                 self.peer_ips.remove(&peer_id);
+                // P3 (§2.2b): drop the disconnected peer's decay sample.
+                self.node_state.forget_peer_height(commputer::peer_hash::peer_bucket(&peer_id));
                 self.peer_subnets.remove(&peer_id);
                 self.peer_rtts.remove(&peer_id);
                 self.ping_timestamps.remove(&peer_id);
@@ -1733,11 +1775,6 @@ impl EventLoop {
                 let hash = block.hash();
                 let height = block.height();
 
-                // Track highest block height seen from peers (for sync gate).
-                if height > self.network_height {
-                    self.network_height = height;
-                }
-
                 if self.state.blocks.contains(&hash) {
                     return; // Already finalized this block.
                 }
@@ -1746,6 +1783,12 @@ impl EventLoop {
                 if !self.validate_block_from_peer(&block, source) {
                     return;
                 }
+
+                // SECURITY(net-height §0): advance the sync target ONLY after the
+                // block passes full validation, clamped to tip + MAX_SYNC_WINDOW.
+                self.advance_network_height(height);
+                // P3: feed the decay tracker with this authenticated sample.
+                self.node_state.record_peer_height(commputer::peer_hash::peer_bucket(&source), height);
 
                 debug!("Received block candidate {} at height {}", hash, height);
                 self.consensus.add_candidate(block);
@@ -1763,9 +1806,9 @@ impl EventLoop {
             }
             ConsensusMessage::SnowballQuery { height, querier_preference: _, round, .. } => {
                 // Legacy: respond or request block if we don't have it.
-                if height > self.network_height {
-                    self.network_height = height;
-                }
+                // SECURITY(net-height §0): unauthenticated gossip query carrying NO
+                // block — do NOT raise network_height from it at all (this is the
+                // cheapest u64::MAX poison vector, one tiny TOPIC_CONSENSUS frame).
                 if let Some(pref) = self.consensus.query_preference(height) {
                     let response = ConsensusMessage::VoteResponse {
                         height, preference: pref, round,
@@ -1775,9 +1818,13 @@ impl EventLoop {
                     self.request_block(height);
                 }
             }
-            ConsensusMessage::SnowballResponse { height, preference, .. } => {
-                self.consensus.record_response(height, preference);
-            }
+            // E2 (finding [4]): legacy gossipsub vote arm DELETED at the alpha reset.
+            // Signed+Strict gossip only proves the embedded key signed the frame, not
+            // that the source is a connected/authenticated peer — one connection can
+            // mint unlimited keypairs and fabricate a quorum. Request-response
+            // (ConsensusResponse::Vote) is the sole authenticated vote path. Kept as an
+            // inert no-op to preserve match exhaustiveness.
+            ConsensusMessage::SnowballResponse { .. } => {}
             ConsensusMessage::BlockRequest { height } => {
                 // Serve block from our chain if we have it.
                 let block = self.state.blocks.get_by_height(height).cloned();
@@ -1790,11 +1837,16 @@ impl EventLoop {
             ConsensusMessage::BlockResponse { block: Some(block), requested_height } => {
                 debug!("Received block response for height {}", requested_height);
                 let height = block.height();
-                if height > self.network_height {
-                    self.network_height = height;
-                }
 
                 if height == requested_height && !self.state.blocks.contains(&block.hash()) {
+                    // Slice 1 Hunk 1.6: this arm previously added an UNVALIDATED block
+                    // to the candidate set (a producer-sig bypass) — validate first.
+                    if !self.validate_block_from_peer(&block, source) {
+                        return;
+                    }
+                    // SECURITY(net-height §0): advance only from the validated block, clamped.
+                    self.advance_network_height(height);
+                    self.node_state.record_peer_height(commputer::peer_hash::peer_bucket(&source), height);
                     self.consensus.add_candidate(block);
                     self.consensus.try_finalize_round(height, self.peer_ips.len());
                     self.try_apply_finalized(height);
@@ -1819,10 +1871,6 @@ impl EventLoop {
                 let hash = block.hash();
                 let height = block.height();
 
-                if height > self.network_height {
-                    self.network_height = height;
-                }
-
                 if self.state.blocks.contains(&hash) {
                     return;
                 }
@@ -1830,6 +1878,10 @@ impl EventLoop {
                 if !self.validate_block_from_peer(&block, source) {
                     return;
                 }
+
+                // SECURITY(net-height §0): advance only after full validation, clamped.
+                self.advance_network_height(height);
+                self.node_state.record_peer_height(commputer::peer_hash::peer_bucket(&source), height);
 
                 debug!("Received block proposal {} at height {}", hash, height);
                 self.consensus.add_candidate(block);
@@ -1847,10 +1899,8 @@ impl EventLoop {
                 }
             }
             ConsensusMessage::BlockQuery { height, preference: _, round } => {
-                if height > self.network_height {
-                    self.network_height = height;
-                }
-
+                // SECURITY(net-height §0): unauthenticated gossip query carrying NO
+                // block — do NOT raise network_height from it.
                 if let Some(pref) = self.consensus.query_preference(height) {
                     let response = ConsensusMessage::VoteResponse {
                         height,
@@ -1863,9 +1913,24 @@ impl EventLoop {
                     self.request_block(height);
                 }
             }
-            ConsensusMessage::VoteResponse { height, preference, .. } => {
-                self.consensus.record_response(height, preference);
-            }
+            // E2 (finding [4]): legacy gossipsub vote arm DELETED at the alpha reset
+            // (see SnowballResponse above). Request-response is the sole authenticated
+            // vote path. Inert no-op to preserve match exhaustiveness.
+            ConsensusMessage::VoteResponse { .. } => {}
+        }
+    }
+
+    /// SECURITY(net-height §0, findings [0]/[2]/[7]): raise the observed sync
+    /// target ONLY from validated evidence, clamped to our tip + MAX_SYNC_WINDOW.
+    /// This defangs the network_height-poisoning chain-halt: no single message can
+    /// jump the monotonic target to an unreachable value, and honest far-behind
+    /// nodes still converge as the ceiling rises with each applied batch. NEVER
+    /// call this with an unvalidated attacker-supplied height field.
+    fn advance_network_height(&mut self, candidate: u64) {
+        let ceiling = self.state.blocks.height().saturating_add(commputer::peer_hash::MAX_SYNC_WINDOW);
+        let clamped = candidate.min(ceiling);
+        if clamped > self.network_height {
+            self.network_height = clamped;
         }
     }
 
@@ -1943,6 +2008,23 @@ impl EventLoop {
             }
         }
 
+        // === Stage 1c: Producer-signature enforcement ===
+        // E4 (finding [4] hardening): reject any peer-received block at height 0
+        // outright — a node has its own genesis before it has peers, so no honest
+        // peer sends one; without this, the strict-verifier genesis carve-out would
+        // leave height 0 as the one unsigned-block injection point post-flip.
+        if block.height() == 0 {
+            self.adjust_peer_score(source, -20);
+            return false;
+        }
+        // Post-reset every non-genesis block must carry a valid ed25519 signature
+        // whose embedded public key hashes to the declared producer address.
+        // (ENFORCE_PRODUCER_SIGNATURES flips true in core/block.rs at the reset.)
+        if !block.verify_producer_signature() {
+            self.ban_peer(source, "sent block with missing/invalid producer signature");
+            return false;
+        }
+
         // === Stage 2: Merkle root verification ===
 
         // Check merkle roots.
@@ -1992,7 +2074,19 @@ impl EventLoop {
             return; // Already have this block.
         }
 
-        // Feature 128: Record block propagation timing.
+        // SECURITY[24] + Slice-1 Hunk 1.7 (deconflicted): validate BEFORE any
+        // bookkeeping insert or orphan-buffering. This (a) stops pre-validation
+        // blocks from ever growing block_seen_times / producer_blocks / orphan_pool,
+        // (b) means process_orphans no longer re-injects un-validated blocks
+        // (candidate-entry bypass #2 closed), and (c) post-flip rejects
+        // unsigned/forged blocks up front — incl. the E4 height-0 reject inside
+        // validate_block_from_peer.
+        if !self.validate_block_from_peer(&block, source) {
+            return;
+        }
+        let applied_tip = self.state.blocks.height();
+
+        // Feature 128: Record block propagation timing (validated blocks only).
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2009,6 +2103,8 @@ impl EventLoop {
                 }
             }
         }
+        // SECURITY[24]: bound block_seen_times (see block_maps.rs).
+        commputer::block_maps::prune_block_seen_times(&mut self.block_seen_times, applied_tip);
 
         // Feature 131: Duplicate block detection (equivocation).
         let producer_key = (producer, height);
@@ -2023,26 +2119,21 @@ impl EventLoop {
         } else {
             self.producer_blocks.insert(producer_key, hash);
         }
+        // SECURITY[24]: drop producer_blocks at/below applied tip, cap the rest.
+        commputer::block_maps::prune_producer_blocks(&mut self.producer_blocks, applied_tip);
 
         // Feature 127: Check if parent exists. If not, add to orphan pool.
         if height > 0 && !self.state.blocks.contains(&block.header.parent_hash)
             && self.state.blocks.height() + 1 != height
         {
             debug!("Block {} at height {} is orphaned — parent {} not found", hash, height, block.header.parent_hash);
-            // Cap orphan pool at 100 entries to prevent memory exhaustion (VULN-5).
-            if self.orphan_pool.len() < 100 {
-                self.orphan_pool
-                    .entry(block.header.parent_hash)
-                    .or_default()
-                    .push(block);
-            } else {
-                warn!("Orphan pool full (100 entries), dropping orphan block at height {}", height);
-            }
-            return;
-        }
-
-        // Validate before accepting.
-        if !self.validate_block_from_peer(&block, source) {
+            // SECURITY[13]: per-parent (<=20) AND total (<=200) orphan caps (was
+            // distinct-parent count only). Block already passed validation above.
+            commputer::block_maps::bounded_orphan_insert(
+                &mut self.orphan_pool,
+                block.header.parent_hash,
+                block,
+            );
             return;
         }
 
@@ -2122,6 +2213,12 @@ impl EventLoop {
         // Item 51: Track when transaction was added for expiry.
         self.mempool_added_at.insert(tx_hash, std::time::Instant::now());
         self.pending_txs.push(tx);
+        // Finding [12]: the RPC ingress path must honour the 5000-tx global cap too.
+        // The gossip path already enforces it; without this, /tx admissions grow
+        // pending_txs unboundedly (the per-account quota + fee floor bound single-key
+        // floods, but not many-key RPC spam). Run before update_rpc_status so the
+        // status reflects the post-eviction size.
+        self.enforce_mempool_limit();
         self.update_rpc_status();
     }
 
@@ -2130,6 +2227,14 @@ impl EventLoop {
         if tx.from.0 == [0u8; 32] {
             return Err("null sender");
         }
+        // Storage follow-up (findings [3]/[5]/[6] MultiSig, [11]/[22] StorageWill):
+        // enforce the core structural caps at INGRESS so oversized MultiSig /
+        // StorageWill / Batch payloads are rejected before they occupy mempool RAM
+        // or reach the (now size-guarded) apply-side verify loops. Cheaper than
+        // tx.verify(), so it runs first. Internal fee-exempt direct pushes bypass
+        // this fn and are unaffected. Catch-all `_ => {}` in validate_kind_shape
+        // leaves Transfer/ValidatorRegister/PoUW kinds untouched.
+        tx.validate_shape()?;
         if !tx.verify() {
             return Err("signature verification failed");
         }
@@ -2181,8 +2286,46 @@ impl EventLoop {
             .unwrap_or(0);
         let pending_from_sender = self.pending_txs.iter()
             .filter(|ptx| ptx.from == tx.from)
-            .count() as u64;
-        let expected_nonce = on_chain_nonce + pending_from_sender;
+            .count();
+
+        // E3: the compiled faucet address is a trusted internal issuer whose nonce
+        // is serialized in rpc.rs. Exempt it from BOTH the F-3 quota and the
+        // fee-payability floor: an admission rejection would strand faucet_next_nonce
+        // (already consumed on try_send) and brick the faucet until node restart.
+        // If the const is None (faucet disabled) this is always false — correct.
+        let faucet_exempt = commputer::testnet_genesis::ALPHA_FAUCET_ADDRESS_HEX
+            .and_then(|h| commputer_core::identity::Address::from_hex(h).ok())
+            .is_some_and(|fa| fa == tx.from);
+
+        // F-3 per-account mempool quota (independent gate; composes with the C7
+        // kind-aware ingress filter above). REJECT (never evict — eviction would
+        // orphan this sender's higher contiguous nonces).
+        if !faucet_exempt {
+            commputer::mempool_quota::account_quota_ok(
+                pending_from_sender,
+                commputer::mempool_quota::MAX_MEMPOOL_TXS_PER_ACCOUNT,
+            )?;
+        }
+
+        // Finding [18]: fee-payability floor. The sender's on-chain balance must
+        // cover this tx's fee PLUS the fees already committed by its pending mempool
+        // txs. Closes free flooding (fresh 0-balance keypair streaming nonces) and
+        // unpayable-max-fee eviction capture. Deliberately conservative (fees only;
+        // transfer AMOUNT payability stays enforced at apply) so legitimate
+        // future-funded chained sends are not false-rejected.
+        if !faucet_exempt {
+            let balance = self.state.accounts.get(&tx.from)
+                .map(|a| a.balance.raw())
+                .unwrap_or(0);
+            let committed_fees = self.pending_txs.iter()
+                .filter(|ptx| ptx.from == tx.from)
+                .fold(0u64, |acc, ptx| acc.saturating_add(ptx.fee));
+            if balance < committed_fees.saturating_add(tx.fee) {
+                return Err("sender cannot cover fee");
+            }
+        }
+
+        let expected_nonce = on_chain_nonce + pending_from_sender as u64;
         if tx.nonce != expected_nonce {
             return Err("invalid nonce");
         }
@@ -2318,16 +2461,25 @@ impl EventLoop {
     /// Maximum number of transactions in the mempool.
     const MAX_MEMPOOL_SIZE: usize = 5000;
 
-    /// Enforce mempool size limit by evicting lowest-fee transactions.
+    /// Enforce mempool size limit. Finding [18]: evict fee-UNAFFORDABLE txs first
+    /// (sender's on-chain balance cannot cover the tx fee), then lowest-fee — so a
+    /// flood of unpayable high-fee txs cannot capture the pool by out-surviving
+    /// honest lower-fee txs under a pure lowest-fee eviction.
     fn enforce_mempool_limit(&mut self) {
         while self.pending_txs.len() > Self::MAX_MEMPOOL_SIZE {
-            // Find the index of the lowest-fee transaction.
-            if let Some((min_idx, _)) = self.pending_txs.iter()
+            // `(affordable, fee)` sorts unaffordable (false) first, then lowest fee.
+            let victim = self.pending_txs.iter()
                 .enumerate()
-                .min_by_key(|(_, tx)| tx.fee)
-            {
+                .min_by_key(|(_, tx)| {
+                    let bal = self.state.accounts.get(&tx.from)
+                        .map(|a| a.balance.raw())
+                        .unwrap_or(0);
+                    (bal >= tx.fee, tx.fee)
+                })
+                .map(|(idx, _)| idx);
+            if let Some(min_idx) = victim {
                 let evicted = self.pending_txs.remove(min_idx);
-                debug!("Evicted low-fee tx from mempool: fee={}", evicted.fee);
+                debug!("Evicted tx from mempool (affordable-first): fee={}", evicted.fee);
             } else {
                 break;
             }
@@ -3007,7 +3159,10 @@ impl EventLoop {
                         match self.consensus.query_preference(next_height) {
                             Some(pref) => {
                                 info!("Solo self-vote at height {} for {}", next_height, pref);
-                                self.consensus.record_response(next_height, pref);
+                                // Slice 2 feed site: attribute the solo self-vote to our own PeerId
+                                // (peer_count == 0 ⇒ params (1,1,1); per-round aggregator reset lets
+                                // each round's self-vote count fresh).
+                                self.consensus.record_peer_response(next_height, pref, self.network.local_peer_id);
                             }
                             None => {
                                 warn!("Solo stall at height {} but no preference -- voter not initialized?", next_height);
@@ -3052,7 +3207,13 @@ impl EventLoop {
         if height != expected {
             if height > expected {
                 // We're behind — request missing blocks via sync protocol.
-                for h in expected..height {
+                // [1]/E6: bound the gap-request to one sync batch (MAX_SYNC_GAP).
+                // This is the TWIN of the apply_synced_block loop that E6 alone
+                // does NOT clamp; finding [1] requires both. `height` here is a
+                // finalized height (needs Snowball quorum to reach) but is clamped
+                // identically for symmetry and defense in depth.
+                let gap_end = height.min(expected.saturating_add(commputer::sync_machine::MAX_SYNC_GAP));
+                for h in expected..gap_end {
                     self.request_block(h);
                 }
             }
@@ -3190,17 +3351,34 @@ impl EventLoop {
         }
 
         let expected = self.state.blocks.height() + 1;
+        // [1]: reject implausibly-far-ahead synced blocks. `height` is an
+        // attacker-controlled header field; a bogus (e.g. u64::MAX) height would
+        // otherwise pollute the orphan pool and drive the gap-request path. A
+        // genuinely far-behind node catches up via the bounded sync_machine
+        // batches, never via an unsolicited jump this large.
+        if height > expected.saturating_add(commputer::sync_machine::MAX_SYNC_TARGET_GAP) {
+            warn!("Sync: dropping implausibly-far-ahead block {} at height {} (tip {})",
+                hash, height, expected - 1);
+            return;
+        }
         if height != expected {
             if height > expected {
                 // Out of order — buffer as orphan, request missing blocks.
                 debug!("Sync: buffering block at height {} (expected {})", height, expected);
-                if self.orphan_pool.len() < 100 {
-                    self.orphan_pool
-                        .entry(block.header.parent_hash)
-                        .or_default()
-                        .push(block);
-                }
-                for h in expected..height {
+                // SECURITY[13] (P2 merge): per-parent + total orphan caps (was
+                // orphan_pool.len() < 100). Note apply_synced_block is the direct-
+                // sync path; its blocks are consensus-finalized upstream.
+                commputer::block_maps::bounded_orphan_insert(
+                    &mut self.orphan_pool,
+                    block.header.parent_hash,
+                    block,
+                );
+                // [1]/E6: bound the gap-request to one sync batch (MAX_SYNC_GAP).
+                // Unbounded `for h in expected..height` runs ~1.8e19 iterations
+                // for height=u64::MAX (permanent event-loop freeze + outbound
+                // GetBlock flood). Bulk catch-up is the sync_machine's job.
+                let gap_end = height.min(expected.saturating_add(commputer::sync_machine::MAX_SYNC_GAP));
+                for h in expected..gap_end {
                     self.request_block(h);
                 }
             }

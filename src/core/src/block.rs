@@ -124,13 +124,14 @@ impl BlockHeader {
     }
 }
 
-/// Enforcement flag for producer signatures. While `false`, unsigned blocks are
-/// accepted for backward compatibility with the pre-signing testnet; the strict
-/// logic is still compiled and unit-tested via
-/// [`Block::verify_producer_signature_strict`]. The founder-gated protected
-/// enforcement batch flips this to `true` at the alpha genesis reset, at which
-/// point unsigned non-genesis blocks are rejected network-wide.
-pub const ENFORCE_PRODUCER_SIGNATURES: bool = false;
+/// Enforcement flag for producer signatures. Flipped to `true` at the alpha
+/// genesis reset (protected batch §2.8): [`Block::verify_producer_signature`]
+/// now delegates to the strict check, so every non-genesis block must carry a
+/// valid ed25519 signature whose embedded key hashes to the declared producer.
+/// Unsigned non-genesis blocks are rejected network-wide. Consensus-affecting —
+/// rides the genesis reset (all nodes restart on the flipped binary). A runtime
+/// boot assertion in main.rs `run_node` guards against a forgotten flip.
+pub const ENFORCE_PRODUCER_SIGNATURES: bool = true;
 
 /// Maximum number of transactions per block.
 pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 500;

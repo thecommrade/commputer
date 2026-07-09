@@ -9,7 +9,7 @@ use serde::Deserialize;
 pub const DEFAULT_TESTNET_SEEDS: &[&str] = &["seed.commputer.xyz:9000"];
 
 /// Default chain ID for testnet.
-pub const DEFAULT_TESTNET_CHAIN_ID: &str = "commputer-testnet-1";
+pub const DEFAULT_TESTNET_CHAIN_ID: &str = "commputer-testnet-2";
 
 /// Commputer node configuration file format.
 #[derive(Debug, Clone, Deserialize)]

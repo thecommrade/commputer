@@ -456,6 +456,9 @@ fn open_chain_state(testnet: bool) -> Result<ChainState> {
     let mut state = ChainState::open(&dir)?;
     if state.blocks.is_empty() {
         let genesis = create_genesis();
+        // E1 parity with run_node: identical genesis-accounts credit before apply_block.
+        let alloc = testnet_genesis::alpha_genesis_accounts();
+        state.apply_genesis_accounts(&alloc)?;
         state.apply_block(&genesis)?;
     }
     Ok(state)
@@ -858,6 +861,14 @@ async fn run_node(
     json_log: bool,
     cors_origins: String,
 ) -> Result<()> {
+    // P4: fail LOUD at boot if the enforcement flip was forgotten. The alpha
+    // reset requires producer-signature enforcement network-wide; a node built
+    // with the flip off must never join.
+    assert!(
+        commputer_core::block::ENFORCE_PRODUCER_SIGNATURES,
+        "alpha reset requires producer-signature enforcement (ENFORCE_PRODUCER_SIGNATURES must be true)"
+    );
+
     // Initialize logging. Item 48: Support structured JSON output.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| log_level.parse().unwrap_or_default());
@@ -911,6 +922,11 @@ async fn run_node(
     if state.blocks.is_empty() {
         let genesis = create_genesis();
         info!("Genesis block hash: {}", genesis.hash());
+        // E1: credit compiled genesis accounts (the alpha faucet) BEFORE
+        // apply_block so the credits fold into block 0's atomic WriteBatch
+        // (crash-safe). Empty list (faucet address unset) = byte-identical genesis.
+        let alloc = testnet_genesis::alpha_genesis_accounts();
+        state.apply_genesis_accounts(&alloc)?;
         state.apply_block(&genesis)?;
     } else {
         info!(
@@ -1135,6 +1151,12 @@ async fn run_node(
         pending_txs: 0,
     };
 
+    // D6/E10: provision the faucet signing wallet from COMMPUTER_FAUCET_SEED.
+    // P8 fail-closed — a set-but-invalid seed or an address that does not match
+    // the compiled ALPHA_FAUCET_ADDRESS_HEX aborts boot here (the `?`). `None`
+    // when the env var is unset (faucet disabled on this node).
+    let (faucet_wallet, faucet_next_nonce) = rpc::provision_faucet_from_env(&state)?;
+
     let rpc_state = std::sync::Arc::new(rpc::RpcState {
         tx_sender,
         status: tokio::sync::Mutex::new(initial_status),
@@ -1171,6 +1193,8 @@ async fn run_node(
         proof_history: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         proof_leaderboard: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         capacity: tokio::sync::Mutex::new((0, 0, 0, 0)),
+        faucet_wallet,
+        faucet_next_nonce: tokio::sync::Mutex::new(faucet_next_nonce),
     });
 
     // Create event loop and attach RPC channel (shares status with RPC server).

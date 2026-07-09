@@ -401,13 +401,13 @@ impl ConsensusManager {
         false
     }
 
-    /// Legacy count-based entry point, retained as a LIVE (non-cfg) delegating
-    /// shim so the unmodified event_loop call sites -- and this module's tests --
-    /// compile and behave EXACTLY as before. Attributing each call to a fresh
-    /// random PeerId makes every call a distinct voter, so N calls add N to the
-    /// round tally: the exact pre-dedup semantics. The founder's protected
-    /// stage-1a commit adds `#[cfg(test)]` here in the SAME change that switches
-    /// the feed sites to `record_peer_response`.
+    /// Legacy count-based entry point, retained as a TEST-ONLY delegating shim.
+    /// The protected batch switched every production feed site to
+    /// `record_peer_response` (PeerId-dedup), so this Sybil-countable path is now
+    /// `#[cfg(test)]` — gone from the production API, kept only so this module's
+    /// tests exercise the tally with the exact pre-dedup semantics (each call is a
+    /// fresh random PeerId ⇒ a distinct voter ⇒ N calls add N to the round tally).
+    #[cfg(test)]
     pub fn record_response(&mut self, height: u64, preference: BlockHash) {
         self.record_peer_response(height, preference, PeerId::random());
     }

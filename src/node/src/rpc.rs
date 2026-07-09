@@ -128,6 +128,15 @@ pub struct RpcState {
     pub proof_leaderboard: Mutex<HashMap<String, Vec<serde_json::Value>>>,
     /// Capacity breakdown: (total, reserve_pct, flagship_slots, user_slots).
     pub capacity: Mutex<(u64, u64, u64, u64)>,
+    /// Alpha reset (D6): the provisioned faucet signing wallet, or `None` when the
+    /// faucet is disabled on this node. Threaded from `provision_faucet_from_env`
+    /// in main.rs; `None` until `COMMPUTER_FAUCET_SEED` is set on the one
+    /// provisioner node at the reset.
+    pub faucet_wallet: Option<commputer_core::wallet::Wallet>,
+    /// Alpha reset (D6/E3): next nonce for the faucet dispenser. The dispense path
+    /// holds this lock across the claim check + build + send so concurrent claims
+    /// from one IP cannot bypass the per-epoch limit or desync the nonce.
+    pub faucet_next_nonce: Mutex<u64>,
 }
 
 /// Response for a submitted transaction.
@@ -924,27 +933,64 @@ async fn faucet(
 
     let current_epoch = state.status.lock().await.epoch;
 
-    // Rate limit: 1 request per address per epoch.
-    let claims = state.faucet_claims.lock().await;
-    if let Some(&last_epoch) = claims.get(&req.address)
-        && last_epoch >= current_epoch {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
-                "error": "faucet already claimed this epoch",
-                "next_available_epoch": current_epoch + 1,
-            })));
+    // D6 dispense path: only when a faucet wallet is provisioned on this node.
+    // The whole check-build-send is serialized under the faucet nonce lock (E3)
+    // so N concurrent claims from one IP cannot each pass the per-epoch check
+    // before any claim is recorded, and the nonce cannot desync. On a send
+    // failure the nonce is NOT consumed and the claim is NOT recorded (retryable).
+    if let Some(wallet) = state.faucet_wallet.as_ref() {
+        // The address was length-validated (32 bytes) above.
+        let to = match hex::decode(&req.address)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        {
+            Some(arr) => commputer_core::identity::Address(arr),
+            None => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "invalid address format (expected 64 hex characters)",
+                })));
+            }
+        };
+
+        let mut next_nonce = state.faucet_next_nonce.lock().await;
+        {
+            let claims = state.faucet_claims.lock().await;
+            if let Some(&last_epoch) = claims.get(&req.address)
+                && last_epoch >= current_epoch
+            {
+                return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                    "error": "faucet already claimed this epoch",
+                    "next_available_epoch": current_epoch + 1,
+                })));
+            }
         }
 
-    // W5.7 F-6: HONESTY FIX. The faucet has no provisioned signing wallet:
-    // RpcState carries no faucet keypair, and no funded faucet/treasury
-    // account exists in genesis. Previously this handler inserted the
-    // rate-limit claim and returned {success:true, "1 COMME dispensed"}
-    // WITHOUT ever building, signing, or queueing a Transfer — it lied.
-    // Until a faucet wallet is wired (requires a protected-file change to
-    // main.rs RpcState construction + a funded faucet account in genesis),
-    // return 503 instead of a false success. Do NOT consume the per-epoch
-    // claim slot on a request we cannot fulfill.
-    drop(claims);
+        let tx = build_faucet_transfer(wallet, to, *next_nonce);
+        match state.tx_sender.try_send(tx) {
+            Ok(()) => {
+                *next_nonce += 1;
+                state.faucet_claims.lock().await.insert(req.address.clone(), current_epoch);
+                return (StatusCode::OK, Json(serde_json::json!({
+                    "success": true,
+                    "detail": "1 COMME dispensed",
+                    "address": req.address,
+                    "epoch": current_epoch,
+                })));
+            }
+            Err(_) => {
+                // Channel full/closed — do NOT consume the nonce or the claim slot.
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                    "error": "faucet temporarily unavailable",
+                    "detail": "node is busy; retry shortly",
+                    "address": req.address,
+                    "epoch": current_epoch,
+                })));
+            }
+        }
+    }
 
+    // Unprovisioned faucet (no wallet on this node): honest 503 (F-6). Do NOT
+    // consume the per-epoch claim slot on a request we cannot fulfill.
     (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
         "error": "faucet not provisioned",
         "detail": "no faucet wallet is configured on this node; tokens cannot be dispensed",
@@ -1720,6 +1766,8 @@ mod tests {
             proof_history: Mutex::new(HashMap::new()),
             proof_leaderboard: Mutex::new(HashMap::new()),
             capacity: Mutex::new((0, 0, 0, 0)),
+            faucet_wallet: None,
+            faucet_next_nonce: Mutex::new(0),
         });
         (state, rx)
     }
