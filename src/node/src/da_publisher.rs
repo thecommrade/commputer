@@ -23,8 +23,15 @@
 // test `InMemoryTransport`, and covers the WHOLE `program‖input` envelope rather
 // than the program alone (world.rs held input out-of-band).
 //
-// `live_chunk_hashes(&att)` returns the set of transport keys a job's chunks live
-// under, so the `DaStore::gc` caller can scope retention to active jobs.
+//   4. (Q15) ALSO persists the SERIALIZED `DaAttestation` itself as a well-known DA
+//      object under `attestation_key(da_root) = sha256(da_root ‖ "/attestation")`, so a
+//      node holding ONLY the bare on-chain `da_root` can resolve the full attestation it
+//      needs to run `verify_available` (see `da_attestation.rs`). Additive — a new DA
+//      object, no `SubmitJobV2` schema change, no reset.
+//
+// `live_chunk_hashes(&att)` returns the set of transport keys a job's chunks + its
+// attestation blob live under, so the `DaStore::gc` caller can scope retention to active
+// jobs (it must retain the attestation blob for the life of the job).
 //
 // The DA outcome is NEVER hashed into consensus (it degrades to Abstain), so nothing
 // here is consensus- or fork-relevant; this is pure local plumbing that is
@@ -49,9 +56,15 @@ use commputer_da::commit::{build_attestation, chunk_proof};
 use commputer_da::facade::chunk_hash;
 use commputer_da::params::{ChunkingParams, DaAttestation, DaError};
 use commputer_network::da_protocol::DaChunk;
+use sha2::{Digest, Sha256};
 
 use crate::da_store::DaStore;
 use crate::executor_planner::encode_job_blob;
+
+/// Domain-separation suffix for the reserved DA object that holds a job's serialized
+/// [`DaAttestation`]. Distinct from the `index_le` suffix `chunk_hash` uses, so an
+/// attestation blob key can never collide with a coded-chunk key.
+const ATTESTATION_KEY_SUFFIX: &[u8] = b"/attestation";
 
 /// Everything that can go wrong publishing a job blob into the DA store.
 #[derive(Debug)]
@@ -132,16 +145,94 @@ pub fn publish_job_blob(
         store.put(key, &da_chunk)?;
     }
 
+    // (4) Q15 — ALSO publish the serialized `DaAttestation` itself as a well-known DA
+    //     object keyed deterministically from `da_root` (`attestation_key`). This is the
+    //     additive resolution channel: a fetcher holding ONLY the bare on-chain 32-byte
+    //     `da_root` (all `SubmitJobV2` carries) fetches this object, deserializes it, and
+    //     recovers the full attestation (`program_id`, `n_data`, `n_total`, `data_len`, …)
+    //     it needs to run `verify_available`. No on-chain schema change, no reset — just a
+    //     new DA object. The attestation crate (`DaAttestation`) does NOT derive
+    //     Serialize/Deserialize (it is `#[derive(Clone, Copy, Debug, PartialEq, Eq)]`
+    //     only), so its 7 fields are hand-serialized into a fixed 82-byte layout by
+    //     `serialize_attestation`. Stored as a single raw `DaChunk` with a trivial (empty)
+    //     Merkle path: the object is self-identifying (the resolver rebinds it by checking
+    //     `att.da_root == da_root`), and the downstream `verify_available` re-derives real
+    //     integrity over the coded chunks (Merkle-path + `sha256(recon)==program_id`), so a
+    //     forged attestation only ever degrades to Abstain, never a wrong payout.
+    let attestation_blob = DaChunk {
+        bytes: serialize_attestation(&att),
+        merkle_path: serialize_merkle_path(&[]),
+    };
+    store.put(attestation_key(att.da_root), &attestation_blob)?;
+
     Ok(att)
 }
 
-/// The set of transport chunk keys a published job's coded chunks live under
-/// (`sha256(da_root ‖ index_le)` for every `index` in `[0, n_total)`). A
-/// `DaStore::gc` caller unions these across its active jobs to scope retention.
+/// The reserved DA-object key under which a job's serialized [`DaAttestation`] is stored
+/// and advertised: `sha256(da_root ‖ "/attestation")`. Deterministic and
+/// domain-separated from every coded-chunk key (`chunk_hash` suffixes `index_le`, this
+/// suffixes the ASCII tag), so the attestation blob can never collide with chunk `0`.
+/// A [`crate::da_attestation::DaBackedAttestationSource`] recomputes this from a bare
+/// on-chain `da_root` to resolve the full attestation (Q15).
+pub fn attestation_key(da_root: [u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(da_root);
+    h.update(ATTESTATION_KEY_SUFFIX);
+    h.finalize().into()
+}
+
+/// Serialize a [`DaAttestation`] into a fixed 82-byte layout (all multi-byte fields
+/// little-endian). `DaAttestation` derives no `Serialize`/`Deserialize`, so this is the
+/// canonical on-DA encoding of the attestation blob. Layout:
+///   `[program_id:32][da_root:32][data_len:u64][chunk_size:u32][n_data:u16][n_total:u16][params_version:u16]`.
+pub fn serialize_attestation(att: &DaAttestation) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(82);
+    buf.extend_from_slice(&att.program_id);
+    buf.extend_from_slice(&att.da_root);
+    buf.extend_from_slice(&att.data_len.to_le_bytes());
+    buf.extend_from_slice(&att.chunk_size.to_le_bytes());
+    buf.extend_from_slice(&att.n_data.to_le_bytes());
+    buf.extend_from_slice(&att.n_total.to_le_bytes());
+    buf.extend_from_slice(&att.params_version.to_le_bytes());
+    buf
+}
+
+/// Inverse of [`serialize_attestation`]. Returns `None` on any length mismatch so a
+/// corrupt/hostile attestation blob cannot panic the resolver — it simply fails to
+/// resolve → the loop Abstains (honest inert).
+pub fn deserialize_attestation(raw: &[u8]) -> Option<DaAttestation> {
+    if raw.len() != 82 {
+        return None;
+    }
+    let program_id: [u8; 32] = raw[0..32].try_into().ok()?;
+    let da_root: [u8; 32] = raw[32..64].try_into().ok()?;
+    let data_len = u64::from_le_bytes(raw[64..72].try_into().ok()?);
+    let chunk_size = u32::from_le_bytes(raw[72..76].try_into().ok()?);
+    let n_data = u16::from_le_bytes(raw[76..78].try_into().ok()?);
+    let n_total = u16::from_le_bytes(raw[78..80].try_into().ok()?);
+    let params_version = u16::from_le_bytes(raw[80..82].try_into().ok()?);
+    Some(DaAttestation {
+        program_id,
+        da_root,
+        data_len,
+        chunk_size,
+        n_data,
+        n_total,
+        params_version,
+    })
+}
+
+/// The set of transport keys a published job lives under: every coded-chunk key
+/// (`sha256(da_root ‖ index_le)` for `index` in `[0, n_total)`) PLUS the reserved
+/// attestation-blob key ([`attestation_key`]). A `DaStore::gc` caller unions these across
+/// its active jobs to scope retention — the attestation blob MUST be retained so a fetcher
+/// can still resolve `da_root → DaAttestation` (Q15) for the life of the job.
 pub fn live_chunk_hashes(attestation: &DaAttestation) -> HashSet<[u8; 32]> {
-    (0..attestation.n_total)
+    let mut set: HashSet<[u8; 32]> = (0..attestation.n_total)
         .map(|index| chunk_hash(attestation, index))
-        .collect()
+        .collect();
+    set.insert(attestation_key(attestation.da_root));
+    set
 }
 
 /// Serialize a Merkle inclusion path into the `LocalDiskTransport` on-disk shape — the
@@ -306,8 +397,12 @@ mod tests {
         let live = live_chunk_hashes(&att);
         assert_eq!(
             live.len(),
-            att.n_total as usize,
-            "one live key per coded chunk"
+            att.n_total as usize + 1,
+            "one live key per coded chunk PLUS the reserved attestation-blob key"
+        );
+        assert!(
+            live.contains(&attestation_key(att.da_root)),
+            "the attestation key is in the live set so gc retains it"
         );
         for &key in &live {
             assert!(store.has(key), "every live chunk must be persisted");
@@ -370,9 +465,14 @@ mod tests {
         let store = DaStore::open(tmp_dir("withhold")).unwrap();
         let att = publish_job_blob(&store, &program, &input).expect("publish succeeds");
 
-        // Drop every chunk (empty live set) — the job's bytes leave the store.
+        // Drop every chunk (empty live set) — the job's bytes AND its attestation blob
+        // leave the store (n_total coded chunks + 1 attestation object).
         let removed = store.gc(&HashSet::new()).unwrap();
-        assert_eq!(removed, att.n_total as usize, "all coded chunks gc'd");
+        assert_eq!(
+            removed,
+            att.n_total as usize + 1,
+            "all coded chunks + the attestation blob gc'd"
+        );
 
         let transport = StoreTransport {
             store: &store,
@@ -473,6 +573,89 @@ mod tests {
             assert!(
                 verify_chunk(&att, index, &da_chunk.bytes, &path),
                 "chunk {index} must Merkle-verify under da_root"
+            );
+        }
+    }
+
+    /// Q15: `publish_job_blob` ALSO persists the serialized attestation under the reserved
+    /// `attestation_key`, and fetching that blob back deserializes to the exact original
+    /// `DaAttestation`. This is the additive resolution channel the on-chain `da_root`
+    /// (all `SubmitJobV2` carries) resolves through.
+    #[test]
+    fn publish_stores_resolvable_attestation_blob() {
+        let program = wat::parse_str(DOUBLER).expect("guest assembles");
+        let input = b"attestation-resolve".to_vec();
+        let store = DaStore::open(tmp_dir("att-blob")).unwrap();
+        let att = publish_job_blob(&store, &program, &input).expect("publish succeeds");
+
+        let key = attestation_key(att.da_root);
+        assert!(
+            store.has(key),
+            "the attestation blob must be persisted under attestation_key"
+        );
+        assert!(
+            live_chunk_hashes(&att).contains(&key),
+            "the attestation key must be gc-retained"
+        );
+
+        // Fetch the blob back and deserialize → equals the original attestation.
+        let blob = store.get(key).unwrap().expect("attestation blob present");
+        let recovered =
+            deserialize_attestation(&blob.bytes).expect("attestation blob deserializes");
+        assert_eq!(
+            recovered, att,
+            "the fetched attestation blob equals the published attestation"
+        );
+    }
+
+    /// The attestation field-serialization round-trips exactly and never panics on a
+    /// malformed (wrong-length) buffer.
+    #[test]
+    fn attestation_serde_round_trips() {
+        let att = DaAttestation {
+            program_id: [3u8; 32],
+            da_root: [7u8; 32],
+            data_len: 123_456,
+            chunk_size: 65_536,
+            n_data: 5,
+            n_total: 10,
+            params_version: 1,
+        };
+        let bytes = serialize_attestation(&att);
+        assert_eq!(bytes.len(), 82, "fixed 82-byte layout");
+        assert_eq!(
+            deserialize_attestation(&bytes),
+            Some(att),
+            "attestation must round-trip exactly"
+        );
+        // Wrong length → None (never a panic).
+        assert_eq!(deserialize_attestation(&bytes[..81]), None);
+        assert_eq!(deserialize_attestation(&[]), None);
+        let mut too_long = bytes.clone();
+        too_long.push(0);
+        assert_eq!(deserialize_attestation(&too_long), None);
+    }
+
+    /// `attestation_key` is deterministic and domain-separated from every coded-chunk key
+    /// (so the attestation object can never collide with chunk 0).
+    #[test]
+    fn attestation_key_is_deterministic_and_domain_separated() {
+        let root = [9u8; 32];
+        assert_eq!(attestation_key(root), attestation_key(root), "deterministic");
+        let att = DaAttestation {
+            program_id: [0u8; 32],
+            da_root: root,
+            data_len: 0,
+            chunk_size: 65_536,
+            n_data: 1,
+            n_total: 2,
+            params_version: 1,
+        };
+        for i in 0..att.n_total {
+            assert_ne!(
+                attestation_key(root),
+                chunk_hash(&att, i),
+                "attestation key must not collide with any coded-chunk key"
             );
         }
     }

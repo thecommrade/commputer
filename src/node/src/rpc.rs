@@ -913,6 +913,153 @@ pub fn provision_faucet_from_env(
     Ok((Some(wallet), next_nonce))
 }
 
+// ── Track-2 (Phase A): PoUW job-submission builder (inert, non-protected substrate) ──
+//
+// These are the money-path builders the PROTECTED Phase B `POST /submit_job` handler
+// will call once `RpcState` gains `da_store` / `da_command_tx` fields (added by the
+// founder in main.rs's protected RpcState constructor). Exactly like the faucet's
+// `build_faucet_transfer`, this is a pure free function: it takes the DA store + the
+// submitter wallet, does the DA publish + tx build/sign, and returns the artifacts.
+// It is NOT reachable from any route yet, so a node that never enables DA is
+// byte-identical on-chain. Verified by `build_and_publish_job_*` tests below.
+
+/// Maximum combined `program.len() + input.len()` a single job may carry.
+///
+/// The DA publisher wraps the two into ONE envelope `[program_len:u32 LE][program][input]`
+/// (`encode_job_blob`), and the frozen da crate refuses an envelope needing more than
+/// 128 data chunks (its GF(2^8) rate-1/2 ceiling → 256 coded chunks). The 4-byte length
+/// prefix is part of that envelope, so the payload ceiling is `128 * chunk_size - 4`.
+/// Reject above this with a precise error rather than surfacing an opaque `DaError::TooLarge`.
+#[allow(dead_code)]
+pub const MAX_JOB_BLOB_BYTES: usize =
+    128 * commputer_da::params::DEFAULT_CHUNK_SIZE as usize - 4; // = 8_388_604 at the 64 KiB default
+
+/// Minimum `comme_budget` (raw units) a job pot may carry: 1 $COMME.
+///
+/// `comme_budget` is ESCROWED into the per-job pot at submit and, on a Confirmed
+/// settlement, split worker 85% / verifiers 10% / burn 5%. A 1-COMME floor keeps every
+/// slice well above `MINIMUM_FEE` and out of dust-rounding territory.
+#[allow(dead_code)]
+pub const MIN_JOB_BUDGET: u64 = commputer_core::token::UNITS_PER_COMME; // 100_000_000
+
+/// Default declared job duration stamped into the built `SubmitJobV2` (the Phase B
+/// handler may later thread a caller-supplied value; the substrate uses a fixed default).
+const DEFAULT_JOB_MAX_DURATION_SECS: u64 = 3_600;
+
+/// Everything that can go wrong building + publishing a job before it is admitted.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum JobSubmitError {
+    /// `program.len() + input.len()` exceeds [`MAX_JOB_BLOB_BYTES`] (would overflow the DA
+    /// 128-data-chunk ceiling).
+    TooLarge { got: usize, max: usize },
+    /// `budget` is below [`MIN_JOB_BUDGET`].
+    BudgetTooLow { got: u64, min: u64 },
+    /// The DA publisher failed to build the attestation or persist a coded chunk.
+    Publish(commputer::da_publisher::PublishError),
+}
+
+impl std::fmt::Display for JobSubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JobSubmitError::TooLarge { got, max } =>
+                write!(f, "job blob too large: {got} bytes (max {max})"),
+            JobSubmitError::BudgetTooLow { got, min } =>
+                write!(f, "job budget too low: {got} raw units (min {min})"),
+            JobSubmitError::Publish(e) => write!(f, "da publish failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for JobSubmitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            JobSubmitError::Publish(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<commputer::da_publisher::PublishError> for JobSubmitError {
+    fn from(e: commputer::da_publisher::PublishError) -> Self {
+        JobSubmitError::Publish(e)
+    }
+}
+
+/// Publish a job's `program‖input` into the node-local DA store and build a signed
+/// `SubmitJobV2` transaction anchoring the resulting `da_root`.
+///
+/// Steps: (1) size-cap `program+input`; (2) budget floor; (3) `publish_job_blob` persists
+/// the 2N coded chunks + returns the `DaAttestation`; (4) compute the linchpin
+/// `program_hash = sha256(program)` / `input_hash = sha256(input)`; (5) build + sign a
+/// `SubmitJobV2 { da_root, program_hash, input_hash, comme_budget, … }` with the submitter
+/// wallet. Returns the tx + attestation; the caller (Phase B handler) advertises
+/// `live_chunk_hashes(&att)` over the DA backend and submits the tx.
+///
+/// NONCE (Phase B, PROTECTED): the built tx carries `nonce = 0`. This free function does
+/// not read chain state, so it cannot know the submitter's account nonce. The Phase B
+/// handler — which owns `ChainState` — MUST set the submitter's real nonce and re-sign (or
+/// this builder must gain a `nonce` parameter at wire-in). With `nonce = 0` the signature
+/// is valid (self-consistent) and the tx is structurally complete, which is all the inert
+/// substrate + its tests require. This is called out in the Track-2 Phase B checklist.
+#[allow(dead_code)]
+pub fn build_and_publish_job(
+    store: &commputer::da_store::DaStore,
+    program: &[u8],
+    input: &[u8],
+    budget: u64,
+    nonce: u64,
+    submitter: &commputer_core::wallet::Wallet,
+) -> Result<(Transaction, commputer_da::params::DaAttestation), JobSubmitError> {
+    use sha2::{Digest, Sha256};
+
+    // (1) Size cap: envelope = 4-byte len prefix + program + input must stay under the
+    //     128-data-chunk DA ceiling. Reject early with a precise error.
+    let payload = program.len().saturating_add(input.len());
+    if payload > MAX_JOB_BLOB_BYTES {
+        return Err(JobSubmitError::TooLarge { got: payload, max: MAX_JOB_BLOB_BYTES });
+    }
+
+    // (2) Budget floor.
+    if budget < MIN_JOB_BUDGET {
+        return Err(JobSubmitError::BudgetTooLow { got: budget, min: MIN_JOB_BUDGET });
+    }
+
+    // (3) Publish program‖input into the DA store (persists 2N coded chunks + the Q15
+    //     attestation whose da_root this tx anchors). Deterministic — no clock, no rng.
+    let att = commputer::da_publisher::publish_job_blob(store, program, input)?;
+
+    // (4) The linchpin identities the verification game re-binds on fetch/re-exec.
+    let program_hash: [u8; 32] = Sha256::digest(program).into();
+    let input_hash: [u8; 32] = Sha256::digest(input).into();
+
+    // (5) Build + sign the SubmitJobV2 with the submitter's key at the caller-supplied
+    //     nonce. The Phase-B handler passes the submitter's real next nonce
+    //     (on-chain + pending); signing binds it, so the caller must not mutate it after.
+    let mut tx = Transaction {
+        from: *submitter.address(),
+        nonce,
+        kind: commputer_core::transaction::TxKind::SubmitJobV2 {
+            program_hash,
+            input_hash,
+            da_root: att.da_root,
+            // Minimal CPU declaration; the Phase B handler may parameterize from the request.
+            resources: commputer_core::compute::ResourceRequirements::cpu_only(1, 0),
+            max_duration_secs: DEFAULT_JOB_MAX_DURATION_SECS,
+            comme_budget: commputer_core::token::Amount::from_raw(budget),
+            l2_id: None,
+        },
+        fee: commputer_core::transaction::MINIMUM_FEE,
+        signature: vec![],
+        public_key: vec![],
+        memo: None,
+        timelock: None,
+    };
+    commputer_core::signing::sign_transaction(&mut tx, submitter);
+
+    Ok((tx, att))
+}
+
 /// POST /faucet — dispense testnet COMME.
 async fn faucet(
     State(state): State<Arc<RpcState>>,
@@ -2596,6 +2743,122 @@ mod tests {
             }
             other => panic!("expected Transfer, got {:?}", other),
         }
+    }
+
+    // ── Track-2 (Phase A): PoUW submit_job builder tests ──
+
+    /// A unique temp dir per test invocation for the in-process DaStore.
+    fn submit_job_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "commputer-submit-job-{tag}-{}-{}",
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    /// `build_and_publish_job` produces a valid, signed `SubmitJobV2` whose `da_root`
+    /// matches the published attestation and whose linchpin hashes / budget are correct,
+    /// AND every coded chunk it published is retrievable from the DA store.
+    #[test]
+    fn build_and_publish_job_makes_valid_signed_submit_job_v2() {
+        use commputer::da_store::DaStore;
+        use sha2::{Digest, Sha256};
+
+        let program = b"\x00\x61\x73\x6d\x01\x00\x00\x00program-bytes".to_vec();
+        let input = b"da-input-bytes".to_vec();
+        let budget = MIN_JOB_BUDGET; // exactly at the floor — accepted
+
+        let dir = submit_job_tmp_dir("valid");
+        let store = DaStore::open(&dir).expect("open da store");
+        let submitter = Wallet::generate();
+
+        let (tx, att) = build_and_publish_job(&store, &program, &input, budget, 0, &submitter)
+            .expect("build_and_publish_job succeeds");
+
+        // (1) Valid, signed, from the submitter.
+        assert!(tx.verify(), "submit_job tx must carry a valid signature");
+        assert_eq!(tx.from, *submitter.address(), "tx.from must be the submitter");
+        assert!(
+            tx.fee >= commputer_core::transaction::MINIMUM_FEE,
+            "SubmitJobV2 must cover MINIMUM_FEE"
+        );
+
+        // (2) A SubmitJobV2 whose da_root matches the attestation + correct linchpins/budget.
+        match tx.kind {
+            TxKind::SubmitJobV2 {
+                program_hash,
+                input_hash,
+                da_root,
+                comme_budget,
+                ..
+            } => {
+                assert_eq!(da_root, att.da_root, "tx da_root must match the published attestation");
+                let ph: [u8; 32] = Sha256::digest(&program).into();
+                let ih: [u8; 32] = Sha256::digest(&input).into();
+                assert_eq!(program_hash, ph, "program_hash must be sha256(program)");
+                assert_eq!(input_hash, ih, "input_hash must be sha256(input)");
+                assert_eq!(comme_budget.raw(), budget, "comme_budget must equal the escrowed budget");
+            }
+            other => panic!("expected SubmitJobV2, got {:?}", other),
+        }
+
+        // (3) Every attested coded chunk is retrievable from the store (NON-VACUOUS: proves
+        //     the publish actually persisted the DA set the da_root commits to).
+        let live = commputer::da_publisher::live_chunk_hashes(&att);
+        assert!(!live.is_empty(), "a published job has at least one coded chunk");
+        for key in &live {
+            assert!(store.has(*key), "every published chunk must be retrievable");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A budget below the floor is rejected BEFORE any DA disk write (nothing is published).
+    #[test]
+    fn build_and_publish_job_rejects_low_budget() {
+        use commputer::da_store::DaStore;
+
+        let dir = submit_job_tmp_dir("low-budget");
+        let store = DaStore::open(&dir).expect("open da store");
+        let submitter = Wallet::generate();
+
+        let err = build_and_publish_job(&store, b"prog", b"in", MIN_JOB_BUDGET - 1, 0, &submitter)
+            .expect_err("sub-floor budget must be rejected");
+        match err {
+            JobSubmitError::BudgetTooLow { got, min } => {
+                assert_eq!(got, MIN_JOB_BUDGET - 1);
+                assert_eq!(min, MIN_JOB_BUDGET);
+            }
+            other => panic!("expected BudgetTooLow, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An oversized `program + input` is rejected up front (returns before publishing).
+    #[test]
+    fn build_and_publish_job_rejects_oversized_blob() {
+        use commputer::da_store::DaStore;
+
+        let dir = submit_job_tmp_dir("oversized");
+        let store = DaStore::open(&dir).expect("open da store");
+        let submitter = Wallet::generate();
+
+        // One byte over the payload ceiling (empty input, program = MAX + 1).
+        let program = vec![0u8; MAX_JOB_BLOB_BYTES + 1];
+        let err = build_and_publish_job(&store, &program, b"", MIN_JOB_BUDGET, 0, &submitter)
+            .expect_err("oversized blob must be rejected");
+        match err {
+            JobSubmitError::TooLarge { got, max } => {
+                assert_eq!(got, MAX_JOB_BLOB_BYTES + 1);
+                assert_eq!(max, MAX_JOB_BLOB_BYTES);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Security: RPC deadlock safety + WS connection cap ──

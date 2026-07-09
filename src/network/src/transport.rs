@@ -153,6 +153,14 @@ pub struct CommpBehaviour {
     pub sync: libp2p::request_response::Behaviour<crate::sync_protocol::SyncCodec>,
     /// Direct consensus protocol — block proposals and votes via request-response.
     pub consensus: libp2p::request_response::Behaviour<crate::consensus_protocol::ConsensusCodec>,
+    /// Track-2 DA protocol — serve/fetch erasure-coded job chunks over `/commputer/da/1`
+    /// (`DaRequest::GetChunk` → `DaResponse::Chunk`). Registered unconditionally (consistent
+    /// with `sync`/`consensus`), so the node negotiates the protocol always; but until the
+    /// PROTECTED Phase-B `event_loop` `Da` arm lands there is no handler, so inbound requests
+    /// go unanswered (inert). Phase B adds the serve path (from the local `DaStore`) with a
+    /// per-peer rate limit (P8). `CommpBehaviourEvent::Da` is auto-derived by
+    /// `NetworkBehaviour` from this field.
+    pub da: libp2p::request_response::Behaviour<crate::da_protocol::DaCodec>,
 }
 
 /// Write the persistent libp2p identity key to `path`, owner-only (0600) from
@@ -286,6 +294,7 @@ impl CommpNetwork {
                 // Dedicated sync protocol — direct peer-to-peer, no gossipsub
                 let sync = crate::sync_protocol::sync_behaviour();
                 let consensus = crate::consensus_protocol::consensus_behaviour();
+                let da = crate::da_protocol::da_behaviour();
 
                 Ok(CommpBehaviour {
                     gossipsub,
@@ -296,6 +305,7 @@ impl CommpNetwork {
                     upnp,
                     sync,
                     consensus,
+                    da,
                 })
             })?
             .with_swarm_config(|cfg| {

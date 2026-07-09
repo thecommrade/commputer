@@ -24,3 +24,12 @@ pub mod verifier_planner;
 // Track-2 Phase 0: inert DA publisher — build_attestation over the program‖input envelope,
 // persist every coded chunk into the DaStore keyed by its transport chunk_hash.
 pub mod da_publisher;
+// Track-2 Phase A: inert off-thread executor auto-claim loop + the shared DA seams
+// (AttestationSource / BlobFetcher) the verifier loop re-uses.
+pub mod executor_loop;
+// Track-2 Phase A: inert off-thread verifier commit/reveal loop (salt-durable, restart-safe).
+pub mod verifier_loop;
+// Track-2 Phase A: the Q15 attestation resolver — resolve a bare on-chain da_root into the
+// full DaAttestation (via a well-known DA object) + reconstruct the program‖input blob.
+// The payout-critical AttestationSource/BlobFetcher production impls (inert until spawned).
+pub mod da_attestation;
