@@ -16,6 +16,9 @@ commputer-validator = { workspace = true }
 # PoUW on-chain wiring (P0): deterministic fuel-metered execution + adapters.
 commputer-pouw = { path = "../staging/pouw", features = ["wasm-runtime"] }
 commputer-pouw-onchain = { path = "../staging/pouw-onchain" }
+# Track-2 Phase 0 DA substrate: build_attestation / chunk_proof / chunk_hash for the
+# job-blob publisher (src/node/src/da_publisher.rs). Inert until the PROTECTED wire-in.
+commputer-da = { path = "../staging/da" }
 tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
