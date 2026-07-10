@@ -211,6 +211,18 @@ enum Commands {
         #[arg(long, default_value = "9944")]
         rpc_port: u16,
     },
+    /// Bond COMME as validator stake (required to run the PoUW actor loops + be a
+    /// committee candidate). Signs a Bond tx with the local wallet and broadcasts
+    /// it. Password via the COMMPUTER_WALLET_PASSWORD env var for non-interactive use.
+    Bond {
+        /// Amount in whole COMME to bond.
+        amount: u64,
+        #[arg(long, default_value = "true")]
+        testnet: bool,
+        /// RPC port of the running node (for broadcast).
+        #[arg(long, default_value = "9944")]
+        rpc_port: u16,
+    },
     /// Item 106: Mining statistics
     MiningStats {
         #[arg(long, default_value = "9944")]
@@ -760,6 +772,67 @@ async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result
         }
     }
 
+    Ok(())
+}
+
+/// Bond COMME as validator stake (Track-2: required to run the PoUW actor loops +
+/// be a committee candidate). Mirrors cmd_send but emits a `TxKind::Bond` and
+/// returns Err on rejection so scripts can detect failure. Password via
+/// COMMPUTER_WALLET_PASSWORD for non-interactive use.
+async fn cmd_bond(amount: u64, testnet: bool, rpc_port: u16) -> Result<()> {
+    let path = wallet_path(testnet);
+    if !path.exists() {
+        anyhow::bail!("No wallet found. Run `commputer wallet create` first.");
+    }
+    let password = read_password("Password: ");
+    let wallet = Keystore::load(&path, &password).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let from_addr = *wallet.address();
+    let from_hex = hex::encode(from_addr.0);
+
+    // Nonce from the running node (fall back to local chain state).
+    let client = reqwest::Client::new();
+    let nonce_url = format!("http://127.0.0.1:{}/nonce/{}", rpc_port, from_hex);
+    let nonce = match client.get(&nonce_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            body["nonce"].as_u64().unwrap_or(0)
+        }
+        _ => {
+            let state = open_chain_state(testnet)?;
+            state.accounts.get(&from_addr).map(|a| a.nonce).unwrap_or(0)
+        }
+    };
+
+    let mut tx = Transaction {
+        from: from_addr,
+        nonce,
+        kind: TxKind::Bond { amount: Amount::from_comme(amount) },
+        fee: commputer_core::transaction::MINIMUM_FEE,
+        signature: vec![],
+        public_key: vec![],
+        memo: None,
+        timelock: None,
+    };
+    sign_transaction(&mut tx, &wallet);
+    let tx_hash = tx.hash();
+    println!(
+        "Bond: from {} amount {} COMME nonce {} hash {}",
+        from_addr, amount, nonce, hex::encode(tx_hash.0)
+    );
+
+    let url = format!("http://127.0.0.1:{}/tx", rpc_port);
+    let resp = client
+        .post(&url)
+        .json(&tx)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("could not reach node at {}: {}", url, e))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("node rejected bond tx (HTTP {}): {}", status, body);
+    }
+    println!("Bond tx accepted: {}", body);
     Ok(())
 }
 
@@ -1487,6 +1560,9 @@ async fn main() -> Result<()> {
         }
         Commands::Send { to, amount, testnet, rpc_port } => {
             cmd_send(&to, amount, testnet, rpc_port).await?;
+        }
+        Commands::Bond { amount, testnet, rpc_port } => {
+            cmd_bond(amount, testnet, rpc_port).await?;
         }
         Commands::MiningStats { rpc_port } => {
             cmd_mining_stats(rpc_port).await?;
