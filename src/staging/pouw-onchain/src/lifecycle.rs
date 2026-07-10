@@ -36,6 +36,28 @@ use crate::escrow_ledger::Ledger;
 use crate::settlement_resolution::{resolve_confirmed, resolve_disputed, resolve_timeout, ResolutionParams};
 use borsh::{BorshSerialize, BorshDeserialize};
 
+/// §332 partition: split `reveals` into `(agreeing, disagreeing)` verifier-id sets relative to
+/// `value` under the consensus equivalence oracle. `agreeing` are the honest verifiers whose
+/// revealed hash matches the vindicated/confirmed `value`; `disagreeing` are the wrong-side
+/// revealers (colluders / griefers) whose bonds are forfeited at settlement. Uses the SAME `eq`
+/// that `compute_verdict` used to reach the verdict, so the classes are consistent with it.
+fn partition_by_hash(
+    reveals: &[Reveal],
+    value: &[u8; 32],
+    eq: &dyn EquivalenceOracle,
+) -> (Vec<ParticipantId>, Vec<ParticipantId>) {
+    let mut agreeing = Vec::new();
+    let mut disagreeing = Vec::new();
+    for r in reveals {
+        if eq.equiv(&r.result_hash, value) {
+            agreeing.push(r.verifier);
+        } else {
+            disagreeing.push(r.verifier);
+        }
+    }
+    (agreeing, disagreeing)
+}
+
 /// Lifecycle phase. Advances by block height; `submit_result` moves AwaitingResult→Committing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -634,25 +656,27 @@ impl JobLifecycle {
 
                 let quorum = self.params.quorum(self.params.k);
                 match compute_verdict(&self.reveals, &executor_hash, quorum, eq) {
-                    Verdict::Confirmed { .. } => {
+                    Verdict::Confirmed { result_hash } => {
+                        // §332: partition revealers into honest confirmers (revealed == the
+                        // confirmed value) vs dissenters (revealed a different hash). Dissenters
+                        // forfeit their bond (burned by resolve_confirmed), NOT returned.
+                        let (honest, dissenters) = partition_by_hash(&self.reveals, &result_hash, eq);
                         let mut out = resolve_confirmed(
                             l, &self.params, self.job_id, self.budget, self.executor,
-                            self.executor_bond, &revealed_ids, self.verifier_bond,
+                            self.executor_bond, &honest, &dissenters, self.verifier_bond,
                         );
                         out.burned += forfeit_burned;
                         out.slashed.extend(forfeit_slashed);
                         Terminal::Confirmed(out)
                     }
                     Verdict::Disputed { correct_hash } => {
-                        let honest: Vec<ParticipantId> = self
-                            .reveals
-                            .iter()
-                            .filter(|r| eq.equiv(&r.result_hash, &correct_hash))
-                            .map(|r| r.verifier)
-                            .collect();
+                        // §332: honest revealers proved `correct_hash`; wrong-side revealers
+                        // rubber-stamped the executor's wrong hash. Only honest bonds return;
+                        // wrong-side bonds are forfeited (burned by resolve_disputed).
+                        let (honest, wrong_side) = partition_by_hash(&self.reveals, &correct_hash, eq);
                         let mut out = resolve_disputed(
                             l, &self.params, self.job_id, self.budget, self.submitter,
-                            self.executor, self.executor_bond, &revealed_ids, &honest,
+                            self.executor, self.executor_bond, &honest, &wrong_side,
                             self.verifier_bond,
                         );
                         out.burned += forfeit_burned;
@@ -983,6 +1007,60 @@ mod tests {
         }
         assert_eq!(l.total_supply(), total0);
         assert_eq!(l.escrowed_for(&job), 0);
+    }
+
+    #[test]
+    fn settle_disputed_burns_colluding_wrong_side_revealer_bond() {
+        // §332 collusion: executor claims 7 (wrong); 2 honest verifiers reveal the correct 5 and
+        // win quorum ⇒ Disputed; the 3rd verifier COLLUDES — reveals the executor's wrong 7. The
+        // colluder's bond must be FORFEITED (burned), not returned.
+        let (budget, e_bond, v_bond) = min_funding();
+        let job = [7u8; 32];
+        let result = [7u8; 32];   // executor claims 7
+        let correct = [5u8; 32];  // honest committee proves 5
+        // pid(10),pid(11) reveal 5 (honest); pid(12) reveals 7 (rubber-stamps the executor).
+        let revealed = vec![(pid(10), correct), (pid(11), correct), (pid(12), result)];
+        let (term, l, total0) = run_round(job, result, budget, e_bond, v_bond, &cands3(), &revealed);
+        match term {
+            Terminal::Disputed(out) => {
+                assert_eq!(out.submitter_refunded, budget, "submitter fully refunded");
+                assert_eq!(out.verifiers_paid, 792, "20% of Be bounty across the 2 honest (396 each)");
+                // burn = exec-bond remainder (3960-792=3168) + the forfeited colluder bond (1650).
+                assert_eq!(out.burned, (e_bond - 792) + v_bond, "exec remainder + colluder bond");
+                assert_eq!(out.bonds_returned, 2 * v_bond, "only the 2 honest revealers' bonds");
+                assert_eq!(out.slashed, vec![(pid(9), e_bond), (pid(12), v_bond)], "executor + colluder");
+            }
+            other => panic!("expected Disputed, got {other:?}"),
+        }
+        // The colluder ends with ZERO (its escrowed bond was burned, not returned).
+        assert_eq!(l.balance_of(&pid(12)), 0, "colluding wrong-side revealer forfeited its bond");
+        assert_eq!(l.balance_of(&pid(10)), 396 + v_bond, "honest: bounty share + bond back");
+        assert_eq!(l.total_supply(), total0, "supply conserved (colluder bond moved to burned)");
+        assert_eq!(l.escrowed_for(&job), 0, "pot drained to exactly 0");
+    }
+
+    #[test]
+    fn settle_confirmed_burns_dissenting_revealer_bond() {
+        // §332 (Confirmed side): executor's 7 is correct; 2 verifiers confirm 7 (quorum ⇒
+        // Confirmed); the 3rd dissents with 8. The dissenter's bond is forfeited (burned).
+        let (budget, e_bond, v_bond) = min_funding();
+        let job = [8u8; 32];
+        let result = [7u8; 32];
+        let revealed = vec![(pid(10), result), (pid(11), result), (pid(12), [8u8; 32])];
+        let (term, l, total0) = run_round(job, result, budget, e_bond, v_bond, &cands3(), &revealed);
+        match term {
+            Terminal::Confirmed(out) => {
+                assert_eq!(out.worker_paid, 3_366, "85% of budget");
+                assert_eq!(out.verifiers_paid, 396, "10% pool across the 2 confirmers");
+                assert_eq!(out.burned, 198 + v_bond, "5% protocol slice + forfeited dissenter bond");
+                assert_eq!(out.bonds_returned, e_bond + 2 * v_bond, "exec + only the 2 confirmers' bonds");
+                assert!(out.slashed.contains(&(pid(12), v_bond)), "dissenter bond logged slashed");
+            }
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+        assert_eq!(l.balance_of(&pid(12)), 0, "dissenting revealer forfeited its bond");
+        assert_eq!(l.total_supply(), total0, "supply conserved");
+        assert_eq!(l.escrowed_for(&job), 0, "pot drained to exactly 0");
     }
 
     #[test]

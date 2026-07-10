@@ -145,11 +145,22 @@ pub fn resolve_escalation_fallback(
     }
 }
 
-/// `Confirmed` verdict (sampled committee): split the budget 85/10/5 and return every
-/// bond. Verdict + committee are on-chain data by settlement time. Delegates the budget
-/// split to the frozen game `settle_confirmed_sampled` (which returns `bonds_returned: 0`),
-/// then returns the executor + committee bonds and records `bonds_returned` itself —
-/// mirroring `engine.rs:251-258`.
+/// `Confirmed` verdict (sampled committee): split the budget 85/10/5, return the executor
+/// bond + every HONEST confirmer's bond, and BURN each dissenter's bond (WHITEPAPER §332).
+/// Verdict + committee are on-chain data by settlement time.
+///
+/// §332 forfeiture (2026-07-09): `honest_verifiers` are the revealers whose result_hash ==
+/// the confirmed quorum value; `dissenters` are the revealers whose result_hash disagrees
+/// with it (they tried to overturn a correct result). Only the honest confirmers share the
+/// 10% verifier pool (delegated to the frozen `settle_confirmed_sampled`) and get their bond
+/// back; each dissenter's bond is BURNED (added to `burned`, logged in `slashed`) rather than
+/// returned — a wrong-side vote is never a free option. Delegates the budget split to the
+/// frozen game (which returns `bonds_returned: 0`), then accounts the bonds itself.
+///
+/// Conservation: the pot holds `budget + executor_bond + (|honest|+|dissenters|)·verifier_bond`
+/// (non-revealer bonds were burned upstream by `settle`). This pays the 85/10/5 budget split,
+/// returns the executor bond + honest bonds, and burns the dissenter bonds — every unit paid
+/// or burned, pot drained to 0.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_confirmed(
     l: &mut impl Ledger,
@@ -158,25 +169,44 @@ pub fn resolve_confirmed(
     budget: u64,
     worker: ParticipantId,
     executor_bond: u64,
-    committee: &[ParticipantId],
+    honest_verifiers: &[ParticipantId],
+    dissenters: &[ParticipantId],
     verifier_bond: u64,
 ) -> SettlementOutcome {
     l.for_job(job_id);
-    let mut out = settle_confirmed_sampled(l, p, budget, worker, committee);
+    // Only the honest confirmers share the 10% verifier pool.
+    let mut out = settle_confirmed_sampled(l, p, budget, worker, honest_verifiers);
     l.pay(worker, executor_bond);
-    for v in committee {
+    for v in honest_verifiers {
         l.pay(*v, verifier_bond);
     }
-    out.bonds_returned = executor_bond + committee.len() as u64 * verifier_bond;
+    // §332: a verifier that reveals a hash disagreeing with the confirmed quorum result
+    // forfeits its own bond — burned, not returned. Recorded in `slashed` as a log.
+    for v in dissenters {
+        l.burn(verifier_bond);
+        out.slashed.push((*v, verifier_bond));
+    }
+    out.bonds_returned = executor_bond + honest_verifiers.len() as u64 * verifier_bond;
+    out.burned += dissenters.len() as u64 * verifier_bond;
     out
 }
 
-/// `Disputed` verdict (committee proved the executor wrong): refund the full budget,
-/// slash the executor bond (bounty to honest verifiers + burn the rest), and return every
-/// committee member's bond — the catch bounty went to the honest subset, but ALL committee
-/// bonds return (only the executor's Be is slashed on a committee Disputed). Delegates the
-/// budget/bond split to the frozen game `settle_committee_disputed` and records the
-/// returned committee bonds itself — mirroring `engine.rs:260-277`.
+/// `Disputed` verdict (committee proved the executor wrong): refund the full budget, slash
+/// the executor bond (bounty to honest verifiers + burn the rest), return the HONEST
+/// revealers' bonds, and BURN each wrong-side revealer's bond (WHITEPAPER §332).
+///
+/// §332 forfeiture (2026-07-09): `honest_verifiers` revealed the vindicated `correct_hash`;
+/// `wrong_side` are the revealers who rubber-stamped the executor's WRONG hash (colluders).
+/// The catch bounty + returned bond go ONLY to the honest subset; each wrong-side revealer's
+/// bond is BURNED (added to `burned`, logged in `slashed`) — collusion is not a free option.
+/// Delegates the budget/executor-bond split to the frozen `settle_committee_disputed` (which
+/// returns `bonds_returned: 0` and slashes only the executor), then accounts the verifier
+/// bonds itself.
+///
+/// Conservation: the pot holds `budget + executor_bond + (|honest|+|wrong_side|)·verifier_bond`
+/// (non-revealer bonds were burned upstream by `settle`). This refunds the budget, splits the
+/// executor bond (bounty + burn), returns honest bonds, and burns wrong-side bonds — every
+/// unit paid or burned, pot drained to 0.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_disputed(
     l: &mut impl Ledger,
@@ -186,17 +216,24 @@ pub fn resolve_disputed(
     submitter: ParticipantId,
     executor: ParticipantId,
     executor_bond: u64,
-    committee: &[ParticipantId],
     honest_verifiers: &[ParticipantId],
+    wrong_side: &[ParticipantId],
     verifier_bond: u64,
 ) -> SettlementOutcome {
     l.for_job(job_id);
     let mut out =
         settle_committee_disputed(l, p, budget, submitter, executor, executor_bond, honest_verifiers);
-    for v in committee {
+    // Return the bond ONLY to the honest revealers...
+    for v in honest_verifiers {
         l.pay(*v, verifier_bond);
     }
-    out.bonds_returned = committee.len() as u64 * verifier_bond;
+    // ...and BURN each wrong-side (colluding) revealer's bond (§332). Logged in `slashed`.
+    for v in wrong_side {
+        l.burn(verifier_bond);
+        out.slashed.push((*v, verifier_bond));
+    }
+    out.bonds_returned = honest_verifiers.len() as u64 * verifier_bond;
+    out.burned += wrong_side.len() as u64 * verifier_bond;
     out
 }
 
@@ -239,7 +276,10 @@ mod tests {
     }
 
     #[test]
-    fn disputed_refunds_submitter_bounties_honest_returns_committee_bonds() {
+    fn disputed_bounties_honest_returns_honest_bonds_burns_wrong_side() {
+        // §332: 2 of 3 revealed the vindicated value (honest); the 3rd rubber-stamped the
+        // executor's wrong hash (wrong-side). Honest get bounty + bond back; the wrong-side
+        // revealer's bond is FORFEITED (burned), NOT returned — collusion costs its bond.
         let p = GameParams::default();
         let f = 100_000_000u64;
         let budget = budget_min(f, &p).unwrap();                // 3_960
@@ -248,7 +288,8 @@ mod tests {
         let job = [5u8; 32];
         let (submitter, executor) = (pid(0), pid(9));
         let committee = [pid(10), pid(11), pid(12)];
-        let honest = [pid(10), pid(11)]; // 2 of 3 revealed the vindicated value
+        let honest = [pid(10), pid(11)];   // revealed the vindicated value
+        let wrong_side = [pid(12)];        // rubber-stamped the executor's wrong hash
 
         let mut l = EscrowLedger::new();
         let mut parts = vec![(submitter, budget), (executor, e_bond)];
@@ -258,18 +299,23 @@ mod tests {
         let total0 = fund_pot(&mut l, job, &parts);
 
         let out = resolve_disputed(
-            &mut l, &p, job, budget, submitter, executor, e_bond, &committee, &honest, v_bond,
+            &mut l, &p, job, budget, submitter, executor, e_bond, &honest, &wrong_side, v_bond,
         );
 
         // dispute_bounty_bps = 2000 → bounty = 20% of 3_960 = 792, split 2 ways = 396 each.
         assert_eq!(out.submitter_refunded, budget, "full budget refunded");
         assert_eq!(out.verifiers_paid, 792, "20% of Be to the 2 honest verifiers");
-        assert_eq!(out.burned, e_bond - 792, "remainder of the slashed bond (3960-792=3168)");
-        assert_eq!(out.bonds_returned, 3 * v_bond, "all 3 committee bonds returned");
-        assert_eq!(out.slashed, vec![(executor, e_bond)]);
+        // burn = executor-bond remainder (3960-792=3168) + the forfeited wrong-side bond (1650).
+        assert_eq!(out.burned, (e_bond - 792) + v_bond, "exec remainder + forfeited wrong-side bond");
+        assert_eq!(out.bonds_returned, 2 * v_bond, "only the 2 HONEST committee bonds returned");
+        assert_eq!(
+            out.slashed,
+            vec![(executor, e_bond), (pid(12), v_bond)],
+            "executor bond + wrong-side verifier bond both logged slashed"
+        );
         assert_eq!(l.balance_of(&submitter), budget);
         assert_eq!(l.balance_of(&honest[0]), 396 + v_bond, "bounty share + bond back");
-        assert_eq!(l.balance_of(&committee[2]), v_bond, "non-honest member: bond back only");
+        assert_eq!(l.balance_of(&committee[2]), 0, "wrong-side member: bond FORFEITED (burned)");
         assert_eq!(l.balance_of(&executor), 0, "executor bond slashed");
         assert_eq!(l.total_supply(), total0);
         assert_eq!(l.escrowed_for(&job), 0);
@@ -293,7 +339,8 @@ mod tests {
         }
         let total0 = fund_pot(&mut l, job, &parts);
 
-        let out = resolve_confirmed(&mut l, &p, job, budget, executor, e_bond, &committee, v_bond);
+        // All 3 confirmed the executor's result ⇒ no dissenters ⇒ every bond returned as before.
+        let out = resolve_confirmed(&mut l, &p, job, budget, executor, e_bond, &committee, &[], v_bond);
 
         assert_eq!(out.worker_paid, 3_366, "85% of 3_960");
         assert_eq!(out.verifiers_paid, 396, "10% split across 3 (132 each)");
@@ -304,6 +351,47 @@ mod tests {
         assert_eq!(l.balance_of(&submitter), 0, "confirmed: submitter not refunded");
         assert_eq!(l.total_supply(), total0);
         assert_eq!(l.escrowed_for(&job), 0);
+    }
+
+    #[test]
+    fn confirmed_burns_dissenter_bond_returns_only_confirmers() {
+        // §332 (Confirmed side): 2 confirmers agree with the executor's correct result; a 3rd
+        // dissenter revealed a different hash (tried to overturn a correct result). Only the 2
+        // confirmers share the 10% pool + get their bond back; the dissenter's bond is BURNED.
+        let p = GameParams::default();
+        let f = 100_000_000u64;
+        let budget = budget_min(f, &p).unwrap();                // 3_960
+        let e_bond = executor_bond_min(f, budget, &p).unwrap(); // 3_960
+        let v_bond = verifier_bond_min(f, &p).unwrap();         // 1_650
+        let job = [7u8; 32];
+        let (submitter, executor) = (pid(0), pid(9));
+        let committee = [pid(10), pid(11), pid(12)];
+        let confirmers = [pid(10), pid(11)]; // revealed the confirmed value
+        let dissenters = [pid(12)];          // revealed a disagreeing hash
+
+        let mut l = EscrowLedger::new();
+        let mut parts = vec![(submitter, budget), (executor, e_bond)];
+        for c in &committee {
+            parts.push((*c, v_bond));
+        }
+        let total0 = fund_pot(&mut l, job, &parts);
+
+        let out = resolve_confirmed(
+            &mut l, &p, job, budget, executor, e_bond, &confirmers, &dissenters, v_bond,
+        );
+
+        assert_eq!(out.worker_paid, 3_366, "85% of 3_960");
+        // 10% pool = 396 split across the 2 confirmers (198 each); 5% (198) protocol burn.
+        assert_eq!(out.verifiers_paid, 396, "10% split across the 2 confirmers");
+        // burn = 5% protocol slice (198) + the forfeited dissenter bond (1_650).
+        assert_eq!(out.burned, 198 + v_bond, "protocol 5% + forfeited dissenter bond");
+        assert_eq!(out.bonds_returned, e_bond + 2 * v_bond, "exec bond + only the 2 confirmer bonds");
+        assert!(out.slashed.contains(&(pid(12), v_bond)), "dissenter bond logged slashed");
+        assert_eq!(l.balance_of(&executor), 3_366 + e_bond, "worker share + bond back");
+        assert_eq!(l.balance_of(&confirmers[0]), 198 + v_bond, "pool share + bond back");
+        assert_eq!(l.balance_of(&pid(12)), 0, "dissenter: bond FORFEITED (burned)");
+        assert_eq!(l.total_supply(), total0, "supply conserved");
+        assert_eq!(l.escrowed_for(&job), 0, "pot drained");
     }
 
     #[test]
@@ -426,7 +514,7 @@ mod tests {
         for c in &committee {
             lb.escrow(*c, v_bond);
         }
-        let _ = resolve_confirmed(&mut lb, &p, job_b, budget, executor, e_bond, &committee, v_bond);
+        let _ = resolve_confirmed(&mut lb, &p, job_b, budget, executor, e_bond, &committee, &[], v_bond);
 
         // Identical end-state: every actor balance, supply, no stranded escrow.
         for who in [submitter, executor, committee[0], committee[1], committee[2]] {

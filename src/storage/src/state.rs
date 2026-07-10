@@ -4961,6 +4961,42 @@ mod tests {
         assert_eq!(both.chain.total_burned, 198 + 1_650, "on-chain burn includes the forfeit");
     }
 
+    #[test]
+    fn equivalence_disputed_with_wrong_side_forfeiture_matches() {
+        // §332 collusion, cross-backend: executor claims 7; pid(10)/pid(11) reveal the correct 5
+        // (honest, win quorum ⇒ Disputed); pid(12) rubber-stamps the executor's wrong 7. pid(12)'s
+        // bond is FORFEITED (burned), not returned. Proves the forfeiture is byte-identical on the
+        // staging EscrowLedger and the on-chain ChainState.
+        let claimed = [7u8; 32];
+        let correct = [5u8; 32];
+        let both = run_on_both(&Scenario {
+            job: [9u8; 32],
+            executor_result: Some(claimed),
+            candidates: vec![10, 11, 12],
+            commits: vec![(10, correct, true), (11, correct, true), (12, claimed, true)],
+        });
+        match &both.chain_terminal {
+            Terminal::Disputed(out) => {
+                assert_eq!(out.submitter_refunded, 3_960, "submitter fully refunded");
+                assert_eq!(out.verifiers_paid, 792, "20% of exec bond bounty across the honest 2");
+                // burn = exec-bond remainder (3_960-792) + the forfeited wrong-side bond (1_650).
+                assert_eq!(out.burned, (3_960 - 792) + 1_650, "exec remainder + colluder bond");
+                assert_eq!(out.bonds_returned, 2 * 1_650, "only the 2 honest revealers' bonds returned");
+                assert_eq!(
+                    out.slashed,
+                    vec![(lpid(9), 3_960), (lpid(12), 1_650)],
+                    "executor bond + wrong-side verifier bond logged slashed"
+                );
+            }
+            other => panic!("expected Disputed, got {other:?}"),
+        }
+        assert_equivalent(&both);
+        assert_eq!(both.chain.escrowed_for_job(&both.job), 0, "pot drained on Disputed");
+        // The colluder (pid 12) forfeited its bond on BOTH backends.
+        assert_eq!(both.chain.accounts.get(&lpaddr(12)).map(|a| a.balance.raw()).unwrap_or(0), 0);
+        assert_eq!(both.staging.balance_of(&lpid(12)), 0);
+    }
+
     fn genesis_block() -> Block {
         Block {
             header: BlockHeader {

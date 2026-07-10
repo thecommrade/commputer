@@ -55,6 +55,8 @@ use commputer_da::params::ProviderId;
 use commputer_da::transport::{DaTransport, MerklePath};
 use commputer_network::da_protocol::DaChunk;
 
+use commputer_pouw::commit_reveal::make_commitment;
+use commputer_pouw::ids::ParticipantId;
 use commputer_pouw::wasm::WasmLimits;
 use commputer_pouw_onchain::consensus_params::PhaseWindows;
 use commputer_pouw_onchain::lifecycle::Phase;
@@ -674,5 +676,225 @@ fn pouw_disputed_slashes_cheating_executor_pays_honest_verifiers() {
     assert_eq!(s.escrowed_for_job(&job), 0, "pot drained to 0 at the Disputed terminal");
     assert_eq!(conserved(s), conserved0, "total supply conserved (balances + bonded + burned)");
     assert_eq!(MIN_BUDGET + verifiers_paid + bond_slash_burn, MIN_BUDGET + e_bond, "pot fully accounted");
+    assert!(blocks <= 20, "converged quickly (was {})", blocks);
+}
+
+/// COLLUSION PATH (WHITEPAPER §332: "a verifier who rubber-stamps a wrong result forfeits its own
+/// bond"). Same fraud setup as the Disputed test — the executor COMPLETES WITH A BOGUS `result_hash`
+/// — but now ONE committee verifier COLLUDES: instead of the honest verifier loop (DA-fetch,
+/// re-execute, reveal the TRUE hash), it directly commits+reveals the executor's SAME bogus hash.
+/// The other two verifiers run the REAL honest loop and reveal the TRUE hash, winning quorum ⇒
+/// `Verdict::Disputed`. The colluder is on the losing side, so `settle` → `resolve_disputed` must
+/// BURN the colluder's bond (NOT return it), while the two honest verifiers are paid the catch
+/// bounty + keep their bonds and the cheating executor is slashed. Supply is conserved every block.
+///
+/// This is the fix's acceptance proof: BEFORE the fix a wrong-side revealer got its bond back at
+/// zero cost (collusion a free option); AFTER, its bond is forfeited (burned).
+#[test]
+fn pouw_disputed_burns_colluding_verifier_bond() {
+    // The bogus result the cheating executor commits to — and the colluding verifier rubber-stamps.
+    const BOGUS_HASH: [u8; 32] = [0xABu8; 32];
+    // Fixed salt the colluder uses to open its (bogus) commitment.
+    const COLLUDER_SALT: [u8; 32] = [0x5Au8; 32];
+
+    let submitter = addr(2);
+    let executor = addr(1);
+    let verifiers = [addr(3), addr(4), addr(5)];
+    let colluder = verifiers[2]; // addr(5): rubber-stamps the executor's wrong hash
+    let honest = [verifiers[0], verifiers[1]]; // addr(3), addr(4): re-execute + reveal the TRUE hash
+
+    let mut state = ChainState::new();
+    state.phase_windows = PhaseWindows { result_blocks: 3, commit_blocks: 3, reveal_blocks: 3, claim_blocks: 6 };
+    state.apply_block(&genesis_block()).unwrap();
+
+    // Identical funding + bonding to the Disputed test.
+    state.accounts.get_or_create(submitter).balance = Amount::from_raw(MIN_BUDGET);
+    {
+        let e = state.accounts.get_or_create(executor);
+        e.is_validator = true;
+        e.balance = Amount::from_raw(MIN_BUDGET);
+    }
+    for &v in &verifiers {
+        let a = state.accounts.get_or_create(v);
+        a.is_validator = true;
+        a.balance = Amount::from_raw(MIN_BOND + VERIFIER_BOND);
+    }
+    for &v in &verifiers {
+        state.bond(&v, MIN_BOND).unwrap();
+    }
+
+    let conserved0 = conserved(&state);
+    let submitter_before = bal(&state, submitter);
+    let executor_before = bal(&state, executor);
+    let honest_before = bal(&state, honest[0]);
+    let colluder_before = bal(&state, colluder);
+    assert_eq!(
+        (submitter_before, executor_before, honest_before, colluder_before),
+        (MIN_BUDGET, MIN_BUDGET, VERIFIER_BOND, VERIFIER_BOND)
+    );
+
+    // Publish + submit the job (budget escrowed).
+    let program = wat::parse_str(DOUBLER).expect("guest assembles");
+    let input = vec![1u8, 2, 3, 40, 7];
+    let store = DaStore::open(scratch("da")).unwrap();
+    let att = da_publisher::publish_job_blob(&store, &program, &input).expect("publish job blob");
+    let program_hash: [u8; 32] = Sha256::digest(&program).into();
+    let input_hash: [u8; 32] = Sha256::digest(&input).into();
+    let submit_kind = TxKind::SubmitJobV2 {
+        program_hash,
+        input_hash,
+        da_root: att.da_root,
+        resources: ResourceRequirements::cpu_only(1, 0),
+        max_duration_secs: 60,
+        comme_budget: Amount::from_raw(MIN_BUDGET),
+        l2_id: None,
+    };
+    let submit_tx = unsigned(submitter, 0, submit_kind);
+    let job = submit_tx.hash().0;
+    state.apply_block(&next_block(&state, vec![submit_tx])).unwrap();
+    assert_eq!(state.escrowed_for_job(&job), MIN_BUDGET, "budget escrowed at submit");
+    assert_eq!(conserved(&state), conserved0, "conserved after submit");
+
+    // Salt stores only for the 2 HONEST verifiers (the colluder is hand-driven).
+    let mut salts: Vec<SaltStore> =
+        (0..honest.len()).map(|i| SaltStore::open(scratch(&format!("salt{i}"))).unwrap()).collect();
+    let exec_cfg = ExecutorCfg { max_concurrent_claims: 4, min_balance_reserve: 0, executor_bond: EXECUTOR_BOND_FLAT };
+    let ver_cfg = VerifierCfg { min_balance_reserve: 0 };
+
+    let (mut claims, mut completes, mut honest_commits, mut honest_reveals, mut blocks) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut cheated = false; // inject the fraudulent CompleteJob exactly once
+    let mut colluder_committed = false;
+    let mut colluder_revealed = false;
+
+    while (!state.pending_jobs.is_empty() || !state.job_lifecycles.is_empty()) && blocks < 40 {
+        let now = state.blocks.height();
+        let mut txs: Vec<Transaction> = Vec::new();
+
+        // EXECUTOR: honest CLAIM while pending; then inject ONE bogus CompleteJob.
+        if !state.pending_jobs.is_empty() {
+            let exec_view = executor_loop::build_chain_view(
+                now, 0, executor, bal(&state, executor), &state.pending_jobs, &state.job_lifecycles,
+            );
+            for kind in drive_executor(&store, exec_view, exec_cfg) {
+                match kind {
+                    TxKind::ClaimJob { .. } => claims += 1,
+                    other => panic!("executor should only CLAIM while the job is pending, got {other:?}"),
+                }
+                txs.push(unsigned(executor, nonce(&state, executor), kind));
+            }
+        } else if !cheated {
+            if let Some(lc) = state.job_lifecycles.get(&job) {
+                if lc.phase() == Phase::AwaitingResult && !lc.executor_hash_is_set() {
+                    completes += 1;
+                    cheated = true;
+                    txs.push(unsigned(
+                        executor,
+                        nonce(&state, executor),
+                        TxKind::CompleteJob { job_id: job, result_hash: BOGUS_HASH },
+                    ));
+                }
+            }
+        }
+
+        // HONEST verifiers: REAL loop ⇒ re-execute + commit/reveal the TRUE hash.
+        for (i, &v) in honest.iter().enumerate() {
+            let tick = verifier_loop::build_verifier_views(now, v, bal(&state, v), &state.job_lifecycles);
+            for kind in drive_verifier(&store, tick, &mut salts[i], ver_cfg, v.0) {
+                match kind {
+                    TxKind::Commit { .. } => honest_commits += 1,
+                    TxKind::Reveal { .. } => honest_reveals += 1,
+                    other => panic!("honest verifier emitted unexpected {other:?}"),
+                }
+                txs.push(unsigned(v, nonce(&state, v), kind));
+            }
+        }
+
+        // COLLUDER: hand-inject Commit(bogus) during Committing, Reveal(bogus) during Revealing —
+        // it rubber-stamps the executor's WRONG hash instead of re-executing.
+        if let Some(lc) = state.job_lifecycles.get(&job) {
+            match lc.phase() {
+                Phase::Committing if !colluder_committed => {
+                    let c = make_commitment(&ParticipantId(colluder.0), &BOGUS_HASH, &COLLUDER_SALT, VERIFIER_BOND);
+                    colluder_committed = true;
+                    txs.push(unsigned(
+                        colluder,
+                        nonce(&state, colluder),
+                        TxKind::Commit { job_id: job, commit: c.commit, bond: Amount::from_raw(VERIFIER_BOND) },
+                    ));
+                }
+                Phase::Revealing if colluder_committed && !colluder_revealed => {
+                    colluder_revealed = true;
+                    txs.push(unsigned(
+                        colluder,
+                        nonce(&state, colluder),
+                        TxKind::Reveal { job_id: job, result_hash: BOGUS_HASH, salt: COLLUDER_SALT },
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        state.apply_block(&next_block(&state, txs)).unwrap();
+        blocks += 1;
+        assert_eq!(conserved(&state), conserved0, "money conserved after driven block {blocks}");
+    }
+
+    assert!(state.job_lifecycles.is_empty(), "lifecycle settled + drained within the block bound");
+    assert!(state.pending_jobs.is_empty(), "no pending record left behind");
+
+    // The loops really drove the collusion: honest claim, one bogus complete, 2 honest commit+reveal
+    // pairs (TRUE hash), and the colluder's injected commit+reveal of the bogus hash.
+    assert!(claims >= 1, "executor loop emitted a ClaimJob");
+    assert!(cheated, "the fraudulent CompleteJob was injected");
+    assert_eq!(completes, 1, "exactly one fraudulent CompleteJob");
+    assert_eq!(honest_commits, 2, "both honest verifier loops committed the true hash");
+    assert_eq!(honest_reveals, 2, "both honest verifier loops revealed the true hash");
+    assert!(colluder_committed && colluder_revealed, "the colluder committed + revealed the bogus hash");
+
+    let s = &state;
+
+    // ── The EXACT resolve_disputed split with §332 forfeiture. Inputs: budget = e_bond = 1_000_000,
+    //    v_bond = 20, dispute_bounty_bps = 2_000. honest = 2 revealers; wrong_side = the 1 colluder.
+    //      submitter refunded the full budget; catch-bounty = 20% of the slashed executor bond split
+    //      across the 2 HONEST revealers; the rest of the executor bond burned; the 2 honest bonds
+    //      returned; the COLLUDER's bond BURNED (the fix). ──
+    let e_bond = MIN_BUDGET;
+    let bounty_pool = MIN_BUDGET * DISPUTE_BOUNTY_BPS / 10_000; // 200_000
+    let bounty_each = bounty_pool / 2; // pay_even across the 2 honest = 100_000
+    let verifiers_paid = bounty_each * 2; // 200_000 (no rounding remainder)
+    let exec_bond_burn = e_bond - verifiers_paid; // 800_000
+    let total_burn = exec_bond_burn + VERIFIER_BOND; // + the forfeited colluder bond (20) = 800_020
+    assert_eq!((bounty_pool, bounty_each, verifiers_paid, exec_bond_burn), (200_000, 100_000, 200_000, 800_000));
+
+    // SUBMITTER made whole (Disputed ⇒ full refund).
+    assert_eq!(bal(s, submitter), MIN_BUDGET, "submitter fully refunded on Disputed");
+
+    // EXECUTOR slashed to zero (bond gone, no worker comp).
+    assert_eq!(bal(s, executor), 0, "cheating executor slashed to zero");
+    assert_eq!(executor_before - bal(s, executor), MIN_BUDGET, "executor lost its entire bond");
+
+    // HONEST verifiers paid: bond returned (nets zero) + bounty share ⇒ net delta = the bounty share.
+    for &v in &honest {
+        assert_eq!(bal(s, v), VERIFIER_BOND + bounty_each, "honest verifier: bond back + bounty share");
+        assert_eq!(bal(s, v) - honest_before, bounty_each, "honest net delta = bounty share");
+    }
+
+    // ★ THE FIX: the COLLUDER forfeited its bond — balance 0, a NET LOSS of one VERIFIER_BOND.
+    // (BEFORE the fix this would be VERIFIER_BOND: bond returned at zero cost.)
+    assert_eq!(bal(s, colluder), 0, "colluding verifier's bond FORFEITED (burned), not returned");
+    assert_eq!(colluder_before - bal(s, colluder), VERIFIER_BOND, "colluder net delta = -1 bond (forfeited)");
+
+    // Protocol burn = non-bounty remainder of the slashed executor bond + the forfeited colluder bond.
+    assert_eq!(s.total_burned, total_burn, "burn = exec-bond remainder + forfeited colluder bond");
+
+    // Pot drained; supply conserved; pot fully accounted for (budget + e_bond + 3 v_bonds in ==
+    // refund + bounty + burns + 2 returned honest bonds out).
+    assert_eq!(s.escrowed_for_job(&job), 0, "pot drained to 0 at the Disputed terminal");
+    assert_eq!(conserved(s), conserved0, "total supply conserved across the collusion lifecycle");
+    assert_eq!(
+        MIN_BUDGET + verifiers_paid + total_burn + 2 * VERIFIER_BOND,
+        MIN_BUDGET + e_bond + 3 * VERIFIER_BOND,
+        "pot fully accounted (in == out)"
+    );
     assert!(blocks <= 20, "converged quickly (was {})", blocks);
 }
