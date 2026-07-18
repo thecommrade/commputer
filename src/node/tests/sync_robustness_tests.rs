@@ -119,17 +119,47 @@ fn start_is_ignored_while_actively_syncing() {
 
 #[test]
 fn reset_clears_all_transient_state() {
-    let mut m = downloading_to(100);
+    // Exhaust the peer BEFORE entering Downloading: record_batch_failure counts in
+    // any state, but the stall watchdog (MAX_STALL_BATCH_FAILURES) only arms while
+    // Downloading toward a nonzero target — armed, the failure that exhausts a lone
+    // peer would ALSO self-reset the machine (pinned by the watchdog test below),
+    // which this test must sidestep to observe reset() itself doing the clearing.
+    let mut m = SyncMachine::new();
     let peer = PeerId::random();
     for _ in 0..MAX_PEER_FAILURES {
         m.record_batch_failure(peer);
     }
-    // Peer is exhausted before reset.
-    assert_eq!(m.select_peer(&[peer]), None);
+    assert_eq!(m.select_peer(&[peer]), None, "peer exhausted");
 
+    // Exhaustion survives entering a fresh download...
+    m.start();
+    m.record_height(100);
+    m.begin_downloading(0);
+    assert_eq!(*m.state(), SyncState::Downloading);
+    assert_eq!(m.select_peer(&[peer]), None, "exhaustion persists across begin_downloading");
+
+    // ...and reset() clears all of it.
     m.reset();
     assert_eq!(*m.state(), SyncState::Idle);
     assert_eq!(m.target_height(), 0);
     // Exhausted set cleared → the peer is selectable again.
     assert_eq!(m.select_peer(&[peer]), Some(peer));
+}
+
+#[test]
+fn stall_watchdog_self_resets_on_the_exhausting_failure() {
+    // Liveness watchdog (MAX_STALL_BATCH_FAILURES == MAX_PEER_FAILURES): while
+    // Downloading toward a nonzero target with no forward progress, the failure
+    // that exhausts a lone peer must ALSO trip the watchdog and reset the machine
+    // — once a lone peer is exhausted, select_peer returns None and no further
+    // failures are ever recorded, so firing any later would wedge the node in
+    // Downloading forever.
+    let mut m = downloading_to(100);
+    let peer = PeerId::random();
+    for _ in 0..MAX_PEER_FAILURES {
+        m.record_batch_failure(peer);
+    }
+    assert_eq!(*m.state(), SyncState::Idle, "watchdog tore the wedged sync down");
+    assert_eq!(m.target_height(), 0);
+    assert_eq!(m.select_peer(&[peer]), Some(peer), "self-reset cleared the exhaustion");
 }
