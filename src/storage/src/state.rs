@@ -1848,10 +1848,17 @@ impl ChainState {
                 "zero address cannot claim compute jobs".into(),
             ));
         }
-        // Guard order matters: lifecycle-exists FIRST so a double-claim can never fall through
-        // to the legacy no-op accept.
+        // Permissionless claim race (whitepaper: any bonded validator may claim an open job).
+        // LOSING the race is a NORMAL outcome, not a block-invalidating error: a ClaimJob for a
+        // job that is already claimed applies as a nonce-consuming NO-OP (the caller bumps the
+        // nonce). This is essential for liveness — a stuck losing-ClaimJob nonce would otherwise
+        // wedge the loser's sequence, so its LATER committee Commit/Reveal at nonce+1 could never
+        // apply (→ verifiers can't reach quorum → jobs never pay out). The winner's claim stands:
+        // we return BEFORE opening any lifecycle or escrowing a bond, so the one-executor-per-job
+        // invariant is fully preserved (no second lifecycle, no double-escrow). Deterministic —
+        // reads only consensus `job_lifecycles` — so every node agrees the block is valid.
         if self.job_lifecycles.contains_key(&job_id) {
-            return Err(StateError::InvalidBlock("job already claimed".into()));
+            return Ok(());
         }
         // Validator gate KEPT (legacy Feature-53 semantics + patch-spec §4 keeps tx-level gates).
         let is_validator = self.accounts.get(&from).map(|a| a.is_validator).unwrap_or(false);
@@ -7345,22 +7352,33 @@ mod tests {
     }
 
     #[test]
-    fn b3_double_claim_rejects_second_tx() {
+    fn b3_losing_claim_is_nonce_consuming_noop() {
         let (mut state, job) = claimed_job_state(None);
         let pot = state.escrowed_for_job(&job);
-        // addr(3) is a bonded validator — but the job is already claimed.
-        let err = state
+        let bal3 = bal(&state, 3);
+        // addr(3) is a bonded validator — but the job is already claimed. Losing the
+        // permissionless claim race is a NORMAL outcome, not a block-invalidating error:
+        // the block applies and the losing ClaimJob is a nonce-consuming no-op (an Err here
+        // would permanently wedge the loser's nonce, so its later committee Commit/Reveal
+        // could never apply — no quorum, jobs refund instead of paying).
+        state
             .apply_block(&block_with(&state, 3, vec![unsigned(addr(3), 0, TxKind::ClaimJob { job_id: job })]))
-            .unwrap_err();
-        assert!(err.to_string().contains("already claimed"), "got: {err}");
+            .unwrap();
+        assert_eq!(state.accounts.get(&addr(3)).unwrap().nonce, 1, "loser's nonce consumed");
         assert_eq!(state.escrowed_for_job(&job), pot, "no second bond escrowed");
-        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().executor, addr(1).0);
+        assert_eq!(bal(&state, 3), bal3, "loser's bond untouched");
+        assert_eq!(
+            state.job_lifecycles.get(&job).unwrap().to_record().executor,
+            addr(1).0,
+            "winner's claim stands"
+        );
     }
 
     #[test]
-    fn b3_double_claim_within_one_batch_rejects_and_rolls_back() {
-        // The FIRST op opens the lifecycle, the second hits the lifecycle-exists guard ⇒ the
-        // whole block is rejected and P1 rollback erases the first op's open + bond escrow.
+    fn b3_double_claim_within_one_batch_first_wins_second_noop() {
+        // The FIRST op opens the lifecycle + escrows the bond; the second hits the
+        // lifecycle-exists guard and applies as a money-free no-op — the batch (and block)
+        // stays valid, the bond is escrowed exactly once, and the batch bumps the nonce once.
         let mut state = ChainState::new();
         state.apply_block(&genesis_block()).unwrap();
         state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(MIN_BUDGET);
@@ -7370,20 +7388,26 @@ mod tests {
         let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
         let job = submit.hash().0;
         state.apply_block(&block_with(&state, 1, vec![submit])).unwrap();
-        let root = state.compute_state_root();
 
         let batch = TxKind::Batch {
             operations: vec![TxKind::ClaimJob { job_id: job }, TxKind::ClaimJob { job_id: job }],
         };
-        let err = state
+        state
             .apply_block(&block_with(&state, 2, vec![unsigned(addr(3), 0, batch)]))
-            .unwrap_err();
-        assert!(err.to_string().contains("already claimed"), "got: {err}");
-        assert!(state.job_lifecycles.is_empty(), "P1 rollback undid the first op's open");
-        assert!(state.pending_jobs.contains_key(&job), "pending restored");
-        assert_eq!(state.escrowed_for_job(&job), MIN_BUDGET, "bond escrow rolled back");
-        assert_eq!(bal(&state, 3), MIN_BUDGET, "claimer refunded by the rollback");
-        assert_eq!(state.compute_state_root(), root);
+            .unwrap();
+        assert!(!state.pending_jobs.contains_key(&job), "pending consumed by the first op");
+        assert_eq!(
+            state.job_lifecycles.get(&job).unwrap().to_record().executor,
+            addr(3).0,
+            "first op's claim stands"
+        );
+        assert_eq!(
+            state.escrowed_for_job(&job),
+            2 * MIN_BUDGET,
+            "budget + exactly ONE executor bond (the no-op escrowed nothing)"
+        );
+        assert_eq!(bal(&state, 3), 0, "bond debited once, not twice");
+        assert_eq!(state.accounts.get(&addr(3)).unwrap().nonce, 1, "batch bumps nonce once");
     }
 
     #[test]

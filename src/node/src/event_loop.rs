@@ -445,13 +445,39 @@ impl EventLoop {
                 let has = self.da_store.as_ref().map(|s| s.has(chunk_hash)).unwrap_or(false);
                 let _ = reply.send(has);
             }
-            DaCommand::FindProviders { chunk_hash, reply } => {
-                let key = libp2p::kad::RecordKey::new(&chunk_hash);
-                let qid = self.network.swarm.behaviour_mut().kademlia.get_providers(key);
-                self.pending_find.insert(qid, reply);
+            DaCommand::FindProviders { chunk_hash: _, reply } => {
+                // v1 discovery (Q3 decision): DHT provider records don't propagate in a small/fresh
+                // net, so treat every connected peer as a candidate. A GetChunk to a peer that lacks
+                // the chunk returns None (harmless); verify_available's Merkle+sha256 rebind rejects
+                // any wrong bytes, so over-asking is safe.
+                let peers: Vec<libp2p::PeerId> = self.peer_ips.keys().copied().collect();
+                let out: Vec<commputer_da::params::ProviderId> = peers
+                    .into_iter()
+                    .map(|peer| {
+                        let tag = Self::da_provider_tag(&peer);
+                        self.da_provider_ids.insert(tag, peer);
+                        commputer_da::params::ProviderId(tag)
+                    })
+                    .collect();
+                let _ = reply.send(out);
             }
             DaCommand::FetchChunk { chunk_hash, from, reply } => {
-                if let Some(peer) = self.da_provider_ids.get(&from.0).copied() {
+                // Local-first: the peer path below only dials OTHERS, so a publisher
+                // drawn onto the committee could never fetch its own blob (Abstain →
+                // lost verifier → flaky quorum in small nets). A node that holds the
+                // chunk serves itself; wrong/corrupt local bytes are harmless —
+                // verify_available's Merkle+sha256 rebind rejects them.
+                let local = self
+                    .da_store
+                    .as_ref()
+                    .and_then(|s| s.get(chunk_hash).ok().flatten())
+                    .and_then(|c| {
+                        commputer::da_publisher::deserialize_merkle_path(&c.merkle_path)
+                            .map(|path| (c.bytes, path))
+                    });
+                if local.is_some() {
+                    let _ = reply.send(local);
+                } else if let Some(peer) = self.da_provider_ids.get(&from.0).copied() {
                     let req = commputer_network::da_protocol::DaRequest::GetChunk { chunk_hash };
                     let rid = self.network.swarm.behaviour_mut().da.send_request(&peer, req);
                     self.pending_fetch.insert(rid, reply);
