@@ -11,6 +11,7 @@ use commputer_core::transaction::{TxKind, Transaction};
 use commputer_core::compliance::{ComplianceStatus, NerfRate};
 use commputer_pouw_onchain::lifecycle::{JobLifecycle, EventResult, Terminal, Phase, PhaseDeadlines};
 use commputer_pouw_onchain::escrow_ledger::Ledger;
+use commputer_pouw_onchain::escalation_round::EscalationRound;
 use commputer_pouw_onchain::consensus_params::PhaseWindows;
 use commputer_pouw::oracle::{ByteEq, ChainHooks, EquivalenceOracle};
 use commputer_pouw::ids::ParticipantId;
@@ -175,7 +176,7 @@ pub struct ChainState {
     /// budget here; `ClaimJob` adds the executor bond; `Commit` adds verifier bonds; the
     /// settle/expiry drivers drain it.
     ///
-    /// PERSISTENCE (P2 step 1.0, complete — applies to all FIVE consensus maps): every
+    /// PERSISTENCE (P2 step 1.0, complete — applies to all SIX consensus maps): every
     /// `apply_*` commits block + meta + dirty accounts + map deltas in ONE WriteBatch
     /// (`persist_applied_block`); entries removed in-memory are CF-deleted via the
     /// persisted-key mirrors; loaded in `open()`; folded into `compute_state_root` (Policy B).
@@ -228,6 +229,13 @@ pub struct ChainState {
     /// `expire_pending_job` once `claim_by` passes. Persisted per-block (CF_PENDING) and folded
     /// into the state root exactly like the other four maps.
     pub pending_jobs: HashMap<[u8; 32], PendingJobRecord>,
+    /// PoUW S4 (EscalationRound, 2026-07-19): the 6th consensus map — in-flight escalation panel
+    /// rounds (`job_id` -> `EscalationRound`), opened when a `JobLifecycle` settles to
+    /// `Terminal::Escalate` (the open/apply site is Tasks 5-6). Persisted per-block as borsh
+    /// `EscalationRoundRecord` DTOs (CF_ESCALATION) and folded into the state root (the sixth and
+    /// final Policy-B section, appended after `pending_jobs` — order is consensus); params
+    /// re-injected on load exactly like `job_lifecycles` (see the B1b note on `game_params` above).
+    pub escalation_rounds: HashMap<[u8; 32], EscalationRound>,
     // Node-local mirrors of the keys currently persisted in each consensus-map CF (never
     // state-rooted, never serialized). Each persist computes `mirror − current_keys` to
     // CF-delete removed entries, then re-puts every live entry full-value; the mirror advances
@@ -240,6 +248,7 @@ pub struct ChainState {
     persisted_unbonding_keys: HashSet<Address>,
     persisted_lifecycle_keys: HashSet<[u8; 32]>,
     persisted_pending_keys: HashSet<[u8; 32]>,
+    persisted_escalation_keys: HashSet<[u8; 32]>,
 }
 
 // Manual Debug impl since RocksStore doesn't derive Debug.
@@ -263,6 +272,7 @@ impl std::fmt::Debug for ChainState {
             .field("unbonding_stake", &self.unbonding_stake.len())
             .field("job_lifecycles", &self.job_lifecycles.len())
             .field("pending_jobs", &self.pending_jobs.len())
+            .field("escalation_rounds", &self.escalation_rounds.len())
             .finish()
     }
 }
@@ -300,11 +310,13 @@ impl ChainState {
             capacity_params: commputer_pouw_onchain::capacity::CapacityParams::default(),
             job_lifecycles: HashMap::new(),
             pending_jobs: HashMap::new(),
+            escalation_rounds: HashMap::new(),
             persisted_escrow_keys: HashSet::new(),
             persisted_bonded_keys: HashSet::new(),
             persisted_unbonding_keys: HashSet::new(),
             persisted_lifecycle_keys: HashSet::new(),
             persisted_pending_keys: HashSet::new(),
+            persisted_escalation_keys: HashSet::new(),
         }
     }
 
@@ -392,6 +404,16 @@ impl ChainState {
             .map(|(id, rec)| (id, JobLifecycle::from_record(rec, game_params.clone(), resolution_params)))
             .collect();
 
+        // PoUW S4: load persisted escalation_rounds. Same param re-injection discipline as
+        // job_lifecycles above — GameParams is genesis-anchored (identical for every round) so it
+        // is NOT persisted per-round; re-injected here (and again by `set_consensus_params`, C1).
+        let escalation_rounds: HashMap<[u8; 32], EscalationRound> = rocks
+            .all_escalation()
+            .map_err(StateError::StorageError)?
+            .into_iter()
+            .map(|(id, rec)| (id, EscalationRound::from_record(rec, game_params.clone())))
+            .collect();
+
         // Persisted-key mirrors start EXACT: load IS a CF scan, so each loaded key set equals
         // the rows on disk. (Warn-skipped malformed rows linger as junk OUTSIDE the mirror and
         // the state root; they are re-skipped on every open and cannot resurrect — no
@@ -401,6 +423,7 @@ impl ChainState {
         let persisted_unbonding_keys: HashSet<Address> = unbonding_stake.keys().copied().collect();
         let persisted_lifecycle_keys: HashSet<[u8; 32]> = job_lifecycles.keys().copied().collect();
         let persisted_pending_keys: HashSet<[u8; 32]> = pending_jobs.keys().copied().collect();
+        let persisted_escalation_keys: HashSet<[u8; 32]> = escalation_rounds.keys().copied().collect();
 
         let account_count = accounts.len();
         let block_count = blocks.len();
@@ -440,11 +463,13 @@ impl ChainState {
             capacity_params: commputer_pouw_onchain::capacity::CapacityParams::default(),
             job_lifecycles,
             pending_jobs,
+            escalation_rounds,
             persisted_escrow_keys,
             persisted_bonded_keys,
             persisted_unbonding_keys,
             persisted_lifecycle_keys,
             persisted_pending_keys,
+            persisted_escalation_keys,
         })
     }
 
@@ -548,6 +573,22 @@ impl ChainState {
             })
         }).collect();
 
+        // PoUW S4: escalation_rounds (debug-only; the authoritative commitment is `state_root`).
+        let mut escalations: Vec<(&[u8; 32], &EscalationRound)> = self.escalation_rounds.iter().collect();
+        escalations.sort_by(|a, b| a.0.cmp(b.0));
+        let escalations_json: Vec<serde_json::Value> = escalations.iter().map(|(id, er)| {
+            let r = er.to_record();
+            serde_json::json!({
+                "job_id": hex::encode(id),
+                "phase": format!("{:?}", er.phase()),
+                "panel": r.panel.len(),
+                "commitments": r.commitments.len(),
+                "reveals": r.reveals.len(),
+                "settled": r.settled.is_some(),
+                "expected_escrow": er.expected_escrow(),
+            })
+        }).collect();
+
         serde_json::json!({
             "height": self.blocks.height(),
             "total_emitted": self.total_emitted,
@@ -560,6 +601,7 @@ impl ChainState {
             "unbonding_stake": unbonding_json,
             "job_lifecycles": lifecycles_json,
             "pending_jobs": pending_json,
+            "escalation_rounds": escalations_json,
         })
     }
 
@@ -577,11 +619,11 @@ impl ChainState {
     /// Compute the state root.
     ///
     /// PoUW P2 (B1a) — POLICY B (zero consensus change until the money path goes live): while all
-    /// FIVE consensus maps are empty (a chain that has never seen a PoUW tx), this returns
+    /// SIX consensus maps are empty (a chain that has never seen a PoUW tx), this returns
     /// the accounts-only root BYTE-IDENTICAL to before B1a. Once ANY map is non-empty, the root
-    /// folds the accounts root + ALL FIVE maps (each iterated in SORTED key order — HashMap
+    /// folds the accounts root + ALL SIX maps (each iterated in SORTED key order — HashMap
     /// iteration is nondeterministic — and length-prefixed so the encoding is injective across
-    /// map boundaries); the first Bond tx alone flips a chain to the 5-section format (the
+    /// map boundaries); the first Bond tx alone flips a chain to the 6-section format (the
     /// early-return is all-or-nothing — P10a). The format change thus lands with the same
     /// coordinated flip that makes the maps fillable.
     pub fn compute_state_root(&self) -> [u8; 32] {
@@ -591,6 +633,7 @@ impl ChainState {
             && self.unbonding_stake.is_empty()
             && self.job_lifecycles.is_empty()
             && self.pending_jobs.is_empty()
+            && self.escalation_rounds.is_empty()
         {
             return accounts_root;
         }
@@ -635,9 +678,9 @@ impl ChainState {
         // job_lifecycles: sorted by job_id, length-prefixed; value = borsh(JobLifecycleRecord). The DTO
         // holds only Vec/Option/primitive fields (NO HashMap/HashSet) ⇒ borsh is canonical, Vec order is
         // the chain's append order (consensus-deterministic) ⇒ the fold is injective + deterministic
-        // across nodes. Per-entry blob length-prefixed (LE) so the encoding stays injective. Phase 1.1
-        // extends the Policy-B fold to FIVE sections (pending_jobs below); while ALL five maps are empty
-        // the root stays the pre-B1a accounts-only root byte-for-byte.
+        // across nodes. Per-entry blob length-prefixed (LE) so the encoding stays injective. The
+        // Policy-B fold has SIX sections total (pending_jobs + escalation_rounds below); while ALL six
+        // maps are empty the root stays the pre-B1a accounts-only root byte-for-byte.
         let mut lifecycles: Vec<(&[u8; 32], &JobLifecycle)> = self.job_lifecycles.iter().collect();
         lifecycles.sort_by(|a, b| a.0.cmp(b.0));
         h.update((lifecycles.len() as u64).to_le_bytes());
@@ -651,8 +694,8 @@ impl ChainState {
 
         // pending_jobs (Phase 1.1 / B2): sorted by job_id, length-prefixed; value =
         // borsh(PendingJobRecord) (all fixed-size fields ⇒ canonical encoding), per-entry blob
-        // length-prefixed (LE) — the CF_LIFECYCLE fold pattern. This is the FIFTH and final
-        // Policy-B section.
+        // length-prefixed (LE) — the CF_LIFECYCLE fold pattern. This is the FIFTH Policy-B section
+        // (escalation_rounds below is the sixth and final).
         let mut pending: Vec<(&[u8; 32], &PendingJobRecord)> = self.pending_jobs.iter().collect();
         pending.sort_by(|a, b| a.0.cmp(b.0));
         h.update((pending.len() as u64).to_le_bytes());
@@ -660,6 +703,20 @@ impl ChainState {
             h.update(job_id);
             let blob = borsh::to_vec(rec)
                 .expect("pending record borsh serialization should not fail");
+            h.update((blob.len() as u64).to_le_bytes());
+            h.update(&blob);
+        }
+
+        // escalation_rounds (EscalationRound 2026-07-19): sorted by job_id, length-prefixed;
+        // value = borsh(EscalationRoundRecord). The SIXTH Policy-B section — appended after
+        // pending_jobs; the section order is consensus.
+        let mut escalations: Vec<(&[u8; 32], &EscalationRound)> = self.escalation_rounds.iter().collect();
+        escalations.sort_by(|a, b| a.0.cmp(b.0));
+        h.update((escalations.len() as u64).to_le_bytes());
+        for (job_id, er) in escalations {
+            h.update(job_id);
+            let blob = borsh::to_vec(&er.to_record())
+                .expect("escalation record borsh serialization should not fail");
             h.update((blob.len() as u64).to_le_bytes());
             h.update(&blob);
         }
@@ -850,7 +907,7 @@ impl ChainState {
     /// journal and smeared maps stayed live, so the NEXT successful block's
     /// `persist_applied_block` wrote them into the CFs and the state root — a malicious block
     /// fed to a subset of nodes forked honest nodes persistently. Rollback semantics:
-    /// - rocks-backed: reload accounts + all five consensus maps + meta counters from the CFs
+    /// - rocks-backed: reload accounts + all six consensus maps + meta counters from the CFs
     ///   (disk == post-last-good-block by step 1.0's per-block-batch guarantee) and re-run
     ///   `open()`'s hygiene (clean journals, mirrors == CF key sets). Out-of-band mutations
     ///   not yet swept by a block (grace drains, epoch bump) are rewound too — identical to
@@ -899,6 +956,13 @@ impl ChainState {
             unbonding_stake: self.unbonding_stake.clone(),
             job_lifecycles: self.job_lifecycles.clone(),
             pending_jobs: self.pending_jobs.clone(),
+            // EscalationRound does not derive Clone (unlike JobLifecycle) — rebuild each round
+            // through its own DTO round-trip instead. Lossless (`to_record`/`from_record` are
+            // mutually inverse — see `record_round_trips_through_dto_and_settles_identically` in
+            // escalation_round.rs) and never runs game logic, exactly like a real clone would.
+            escalation_rounds: self.escalation_rounds.iter()
+                .map(|(id, er)| (*id, EscalationRound::from_record(er.to_record(), self.game_params.clone())))
+                .collect(),
             total_emitted: self.total_emitted,
             total_burned: self.total_burned,
             current_epoch: self.current_epoch,
@@ -915,6 +979,7 @@ impl ChainState {
         self.unbonding_stake = snap.unbonding_stake;
         self.job_lifecycles = snap.job_lifecycles;
         self.pending_jobs = snap.pending_jobs;
+        self.escalation_rounds = snap.escalation_rounds;
         self.total_emitted = snap.total_emitted;
         self.total_burned = snap.total_burned;
         self.current_epoch = snap.current_epoch;
@@ -2075,6 +2140,7 @@ impl ChainState {
             || !self.unbonding_stake.is_empty()
             || !self.job_lifecycles.is_empty()
             || !self.pending_jobs.is_empty()
+            || !self.escalation_rounds.is_empty()
         {
             return Err(StateError::InvalidBlock(REVERT_REFUSAL.into()));
         }
@@ -2637,6 +2703,7 @@ impl ChainState {
             self.persisted_unbonding_keys.clone(),
             self.persisted_lifecycle_keys.clone(),
             self.persisted_pending_keys.clone(),
+            self.persisted_escalation_keys.clone(),
         );
 
         // Reset state.
@@ -2649,6 +2716,7 @@ impl ChainState {
         self.unbonding_stake.clear();
         self.job_lifecycles.clear();
         self.pending_jobs.clear();
+        self.escalation_rounds.clear();
         self.cumulative_score = 0;
         self.state_diffs.clear();
 
@@ -2673,6 +2741,7 @@ impl ChainState {
                 self.persisted_unbonding_keys,
                 self.persisted_lifecycle_keys,
                 self.persisted_pending_keys,
+                self.persisted_escalation_keys,
             ) = saved_mirrors;
             return Err(e);
         }
@@ -2722,6 +2791,7 @@ impl ChainState {
                     self.persisted_unbonding_keys,
                     self.persisted_lifecycle_keys,
                     self.persisted_pending_keys,
+                    self.persisted_escalation_keys,
                 ) = saved_mirrors;
                 return Err(StateError::StorageError(e.to_string()));
             }
@@ -2793,7 +2863,7 @@ impl ChainState {
         Ok(())
     }
 
-    /// Append the five consensus maps' CF deltas to `batch`: delete every persisted key that
+    /// Append the six consensus maps' CF deltas to `batch`: delete every persisted key that
     /// no longer exists in memory (`mirror − current`), then re-put every live entry
     /// FULL-VALUE — lifecycles mutate internally without key churn, so key-level tracking
     /// alone cannot suffice, and a value re-put is O(map size), trivial at testnet scale
@@ -2833,9 +2903,15 @@ impl ChainState {
         for (job_id, rec) in &self.pending_jobs {
             rocks.batch_put_pending(batch, job_id, rec);
         }
+        for job_id in stale_keys(&self.persisted_escalation_keys, &self.escalation_rounds) {
+            rocks.batch_delete_escalation(batch, job_id);
+        }
+        for (job_id, er) in &self.escalation_rounds {
+            rocks.batch_put_escalation(batch, job_id, &er.to_record());
+        }
     }
 
-    /// Advance all five persisted-key mirrors to the maps' current key sets. Call ONLY after
+    /// Advance all six persisted-key mirrors to the maps' current key sets. Call ONLY after
     /// a successful CF write — on failure the stale mirror recomputes a superset of deletes at
     /// the next attempt (deleting an absent key is a RocksDB no-op, so over-deleting is safe).
     fn commit_map_mirrors(&mut self) {
@@ -2844,6 +2920,7 @@ impl ChainState {
         self.persisted_unbonding_keys = self.unbonding_stake.keys().copied().collect();
         self.persisted_lifecycle_keys = self.job_lifecycles.keys().copied().collect();
         self.persisted_pending_keys = self.pending_jobs.keys().copied().collect();
+        self.persisted_escalation_keys = self.escalation_rounds.keys().copied().collect();
     }
 
     /// Persist all meta counters to RocksDB.
@@ -2896,10 +2973,10 @@ impl ChainState {
         Ok(())
     }
 
-    /// PoUW P2: reconciling flush of the FIVE consensus maps (escrow_by_job / bonded_stake /
-    /// unbonding_stake / job_lifecycles / pending_jobs) — deletes CF rows for keys removed
-    /// in-memory (via the persisted-key mirrors), then re-puts every live entry, in one
-    /// WriteBatch. Safe to call at any time; kept as the shutdown-tail sweeper behind the
+    /// PoUW P2: reconciling flush of the SIX consensus maps (escrow_by_job / bonded_stake /
+    /// unbonding_stake / job_lifecycles / pending_jobs / escalation_rounds) — deletes CF rows for
+    /// keys removed in-memory (via the persisted-key mirrors), then re-puts every live entry, in
+    /// one WriteBatch. Safe to call at any time; kept as the shutdown-tail sweeper behind the
     /// per-block batch.
     fn flush_consensus_maps(&mut self) -> Result<(), StateError> {
         let Some(rocks) = self.rocks.as_ref() else { return Ok(()) };
@@ -2928,6 +3005,7 @@ impl ChainState {
         self.unbonding_stake.clear();
         self.job_lifecycles.clear();
         self.pending_jobs.clear();
+        self.escalation_rounds.clear();
         self.nerf_rate = NerfRate::INITIAL;
         self.current_epoch = 0;
         self.receipts = ReceiptStore::new();
@@ -2951,6 +3029,7 @@ impl ChainState {
         self.persisted_unbonding_keys.clear();
         self.persisted_lifecycle_keys.clear();
         self.persisted_pending_keys.clear();
+        self.persisted_escalation_keys.clear();
 
         info!("Chain state reset to genesis complete");
         Ok(())
@@ -2967,6 +3046,7 @@ struct BlockSnapshot {
     unbonding_stake: HashMap<Address, Vec<UnbondingChunk>>,
     job_lifecycles: HashMap<[u8; 32], JobLifecycle>,
     pending_jobs: HashMap<[u8; 32], PendingJobRecord>,
+    escalation_rounds: HashMap<[u8; 32], EscalationRound>,
     total_emitted: u64,
     total_burned: u64,
     current_epoch: u64,
@@ -3727,6 +3807,11 @@ impl ChainState {
         for life in self.job_lifecycles.values_mut() {
             let rec = life.to_record();
             *life = JobLifecycle::from_record(rec, self.game_params.clone(), self.resolution_params);
+        }
+        // C1: same re-injection for escalation rounds (params are never persisted).
+        for er in self.escalation_rounds.values_mut() {
+            let rec = er.to_record();
+            *er = EscalationRound::from_record(rec, self.game_params.clone());
         }
         Ok(())
     }
@@ -5588,6 +5673,65 @@ mod tests {
             Some(rec),
             "lifecycle persisted by apply_block_atomic",
         );
+    }
+
+    // --- PoUW S4: escalation_rounds persistence + state-root folding ------------
+
+    /// A mid-flight escalation round (Committing, no commits yet) opened via `EscalationRound::open`
+    /// with a 2-candidate panel pool — small enough to build by hand, big enough to exercise the
+    /// panel-draw and DTO round-trip.
+    fn test_escalation_round(job: [u8; 32]) -> EscalationRound {
+        let identity = commputer_pouw_onchain::escalation_round::JobIdentity {
+            program_hash: [0xAA; 32], input_hash: [0xBB; 32], da_root: [0xCC; 32],
+        };
+        let handoff = commputer_pouw_onchain::lifecycle::EscalationHandoff {
+            budget: 1000,
+            submitter: lpid(0),
+            executor: lpid(9),
+            executor_hash: [7u8; 32],
+            executor_bond: 100,
+            committee_reveals: vec![Reveal { verifier: lpid(10), result_hash: [7u8; 32], salt: [0u8; 32] }],
+            committee_bonds: vec![20],
+            verifier_bond: 20,
+        };
+        let candidates = vec![lpid(20), lpid(21)];
+        let stake = |_: &ParticipantId| 1u64;
+        EscalationRound::open(
+            handoff, job, identity, candidates, [42u8; 32], GameParams::default(),
+            commputer_pouw_onchain::escalation_round::PanelDeadlines { commit_by: 20, reveal_by: 30 },
+            &stake,
+        )
+    }
+
+    #[test]
+    fn escalation_rounds_fold_persist_and_reload() {
+        // A mid-flight round folds into the root, survives capture/rollback, persists to
+        // CF_ESCALATION, and reloads identically with params re-injected.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = ChainState::open(dir.path()).unwrap();
+        s.apply_block(&genesis_block()).unwrap();
+        let root_before = s.compute_state_root();
+        let r = test_escalation_round([5u8; 32]);
+        s.escalation_rounds.insert([5u8; 32], r);
+        let root_with = s.compute_state_root();
+        assert_ne!(root_before, root_with, "6th section folds in");
+
+        // Rollback restores byte-identically. `capture_pre_block`/`rollback_to_pre_block` are
+        // private but reachable here (this test module is a descendant of the defining module) —
+        // the same idiom the P1 rollback regressions use, just invoked directly instead of via a
+        // failing block.
+        let snap = s.capture_pre_block();
+        s.escalation_rounds.clear();
+        assert_ne!(s.compute_state_root(), root_with, "cleared map changes the root");
+        s.rollback_to_pre_block(snap);
+        assert_eq!(s.compute_state_root(), root_with, "rollback restores the round byte-identically");
+
+        // Persist + reload (the b1b_job_lifecycles_persist_across_reopen idiom: flush, drop, reopen).
+        s.flush().unwrap();
+        drop(s);
+        let s2 = ChainState::open(dir.path()).unwrap();
+        assert_eq!(s2.escalation_rounds.len(), 1);
+        assert_eq!(s2.compute_state_root(), root_with, "reload reproduces the root");
     }
 
     #[test]
