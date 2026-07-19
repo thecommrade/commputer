@@ -355,7 +355,7 @@ mod tests {
         std::fs::write(
             &p,
             br#"{
-                "chain_id": "commputer-testnet-1",
+                "chain_id": "commputer-testnet-3",
                 "total_supply": 200000000000000000,
                 "epoch_duration_secs": 3600,
                 "emission_base_rate": 10000000000,

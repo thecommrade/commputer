@@ -2,7 +2,7 @@
 # Place at ~/.commputer/config.toml on the seed node machine.
 
 network = "testnet"
-chain_id = "commputer-testnet-1"
+chain_id = "commputer-testnet-3"
 
 # Seed nodes don't need to connect to other seeds (they ARE the seed)
 seeds = []

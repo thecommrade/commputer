@@ -106,11 +106,18 @@ pub struct OperatorConfig {
     pub cors_origins: String,
 }
 
+// DRIFT WARNING: this crate deliberately does NOT depend on `commputer-core` (it stays
+// dependency-light and independent of node/core internals so it can validate an operator's
+// config before the node binary is even built — see the header comment above). That means
+// the chain-id literals below are NOT derived from `commputer_core::genesis::TESTNET_CHAIN_ID`
+// and must be bumped by hand whenever that const changes (last synced: "commputer-testnet-3",
+// 2026-07-19 go-live batch Task E). If a `doctor` run and the real chain disagree on the
+// expected chain-id, check here first.
 impl Default for OperatorConfig {
     fn default() -> Self {
         Self {
             network: "testnet".into(),
-            chain_id: "commputer-testnet-1".into(),
+            chain_id: "commputer-testnet-3".into(),
             seeds: vec!["seed.commputer.xyz:9000".into()],
             port: 9000,
             rpc_port: 9944,
@@ -264,7 +271,7 @@ fn validate_config_values(cfg: &OperatorConfig, results: &mut Vec<CheckResult>) 
         results.push(CheckResult::err(
             "config.chain_id",
             "chain_id is empty",
-            "set chain_id = \"commputer-testnet-1\" or the mainnet equivalent",
+            "set chain_id = \"commputer-testnet-3\" or the mainnet equivalent",
         ));
     } else if cfg.network == "mainnet" && cfg.chain_id.contains("testnet") {
         results.push(CheckResult::err(

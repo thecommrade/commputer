@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Chain ID constants.
-pub const TESTNET_CHAIN_ID: &str = "commputer-testnet-2";
+pub const TESTNET_CHAIN_ID: &str = "commputer-testnet-3";
 pub const MAINNET_CHAIN_ID: &str = "commputer-mainnet-1";
 
 /// Genesis configuration — defines the initial parameters for a Commputer chain.
@@ -265,7 +265,7 @@ pub fn default_genesis() -> GenesisConfig {
         proof_challenge_interval_secs: 300,
         block_time_secs: 2,
         emission_decay_rate: 0.0001,
-        genesis_timestamp: 1783555200, // 2026-07-09 00:00:00 UTC — alpha reset epoch (severs old genesis hash)
+        genesis_timestamp: 1784505600, // 2026-07-20 00:00:00 UTC — alpha reset epoch — founder confirms/sets the final value at the reset ceremony
         consensus_params: ConsensusParamsConfig::default(),
         // A-batch item 7: no genesis allocations by default — keeps today's
         // genesis byte-identical (empty ⇒ zero credits ⇒ unchanged state root).
