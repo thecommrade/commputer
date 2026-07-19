@@ -9505,6 +9505,97 @@ mod tests {
         assert!(state.escalation_rounds.contains_key(&job), "valid settle block opens the round");
     }
 
+    /// Snapshot-restore of an INSERTED round: within ONE tail sweep, job A (viable pool) opens
+    /// an escalation round, then job B's settle Errs (tampered pot) ⇒ the whole block is
+    /// rejected ⇒ `BlockSnapshot.escalation_rounds` must erase A's inserted round. This is the
+    /// scenario where the S4 snapshot field is load-bearing — `rejected_block_leaves_…` above
+    /// aborts in the tx loop, so no round is ever inserted there.
+    #[test]
+    fn mid_sweep_failure_rolls_back_an_inserted_escalation_round() {
+        let min_bond = StakeParams::default().min_bond;
+        let v_bond = GameParams::default().verifier_bond;
+        let mut state = ChainState::new();
+        state.phase_windows =
+            PhaseWindows { result_blocks: 2, commit_blocks: 2, reveal_blocks: 2, claim_blocks: 5 };
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(2 * MIN_BUDGET);
+        let e = state.accounts.get_or_create(addr(1));
+        e.is_validator = true;
+        e.balance = Amount::from_raw(2 * MIN_BUDGET); // two executor bonds
+        for v in 3u8..15 {
+            let a = state.accounts.get_or_create(addr(v));
+            a.is_validator = true;
+            a.balance = Amount::from_raw(v_bond);
+            state.bonded_stake.insert(addr(v), min_bond);
+        }
+        state.total_emitted = 4 * MIN_BUDGET + 12 * (v_bond + min_bond);
+        // Two submits in b1; roles by job-id ORDER so the sorted sweep visits A before B:
+        // A = smaller id (full NoQuorum round ⇒ opens), B = larger id (claimed, never
+        // completed ⇒ TimedOut-due at the SAME height, pot tampered ⇒ settle Errs AFTER A).
+        let s1 = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+        let s2 = unsigned(addr(2), 1, v2_kind(MIN_BUDGET));
+        let (j1, j2) = (s1.hash().0, s2.hash().0);
+        let (job_a, job_b) = if j1 < j2 { (j1, j2) } else { (j2, j1) };
+        state.apply_block(&block_with(&state, 1, vec![s1, s2])).unwrap();
+        // b2: claim A (parent 1 ⇒ A: result_by 3 / commit_by 5 / reveal_by 7 ⇒ due at 8).
+        state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job_a })]))
+            .unwrap();
+        // b3: CompleteJob A ⇒ tail draws A's committee.
+        state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(1), 1, TxKind::CompleteJob { job_id: job_a, result_hash: [7u8; 32] })]))
+            .unwrap();
+        let committee = state.job_lifecycles.get(&job_a).unwrap().to_record().committee;
+        assert_eq!(committee.len(), 3);
+        // b4: A's committee 3-way-split commits.
+        let commits: Vec<Transaction> = committee
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let c = make_commitment(&ParticipantId(*m), &[(i + 1) as u8; 32], &[i as u8; 32], v_bond);
+                unsigned(Address(*m), 0, TxKind::Commit {
+                    job_id: job_a, commit: c.commit, bond: Amount::from_raw(v_bond),
+                })
+            })
+            .collect();
+        state.apply_block(&block_with(&state, 4, commits)).unwrap();
+        state.apply_block(&block_with(&state, 5, vec![])).unwrap();
+        // b6: claim B (parent 5 ≤ claim_by 5 ⇒ B: result_by 7, never completed ⇒ due at 8 too).
+        state
+            .apply_block(&block_with(&state, 6, vec![unsigned(addr(1), 2, TxKind::ClaimJob { job_id: job_b })]))
+            .unwrap();
+        // b7: A's 3-way-split reveals.
+        let reveals: Vec<Transaction> = committee
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                unsigned(Address(*m), 1, TxKind::Reveal {
+                    job_id: job_a, result_hash: [(i + 1) as u8; 32], salt: [i as u8; 32],
+                })
+            })
+            .collect();
+        state.apply_block(&block_with(&state, 7, reveals)).unwrap();
+        assert!(state.escalation_rounds.is_empty(), "nothing settled before the b8 sweep");
+        // Tamper job B's pot (out-of-band, like the d2 malformed-pot trick) so its settle
+        // preflight Errs — AFTER job A's round insert (A < B in the sorted sweep).
+        let pot_b = state.escrowed_for_job(&job_b);
+        assert_eq!(pot_b, 2 * MIN_BUDGET, "B holds budget + e_bond");
+        state.escrow_by_job.insert(job_b, pot_b - 1);
+        let root_before = state.compute_state_root();
+        let b8 = block_with(&state, 8, vec![]);
+        let err = state.apply_block(&b8).unwrap_err();
+        assert!(err.to_string().contains("job pot"), "B's pot preflight rejected the block: {err}");
+        // THE pin: A's round WAS inserted mid-sweep; the snapshot must have erased it.
+        assert!(state.escalation_rounds.is_empty(), "A's inserted round rolled back");
+        assert_eq!(state.job_lifecycles.len(), 2, "both lifecycles restored (A un-drained)");
+        assert_eq!(state.compute_state_root(), root_before, "state byte-identical after rollback");
+        // Non-vacuity: repair B's pot ⇒ the SAME block applies and A's round opens for real.
+        state.escrow_by_job.insert(job_b, pot_b);
+        state.apply_block(&b8).unwrap();
+        assert!(state.escalation_rounds.contains_key(&job_a), "untampered sweep opens A's round");
+        assert!(state.job_lifecycles.is_empty(), "A drained into the round; B settled TimedOut");
+    }
+
     /// Drive a full Confirmed round (on-chain B5 draw) to REVEALED-but-not-settled, on any backend,
     /// with NON-DEFAULT game params (worker/verifier split ≠ default) + short windows. Returns job.
     fn c1_drive_to_revealed(state: &mut ChainState) -> [u8; 32] {
