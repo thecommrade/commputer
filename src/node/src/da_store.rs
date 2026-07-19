@@ -17,13 +17,29 @@
 // The DA outcome is never hashed into consensus, so nothing here is consensus- or
 // fork-relevant; the store is pure local plumbing.
 //
-// WIRING (INERT until the PROTECTED Phase 2 wire-in): main.rs constructs one
-// `DaStore::open(data_dir/da_chunks)` and hands it to the event_loop's DA backend,
-// which serves inbound `DaRequest::GetChunk` from `get()`/`has()`, `put()`s coded
-// chunks the publisher produced, and calls `gc()` scoped to `job_lifecycles` /
-// `pending_jobs` at settlement. Nothing here is wired into the running node yet.
-// FILES NEEDING CHANGES (later, gated): node/src/main.rs (construct + thread the
-// store), node/src/event_loop.rs (PROTECTED: serve GetChunk, put, periodic gc).
+// WIRING: main.rs constructs one `DaStore::open(data_dir/da_chunks)` and hands it
+// to the event_loop's DA backend, which serves inbound `DaRequest::GetChunk` from
+// `get()`/`has()` and `put()`s coded chunks the publisher produced — that half is
+// live (as of the 2026-07-18 live-payout fixes, publishers/executors/verifiers
+// actually read/write through this store on a real multi-node network).
+//
+// `gc()` ITSELF REMAINS UNWIRED: there are ZERO production call sites for it as of
+// this writing — nothing periodically prunes the store. The correct live-set to
+// scope retention to (once wired) is the union of the THREE consensus maps that
+// can reference an outstanding job's DA bytes: `pending_jobs ∪ job_lifecycles ∪
+// escalation_rounds` (see `src/storage/src/state.rs` — `escalation_rounds` is the
+// PoUW S4 2026-07-19 addition, an in-flight `EscalationRound` still needs its
+// job's DA bytes reachable) — PLUS, for each of those jobs' `da_root`s, the
+// derived attestation key (`attestation_key(da_root)` in
+// `src/node/src/da_publisher.rs`, ~line 177), since the attestation blob is a
+// separate stored object keyed off the same root and would otherwise be gc'd as dead.
+// Until `gc` is wired, the store only grows: the `DEFAULT_MAX_STORE_BYTES` 4 GiB
+// hard cap below is a slow-burn publisher-liveness item for a long-running seed
+// (it will eventually refuse new `put()`s once full, not lose existing data) —
+// wiring a periodic gc call is a founder-batch item because the call site belongs
+// in the PROTECTED `event_loop.rs` (a periodic task alongside GetChunk serving).
+// FILES NEEDING CHANGES (later, gated): node/src/event_loop.rs (PROTECTED: spawn a
+// periodic gc pass with the live-set above).
 
 use std::collections::HashSet;
 use std::fs;
@@ -47,8 +63,11 @@ pub const MAX_CHUNK_OVERHEAD: usize = 4096;
 /// rejected by `put` (a peer/publisher cannot make us store an oversized blob).
 pub const MAX_ENCODED_CHUNK: usize = DEFAULT_CHUNK_SIZE + MAX_CHUNK_OVERHEAD;
 
-/// Default total on-disk budget for the whole blob store (hard backstop; day-to-day
-/// footprint is bounded by `gc` scoping retention to active jobs). 4 GiB.
+/// Default total on-disk budget for the whole blob store (hard backstop; the
+/// INTENT is for day-to-day footprint to stay bounded by `gc` scoping retention
+/// to active jobs, but `gc` is UNWIRED as of this writing — see the module-level
+/// doc comment — so today this cap is the only thing standing between a
+/// long-running seed and an ever-growing store). 4 GiB.
 pub const DEFAULT_MAX_STORE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// A filesystem-backed, content-addressed store of coded DA chunks.
@@ -163,8 +182,13 @@ impl DaStore {
     }
 
     /// Delete every stored chunk whose hash is NOT in `live`. Returns the number of
-    /// chunks removed. Retention is thereby scoped to the caller's active-job set
-    /// (`job_lifecycles` / `pending_jobs`).
+    /// chunks removed. Retention is thereby scoped to whatever active-job set the
+    /// caller passes in — the correct set is `pending_jobs ∪ job_lifecycles ∪
+    /// escalation_rounds` (plus each of those jobs' `attestation_key(da_root)` in
+    /// `da_publisher.rs`, ~line 177) — see the module-level doc comment for the
+    /// full rationale. UNWIRED as of this writing — no production call site
+    /// invokes this yet; wiring a periodic call is a founder-batch item
+    /// (PROTECTED `event_loop.rs`).
     pub fn gc(&self, live: &HashSet<[u8; 32]>) -> io::Result<usize> {
         let mut removed = 0usize;
         let mut total = self.total_bytes.lock().unwrap();

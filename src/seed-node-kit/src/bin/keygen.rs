@@ -91,8 +91,12 @@ fn main() -> Result<()> {
     println!("         --peer-id {peer_id} \\");
     println!("         --ip <PUBLIC_IP> --port <PORT>");
     println!("  3. Send that multiaddr to the founder for inclusion in");
-    println!("     SEED_NODES (src/network/src/transport.rs:316). It must carry the");
-    println!("     peer id of the key installed at ~/.commputer/peer_id.");
+    println!("     SEED_NODES (src/network/src/transport.rs, near the");
+    println!("     DEFAULT_TESTNET_SEED_HOSTS const). It must carry the peer id of");
+    println!("     the key installed at ~/.commputer/peer_id. Note: nodes ALSO dial");
+    println!("     the compiled-in DNS default (seed.commputer.xyz) unconditionally,");
+    println!("     even with an empty SEED_NODES list, so this step pins the expected");
+    println!("     peer identity as hardening — it is not required just to be found.");
 
     Ok(())
 }
