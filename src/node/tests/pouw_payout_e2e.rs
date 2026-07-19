@@ -383,7 +383,7 @@ fn drive_round(drive_verifiers: bool) -> Round {
         // Verifier loops (each drawn committee member acts on its own tick + salt store).
         if drive_verifiers {
             for (i, &v) in verifiers.iter().enumerate() {
-                let tick = verifier_loop::build_verifier_views(now, v, bal(&state, v), &state.job_lifecycles);
+                let tick = verifier_loop::build_verifier_views(now, v, bal(&state, v), &state.job_lifecycles, &state.escalation_rounds);
                 for kind in drive_verifier(&store, tick, &mut salts[i], ver_cfg, v.0) {
                     match kind {
                         TxKind::Commit { .. } => commits += 1,
@@ -609,7 +609,7 @@ fn pouw_disputed_slashes_cheating_executor_pays_honest_verifiers() {
         // VERIFIERS: fully HONEST — the REAL verifier loop DA-fetches, re-executes, and
         // commit/reveals the TRUE hash (which disagrees with the executor's committed bogus hash).
         for (i, &v) in verifiers.iter().enumerate() {
-            let tick = verifier_loop::build_verifier_views(now, v, bal(&state, v), &state.job_lifecycles);
+            let tick = verifier_loop::build_verifier_views(now, v, bal(&state, v), &state.job_lifecycles, &state.escalation_rounds);
             for kind in drive_verifier(&store, tick, &mut salts[i], ver_cfg, v.0) {
                 match kind {
                     TxKind::Commit { .. } => commits += 1,
@@ -805,7 +805,7 @@ fn pouw_disputed_burns_colluding_verifier_bond() {
 
         // HONEST verifiers: REAL loop ⇒ re-execute + commit/reveal the TRUE hash.
         for (i, &v) in honest.iter().enumerate() {
-            let tick = verifier_loop::build_verifier_views(now, v, bal(&state, v), &state.job_lifecycles);
+            let tick = verifier_loop::build_verifier_views(now, v, bal(&state, v), &state.job_lifecycles, &state.escalation_rounds);
             for kind in drive_verifier(&store, tick, &mut salts[i], ver_cfg, v.0) {
                 match kind {
                     TxKind::Commit { .. } => honest_commits += 1,
@@ -915,7 +915,7 @@ fn pouw_disputed_burns_colluding_verifier_bond() {
 // NoQuorum ⇒ `Terminal::Escalate`. With 6 spare candidates ≥ quorum(k_escalate)=5 the F2
 // viability gate PASSES and a real `EscalationRound` opens, owning the held pot
 // (budget + Be + 3 revealer bonds). The panel is then driven either through the REAL verifier
-// loops (`build_verifier_views_with_escalations` ⇒ DA-fetch, re-execute, commit+reveal the TRUE
+// loops (`build_verifier_views` ⇒ DA-fetch, re-execute, commit+reveal the TRUE
 // hash ⇒ Confirmed) or hand-fed a 3-way split (⇒ the bounded NoQuorum terminal). All money
 // asserts mirror the FROZEN `settle_noquorum_*` math, pinned to the audited game by
 // `golden_full_panel_matches_frozen_escalation_resolve` (escalation_round.rs).
@@ -1140,7 +1140,7 @@ fn open_escalation_round() -> EscalationOpen {
 }
 
 /// ESCALATION (a) — the panel CONFIRMS through the REAL loops: every one of the 6 panel members
-/// is driven per block via `build_verifier_views_with_escalations` + the REAL
+/// is driven per block via `build_verifier_views` + the REAL
 /// `run_verifier_loop` — they DA-fetch the blob, RE-EXECUTE it (deriving the executor's TRUE
 /// hash), and commit+reveal it against the round. 6 agreeing reveals ≥ quorum(k_escalate)=5 and
 /// matching the executor's hash ⇒ `Verdict::Confirmed` ⇒ the frozen `settle_noquorum_confirmed`:
@@ -1161,7 +1161,7 @@ fn pouw_escalation_panel_confirms_pays_executor_and_panel() {
             if h.committee.contains(&v) {
                 continue; // round-1 revealers are NOT panel members (their bonds sit slashed in the pot)
             }
-            let tick = verifier_loop::build_verifier_views_with_escalations(
+            let tick = verifier_loop::build_verifier_views(
                 now, v, bal(&h.state, v), &h.state.job_lifecycles, &h.state.escalation_rounds,
             );
             for kind in drive_verifier(&h.store, tick, &mut h.salts[i], ver_cfg, v.0) {

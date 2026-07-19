@@ -419,7 +419,8 @@ impl EventLoop {
         if !is_validator || !self.state.is_eligible(&me) { return; }
         let my_balance = self.state.accounts.get(&me).map(|a| a.balance.raw()).unwrap_or(0);
         let tick = commputer::verifier_loop::build_verifier_views(
-            self.state.blocks.height(), me, my_balance, &self.state.job_lifecycles,
+            self.state.blocks.height(), me, my_balance,
+            &self.state.job_lifecycles, &self.state.escalation_rounds,
         );
         let _ = tx.send(tick);
     }
@@ -2538,6 +2539,7 @@ impl EventLoop {
             | commputer_core::transaction::TxKind::ClaimJob { job_id } => {
                 if !self.state.job_lifecycles.contains_key(job_id)
                     && !self.state.pending_jobs.contains_key(job_id)
+                    && !self.state.escalation_rounds.contains_key(job_id)
                 {
                     return Err("pouw tx references unknown job");
                 }

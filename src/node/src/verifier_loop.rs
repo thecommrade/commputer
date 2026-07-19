@@ -114,7 +114,7 @@ fn record_phase_to_verifier(p: PhaseRec) -> VerifierPhase {
 /// `VerifierPhase`. A round-1 job_id and its escalation-round job_id never coexist in the two maps
 /// at once (the primary lifecycle's committee-facing entry is drained/settled before the round
 /// opens), so no dedup between the two loops is needed.
-pub fn build_verifier_views_with_escalations(
+pub fn build_verifier_views(
     now_height: u64,
     me: Address,
     my_balance: u64,
@@ -181,20 +181,6 @@ pub fn build_verifier_views_with_escalations(
         my_address: me,
         my_balance,
     }
-}
-
-/// Thin 4-arg shim over [`build_verifier_views_with_escalations`] with an empty escalation-rounds
-/// map. Exists SOLELY so the PROTECTED `event_loop.rs` call site keeps compiling and behaving
-/// identically (no escalation panels are surfaced through this path) until the founder-approved
-/// swap to the 5-arg function (a later task) updates that call site to pass
-/// `&state.escalation_rounds`.
-pub fn build_verifier_views(
-    now_height: u64,
-    me: Address,
-    my_balance: u64,
-    job_lifecycles: &HashMap<[u8; 32], JobLifecycle>,
-) -> VerifierTick {
-    build_verifier_views_with_escalations(now_height, me, my_balance, job_lifecycles, &HashMap::new())
 }
 
 /// Returned when the shared actor-tx receiver is gone (the event loop dropped it) → the loop exits.
@@ -830,7 +816,7 @@ mod tests {
             lc_committee(3, vec![ME], PhaseRec::Revealing, vec![commit_of(ME)], vec![reveal_of(ME)], false),
         );
 
-        let tick = build_verifier_views(55, me, 9_000, &lifecycles);
+        let tick = build_verifier_views(55, me, 9_000, &lifecycles, &StdHashMap::new());
         assert_eq!(tick.now_height, 55);
         assert_eq!(tick.my_address, me);
         assert_eq!(tick.my_balance, 9_000);
@@ -866,7 +852,7 @@ mod tests {
             [1u8; 32],
             lc_committee(1, vec![ME, other], PhaseRec::Committing, vec![commit_of(other)], vec![], false),
         );
-        let tick = build_verifier_views(10, me, 1_000, &lifecycles);
+        let tick = build_verifier_views(10, me, 1_000, &lifecycles, &StdHashMap::new());
         assert_eq!(tick.committees.len(), 1);
         assert!(!tick.committees[0].already_committed, "another verifier's commit is not mine");
         assert!(!tick.committees[0].already_revealed);
@@ -884,7 +870,7 @@ mod tests {
         ] {
             let mut lifecycles = StdHashMap::new();
             lifecycles.insert([1u8; 32], lc_committee(1, vec![ME], rp, vec![], vec![], false));
-            let tick = build_verifier_views(1, me, 0, &lifecycles);
+            let tick = build_verifier_views(1, me, 0, &lifecycles, &StdHashMap::new());
             assert_eq!(tick.committees.len(), 1);
             assert_eq!(tick.committees[0].phase, want);
             assert!(!tick.committees[0].settled);
@@ -892,12 +878,12 @@ mod tests {
         // A settled terminal → `settled == true` (and phase maps to Other).
         let mut lifecycles = StdHashMap::new();
         lifecycles.insert([1u8; 32], lc_committee(1, vec![ME], PhaseRec::Settled, vec![], vec![], true));
-        let tick = build_verifier_views(1, me, 0, &lifecycles);
+        let tick = build_verifier_views(1, me, 0, &lifecycles, &StdHashMap::new());
         assert!(tick.committees[0].settled);
         assert_eq!(tick.committees[0].phase, VerifierPhase::Other);
     }
 
-    // ── build_verifier_views_with_escalations (S8: escalation-panel views) ──────────────────────
+    // ── build_verifier_views (S8: escalation-panel views) ──────────────────────
     use commputer_pouw_onchain::escalation_round::{
         EscalationOutcomeRec, JobIdentity, PanelDeadlines, PanelPhaseRec,
     };
@@ -993,7 +979,7 @@ mod tests {
             [2u8; 32],
             test_round_with_panel(&[[2u8; 32], [3u8; 32], [4u8; 32]], PanelPhase::Committing),
         );
-        let tick = build_verifier_views_with_escalations(10, me, 1_000, &HashMap::new(), &esc);
+        let tick = build_verifier_views(10, me, 1_000, &HashMap::new(), &esc);
         assert_eq!(tick.now_height, 10);
         assert_eq!(tick.my_address, me);
         assert_eq!(tick.my_balance, 1_000);
@@ -1021,7 +1007,7 @@ mod tests {
             [1u8; 32],
             test_round_with_panel(&[me.0, [2u8; 32], [3u8; 32]], PanelPhase::Revealing),
         );
-        let tick = build_verifier_views_with_escalations(10, me, 1_000, &HashMap::new(), &esc);
+        let tick = build_verifier_views(10, me, 1_000, &HashMap::new(), &esc);
         assert_eq!(tick.committees.len(), 1);
         assert_eq!(tick.committees[0].phase, VerifierPhase::Revealing);
         assert!(!tick.committees[0].settled);
@@ -1037,7 +1023,7 @@ mod tests {
             [1u8; 32],
             test_round_with_panel(&[me.0, [2u8; 32], [3u8; 32]], PanelPhase::Settled),
         );
-        let tick = build_verifier_views_with_escalations(10, me, 1_000, &HashMap::new(), &esc);
+        let tick = build_verifier_views(10, me, 1_000, &HashMap::new(), &esc);
         assert_eq!(tick.committees.len(), 1);
         assert_eq!(tick.committees[0].phase, VerifierPhase::Other);
         assert!(tick.committees[0].settled, "settled round → settled == true (salt GC)");
@@ -1058,7 +1044,7 @@ mod tests {
             [1u8; 32],
             test_round_with_panel(&[Address(ME).0, [2u8; 32], [3u8; 32]], PanelPhase::Committing),
         );
-        let tick = build_verifier_views_with_escalations(
+        let tick = build_verifier_views(
             10,
             Address(ME),
             1_000,
@@ -1071,20 +1057,4 @@ mod tests {
         let _ = me; // reserved for readability of the panel-membership assertions above
     }
 
-    /// The 4-arg shim delegates to the 5-arg fn with an empty escalation-rounds map: identical
-    /// output to calling the 5-arg fn directly with `&HashMap::new()` (no behavior change for the
-    /// still-unmigrated PROTECTED `event_loop.rs` call site).
-    #[test]
-    fn shim_delegates_with_empty_escalation_map() {
-        let me = Address(ME);
-        let mut lifecycles = StdHashMap::new();
-        lifecycles.insert(
-            [1u8; 32],
-            lc_committee(1, vec![ME], PhaseRec::Committing, vec![commit_of(ME)], vec![], false),
-        );
-        let via_shim = build_verifier_views(7, me, 500, &lifecycles);
-        let via_full =
-            build_verifier_views_with_escalations(7, me, 500, &lifecycles, &HashMap::new());
-        assert_eq!(via_shim, via_full);
-    }
 }
