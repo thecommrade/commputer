@@ -18,11 +18,11 @@ use commputer_pouw::commit_reveal::reveal_matches;
 use commputer_pouw::committee::select_committee;
 use commputer_pouw::ids::ParticipantId;
 use commputer_pouw::job::{Commitment, Reveal, SettlementOutcome, Verdict};
-use commputer_pouw::oracle::{ChainHooks, EquivalenceOracle};
+use commputer_pouw::oracle::EquivalenceOracle;
 use commputer_pouw::params::GameParams;
 use commputer_pouw::settlement::{settle_noquorum_confirmed, settle_noquorum_disputed};
 use commputer_pouw::verdict::compute_verdict;
-use crate::escrow_ledger::{EscrowLedger, Ledger};
+use crate::escrow_ledger::Ledger;
 use crate::lifecycle::{
     commit_from_rec, commit_to_rec, outcome_from_rec, outcome_to_rec, reveal_from_rec,
     reveal_to_rec, CommitmentRec, RevealRec, SettlementOutcomeRec,
@@ -460,6 +460,8 @@ fn partition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::escrow_ledger::EscrowLedger;
+    use commputer_pouw::oracle::ChainHooks;
 
     fn pid(n: u8) -> ParticipantId {
         ParticipantId([n; 32])
