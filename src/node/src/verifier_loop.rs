@@ -31,6 +31,7 @@ use commputer_core::identity::Address;
 use commputer_core::token::Amount;
 use commputer_core::transaction::TxKind;
 use commputer_pouw::wasm::WasmLimits;
+use commputer_pouw_onchain::escalation_round::{EscalationRound, PanelPhase};
 use commputer_pouw_onchain::lifecycle::{JobLifecycle, PhaseRec};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -75,7 +76,7 @@ pub struct VerifierCommitteeView {
 }
 
 /// The applied-state snapshot the PROTECTED event loop builds each block and sends to the loop.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifierTick {
     pub now_height: u64,
     pub committees: Vec<VerifierCommitteeView>,
@@ -94,21 +95,31 @@ fn record_phase_to_verifier(p: PhaseRec) -> VerifierPhase {
     }
 }
 
-/// Build the verifier's per-block [`VerifierTick`] from the just-applied `job_lifecycles`. Called by
-/// the PROTECTED event loop each block (with `self.state.job_lifecycles`, the wallet address +
-/// spendable balance) and `send`s the result to [`run_verifier_loop`]. PURE + DETERMINISTIC: no
-/// wall-clock, no rng; `committees` is sorted by `job_id` so the tick is byte-stable for a state.
+/// Build the verifier's per-block [`VerifierTick`] from the just-applied `job_lifecycles` AND
+/// `escalation_rounds` (S8). Called by the PROTECTED event loop each block (with
+/// `self.state.job_lifecycles`, `self.state.escalation_rounds`, the wallet address + spendable
+/// balance) and `send`s the result to [`run_verifier_loop`]. PURE + DETERMINISTIC: no wall-clock, no
+/// rng; `committees` is sorted by `job_id` ONCE, after both loops, so the tick is byte-stable for a
+/// state.
 ///
 /// A lifecycle contributes a [`VerifierCommitteeView`] iff this node was drawn onto its committee.
 /// The committee stores each drawn verifier as `ParticipantId(addr.0)` (state.rs `record_commit`),
 /// so membership is `committee.contains(&me.0)`, and `already_committed`/`already_revealed` are the
 /// presence of `me.0` in the record's `commitments`/`reveals` (NOT mere non-emptiness — another
 /// verifier's commit is not ours). `settled` is the terminal cache being populated → salt GC.
-pub fn build_verifier_views(
+///
+/// An `EscalationRound` contributes a view the same way: a panel seat is driven through the SAME
+/// planner/emit path as a round-1 committee seat (the tx kinds — `Commit`/`Reveal` by `job_id` — are
+/// identical, and the chain routes them to the round, state.rs S7); `PanelPhase` maps onto the same
+/// `VerifierPhase`. A round-1 job_id and its escalation-round job_id never coexist in the two maps
+/// at once (the primary lifecycle's committee-facing entry is drained/settled before the round
+/// opens), so no dedup between the two loops is needed.
+pub fn build_verifier_views_with_escalations(
     now_height: u64,
     me: Address,
     my_balance: u64,
     job_lifecycles: &HashMap<[u8; 32], JobLifecycle>,
+    escalation_rounds: &HashMap<[u8; 32], EscalationRound>,
 ) -> VerifierTick {
     let mut committees: Vec<VerifierCommitteeView> = job_lifecycles
         .iter()
@@ -132,6 +143,36 @@ pub fn build_verifier_views(
             })
         })
         .collect();
+
+    // EscalationRound panels (S8): a panel seat is driven through the SAME planner/emit path as a
+    // round-1 committee seat — the tx kinds (Commit/Reveal by job_id) are identical and the chain
+    // routes them to the round (state.rs S7). PanelPhase maps onto the same VerifierPhase. (No
+    // dedup vs. the loop above: a round-1 job_id and its escalation job_id never coexist — the
+    // primary round drains before the round opens.)
+    for (job_id, er) in escalation_rounds {
+        if !er.panel().iter().any(|p| p.0 == me.0) {
+            continue; // not drawn onto this panel.
+        }
+        let identity = er.identity();
+        committees.push(VerifierCommitteeView {
+            job_id: *job_id,
+            phase: match er.phase() {
+                PanelPhase::Committing => VerifierPhase::Committing,
+                PanelPhase::Revealing => VerifierPhase::Revealing,
+                PanelPhase::Settled => VerifierPhase::Other,
+            },
+            commit_by: er.deadlines().commit_by,
+            reveal_by: er.deadlines().reveal_by,
+            verifier_bond: er.verifier_bond(),
+            already_committed: er.commitments().iter().any(|c| c.verifier.0 == me.0),
+            already_revealed: er.reveals().iter().any(|r| r.verifier.0 == me.0),
+            program_hash: identity.program_hash,
+            input_hash: identity.input_hash,
+            da_root: identity.da_root,
+            settled: er.is_settled(),
+        });
+    }
+
     committees.sort_by(|a, b| a.job_id.cmp(&b.job_id));
 
     VerifierTick {
@@ -140,6 +181,20 @@ pub fn build_verifier_views(
         my_address: me,
         my_balance,
     }
+}
+
+/// Thin 4-arg shim over [`build_verifier_views_with_escalations`] with an empty escalation-rounds
+/// map. Exists SOLELY so the PROTECTED `event_loop.rs` call site keeps compiling and behaving
+/// identically (no escalation panels are surfaced through this path) until the founder-approved
+/// swap to the 5-arg function (a later task) updates that call site to pass
+/// `&state.escalation_rounds`.
+pub fn build_verifier_views(
+    now_height: u64,
+    me: Address,
+    my_balance: u64,
+    job_lifecycles: &HashMap<[u8; 32], JobLifecycle>,
+) -> VerifierTick {
+    build_verifier_views_with_escalations(now_height, me, my_balance, job_lifecycles, &HashMap::new())
 }
 
 /// Returned when the shared actor-tx receiver is gone (the event loop dropped it) → the loop exits.
@@ -840,5 +895,196 @@ mod tests {
         let tick = build_verifier_views(1, me, 0, &lifecycles);
         assert!(tick.committees[0].settled);
         assert_eq!(tick.committees[0].phase, VerifierPhase::Other);
+    }
+
+    // ── build_verifier_views_with_escalations (S8: escalation-panel views) ──────────────────────
+    use commputer_pouw_onchain::escalation_round::{
+        EscalationOutcomeRec, JobIdentity, PanelDeadlines, PanelPhaseRec,
+    };
+    use commputer_pouw_onchain::lifecycle::EscalationHandoff;
+
+    fn addr(n: u8) -> Address {
+        Address([n; 32])
+    }
+
+    /// Build an `EscalationRound` whose panel is exactly `wanted`, at the given `phase`. Built via
+    /// the real `open()` (candidates == wanted panel, `k_escalate` (7, `GameParams::default()`) >=
+    /// panel len, equal stakes) so `select_committee` draws exactly the wanted members — asserted
+    /// below, defensively, as a set (the draw is a stake-weighted sort, not identity order). For a
+    /// non-`Committing` phase the round is then carried to that phase through the SAME DTO
+    /// round-trip (`to_record`/`from_record`) the chain uses to persist/reload rounds, rather than
+    /// driving an unrelated full commit/reveal/settle cycle irrelevant to this loop's view-building.
+    fn test_round_with_panel(wanted: &[[u8; 32]], phase: PanelPhase) -> EscalationRound {
+        let candidates: Vec<ParticipantId> = wanted.iter().map(|b| ParticipantId(*b)).collect();
+        let executor = ParticipantId([0xEE; 32]); // distinct from any panel member used in tests
+        let stake = |_: &ParticipantId| 1u64;
+        let handoff = EscalationHandoff {
+            budget: 100,
+            submitter: ParticipantId([0x11; 32]),
+            executor,
+            executor_hash: [0x77; 32],
+            executor_bond: 10,
+            committee_reveals: vec![],
+            committee_bonds: vec![],
+            verifier_bond: 20,
+        };
+        let identity = JobIdentity {
+            program_hash: [0xAA; 32],
+            input_hash: [0xBB; 32],
+            da_root: [0xCC; 32],
+        };
+        let deadlines = PanelDeadlines { commit_by: 20, reveal_by: 30 };
+        let er = EscalationRound::open(
+            handoff,
+            [0x77; 32], // internal job_id; the map key (caller-supplied) is what the view uses
+            identity,
+            candidates,
+            [42u8; 32],
+            GameParams::default(),
+            deadlines,
+            &stake,
+        );
+        let mut got: Vec<[u8; 32]> = er.panel().iter().map(|p| p.0).collect();
+        got.sort();
+        let mut want_sorted = wanted.to_vec();
+        want_sorted.sort();
+        assert_eq!(
+            got, want_sorted,
+            "test_round_with_panel: select_committee did not draw the wanted panel"
+        );
+
+        if phase == PanelPhase::Committing {
+            return er;
+        }
+        let mut rec = er.to_record();
+        rec.phase = match phase {
+            PanelPhase::Committing => unreachable!("handled above"),
+            PanelPhase::Revealing => PanelPhaseRec::Revealing,
+            PanelPhase::Settled => PanelPhaseRec::Settled,
+        };
+        if phase == PanelPhase::Settled {
+            rec.settled = Some(EscalationOutcomeRec::Confirmed(SettlementOutcomeRec {
+                worker_paid: 0,
+                verifiers_paid: 0,
+                burned: 0,
+                submitter_refunded: 0,
+                challenger_paid: 0,
+                panel_paid: 0,
+                bonds_returned: 0,
+                slashed: vec![],
+            }));
+        }
+        EscalationRound::from_record(rec, GameParams::default())
+    }
+
+    /// A round whose panel contains `me` contributes exactly one view, with the panel's
+    /// deadlines/bond/identity carried through and phase mapped from `PanelPhase`; a round NOT
+    /// containing me contributes nothing.
+    #[test]
+    fn build_views_projects_escalation_panels_i_am_on() {
+        let me = addr(1);
+        let mut esc = HashMap::new();
+        esc.insert(
+            [1u8; 32],
+            test_round_with_panel(&[me.0, [2u8; 32], [3u8; 32]], PanelPhase::Committing),
+        );
+        // NOT my panel → excluded.
+        esc.insert(
+            [2u8; 32],
+            test_round_with_panel(&[[2u8; 32], [3u8; 32], [4u8; 32]], PanelPhase::Committing),
+        );
+        let tick = build_verifier_views_with_escalations(10, me, 1_000, &HashMap::new(), &esc);
+        assert_eq!(tick.now_height, 10);
+        assert_eq!(tick.my_address, me);
+        assert_eq!(tick.my_balance, 1_000);
+        assert_eq!(tick.committees.len(), 1, "the non-member round contributes nothing");
+
+        let v = &tick.committees[0];
+        assert_eq!(v.job_id, [1u8; 32]);
+        assert_eq!(v.phase, VerifierPhase::Committing);
+        assert_eq!(v.commit_by, 20);
+        assert_eq!(v.reveal_by, 30);
+        assert_eq!(v.verifier_bond, 20);
+        assert!(!v.already_committed && !v.already_revealed);
+        assert_eq!(v.program_hash, [0xAAu8; 32]); // identity carried from the round
+        assert_eq!(v.input_hash, [0xBBu8; 32]);
+        assert_eq!(v.da_root, [0xCCu8; 32]);
+        assert!(!v.settled);
+    }
+
+    /// `PanelPhase::Revealing` maps onto `VerifierPhase::Revealing`.
+    #[test]
+    fn build_views_maps_revealing_panel_phase() {
+        let me = addr(1);
+        let mut esc = HashMap::new();
+        esc.insert(
+            [1u8; 32],
+            test_round_with_panel(&[me.0, [2u8; 32], [3u8; 32]], PanelPhase::Revealing),
+        );
+        let tick = build_verifier_views_with_escalations(10, me, 1_000, &HashMap::new(), &esc);
+        assert_eq!(tick.committees.len(), 1);
+        assert_eq!(tick.committees[0].phase, VerifierPhase::Revealing);
+        assert!(!tick.committees[0].settled);
+    }
+
+    /// A settled escalation round maps `PanelPhase::Settled` to `VerifierPhase::Other` and sets
+    /// `settled == true` (drives salt GC in the loop, exactly as for a settled round-1 lifecycle).
+    #[test]
+    fn build_views_settled_escalation_round_sets_settled_flag() {
+        let me = addr(1);
+        let mut esc = HashMap::new();
+        esc.insert(
+            [1u8; 32],
+            test_round_with_panel(&[me.0, [2u8; 32], [3u8; 32]], PanelPhase::Settled),
+        );
+        let tick = build_verifier_views_with_escalations(10, me, 1_000, &HashMap::new(), &esc);
+        assert_eq!(tick.committees.len(), 1);
+        assert_eq!(tick.committees[0].phase, VerifierPhase::Other);
+        assert!(tick.committees[0].settled, "settled round → settled == true (salt GC)");
+    }
+
+    /// Membership + already_committed/already_revealed key on `me`'s id, not mere presence, and a
+    /// lifecycle committee view + an escalation-panel view can coexist in one tick (sorted together).
+    #[test]
+    fn build_views_merges_lifecycle_and_escalation_views_sorted() {
+        let me = addr(1);
+        let mut lifecycles = StdHashMap::new();
+        lifecycles.insert(
+            [5u8; 32],
+            lc_committee(5, vec![ME], PhaseRec::Committing, vec![], vec![], false),
+        );
+        let mut esc = HashMap::new();
+        esc.insert(
+            [1u8; 32],
+            test_round_with_panel(&[Address(ME).0, [2u8; 32], [3u8; 32]], PanelPhase::Committing),
+        );
+        let tick = build_verifier_views_with_escalations(
+            10,
+            Address(ME),
+            1_000,
+            &lifecycles,
+            &esc,
+        );
+        assert_eq!(tick.committees.len(), 2, "both a lifecycle and a panel view appear");
+        assert_eq!(tick.committees[0].job_id, [1u8; 32], "sorted by job_id");
+        assert_eq!(tick.committees[1].job_id, [5u8; 32]);
+        let _ = me; // reserved for readability of the panel-membership assertions above
+    }
+
+    /// The 4-arg shim delegates to the 5-arg fn with an empty escalation-rounds map: identical
+    /// output to calling the 5-arg fn directly with `&HashMap::new()` (no behavior change for the
+    /// still-unmigrated PROTECTED `event_loop.rs` call site).
+    #[test]
+    fn shim_delegates_with_empty_escalation_map() {
+        let me = Address(ME);
+        let mut lifecycles = StdHashMap::new();
+        lifecycles.insert(
+            [1u8; 32],
+            lc_committee(1, vec![ME], PhaseRec::Committing, vec![commit_of(ME)], vec![], false),
+        );
+        let via_shim = build_verifier_views(7, me, 500, &lifecycles);
+        let via_full =
+            build_verifier_views_with_escalations(7, me, 500, &lifecycles, &HashMap::new());
+        assert_eq!(via_shim, via_full);
     }
 }
