@@ -265,7 +265,7 @@ pub fn default_genesis() -> GenesisConfig {
         proof_challenge_interval_secs: 300,
         block_time_secs: 2,
         emission_decay_rate: 0.0001,
-        genesis_timestamp: 1784505600, // 2026-07-20 00:00:00 UTC — alpha reset epoch — founder confirms/sets the final value at the reset ceremony
+        genesis_timestamp: 1784419200, // 2026-07-19 00:00:00 UTC — alpha reset epoch — founder confirms/sets the final value at the reset ceremony
         consensus_params: ConsensusParamsConfig::default(),
         // A-batch item 7: no genesis allocations by default — keeps today's
         // genesis byte-identical (empty ⇒ zero credits ⇒ unchanged state root).
