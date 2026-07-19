@@ -5,7 +5,7 @@
 network = "testnet"
 
 # Chain ID for this network
-chain_id = "commputer-testnet-1"
+chain_id = "commputer-testnet-3"
 
 # Seed nodes to connect to on startup
 # These are the default testnet seed nodes

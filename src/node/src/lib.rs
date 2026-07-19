@@ -13,6 +13,11 @@ pub mod block_maps;
 pub mod mempool_quota;
 pub mod peer_hash;
 pub mod da_store;
+// §1.12 (2026-07-19): re-exported so node integration tests can reach
+// `commputer::config::DEFAULT_TESTNET_CHAIN_ID` for the chain-id equality guard
+// (`tests/chain_id_equality.rs`). Mirrors the existing dual bin+lib declaration
+// pattern used above for validation/faucet/testnet_genesis/wizard.
+pub mod config;
 // PoUW executor kernel (already compiled into the binary via main.rs). Re-exported through the lib
 // so the inert executor planner + re-execution shim can call `commputer::pouw_executor::execute_job`.
 pub mod pouw_executor;
