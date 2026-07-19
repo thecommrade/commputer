@@ -834,6 +834,117 @@ mod tests {
         assert_eq!(o1, o2, "reloaded round settles byte-identically");
     }
 
+    use commputer_pouw::escalation::{Escalation, Trigger};
+
+    /// Task 7 GOLDEN ORACLE — the single most important correctness pin of the escalation
+    /// feature: the on-chain `EscalationRound::settle` deliberately does NOT call the frozen
+    /// `escalation::resolve` (it settles the EFFECTIVE panel via the lower-level
+    /// `settle_noquorum_*`), so for the inputs the frozen reference DOES assume — a full
+    /// `k_escalate` panel where every member commits AND reveals — the two paths must agree
+    /// FIELD-FOR-FIELD, anchoring the on-chain machine to the audited frozen game.
+    ///
+    /// Same seed/candidates/executor/stakes on both sides ⇒ the reference's internal
+    /// `select_committee` re-draw is the IDENTICAL panel (asserted explicitly below);
+    /// `quorum(panel.len()) == quorum(k_escalate)` because the panel is full; the second
+    /// ledger replays every panel-bond escrow exactly as `record_commit` did, so both
+    /// ledgers enter settlement in the same state and must leave in the same state.
+    #[test]
+    fn golden_full_panel_matches_frozen_escalation_resolve() {
+        let (budget, e_bond, v_bond) = min_funding();
+        let job = [11u8; 32];
+        let p = GameParams::default();
+        let stake = |_: &ParticipantId| 1u64; // the same stake fn `opened` passes
+
+        // --- On-chain machine: full panel, all commit + all reveal the executor's [7] ---
+        let (mut l1, t1) = held_ledger(job, budget, e_bond, v_bond);
+        let mut r = opened(job, budget, e_bond, v_bond);
+        let panel: Vec<ParticipantId> = r.panel().to_vec();
+        assert_eq!(panel.len(), p.k_escalate, "FULL panel — the frozen reference's assumption");
+        // The frozen resolve re-draws internally from (seed, candidates, executor, k_escalate).
+        // Prove — BEFORE settling — that with `opened`'s exact constants (seed [42;32],
+        // candidates panel7(), executor pid(9), unit stakes) it draws the identical panel.
+        let frozen_panel = select_committee(&[42u8; 32], &panel7(), &pid(9), p.k_escalate, &stake);
+        assert_eq!(frozen_panel, panel, "same seed/candidates/stakes ⇒ same panel, order included");
+
+        for (i, m) in panel.iter().enumerate() {
+            assert_eq!(
+                r.record_commit(&mut l1, commit_of(*m, [7u8; 32], [i as u8; 32], v_bond), 15),
+                EventResult::Accepted
+            );
+        }
+        assert_eq!(r.advance(21), PanelPhase::Revealing);
+        let mut panel_reveals = Vec::new();
+        for (i, m) in panel.iter().enumerate() {
+            let rv = reveal_of(*m, [7u8; 32], [i as u8; 32]);
+            panel_reveals.push(rv);
+            assert_eq!(r.record_reveal(rv, 25), EventResult::Accepted);
+        }
+        let EscalationOutcome::Confirmed(on_chain) = r.settle(&mut l1, &ByteEq) else {
+            panic!("expected Confirmed")
+        };
+
+        // --- The frozen reference over IDENTICAL inputs, on a fresh identically-funded ledger ---
+        let (mut l2, t2) = held_ledger(job, budget, e_bond, v_bond);
+        // Replay each panel member's bond escrow exactly as record_commit did (the DTO
+        // round-trip test's replay pattern), so l2 enters settlement in l1's pre-settle state.
+        l2.for_job(job);
+        for m in &panel {
+            l2.escrow(*m, v_bond);
+        }
+        // `opened`'s handoff_3way constants: submitter pid(0); original committee pid(10/11/12)
+        // revealed [7]/[5]/[9] with [0;32] salts, each bonded v_bond.
+        let committee_reveals = vec![
+            reveal_of(pid(10), [7u8; 32], [0u8; 32]),
+            reveal_of(pid(11), [5u8; 32], [0u8; 32]),
+            reveal_of(pid(12), [9u8; 32], [0u8; 32]),
+        ];
+        let committee_bonds = vec![v_bond; 3];
+        let cands = panel7();
+        let esc = Escalation {
+            seed: [42u8; 32],
+            candidates: &cands,
+            budget,
+            executor: pid(9),
+            executor_hash: [7u8; 32],
+            executor_bond: e_bond,
+            panel_reveals: &panel_reveals,
+            panel_bond: v_bond,
+        };
+        let (verdict, reference) = commputer_pouw::escalation::resolve(
+            &mut l2,
+            &p,
+            &esc,
+            Trigger::NoQuorum {
+                submitter: pid(0),
+                committee_reveals: &committee_reveals,
+                committee_bonds: &committee_bonds,
+            },
+            &ByteEq,
+            &stake,
+        );
+
+        // Non-vacuous: a real Confirmed with real money movement on the reference side.
+        assert_eq!(verdict, Verdict::Confirmed { result_hash: [7u8; 32] });
+        assert!(reference.worker_paid > 0, "worker actually paid");
+        assert!(reference.verifiers_paid > 0, "vindicated original verifier actually paid");
+        assert!(reference.bonds_returned > 0, "bonds actually returned");
+        assert!(!reference.slashed.is_empty(), "rejected original verifiers actually slashed");
+
+        // THE PIN: on-chain path == frozen oracle, field-for-field.
+        assert_eq!(on_chain, reference, "on-chain path == frozen oracle, field-for-field");
+
+        // And the two ledgers land in the identical end-state: every participant's balance,
+        // both pots drained, both supplies conserved.
+        for who in [pid(0), pid(9), pid(10), pid(11), pid(12)].into_iter().chain(panel7()) {
+            assert_eq!(l1.balance_of(&who), l2.balance_of(&who), "balance diverges for {who:?}");
+        }
+        assert_eq!(l1.escrowed_for(&job), 0, "on-chain pot drained");
+        assert_eq!(l2.escrowed_for(&job), 0, "reference pot drained");
+        assert_eq!(l1.total_supply(), t1, "on-chain side conserves");
+        assert_eq!(l2.total_supply(), t2, "reference side conserves");
+        assert_eq!(t1, t2, "both ledgers funded to the same baseline");
+    }
+
     #[test]
     fn accessors_expose_identity_deadlines_and_expected_escrow() {
         let (budget, e_bond, v_bond) = min_funding();

@@ -9700,6 +9700,181 @@ mod tests {
         assert!(state.escalation_rounds.contains_key(&job), "valid settle block opens the round");
     }
 
+    /// Task 7 — the B10 equivalence leg for the escalation round: the IDENTICAL escalation is
+    /// driven through TWO independent ledger backends —
+    ///   (A) ON-CHAIN — the REAL flip (`Terminal::Escalate` → `EscalationRound` inside
+    ///       `ChainState`), panel commits/reveals via the S5 helpers, settled through
+    ///       `escalation_settle_and_drain` (the exact entry point the S6 sweep calls); and
+    ///   (B) STAGING — `EscalationRound::open` over the pure reference `EscrowLedger`, fed the
+    ///       SAME panel inputs the chain used: the same round-1 handoff, the chain's exact seed
+    ///       (recomputed from the settling block b8 with the chain's own formula), candidates =
+    ///       the chain's drawn panel (same seed + equal stakes ⇒ `select_committee` re-draws
+    ///       them in the SAME order — its sort key is order-independent of the candidate list),
+    ///       and the chain round's own identity/deadlines.
+    /// Then: terminal outcome equal field-for-field, per-participant end balances equal, both
+    /// pots drained to 0, both sides conserve — extending the B10 safety net across the last
+    /// money-path (the second panel) so the on-chain escalation cannot silently diverge from
+    /// the audited staging game.
+    #[test]
+    fn equivalence_escalation_confirmed_staging_matches_chainstate() {
+        // ---- (A) ON-CHAIN: real flip opens the round ----
+        let ids: Vec<u8> = (3u8..15).collect(); // 12 bonded verifiers
+        let (mut chain, job) = onchain_claimed_n(&ids);
+        let conserved0 = money_conserved(&chain);
+        let committee = drive_round1_split(&mut [&mut chain], job);
+        let b8 = block_with(&chain, 8, vec![]);
+        chain.apply_block(&b8).unwrap();
+        let chain_round = chain.escalation_rounds.get(&job).expect("round opened");
+        let chain_panel: Vec<ParticipantId> = chain_round.panel().to_vec();
+        let chain_deadlines = chain_round.deadlines();
+        let chain_identity = chain_round.identity();
+        let v_bond = GameParams::default().verifier_bond;
+        let e_bond = MIN_BUDGET; // budget.max(GameParams::default().executor_bond)
+        let min_bond = StakeParams::default().min_bond;
+
+        // ---- (B) STAGING: open the same round over the reference EscrowLedger ----
+        // The handoff round 1 produced: 3-way-split reveals [1]/[2]/[3] with salts [i;32]
+        // (drive_round1_split's constants), executor's hash [7;32], all bonds v_bond.
+        let handoff = commputer_pouw_onchain::lifecycle::EscalationHandoff {
+            budget: MIN_BUDGET,
+            submitter: ParticipantId(addr(2).0),
+            executor: ParticipantId(addr(1).0),
+            executor_hash: [7u8; 32],
+            executor_bond: e_bond,
+            committee_reveals: committee
+                .iter()
+                .enumerate()
+                .map(|(i, m)| Reveal {
+                    verifier: ParticipantId(*m),
+                    result_hash: [(i + 1) as u8; 32],
+                    salt: [i as u8; 32],
+                })
+                .collect(),
+            committee_bonds: vec![v_bond; 3],
+            verifier_bond: v_bond,
+        };
+        // The chain's exact seed formula for the settling block; equal stakes (every candidate
+        // bonded exactly min_bond in onchain_claimed_n) ⇒ the re-draw over the panel-as-pool
+        // reproduces the chain panel, order included (asserted below — the alignment guard).
+        let seed = commputer_pouw::ids::hash_parts(&[&b8.hash().0, &job, b"escalate"]);
+        let stake = |_: &ParticipantId| min_bond;
+        let mut staging_round = EscalationRound::open(
+            handoff,
+            job,
+            chain_identity,
+            chain_panel.clone(),
+            seed,
+            GameParams::default(),
+            commputer_pouw_onchain::escalation_round::PanelDeadlines {
+                commit_by: chain_deadlines.commit_by,
+                reveal_by: chain_deadlines.reveal_by,
+            },
+            &stake,
+        );
+        assert_eq!(
+            staging_round.panel(),
+            &chain_panel[..],
+            "staging draw == chain panel, order included"
+        );
+        // Fund + escrow the staging ledger to the chain's exact held-pot state at open.
+        let mut sl = EscrowLedger::new();
+        sl.credit(ParticipantId(addr(2).0), MIN_BUDGET);
+        sl.credit(ParticipantId(addr(1).0), e_bond);
+        for m in &committee {
+            sl.credit(ParticipantId(*m), v_bond);
+        }
+        for p in &chain_panel {
+            sl.credit(*p, v_bond);
+        }
+        let staging_total0 = sl.total_supply();
+        sl.for_job(job);
+        sl.escrow(ParticipantId(addr(2).0), MIN_BUDGET);
+        sl.escrow(ParticipantId(addr(1).0), e_bond);
+        for m in &committee {
+            sl.escrow(ParticipantId(*m), v_bond);
+        }
+        assert_eq!(
+            sl.escrowed_for(&job),
+            chain.escrowed_for_job(&job),
+            "both backends hold the same pot at open"
+        );
+
+        // ---- identical panel commits (height 8 ≤ commit_by 9), accept/reject cross-checked ----
+        let result = [7u8; 32]; // the executor's round-1 hash ⇒ Confirmed
+        for (i, p) in chain_panel.iter().enumerate() {
+            let c = make_commitment(p, &result, &[0x40 + i as u8; 32], v_bond);
+            let s_res = staging_round.record_commit(&mut sl, c, 8);
+            let c_res = chain.escalation_record_commit(job, c, 8).unwrap();
+            assert_eq!(Some(s_res), c_res, "commit {i} accept/reject must match across backends");
+        }
+        // ---- advance past commit_by 9 (chain: the S6 sweep in b9/b10; staging: advance) ----
+        for h in 9..=10 {
+            chain.apply_block(&block_with(&chain, h, vec![])).unwrap();
+        }
+        assert_eq!(
+            staging_round.advance(10),
+            chain.escalation_rounds.get(&job).unwrap().phase(),
+            "phase after advance must match across backends"
+        );
+        // ---- identical panel reveals (height 10 ≤ reveal_by 11), cross-checked ----
+        for (i, p) in chain_panel.iter().enumerate() {
+            let r = Reveal { verifier: *p, result_hash: result, salt: [0x40 + i as u8; 32] };
+            let s_res = staging_round.record_reveal(r, 10);
+            let c_res = chain.escalation_record_reveal(job, r, 10);
+            assert_eq!(Some(s_res), c_res, "reveal {i} accept/reject must match across backends");
+        }
+
+        // ---- settle both (chain: the sweep's exact entry point, called directly to CAPTURE
+        // the outcome the S6 sweep discards) ----
+        let staging_out = staging_round.settle(&mut sl, &ByteEq);
+        let chain_out = chain
+            .escalation_settle_and_drain(job, &ByteEq)
+            .expect("pot pre-validates")
+            .expect("round exists");
+
+        // 1. Terminal outcome equal FIELD-FOR-FIELD (worker_paid/verifiers_paid/burned/
+        //    submitter_refunded/challenger_paid/panel_paid/bonds_returned/slashed log).
+        assert_eq!(staging_out, chain_out, "staging and on-chain escalation outcomes must be byte-identical");
+        // ...and non-trivially Confirmed (the equality is not over empty outcomes).
+        match &chain_out {
+            EscalationOutcome::Confirmed(o) => {
+                assert_eq!(o.worker_paid, bps_of(MIN_BUDGET, 8_500), "85% comp to the executor");
+                assert!(o.worker_paid > 0 && o.bonds_returned > 0, "real money moved");
+                assert_eq!(o.slashed.len(), 3, "the whole wrong-side round-1 committee slashed");
+            }
+            other => panic!("expected Confirmed, got {other:?}"),
+        }
+
+        // 2. Per-participant end balances equal for EVERY game actor (submitter, executor,
+        //    round-1 committee, full panel). ParticipantId(a) maps byte-identically to Address(a).
+        let mut game_actors: Vec<ParticipantId> =
+            vec![ParticipantId(addr(2).0), ParticipantId(addr(1).0)];
+        game_actors.extend(committee.iter().map(|m| ParticipantId(*m)));
+        game_actors.extend(chain_panel.iter().copied());
+        for a in &game_actors {
+            let s_bal = sl.balance_of(a);
+            let c_bal =
+                chain.accounts.get(&Address(a.0)).map(|acc| acc.balance.raw()).unwrap_or(0);
+            assert_eq!(s_bal, c_bal, "participant {:?} end-balance diverges", &a.0[..2]);
+        }
+        // Non-vacuous: the executor's balance actually CHANGED (0 while the pot was held →
+        // 85% comp + bond back), so the equalities above compare moved money, not no-ops.
+        assert_eq!(
+            bal(&chain, 1),
+            bps_of(MIN_BUDGET, 8_500) + e_bond,
+            "executor balance moved: 85% comp + bond back"
+        );
+
+        // 3. Both pots drained to exactly 0; the chain round is gone (at-most-once).
+        assert_eq!(chain.escrowed_for_job(&job), 0, "chain pot drained");
+        assert_eq!(sl.escrowed_for(&job), 0, "staging pot drained");
+        assert!(chain.escalation_rounds.is_empty(), "round drained from the map");
+
+        // 4. Both sides conserve against their own baseline.
+        assert_eq!(money_conserved(&chain), conserved0, "chain conserves end-to-end");
+        assert_eq!(sl.total_supply(), staging_total0, "staging conserves total supply");
+    }
+
     /// Snapshot-restore of an INSERTED round: within ONE tail sweep, job A (viable pool) opens
     /// an escalation round, then job B's settle Errs (tampered pot) ⇒ the whole block is
     /// rejected ⇒ `BlockSnapshot.escalation_rounds` must erase A's inserted round. This is the
