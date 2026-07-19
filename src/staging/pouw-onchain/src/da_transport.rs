@@ -29,7 +29,28 @@ use std::time::{Duration, Instant};
 /// limit (≈6.7 req/s) with margin; `SAMPLES_PER_VERIFIER` (16) x 150ms = 2.4s total pacing, which
 /// is negligible against both the ≈20s on-chain commit window and the 30s DA retry-window budget
 /// (`executor_loop::DEFAULT_DA_RETRY_WINDOW_TICKS`) it must fit inside.
+///
+/// **Fast-follow (shared-clock fix):** `main.rs` constructs FOUR `with_timeout` instances per node
+/// (executor attestation + executor blob-fetch on the executor thread; verifier attestation +
+/// verifier blob-fetch on the verifier thread) — all presenting as the SAME peer to a remote
+/// holder. A naive per-instance pacing clock bounds each instance to ≈6.7 req/s independently, so
+/// the combined worst case (executor + verifier fetch phases overlapping in real time) is up to
+/// ~4x that — ≈27 req/s, comfortably above the server's 10/s bucket. [`BridgeTransport::pace_fetch`]
+/// therefore paces against [`SHARED_FETCH_CLOCK`], ONE process-wide clock every paced instance
+/// shares, so a node's TOTAL `fetch_chunk` rate across ALL roles/instances is bounded to ≈6.7 req/s
+/// — comfortably under 10/s — regardless of how many `BridgeTransport`s are live at once.
 pub const DEFAULT_MIN_FETCH_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Process-wide reservation clock for `fetch_chunk` pacing (see [`DEFAULT_MIN_FETCH_INTERVAL`]'s
+/// "shared-clock fix" note): every paced `BridgeTransport` instance (`min_fetch_interval.is_some()`)
+/// reserves its send slot against this ONE static rather than a per-instance clock, so the 10/s
+/// server-side budget is enforced across the whole process — i.e. across every role (executor,
+/// verifier) and every seam (attestation resolve, blob fetch) at once, not per-instance. Unpaced
+/// instances (`min_fetch_interval == None`, e.g. every `BridgeTransport::new()` test construction)
+/// never touch this static at all — see [`BridgeTransport::pace_fetch`]'s early return — so they
+/// remain fully isolated from it. A plain `Mutex` (not a per-instance field): `Mutex::new` is a
+/// `const fn`, so this needs no lazy-init machinery.
+static SHARED_FETCH_CLOCK: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Real monotonic clock for the DA retry window (1 tick = 1 ms). NEVER hashed into a consensus value.
 pub struct MonotonicClock {
@@ -83,15 +104,14 @@ pub struct BridgeTransport {
     /// test backend that always replies-or-drops); production should set a generous bound.
     call_timeout: Option<Duration>,
     /// Go-live Task B — client-side pacing: the minimum spacing enforced between the START of
-    /// successive `fetch_chunk` sends. `None` (or a zero `Duration`) disables pacing entirely (the
-    /// `new()` test constructor's default, so existing suites stay fast). `Some(d)` sleeps just
-    /// long enough since the last `fetch_chunk` call before sending the next one — see
-    /// [`Self::with_min_fetch_interval`] and [`DEFAULT_MIN_FETCH_INTERVAL`]. Runs on dedicated OS
-    /// threads only (never the event loop), so blocking-sleep here is safe.
+    /// successive `fetch_chunk` sends, THIS instance requests against the [`SHARED_FETCH_CLOCK`]
+    /// (process-wide, not per-instance — see that static's doc for why). `None` (or a zero
+    /// `Duration`) disables pacing entirely (the `new()` test constructor's default, so existing
+    /// suites stay fast AND unpaced instances never touch the shared clock at all). `Some(d)`
+    /// reserves a send slot at least `d` after the last slot ANY paced instance in this process
+    /// reserved — see [`Self::with_min_fetch_interval`] and [`DEFAULT_MIN_FETCH_INTERVAL`]. Runs on
+    /// dedicated OS threads only (never the event loop), so blocking-sleep here is safe.
     min_fetch_interval: Option<Duration>,
-    /// When the last `fetch_chunk` call was SENT, for pacing. `Mutex` because `DaTransport` methods
-    /// take `&self` (the trait is shared across the executor/verifier loop's call sites).
-    last_fetch_at: Mutex<Option<Instant>>,
 }
 
 impl BridgeTransport {
@@ -103,7 +123,6 @@ impl BridgeTransport {
             cmd_tx,
             call_timeout: None,
             min_fetch_interval: None,
-            last_fetch_at: Mutex::new(None),
         }
     }
 
@@ -112,14 +131,15 @@ impl BridgeTransport {
     /// production (set generously — at least the DA retry window). This IS the exact constructor
     /// `main.rs` calls for the real executor/verifier loops (`da_attestation.rs` wraps whatever it
     /// receives generically, so the pacing default lives HERE rather than requiring a protected
-    /// `main.rs` edit): defaults `min_fetch_interval` to [`DEFAULT_MIN_FETCH_INTERVAL`] (150ms).
-    /// Override with [`Self::with_min_fetch_interval`] if a caller needs it off.
+    /// `main.rs` edit): defaults `min_fetch_interval` to [`DEFAULT_MIN_FETCH_INTERVAL`] (150ms),
+    /// paced against the process-wide [`SHARED_FETCH_CLOCK`] so all four production instances
+    /// (executor/verifier x attestation/fetch) share one 10/s-safe budget. Override with
+    /// [`Self::with_min_fetch_interval`] if a caller needs it off.
     pub fn with_timeout(cmd_tx: Sender<DaCommand>, timeout: Duration) -> Self {
         Self {
             cmd_tx,
             call_timeout: Some(timeout),
             min_fetch_interval: Some(DEFAULT_MIN_FETCH_INTERVAL),
-            last_fetch_at: Mutex::new(None),
         }
     }
 
@@ -139,19 +159,35 @@ impl BridgeTransport {
         }
     }
 
-    /// Sleep just enough since the last `fetch_chunk` call to satisfy `min_fetch_interval`, then
-    /// record this call's start. A no-op when pacing is unconfigured (the common test path). Uses a
-    /// monotonic `Instant` — never hashed into consensus (mirrors `MonotonicClock`'s contract).
+    /// Reserve this call's `fetch_chunk` send slot against the process-wide [`SHARED_FETCH_CLOCK`],
+    /// then sleep until it arrives. A no-op when pacing is unconfigured on THIS instance (the common
+    /// test path) — an unpaced instance never even locks the shared clock, so it can't be delayed by
+    /// (or delay) any paced instance elsewhere in the process.
+    ///
+    /// Reservation, not a plain "sleep since last send": the lock is held only long enough to
+    /// atomically compute `reserved = max(now, shared_last + min_interval)` and record it — the
+    /// actual `sleep` happens AFTER releasing the lock. This lets concurrent callers (e.g. the
+    /// executor thread and the verifier thread pacing against the same clock) each grab a
+    /// sequential slot without one thread's sleep blocking another's ability to even compute its
+    /// own slot — every paced call across the whole process still ends up >= `min_interval` after
+    /// whichever slot was reserved immediately before it.
     fn pace_fetch(&self) {
         let Some(min_interval) = self.min_fetch_interval else { return };
-        let mut last = self.last_fetch_at.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(prev) = *last {
-            let elapsed = prev.elapsed();
-            if elapsed < min_interval {
-                std::thread::sleep(min_interval - elapsed);
-            }
+        let wait_until = {
+            let mut last = SHARED_FETCH_CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            let earliest = match *last {
+                Some(prev) => prev + min_interval,
+                None => now,
+            };
+            let reserved = now.max(earliest);
+            *last = Some(reserved);
+            reserved
+        }; // lock released here — the sleep below happens outside the critical section
+        let now = Instant::now();
+        if wait_until > now {
+            std::thread::sleep(wait_until - now);
         }
-        *last = Some(Instant::now());
     }
 }
 
