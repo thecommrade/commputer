@@ -3,6 +3,17 @@ set -euo pipefail
 
 # Cross-compilation build script for Commputer
 # Builds release binaries for multiple targets
+#
+# DEV HELPER — NOT the release pipeline. This script stages each build at
+# dist/<target-triple>/commputer (e.g. dist/x86_64-apple-darwin/commputer),
+# which does NOT match the asset naming used by src/staging/ops/release.yml or
+# scripts/build-release.sh (commputer-<os>-<arch>, e.g. commputer-macos-x86_64,
+# commputer-linux-aarch64). Kept intentionally unaligned: this script exists for
+# a developer to sanity-check that all four targets still compile locally
+# (including the two Darwin targets, which release.yml can only build on a real
+# macOS runner) — it is not meant to produce release-ready, correctly-named
+# assets. If you need release assets, use scripts/build-release.sh (Linux) or
+# the release.yml build-macos/build-windows jobs (CI-hosted, correct names).
 
 TARGETS=(
     "x86_64-unknown-linux-gnu"

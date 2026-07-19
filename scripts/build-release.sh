@@ -7,7 +7,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
 DIST_DIR="$PROJECT_ROOT/dist"
-VERSION="0.1.0"
+
+# VERSION SOURCE OF TRUTH: src/Cargo.toml [workspace.package] version (same
+# field release.yml's verify-version job checks the tag against). Derive it so
+# this script can't silently drift from the crate; fall back to a hardcoded
+# value only if the grep fails for some reason (keep the fallback in sync with
+# src/Cargo.toml manually if that ever happens).
+VERSION="$(grep -m1 -E '^version' "$SRC_DIR/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+if [ -z "$VERSION" ]; then
+    VERSION="0.1.0-alpha.1"
+    echo "WARNING: could not read version from $SRC_DIR/Cargo.toml, using fallback $VERSION"
+fi
 
 echo "=== Commputer Release Build ==="
 echo "Version: $VERSION"
