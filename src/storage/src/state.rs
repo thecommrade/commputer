@@ -11,7 +11,7 @@ use commputer_core::transaction::{TxKind, Transaction};
 use commputer_core::compliance::{ComplianceStatus, NerfRate};
 use commputer_pouw_onchain::lifecycle::{JobLifecycle, EventResult, Terminal, Phase, PhaseDeadlines};
 use commputer_pouw_onchain::escrow_ledger::Ledger;
-use commputer_pouw_onchain::escalation_round::EscalationRound;
+use commputer_pouw_onchain::escalation_round::{EscalationOutcome, EscalationRound};
 use commputer_pouw_onchain::consensus_params::PhaseWindows;
 use commputer_pouw::oracle::{ByteEq, ChainHooks, EquivalenceOracle};
 use commputer_pouw::ids::ParticipantId;
@@ -927,8 +927,9 @@ impl ChainState {
             // P8: the deterministic in-apply settlement driver — runs INSIDE the rollback
             // envelope (its guards are unreachable by construction, but if one ever fires the
             // block is rejected without smear) and BEFORE the block is stored/persisted, so
-            // every settlement/expiry mutation rides this block's WriteBatch.
-            self.settle_due_jobs(block.height())
+            // every settlement/expiry mutation rides this block's WriteBatch. The block hash
+            // seeds the escalation-panel draw (S5), exactly like the B5 committee draw above.
+            self.settle_due_jobs(block.height(), block.hash())
         })();
         if let Err(e) = applied {
             self.rollback_to_pre_block(snap);
@@ -991,9 +992,16 @@ impl ChainState {
     /// 2. every lifecycle: `advance` (idempotent, money-free height transition), then
     ///    `should_settle` → `lifecycle_settle_and_drain`. A cached-but-undrained terminal
     ///    (`is_settled`, unreachable outside tests) is drained too, so nothing can strand.
+    /// 3. every escalation round (S6): `advance`, then `should_settle` →
+    ///    `escalation_settle_and_drain` — AFTER the lifecycle sweep, so a round opened by a
+    ///    `Terminal::Escalate` this block is advanced (no-op at open height) but never
+    ///    insta-settled (its deadlines are ≥ 1 window ahead by the C4 guard).
+    ///
+    /// `block_hash` seeds the S5 escalation-panel draw inside `lifecycle_settle_and_drain`
+    /// (domain-separated from the B5 committee draw by the "escalate" tag).
     ///
     /// try_reorg's replay reproduces identical settle heights by construction (same tail).
-    fn settle_due_jobs(&mut self, height: u64) -> Result<(), StateError> {
+    fn settle_due_jobs(&mut self, height: u64, block_hash: BlockHash) -> Result<(), StateError> {
         // The consensus equivalence oracle is PINNED to byte-equality: a future oracle change
         // must enter ConsensusParams::fingerprint before becoming configurable.
         const SETTLE_ORACLE: ByteEq = ByteEq;
@@ -1019,7 +1027,25 @@ impl ChainState {
                 .map(|l| l.should_settle(height) || l.is_settled())
                 .unwrap_or(false);
             if due {
-                self.lifecycle_settle_and_drain(job_id, &SETTLE_ORACLE)?;
+                self.lifecycle_settle_and_drain(job_id, &SETTLE_ORACLE, block_hash)?;
+            }
+        }
+
+        // EscalationRound sweep (S6): advance then settle-when-due, SORTED job order (same
+        // discipline as the lifecycle sweep above; the pinned ByteEq oracle is reused).
+        let mut esc: Vec<[u8; 32]> = self.escalation_rounds.keys().copied().collect();
+        esc.sort_unstable();
+        for job_id in esc {
+            if let Some(er) = self.escalation_rounds.get_mut(&job_id) {
+                er.advance(height);
+            }
+            let due = self
+                .escalation_rounds
+                .get(&job_id)
+                .map(|er| er.should_settle(height) || er.is_settled())
+                .unwrap_or(false);
+            if due {
+                self.escalation_settle_and_drain(job_id, &SETTLE_ORACLE)?;
             }
         }
         Ok(())
@@ -3720,22 +3746,27 @@ impl ChainState {
         Ok(Some(terminal))
     }
 
-    /// Phase 1.1 (D2): settle + drain — the P8-driver (and future B6) entry point.
-    /// Confirmed/Disputed/TimedOut drain the pot via settle itself; Escalate settles via the
-    /// zero-comp fallback resolver (`resolve_escalation_fallback`, D2-FINAL). The lifecycle is
-    /// REMOVED on success ⇒ at-most-once settlement by construction (a second call hits
-    /// `Ok(None)` and moves no money).
+    /// Phase 1.1 (D2) → S5 (THE FLIP): settle + drain — the P8-driver (and future B6) entry
+    /// point. Confirmed/Disputed/TimedOut drain the pot via settle itself. `Terminal::Escalate`
+    /// now opens a REAL second-panel `EscalationRound` when the F2 viability gate passes
+    /// (`panel.len() >= quorum(k_escalate)`) — the round takes ownership of the held pot and is
+    /// driven/settled by the S6 sweep — and falls back to the zero-comp refund resolver
+    /// (`resolve_escalation_fallback`, D2-FINAL, byte-identical to the pre-S5 behavior) when the
+    /// candidate pool is structurally too small. The lifecycle is REMOVED on success ⇒
+    /// at-most-once settlement by construction (a second call hits `Ok(None)` and moves no
+    /// money). `fb` is `Some` only on the fallback path (an opened round settles later).
     pub fn lifecycle_settle_and_drain(
         &mut self,
         job_id: [u8; 32],
         eq: &dyn EquivalenceOracle,
+        block_hash: BlockHash,
     ) -> Result<Option<(Terminal, Option<SettlementOutcome>)>, StateError> {
         let Some(terminal) = self.lifecycle_settle(job_id, eq)? else {
             return Ok(None);
         };
         let fb = if let Terminal::Escalate(h) = &terminal {
-            // Pre-validate the pot == the exact sum the fallback will move (defensive:
-            // provably equal after settle, but the ChainLedger .expect()s must stay
+            // Pot preflight (unchanged): the held sum the round (or fallback) will own
+            // (defensive: provably equal after settle, but the ChainLedger .expect()s must stay
             // unreachable). On Err the lifecycle was already re-inserted by lifecycle_settle
             // with its terminal cached, so a retry is idempotent.
             let expected = h
@@ -3745,17 +3776,143 @@ impl ChainState {
             let actual = self.escrowed_for_job(&job_id);
             if actual != expected {
                 return Err(StateError::InvalidBlock(format!(
-                    "escalate pot {actual} != expected {expected}; refusing fallback"
+                    "escalate pot {actual} != expected {expected}; refusing escalation open"
                 )));
             }
+            // EscalationRound (S5, 2026-07-19): draw the panel and apply the F2 viability gate.
+            // Candidates = the settling lifecycle's claim-time snapshot (already SORTED at
+            // ClaimJob) MINUS its round-1 committee (executor auto-excluded inside
+            // select_committee). Seed domain-separated from the round-1 draw by the "escalate"
+            // tag. Deadlines anchor at the CURRENT (parent) height with the round-1 windows
+            // (F3). All inputs are consensus state — deterministic across nodes.
+            let rec = self
+                .job_lifecycles
+                .get(&job_id)
+                .expect("lifecycle re-inserted by lifecycle_settle")
+                .to_record();
+            let committee: HashSet<[u8; 32]> = rec.committee.iter().copied().collect();
+            let candidates: Vec<ParticipantId> = rec
+                .candidates
+                .iter()
+                .filter(|c| !committee.contains(*c))
+                .map(|c| ParticipantId(*c))
+                .collect();
+            let seed = commputer_pouw::ids::hash_parts(&[&block_hash.0, &job_id, b"escalate"]);
+            let height = self.blocks.height(); // G-F: parent height during apply
+            let deadlines = commputer_pouw_onchain::escalation_round::PanelDeadlines {
+                commit_by: height.saturating_add(self.phase_windows.commit_blocks),
+                reveal_by: height
+                    .saturating_add(self.phase_windows.commit_blocks)
+                    .saturating_add(self.phase_windows.reveal_blocks),
+            };
+            let identity = commputer_pouw_onchain::escalation_round::JobIdentity {
+                program_hash: rec.program_hash,
+                input_hash: rec.input_hash,
+                da_root: rec.da_root,
+            };
             let h = h.clone();
-            let mut view = ChainLedger::new(self);
-            Some(resolve_escalation_fallback(&mut view, job_id, &h))
+            let round = {
+                // Borrow dance: `open` only READS self (the stake closure) — scope the shared
+                // borrow before the insert / ChainLedger::new mutable uses (same shape as
+                // `draw_committees_for_completed_jobs`).
+                let chain = &*self;
+                EscalationRound::open(
+                    h.clone(),
+                    job_id,
+                    identity,
+                    candidates,
+                    seed,
+                    chain.game_params.clone(),
+                    deadlines,
+                    &|p| chain.stake_of(&Address(p.0)),
+                )
+            };
+            if round.panel().len() >= self.game_params.quorum(self.game_params.k_escalate) {
+                // F2 gate PASSES: the round owns the held pot from here; no money moves at open.
+                self.escalation_rounds.insert(job_id, round);
+                None
+            } else {
+                // F2 gate FAILS (structural candidate shortage, not misbehavior): zero-comp
+                // refund, byte-identical to the pre-EscalationRound stand-in.
+                let mut view = ChainLedger::new(self);
+                Some(resolve_escalation_fallback(&mut view, job_id, &h))
+            }
         } else {
             None
         };
-        self.job_lifecycles.remove(&job_id); // drain (the pot is 0 on every path here)
+        // Drain: the pot is 0 on every path here EXCEPT an opened round, which owns it now.
+        self.job_lifecycles.remove(&job_id);
         Ok(Some((terminal, fb)))
+    }
+
+    /// S5: record a panel member's escalation commit (escrows the bond into the job pot via the
+    /// round). `None` if no round for `job_id`. Mirrors `lifecycle_record_commit` — same
+    /// balance pre-check + borrow dance; Task 6 routes Commit txs here when the job has an
+    /// escalation round instead of a lifecycle.
+    pub fn escalation_record_commit(
+        &mut self,
+        job_id: [u8; 32],
+        c: Commitment,
+        height: u64,
+    ) -> Result<Option<commputer_pouw_onchain::escalation_round::EventResult>, StateError> {
+        let mut round = match self.escalation_rounds.remove(&job_id) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        // record_commit escrows c.bond from the committer (on Accepted) via the infallible
+        // ChainHooks surface; pre-check the balance so that escrow cannot panic the ledger.
+        let committer = Address(c.verifier.0);
+        let bal = self.accounts.get(&committer).map(|a| a.balance.raw()).unwrap_or(0);
+        if bal < c.bond {
+            self.escalation_rounds.insert(job_id, round);
+            return Err(StateError::InsufficientBalance);
+        }
+        let mut view = ChainLedger::new(self);
+        let r = round.record_commit(&mut view, c, height);
+        self.escalation_rounds.insert(job_id, round);
+        Ok(Some(r))
+    }
+
+    /// S5: record a panel member's escalation reveal (no money move). `None` if no round for
+    /// `job_id`. Mirrors `lifecycle_record_reveal`.
+    pub fn escalation_record_reveal(
+        &mut self,
+        job_id: [u8; 32],
+        r: Reveal,
+        height: u64,
+    ) -> Option<commputer_pouw_onchain::escalation_round::EventResult> {
+        let round = self.escalation_rounds.get_mut(&job_id)?;
+        Some(round.record_reveal(r, height))
+    }
+
+    /// S6: settle + drain one escalation round (all three outcomes drain the pot to 0). Removed
+    /// on success ⇒ at-most-once. The pot preflight mirrors the primary's P1 caller contract;
+    /// on Err the round is re-inserted so a retry is idempotent.
+    pub fn escalation_settle_and_drain(
+        &mut self,
+        job_id: [u8; 32],
+        eq: &dyn EquivalenceOracle,
+    ) -> Result<Option<EscalationOutcome>, StateError> {
+        let mut round = match self.escalation_rounds.remove(&job_id) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if round.is_settled() {
+            // Cached terminal: pot already drained; settle short-circuits to the cached outcome
+            // (moves NO money) and dropping the round is the drain.
+            let out = round.settle(&mut ChainLedger::new(self), eq);
+            return Ok(Some(out));
+        }
+        let expected = round.expected_escrow();
+        let actual = self.escrowed_for_job(&job_id);
+        if actual != expected {
+            self.escalation_rounds.insert(job_id, round);
+            return Err(StateError::InvalidBlock(format!(
+                "escalation pot {actual} != expected {expected}; refusing to settle"
+            )));
+        }
+        let out = round.settle(&mut ChainLedger::new(self), eq);
+        Ok(Some(out))
     }
 
     /// B8 (C1): install the genesis-anchored consensus params AND re-inject them into every
@@ -3942,6 +4099,7 @@ mod tests {
     use commputer_pouw::oracle::ByteEq;
     use commputer_pouw::params::GameParams;
     use commputer_pouw_onchain::lifecycle::PhaseDeadlines;
+    use commputer_pouw_onchain::escalation_round::{EventResult as EscEventResult, PanelPhase};
     use commputer_pouw_onchain::settlement_resolution::ResolutionParams;
     use commputer_pouw_onchain::escrow_ledger::EscrowLedger; // B10: the staging reference ledger
 
@@ -7933,7 +8091,7 @@ mod tests {
         // wrapper removes the map entry ⇒ at-most-once by construction.
         let (mut state, job, _, e_bond, v_bond, conserved) =
             round_ready_state([[7u8; 32]; 3], [true, true, true]);
-        let (t, fb) = state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().expect("due");
+        let (t, fb) = state.lifecycle_settle_and_drain(job, &ByteEq, BlockHash([0u8; 32])).unwrap().expect("due");
         match t {
             Terminal::Confirmed(out) => assert_eq!(out.bonds_returned, e_bond + 3 * v_bond),
             other => panic!("expected Confirmed, got {other:?}"),
@@ -7943,7 +8101,7 @@ mod tests {
         assert_eq!(state.escrowed_for_job(&job), 0);
         assert_eq!(money_conserved(&state), conserved);
         let snap: Vec<u64> = (0..13).map(|n| lbal(&state, n)).collect();
-        assert!(state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().is_none(), "second call: None");
+        assert!(state.lifecycle_settle_and_drain(job, &ByteEq, BlockHash([0u8; 32])).unwrap().is_none(), "second call: None");
         assert_eq!((0..13).map(|n| lbal(&state, n)).collect::<Vec<_>>(), snap, "no re-payment");
     }
 
@@ -7963,13 +8121,13 @@ mod tests {
             GameParams::default(), ResolutionParams::default(), vec![lpid(10)], test_deadlines(),
         );
         state.job_lifecycles.insert(job, lc); // executor never delivers
-        let (t, fb) = state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().expect("due");
+        let (t, fb) = state.lifecycle_settle_and_drain(job, &ByteEq, BlockHash([0u8; 32])).unwrap().expect("due");
         assert!(matches!(t, Terminal::TimedOut(_)), "got {t:?}");
         assert!(fb.is_none());
         assert!(!state.job_lifecycles.contains_key(&job), "entry drained");
         assert_eq!(state.escrowed_for_job(&job), 0);
         assert_eq!(money_conserved(&state), conserved);
-        assert!(state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().is_none());
+        assert!(state.lifecycle_settle_and_drain(job, &ByteEq, BlockHash([0u8; 32])).unwrap().is_none());
     }
 
     #[test]
@@ -7977,7 +8135,7 @@ mod tests {
         // 3-way split ⇒ NoQuorum ⇒ Escalate ⇒ the D2-FINAL zero-comp fallback: pure refund.
         let (mut state, job, budget, e_bond, v_bond, conserved) =
             round_ready_state([[1u8; 32], [2u8; 32], [3u8; 32]], [true, true, true]);
-        let (t, fb) = state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().expect("due");
+        let (t, fb) = state.lifecycle_settle_and_drain(job, &ByteEq, BlockHash([0u8; 32])).unwrap().expect("due");
         assert!(matches!(t, Terminal::Escalate(_)), "got {t:?}");
         let fb = fb.expect("Escalate runs the fallback");
         assert_eq!(fb.worker_paid, 0, "ZERO executor comp (D2-FINAL)");
@@ -7993,7 +8151,7 @@ mod tests {
         assert!(!state.job_lifecycles.contains_key(&job), "entry drained");
         assert_eq!(state.total_burned, 0, "total_burned untouched by the fallback");
         assert_eq!(money_conserved(&state), conserved);
-        assert!(state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().is_none(), "at-most-once");
+        assert!(state.lifecycle_settle_and_drain(job, &ByteEq, BlockHash([0u8; 32])).unwrap().is_none(), "at-most-once");
     }
 
     #[test]
@@ -8017,13 +8175,13 @@ mod tests {
         assert_eq!((0..13).map(|n| lbal(&state, n)).collect::<Vec<_>>(), snap, "cache moves no money");
 
         // Drain: the fallback pays out exactly the REDUCED pot.
-        let (_, fb) = state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().expect("drains");
+        let (_, fb) = state.lifecycle_settle_and_drain(job, &ByteEq, BlockHash([0u8; 32])).unwrap().expect("drains");
         let fb = fb.expect("fallback ran");
         assert_eq!(fb.bonds_returned, e_bond + 2 * v_bond, "only the 2 revealers' bonds");
         assert_eq!(fb.burned, 0, "the forfeit was settle's burn, not the fallback's");
         assert_eq!(state.escrowed_for_job(&job), 0, "reduced pot drained to exactly 0");
         assert_eq!(lbal(&state, 12), 0, "silent committer stays forfeited");
-        assert!(state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().is_none(), "at-most-once");
+        assert!(state.lifecycle_settle_and_drain(job, &ByteEq, BlockHash([0u8; 32])).unwrap().is_none(), "at-most-once");
         assert_eq!(money_conserved(&state), conserved);
     }
 
@@ -8035,13 +8193,13 @@ mod tests {
         let pot = state.escrowed_for_job(&job);
         state.escrow_by_job.insert(job, pot - 1); // tamper: shrink the pot under the fallback
         let snap: Vec<u64> = (0..13).map(|n| lbal(&state, n)).collect();
-        let err = state.lifecycle_settle_and_drain(job, &ByteEq).unwrap_err();
+        let err = state.lifecycle_settle_and_drain(job, &ByteEq, BlockHash([0u8; 32])).unwrap_err();
         assert!(err.to_string().contains("escalate pot"), "got: {err}");
         assert!(state.job_lifecycles.contains_key(&job), "lifecycle kept for retry");
         assert_eq!((0..13).map(|n| lbal(&state, n)).collect::<Vec<_>>(), snap, "nothing moved on Err");
         // Repair the pot ⇒ the retry is clean (deterministic re-check, terminal still cached).
         state.escrow_by_job.insert(job, pot);
-        assert!(state.lifecycle_settle_and_drain(job, &ByteEq).unwrap().is_some());
+        assert!(state.lifecycle_settle_and_drain(job, &ByteEq, BlockHash([0u8; 32])).unwrap().is_some());
         assert_eq!(state.escrowed_for_job(&job), 0);
     }
 
@@ -8858,7 +9016,7 @@ mod tests {
         // CACHED terminal (the P2 short-circuit) then runs the fallback and drains the entry.
         let (c_term, c_out) = both
             .chain
-            .lifecycle_settle_and_drain(both.job, &ByteEq)
+            .lifecycle_settle_and_drain(both.job, &ByteEq, BlockHash([0u8; 32]))
             .expect("pot pre-validates")
             .expect("lifecycle still present");
         assert!(matches!(c_term, Terminal::Escalate(_)));
@@ -8893,7 +9051,7 @@ mod tests {
         let s_out = resolve_escalation_fallback(&mut both.staging, both.job, &h);
         let (_, c_out) = both
             .chain
-            .lifecycle_settle_and_drain(both.job, &ByteEq)
+            .lifecycle_settle_and_drain(both.job, &ByteEq, BlockHash([0u8; 32]))
             .expect("cached-terminal path (P2) — must NOT wedge on the reduced pot")
             .expect("lifecycle still present");
         let c_out = c_out.expect("fallback ran");
@@ -9081,6 +9239,270 @@ mod tests {
         assert_eq!(money_conserved(&state), conserved0, "conservation held across the empty-committee round");
         assert_eq!(bal(&state, 2), MIN_BUDGET, "submitter refunded the budget");
         assert_eq!(bal(&state, 1), MIN_BUDGET, "executor bond returned (zero-comp NoQuorum fallback)");
+    }
+
+    // ===========================================================================================
+    // S5+S6 — THE FLIP: `Terminal::Escalate` opens a gated real second panel (EscalationRound)
+    // instead of the zero-comp fallback; `settle_due_jobs` sweeps escalation rounds.
+    // ===========================================================================================
+
+    /// S5: parametrized `onchain_claimed` — `order.len()` bonded verifiers (bonded_stake insertion
+    /// order = `order`, so the two-node test can prove HashMap-order independence of the PANEL
+    /// draw), SHORT windows (result/commit/reveal 2, claim 5), real Submit + Claim blocks. Returns
+    /// (state, job): lifecycle AwaitingResult at height 2, deadlines result_by 3 / commit_by 5 /
+    /// reveal_by 7.
+    fn onchain_claimed_n(order: &[u8]) -> (ChainState, [u8; 32]) {
+        let min_bond = StakeParams::default().min_bond;
+        let v_bond = GameParams::default().verifier_bond;
+        let mut state = ChainState::new();
+        state.phase_windows =
+            PhaseWindows { result_blocks: 2, commit_blocks: 2, reveal_blocks: 2, claim_blocks: 5 };
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(addr(2)).balance = Amount::from_raw(MIN_BUDGET);
+        let e = state.accounts.get_or_create(addr(1));
+        e.is_validator = true;
+        e.balance = Amount::from_raw(MIN_BUDGET);
+        for &v in order {
+            let a = state.accounts.get_or_create(addr(v));
+            a.is_validator = true;
+            a.balance = Amount::from_raw(v_bond);
+            state.bonded_stake.insert(addr(v), min_bond);
+        }
+        state.total_emitted = 2 * MIN_BUDGET + order.len() as u64 * (v_bond + min_bond);
+        let submit = unsigned(addr(2), 0, v2_kind(MIN_BUDGET));
+        let job = submit.hash().0;
+        state.apply_block(&block_with(&state, 1, vec![submit])).unwrap();
+        state
+            .apply_block(&block_with(&state, 2, vec![unsigned(addr(1), 0, TxKind::ClaimJob { job_id: job })]))
+            .unwrap();
+        (state, job)
+    }
+
+    /// S5: drive identical chains through a round-1 3-way split: CompleteJob([7;32]) at b3, the
+    /// drawn committee commits+reveals three DIFFERENT hashes ([1]/[2]/[3], all ≠ the executor's)
+    /// ⇒ NoQuorum ⇒ `Terminal::Escalate` at the b8 settle block. Every block is built ONCE (from
+    /// `states[0]`) and applied to EVERY state, so multi-state callers stay chain-identical.
+    /// Leaves the chains at height 7 (== reveal_by); the CALLER applies the b8 settle block.
+    /// Returns the drawn round-1 committee.
+    fn drive_round1_split(states: &mut [&mut ChainState], job: [u8; 32]) -> Vec<[u8; 32]> {
+        let v_bond = GameParams::default().verifier_bond;
+        let result = [7u8; 32];
+        let b3 = complete_block_ts(&*states[0], job, result, 5000);
+        for s in states.iter_mut() {
+            s.apply_block(&b3).unwrap();
+        }
+        let committee = states[0].job_lifecycles.get(&job).unwrap().to_record().committee;
+        assert_eq!(committee.len(), 3, "k=3 committee drawn");
+        // b4: the 3 committee members commit three DIFFERENT hashes (parent 3 ≤ commit_by 5).
+        let commits: Vec<Transaction> = committee
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let c = make_commitment(
+                    &ParticipantId(*m), &[(i + 1) as u8; 32], &[i as u8; 32], v_bond,
+                );
+                unsigned(Address(*m), 0, TxKind::Commit {
+                    job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond),
+                })
+            })
+            .collect();
+        let b4 = block_with(&*states[0], 4, commits);
+        for s in states.iter_mut() {
+            s.apply_block(&b4).unwrap();
+        }
+        // b5, b6: empty (past commit_by 5 ⇒ Revealing at b7's parent height 6).
+        for h in 5..=6 {
+            let blk = block_with(&*states[0], h, vec![]);
+            for s in states.iter_mut() {
+                s.apply_block(&blk).unwrap();
+            }
+        }
+        // b7: the 3-way-split reveals (parent 6 > commit_by 5 ⇒ Revealing; 6 ≤ reveal_by 7).
+        let reveals: Vec<Transaction> = committee
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                unsigned(Address(*m), 1, TxKind::Reveal {
+                    job_id: job, result_hash: [(i + 1) as u8; 32], salt: [i as u8; 32],
+                })
+            })
+            .collect();
+        let b7 = block_with(&*states[0], 7, reveals);
+        for s in states.iter_mut() {
+            s.apply_block(&b7).unwrap();
+        }
+        committee
+    }
+
+    /// F2 gate PASSES: enough candidates outside the round-1 committee ⇒ a real round opens,
+    /// the pot stays held, and the panel is deterministic across two nodes.
+    #[test]
+    fn escalate_opens_round_when_panel_viable_and_is_deterministic() {
+        let ids: Vec<u8> = (3u8..15).collect(); // 12 bonded verifiers
+        let rev: Vec<u8> = ids.iter().rev().copied().collect();
+        let (mut a, ja) = onchain_claimed_n(&ids);
+        let (mut b, jb) = onchain_claimed_n(&rev);
+        assert_eq!(ja, jb, "same submit tx ⇒ same job id");
+        let committee = drive_round1_split(&mut [&mut a, &mut b], ja);
+        // b8: the settle block (8 > reveal_by 7) — THE FLIP: Escalate opens a real round.
+        let b8 = block_with(&a, 8, vec![]);
+        a.apply_block(&b8).unwrap();
+        b.apply_block(&b8).unwrap();
+        let ra = a.escalation_rounds.get(&ja).expect("round opened on node a");
+        let rb = b.escalation_rounds.get(&jb).expect("round opened on node b");
+        assert_eq!(ra.panel(), rb.panel(), "panel identical across nodes");
+        let quorum = GameParams::default().quorum(GameParams::default().k_escalate);
+        assert!(ra.panel().len() >= quorum, "panel {} >= quorum(k_escalate) {}", ra.panel().len(), quorum);
+        assert_eq!(ra.panel().len(), 7, "full k_escalate panel from the 9 spare candidates");
+        // Panel excludes the round-1 committee AND the executor.
+        let committee_set: HashSet<[u8; 32]> = committee.iter().copied().collect();
+        for p in ra.panel() {
+            assert!(!committee_set.contains(&p.0), "panelist not in the round-1 committee");
+            assert_ne!(p.0, addr(1).0, "executor never on the panel");
+        }
+        // Pot HELD (budget + Be + 3 revealer bonds), not refunded.
+        let v_bond = GameParams::default().verifier_bond;
+        let e_bond = MIN_BUDGET; // budget.max(GameParams::default().executor_bond)
+        assert_eq!(a.escrowed_for_job(&ja), MIN_BUDGET + e_bond + 3 * v_bond, "pot held by the round");
+        assert!(a.job_lifecycles.is_empty(), "primary lifecycle drained into the round");
+        assert_eq!(
+            a.compute_state_root(),
+            b.compute_state_root(),
+            "identical state roots (the round folds into the root)"
+        );
+    }
+
+    /// F2 gate FAILS: candidate pool too small ⇒ byte-identical to today's fallback refund.
+    #[test]
+    fn escalate_falls_back_when_panel_unviable() {
+        // 5 bonded verifiers: 3 drawn ⇒ 2 spare candidates < quorum(k_escalate)=5 ⇒ fallback.
+        let (mut state, job) = onchain_claimed_n(&[3, 4, 5, 6, 7]);
+        let conserved0 = money_conserved(&state);
+        drive_round1_split(&mut [&mut state], job);
+        let b8 = block_with(&state, 8, vec![]);
+        state.apply_block(&b8).unwrap();
+        assert!(state.escalation_rounds.is_empty(), "no round from an unviable pool");
+        assert!(state.job_lifecycles.is_empty(), "lifecycle drained by the fallback");
+        assert_eq!(state.escrowed_for_job(&job), 0, "pot fully refunded");
+        assert_eq!(bal(&state, 2), MIN_BUDGET, "submitter refunded the budget");
+        assert_eq!(bal(&state, 1), MIN_BUDGET, "executor bond returned (zero comp)");
+        let v_bond = GameParams::default().verifier_bond;
+        for v in 3u8..8 {
+            assert_eq!(bal(&state, v), v_bond, "verifier {v}: revealer bond returned");
+        }
+        assert_eq!(state.total_burned, 0, "fallback burns nothing");
+        assert_eq!(money_conserved(&state), conserved0, "conserved across the fallback");
+    }
+
+    /// The full on-chain escalation: open ⇒ 5 panel members commit+reveal the executor's hash
+    /// (via the state helpers Task 6 will route txs to) ⇒ `settle_due_jobs` at reveal_by+1
+    /// settles Confirmed and drains.
+    #[test]
+    fn escalation_round_settles_confirmed_and_drains() {
+        let ids: Vec<u8> = (3u8..15).collect(); // 12 bonded verifiers
+        let (mut state, job) = onchain_claimed_n(&ids);
+        let conserved0 = money_conserved(&state);
+        let committee = drive_round1_split(&mut [&mut state], job);
+        let b8 = block_with(&state, 8, vec![]);
+        state.apply_block(&b8).unwrap();
+        let round = state.escalation_rounds.get(&job).expect("round opened");
+        // Deadlines anchor at the b8 PARENT height 7 (the G-F anchor): commit_by 9, reveal_by 11.
+        assert_eq!(round.deadlines().commit_by, 9);
+        assert_eq!(round.deadlines().reveal_by, 11);
+        let panel: Vec<ParticipantId> = round.panel().to_vec();
+        let v_bond = GameParams::default().verifier_bond;
+        let e_bond = MIN_BUDGET;
+        let result = [7u8; 32]; // the executor's round-1 hash
+        // 5 of the 7 panelists commit the executor's hash (quorum(7) == 5; 2 abstain — no
+        // forfeiture for a never-committed panelist). Height 8 ≤ commit_by 9.
+        for (i, p) in panel.iter().take(5).enumerate() {
+            let c = make_commitment(p, &result, &[0x40 + i as u8; 32], v_bond);
+            assert_eq!(
+                state.escalation_record_commit(job, c, 8).unwrap(),
+                Some(EscEventResult::Accepted),
+                "panel commit {i} accepted"
+            );
+        }
+        assert_eq!(
+            state.escrowed_for_job(&job),
+            MIN_BUDGET + e_bond + 3 * v_bond + 5 * v_bond,
+            "pot grew by the 5 escrowed panel bonds"
+        );
+        // b9, b10: the sweep advances the round past commit_by 9 ⇒ Revealing.
+        for h in 9..=10 {
+            state.apply_block(&block_with(&state, h, vec![])).unwrap();
+        }
+        assert_eq!(state.escalation_rounds.get(&job).unwrap().phase(), PanelPhase::Revealing);
+        // All 5 committers reveal the executor's hash (height 10 ≤ reveal_by 11).
+        for (i, p) in panel.iter().take(5).enumerate() {
+            let r = Reveal { verifier: *p, result_hash: result, salt: [0x40 + i as u8; 32] };
+            assert_eq!(
+                state.escalation_record_reveal(job, r, 10),
+                Some(EscEventResult::Accepted),
+                "panel reveal {i} accepted"
+            );
+        }
+        // b11: not yet due (11 > reveal_by 11 is false) — the round survives.
+        state.apply_block(&block_with(&state, 11, vec![])).unwrap();
+        assert!(state.escalation_rounds.contains_key(&job), "not due at reveal_by");
+        // b12: due ⇒ the S6 sweep settles Confirmed and drains.
+        state.apply_block(&block_with(&state, 12, vec![])).unwrap();
+        assert!(state.escalation_rounds.is_empty(), "settled + drained");
+        assert_eq!(state.escrowed_for_job(&job), 0, "pot drained to exactly 0");
+        // Confirmed money shape: executor 85% of budget + bond back.
+        assert_eq!(
+            bal(&state, 1),
+            bps_of(MIN_BUDGET, 8_500) + e_bond,
+            "executor: 85% comp + bond back (Confirmed)"
+        );
+        // Panel committers: bond back + even share of the escalation reward
+        // (bps(3·Bv, escalation_reward_bps) split across the 5 revealers).
+        let reward_each =
+            bps_of(3 * v_bond, GameParams::default().escalation_reward_bps) / 5;
+        for p in panel.iter().take(5) {
+            assert_eq!(
+                state.accounts.get(&Address(p.0)).unwrap().balance.raw(),
+                v_bond + reward_each,
+                "panelist: bond back + escalation reward"
+            );
+        }
+        // Abstaining panelists: untouched.
+        for p in panel.iter().skip(5) {
+            assert_eq!(state.accounts.get(&Address(p.0)).unwrap().balance.raw(), v_bond);
+        }
+        // The round-1 committee (all wrong-side) stays slashed to 0.
+        for m in &committee {
+            assert_eq!(state.accounts.get(&Address(*m)).unwrap().balance.raw(), 0);
+        }
+        assert_eq!(money_conserved(&state), conserved0, "conserved end-to-end");
+        // At-most-once: the round is gone; a direct re-drain is a no-op.
+        assert!(state.escalation_settle_and_drain(job, &ByteEq).unwrap().is_none());
+    }
+
+    /// Rollback safety: a block whose LAST tx fails after the tail would have opened a round
+    /// leaves escalation_rounds byte-identical (the whole tail is inside the envelope).
+    #[test]
+    fn rejected_block_leaves_escalation_rounds_untouched() {
+        let ids: Vec<u8> = (3u8..15).collect();
+        let (mut state, job) = onchain_claimed_n(&ids);
+        drive_round1_split(&mut [&mut state], job);
+        let root_before = state.compute_state_root();
+        // A block at the settle height whose tail WOULD open the round, but whose final tx is
+        // invalid (unfunded transfer) — the whole envelope (partial txs + tail) must roll back.
+        let n3 = state.accounts.get(&addr(3)).map(|a| a.nonce).unwrap_or(0);
+        let bad = block_with(&state, 8, vec![
+            unsigned(addr(3), n3, TxKind::WithdrawUnbonded), // valid no-op first tx
+            unsigned(addr(99), 0, TxKind::Transfer {
+                to: addr(98), amount: Amount::from_raw(MIN_BUDGET),
+            }),
+        ]);
+        assert!(state.apply_block(&bad).is_err(), "final invalid tx rejects the block");
+        assert!(state.escalation_rounds.is_empty(), "no round from the rejected block");
+        assert_eq!(state.compute_state_root(), root_before, "state byte-identical after rollback");
+        // Proof the crafted block WOULD have opened it: the same height, valid ⇒ round opens.
+        let b8 = block_with(&state, 8, vec![]);
+        state.apply_block(&b8).unwrap();
+        assert!(state.escalation_rounds.contains_key(&job), "valid settle block opens the round");
     }
 
     /// Drive a full Confirmed round (on-chain B5 draw) to REVEALED-but-not-settled, on any backend,
