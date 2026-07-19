@@ -2048,12 +2048,25 @@ impl ChainState {
         let height = self.blocks.height(); // G-F
         // Verifier is ALWAYS the tx sender — no spoofing surface.
         let c = Commitment { verifier: ParticipantId(from.0), commit, bond };
-        match self.lifecycle_record_commit(job_id, c, height)? {
-            Some(EventResult::Accepted) => Ok(()),
-            Some(EventResult::Rejected(r)) => Err(StateError::InvalidBlock(format!(
-                "commit rejected: {r:?}"
-            ))),
-            None => Err(StateError::InvalidBlock("commit: unknown job".into())),
+        // S7: route by which map owns the job — a job is never live in both (the primary drains
+        // in the same tail that opens the round), so this is defensive; primary takes precedence.
+        if self.job_lifecycles.contains_key(&job_id) {
+            match self.lifecycle_record_commit(job_id, c, height)? {
+                Some(EventResult::Accepted) => Ok(()),
+                Some(EventResult::Rejected(r)) => Err(StateError::InvalidBlock(format!(
+                    "commit rejected: {r:?}"
+                ))),
+                None => Err(StateError::InvalidBlock("commit: unknown job".into())),
+            }
+        } else {
+            use commputer_pouw_onchain::escalation_round::EventResult as PanelEventResult;
+            match self.escalation_record_commit(job_id, c, height)? {
+                Some(PanelEventResult::Accepted) => Ok(()),
+                Some(PanelEventResult::Rejected(r)) => Err(StateError::InvalidBlock(format!(
+                    "panel commit rejected: {r:?}"
+                ))),
+                None => Err(StateError::InvalidBlock("commit: unknown job".into())),
+            }
         }
     }
 
@@ -2078,18 +2091,36 @@ impl ChainState {
             ));
         }
         let height = self.blocks.height(); // G-F
-        // Deliberate addition vs patch-spec §4: drive the height-based Committing→Revealing
-        // transition on the tx path (advance is idempotent + money-free), so a reveal after
-        // commit_by does not depend on the P8 driver having run at this exact height.
-        // Deterministic: a pure function of consensus state + parent height.
-        self.lifecycle_advance(job_id, height);
-        let r = Reveal { verifier: ParticipantId(from.0), result_hash, salt };
-        match self.lifecycle_record_reveal(job_id, r, height) {
-            Some(EventResult::Accepted) => Ok(()),
-            Some(EventResult::Rejected(rr)) => Err(StateError::InvalidBlock(format!(
-                "reveal rejected: {rr:?}"
-            ))),
-            None => Err(StateError::InvalidBlock("reveal: unknown job".into())),
+        // S7: route by which map owns the job (same defensive precedence as apply_commit).
+        if self.job_lifecycles.contains_key(&job_id) {
+            // Deliberate addition vs patch-spec §4: drive the height-based Committing→Revealing
+            // transition on the tx path (advance is idempotent + money-free), so a reveal after
+            // commit_by does not depend on the P8 driver having run at this exact height.
+            // Deterministic: a pure function of consensus state + parent height.
+            self.lifecycle_advance(job_id, height);
+            let r = Reveal { verifier: ParticipantId(from.0), result_hash, salt };
+            match self.lifecycle_record_reveal(job_id, r, height) {
+                Some(EventResult::Accepted) => Ok(()),
+                Some(EventResult::Rejected(rr)) => Err(StateError::InvalidBlock(format!(
+                    "reveal rejected: {rr:?}"
+                ))),
+                None => Err(StateError::InvalidBlock("reveal: unknown job".into())),
+            }
+        } else {
+            // Mirror of the primary's self-advance line, above — idempotent height transition on
+            // the escalation-round tx path.
+            if let Some(round) = self.escalation_rounds.get_mut(&job_id) {
+                round.advance(height);
+            }
+            use commputer_pouw_onchain::escalation_round::EventResult as PanelEventResult;
+            let r = Reveal { verifier: ParticipantId(from.0), result_hash, salt };
+            match self.escalation_record_reveal(job_id, r, height) {
+                Some(PanelEventResult::Accepted) => Ok(()),
+                Some(PanelEventResult::Rejected(rr)) => Err(StateError::InvalidBlock(format!(
+                    "panel reveal rejected: {rr:?}"
+                ))),
+                None => Err(StateError::InvalidBlock("reveal: unknown job".into())),
+            }
         }
     }
 
@@ -4040,9 +4071,15 @@ impl ChainState {
             return false; // keyless zero address is permanently invalid on every money arm
         }
         match &tx.kind {
-            TxKind::Commit { job_id, .. }
-            | TxKind::Reveal { job_id, .. }
-            | TxKind::CompleteJob { job_id, .. } => {
+            // S7: Commit/Reveal also defer for a job that has moved into an active escalation
+            // round (the primary lifecycle is drained by then). CompleteJob has no escalation-round
+            // analogue — a round is a panel Commit/Reveal game only — so it does NOT gain this check.
+            TxKind::Commit { job_id, .. } | TxKind::Reveal { job_id, .. } => {
+                self.job_lifecycles.contains_key(job_id)
+                    || self.pending_jobs.contains_key(job_id)
+                    || self.escalation_rounds.contains_key(job_id)
+            }
+            TxKind::CompleteJob { job_id, .. } => {
                 self.job_lifecycles.contains_key(job_id) || self.pending_jobs.contains_key(job_id)
             }
             _ => false,
@@ -9477,6 +9514,164 @@ mod tests {
         assert_eq!(money_conserved(&state), conserved0, "conserved end-to-end");
         // At-most-once: the round is gone; a direct re-drain is a no-op.
         assert!(state.escalation_settle_and_drain(job, &ByteEq).unwrap().is_none());
+    }
+
+    // --- S7: Commit/Reveal route to an active escalation round ------------------------------
+
+    /// Task 6 (S7): with a real round open (drained primary), Commit/Reveal txs from the panel
+    /// apply THROUGH `apply_block` (not the direct helpers) — proving the routing in
+    /// `apply_commit`/`apply_reveal`, not just the underlying `escalation_record_*` helpers.
+    #[test]
+    fn commit_and_reveal_route_to_an_active_escalation_round() {
+        let ids: Vec<u8> = (3u8..15).collect(); // 12 bonded verifiers
+        let (mut state, job) = onchain_claimed_n(&ids);
+        let committee = drive_round1_split(&mut [&mut state], job);
+        let b8 = block_with(&state, 8, vec![]);
+        state.apply_block(&b8).unwrap();
+        let round = state.escalation_rounds.get(&job).expect("round opened");
+        let panel: Vec<ParticipantId> = round.panel().to_vec();
+        let v_bond = GameParams::default().verifier_bond;
+        let pot0 = state.escrowed_for_job(&job);
+        assert!(state.job_lifecycles.is_empty(), "primary drained; only the round is live");
+
+        // A NON-panel bonded validator (a spare candidate excluded from the drawn panel, so its
+        // round-1 bond is untouched and it still holds exactly v_bond) ⇒ whole-block reject,
+        // NotPanelMember specifically (not InsufficientBalance / WrongPhase).
+        let committee_set: HashSet<[u8; 32]> = committee.iter().copied().collect();
+        let panel_set: HashSet<[u8; 32]> = panel.iter().map(|p| p.0).collect();
+        let non_panel = ids
+            .iter()
+            .copied()
+            .find(|v| !committee_set.contains(&addr(*v).0) && !panel_set.contains(&addr(*v).0))
+            .expect("a spare candidate excluded from the panel exists (9 spares, 7-member panel)");
+        let bad = make_commitment(&ParticipantId(addr(non_panel).0), &[7u8; 32], &[0u8; 32], v_bond);
+        let err = state
+            .apply_block(&block_with(&state, 9, vec![unsigned(addr(non_panel), 0, TxKind::Commit {
+                job_id: job, commit: bad.commit, bond: Amount::from_raw(v_bond),
+            })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("NotPanelMember"), "got: {err}");
+        assert_eq!(state.escrowed_for_job(&job), pot0, "rejected block moves no money");
+        assert_eq!(state.blocks.height(), 8, "the whole block rolled back, not just the tx");
+
+        // A panel member's Commit ⇒ accepted; bond escrowed via the round; nonce bumped.
+        let p0 = panel[0];
+        let nonce0 = state.accounts.get(&Address(p0.0)).map(|a| a.nonce).unwrap_or(0);
+        let commit = make_commitment(&p0, &[7u8; 32], &[0x99u8; 32], v_bond);
+        state
+            .apply_block(&block_with(&state, 9, vec![unsigned(Address(p0.0), nonce0, TxKind::Commit {
+                job_id: job, commit: commit.commit, bond: Amount::from_raw(v_bond),
+            })]))
+            .unwrap();
+        assert_eq!(
+            state.escrowed_for_job(&job),
+            pot0 + v_bond,
+            "escrowed_for_job grew by EXACTLY the panelist's bond"
+        );
+        assert_eq!(
+            state.accounts.get(&Address(p0.0)).unwrap().nonce,
+            nonce0 + 1,
+            "committer's nonce bumped by the applied Commit tx"
+        );
+        assert_eq!(
+            state.escalation_rounds.get(&job).unwrap().commitments().len(),
+            1,
+            "the round recorded the commitment"
+        );
+
+        // Advance past commit_by (the tail sweep flips Committing→Revealing once a block's own
+        // height exceeds commit_by — mirrors the primary's P8 driver).
+        while state.escalation_rounds.get(&job).unwrap().phase() != PanelPhase::Revealing {
+            let h = state.blocks.height() + 1;
+            state.apply_block(&block_with(&state, h, vec![])).unwrap();
+        }
+
+        // Reveal tx ⇒ accepted (the escalation arm self-advances the round by height first, same
+        // as the primary's `lifecycle_advance` line — already Revealing here, so idempotent).
+        let reveal_nonce = state.accounts.get(&Address(p0.0)).unwrap().nonce;
+        let h = state.blocks.height() + 1;
+        state
+            .apply_block(&block_with(&state, h, vec![unsigned(Address(p0.0), reveal_nonce, TxKind::Reveal {
+                job_id: job, result_hash: [7u8; 32], salt: [0x99u8; 32],
+            })]))
+            .unwrap();
+        assert_eq!(
+            state.accounts.get(&Address(p0.0)).unwrap().nonce,
+            reveal_nonce + 1,
+            "the Reveal applied (nonce bumped)"
+        );
+        assert_eq!(
+            state.escalation_rounds.get(&job).unwrap().reveals().len(),
+            1,
+            "the round recorded the reveal"
+        );
+    }
+
+    /// Task 6 (S7): a panel Commit trial-applied during Revealing (or a Reveal during Committing)
+    /// errors ⇒ `tx_is_phase_deferred` must return true because `escalation_rounds` contains the
+    /// job ⇒ `select_applicable_txs` REQUEUES it instead of dropping it (C3).
+    #[test]
+    fn escalation_commit_reveal_are_phase_deferred_not_dropped() {
+        let ids: Vec<u8> = (3u8..15).collect();
+        let (mut state, job) = onchain_claimed_n(&ids);
+        drive_round1_split(&mut [&mut state], job);
+        let b8 = block_with(&state, 8, vec![]);
+        state.apply_block(&b8).unwrap();
+        let round = state.escalation_rounds.get(&job).expect("round opened");
+        assert_eq!(round.phase(), PanelPhase::Committing, "fresh round starts Committing");
+        let panel: Vec<ParticipantId> = round.panel().to_vec();
+        let v_bond = GameParams::default().verifier_bond;
+        let root0 = state.compute_state_root();
+
+        // A Reveal during Committing: WrongPhase, but the job is a live escalation round ⇒
+        // phase-deferred ⇒ requeued.
+        let p0 = panel[0];
+        let reveal = unsigned(Address(p0.0), 0, TxKind::Reveal {
+            job_id: job, result_hash: [7u8; 32], salt: [0x99u8; 32],
+        });
+        let (kept, requeue) = state.select_applicable_txs(vec![reveal.clone()]);
+        assert!(kept.is_empty(), "the premature Reveal does not apply");
+        assert_eq!(requeue.len(), 1, "requeued, not dropped");
+        assert!(
+            matches!(&requeue[0].kind, TxKind::Reveal { job_id, .. } if *job_id == job),
+            "requeued the escalation-round Reveal"
+        );
+        assert_eq!(
+            state.compute_state_root(),
+            root0,
+            "select_applicable_txs trial-applies then fully restores (no smear)"
+        );
+
+        // Sanity: the same tx really does reject with WrongPhase when force-applied.
+        let err = state
+            .apply_block(&block_with(&state, 9, vec![reveal]))
+            .unwrap_err();
+        assert!(err.to_string().contains("WrongPhase"), "got: {err}");
+
+        // The other direction: a panel Commit trial-applied during Revealing is ALSO
+        // phase-deferred (requeued, not dropped).
+        while state.escalation_rounds.get(&job).unwrap().phase() != PanelPhase::Revealing {
+            let h = state.blocks.height() + 1;
+            state.apply_block(&block_with(&state, h, vec![])).unwrap();
+        }
+        let root1 = state.compute_state_root();
+        let p1 = panel[1];
+        let late_commit = make_commitment(&p1, &[7u8; 32], &[0x77u8; 32], v_bond);
+        let commit_tx = unsigned(Address(p1.0), 0, TxKind::Commit {
+            job_id: job, commit: late_commit.commit, bond: Amount::from_raw(v_bond),
+        });
+        let (kept2, requeue2) = state.select_applicable_txs(vec![commit_tx.clone()]);
+        assert!(kept2.is_empty(), "the late Commit does not apply during Revealing");
+        assert_eq!(requeue2.len(), 1, "requeued, not dropped");
+        assert!(
+            matches!(&requeue2[0].kind, TxKind::Commit { job_id, .. } if *job_id == job),
+            "requeued the escalation-round Commit"
+        );
+        assert_eq!(state.compute_state_root(), root1, "no smear from the second trial either");
+        let err2 = state
+            .apply_block(&block_with(&state, state.blocks.height() + 1, vec![commit_tx]))
+            .unwrap_err();
+        assert!(err2.to_string().contains("WrongPhase"), "got: {err2}");
     }
 
     /// Rollback safety: a block whose LAST tx fails after the tail would have opened a round
