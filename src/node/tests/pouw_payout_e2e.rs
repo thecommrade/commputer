@@ -31,6 +31,7 @@
 //! `StoreTransport` is built purely from public API (`DaStore::{get,has}` +
 //! `da_publisher::deserialize_merkle_path` + the public `commputer_da` `DaTransport` trait).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -57,8 +58,10 @@ use commputer_network::da_protocol::DaChunk;
 
 use commputer_pouw::commit_reveal::make_commitment;
 use commputer_pouw::ids::ParticipantId;
+use commputer_pouw::params::GameParams;
 use commputer_pouw::wasm::WasmLimits;
 use commputer_pouw_onchain::consensus_params::PhaseWindows;
+use commputer_pouw_onchain::escalation_round::PanelPhase;
 use commputer_pouw_onchain::lifecycle::Phase;
 use commputer_storage::state::ChainState;
 
@@ -478,6 +481,10 @@ fn pouw_noquorum_refunds_submitter_pays_no_worker_comp() {
     assert_eq!(s.total_burned, 0, "the zero-comp fallback burns nothing");
     assert_eq!(s.escrowed_for_job(&r.job), 0, "pot drained to 0");
     assert_eq!(conserved(s), r.conserved0, "total supply conserved");
+    // F2 viability gate: this 3-verifier harness has candidates == the drawn committee, so the
+    // spare pool is 0 < quorum(k_escalate)=5 ⇒ the Escalate terminal takes the FALLBACK — no
+    // second-panel round ever opens (contrast the 9-verifier escalation tests below).
+    assert!(s.escalation_rounds.is_empty(), "F2 gate: 0 spare candidates < quorum(7) => fallback, no round");
 }
 
 /// FRAUD PATH (the economic-security triptych's third leg: Confirmed pay-out ✓, NoQuorum refund ✓,
@@ -897,4 +904,439 @@ fn pouw_disputed_burns_colluding_verifier_bond() {
         "pot fully accounted (in == out)"
     );
     assert!(blocks <= 20, "converged quickly (was {})", blocks);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// ESCALATION E2E — the second-panel verification round through the REAL loops.
+//
+// A 9-bonded-verifier harness: round 1 is forced to a 3-way committee split (the 3 DRAWN members
+// are HAND-FED three DISTINCT wrong hashes — the fraud path's colluder template — while the
+// executor runs the REAL loop and posts its TRUE re-executed hash) ⇒ `compute_verdict` →
+// NoQuorum ⇒ `Terminal::Escalate`. With 6 spare candidates ≥ quorum(k_escalate)=5 the F2
+// viability gate PASSES and a real `EscalationRound` opens, owning the held pot
+// (budget + Be + 3 revealer bonds). The panel is then driven either through the REAL verifier
+// loops (`build_verifier_views_with_escalations` ⇒ DA-fetch, re-execute, commit+reveal the TRUE
+// hash ⇒ Confirmed) or hand-fed a 3-way split (⇒ the bounded NoQuorum terminal). All money
+// asserts mirror the FROZEN `settle_noquorum_*` math, pinned to the audited game by
+// `golden_full_panel_matches_frozen_escalation_resolve` (escalation_round.rs).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// GameParams::default().escalation_reward_bps — the share of SLASHED bonds paid to the panel.
+const ESCALATION_REWARD_BPS: u64 = 1_000;
+
+/// Round-1 committee split: three DISTINCT hashes, all ALSO different from the executor's TRUE
+/// re-executed hash (asserted against the opened round's record), so ALL THREE round-1 revealers
+/// end wrong-side under every panel verdict — the simple all-slashed accounting.
+const SPLIT_HASHES: [[u8; 32]; 3] = [[0xB1u8; 32], [0xB2u8; 32], [0xB3u8; 32]];
+const SPLIT_SALT: [u8; 32] = [0x51u8; 32];
+
+/// Everything the two escalation tests need once round 1 has split and the round has OPENED.
+/// `blocks` carries the driven-block count across the open + panel phases (one shared bound).
+struct EscalationOpen {
+    state: ChainState,
+    store: DaStore,
+    /// One durable salt store per verifier, index-aligned with `verifiers` (panel members use
+    /// theirs when driven through the real loop; round-1 members are hand-fed and never touch one).
+    salts: Vec<SaltStore>,
+    job: [u8; 32],
+    conserved0: u64,
+    submitter: Address,
+    executor: Address,
+    /// All 9 bonded verifiers (funding order — NOT the draw).
+    verifiers: Vec<Address>,
+    /// The 3 drawn round-1 committee members, DISCOVERED from state (never hardcoded).
+    committee: Vec<Address>,
+    /// The drawn escalation panel, DISCOVERED from the opened round (never hardcoded).
+    panel: Vec<Address>,
+    /// The executor's TRUE re-executed result hash (from the round's record).
+    executor_hash: [u8; 32],
+    blocks: u32,
+}
+
+/// Set up a 9-bonded-verifier chain, publish + submit the job, drive the REAL executor loop
+/// (claim + honest complete), hand-feed the drawn round-1 committee a 3-way split, and drive
+/// blocks until the primary lifecycle settles Escalate and the F2 gate opens a REAL
+/// `EscalationRound`. Asserts conservation after every block and the exact held pot at open.
+fn open_escalation_round() -> EscalationOpen {
+    let submitter = addr(2);
+    let executor = addr(1);
+    let verifiers: Vec<Address> = (3u8..12).map(addr).collect(); // 9 bonded verifiers
+
+    let mut state = ChainState::new();
+    // Same short windows as drive_round (claim@1 ⇒ result_by 4 / commit_by 7 / reveal_by 10 ⇒
+    // primary settles + round opens at height 11 with panel commit_by 13 / reveal_by 16).
+    state.phase_windows = PhaseWindows { result_blocks: 3, commit_blocks: 3, reveal_blocks: 3, claim_blocks: 6 };
+    state.apply_block(&genesis_block()).unwrap();
+
+    // Identical funding shape to drive_round, with 9 verifiers instead of 3.
+    state.accounts.get_or_create(submitter).balance = Amount::from_raw(MIN_BUDGET);
+    {
+        let e = state.accounts.get_or_create(executor);
+        e.is_validator = true;
+        e.balance = Amount::from_raw(MIN_BUDGET);
+    }
+    for &v in &verifiers {
+        let a = state.accounts.get_or_create(v);
+        a.is_validator = true;
+        a.balance = Amount::from_raw(MIN_BOND + VERIFIER_BOND);
+    }
+    for &v in &verifiers {
+        state.bond(&v, MIN_BOND).unwrap();
+    }
+    let conserved0 = conserved(&state);
+
+    // Publish the job blob to a real on-disk DaStore, then submit it on-chain (budget escrowed).
+    let program = wat::parse_str(DOUBLER).expect("guest assembles");
+    let input = vec![1u8, 2, 3, 40, 7];
+    let store = DaStore::open(scratch("da")).unwrap();
+    let att = da_publisher::publish_job_blob(&store, &program, &input).expect("publish job blob");
+    let program_hash: [u8; 32] = Sha256::digest(&program).into();
+    let input_hash: [u8; 32] = Sha256::digest(&input).into();
+    let submit_kind = TxKind::SubmitJobV2 {
+        program_hash,
+        input_hash,
+        da_root: att.da_root,
+        resources: ResourceRequirements::cpu_only(1, 0),
+        max_duration_secs: 60,
+        comme_budget: Amount::from_raw(MIN_BUDGET),
+        l2_id: None,
+    };
+    let submit_tx = unsigned(submitter, 0, submit_kind);
+    let job = submit_tx.hash().0;
+    state.apply_block(&next_block(&state, vec![submit_tx])).unwrap();
+    assert_eq!(state.escrowed_for_job(&job), MIN_BUDGET, "budget escrowed at submit");
+    assert_eq!(conserved(&state), conserved0, "conserved after submit");
+
+    let salts: Vec<SaltStore> =
+        (0..verifiers.len()).map(|i| SaltStore::open(scratch(&format!("esalt{i}"))).unwrap()).collect();
+    let exec_cfg = ExecutorCfg { max_concurrent_claims: 4, min_balance_reserve: 0, executor_bond: EXECUTOR_BOND_FLAT };
+
+    let (mut claims, mut completes, mut blocks) = (0u32, 0u32, 0u32);
+    let mut committee: Vec<Address> = Vec::new();
+    let mut fed_commit = [false; 3];
+    let mut fed_reveal = [false; 3];
+
+    // Drive until the F2 gate opens the round (primary drained into it), or the bound trips.
+    while !state.escalation_rounds.contains_key(&job) && blocks < 40 {
+        let now = state.blocks.height();
+        let mut txs: Vec<Transaction> = Vec::new();
+
+        // EXECUTOR: the REAL loop end-to-end — honest ClaimJob, then the honest CompleteJob
+        // carrying its TRUE DA-fetched + re-executed result hash.
+        let exec_view = executor_loop::build_chain_view(
+            now, 0, executor, bal(&state, executor), &state.pending_jobs, &state.job_lifecycles,
+        );
+        for kind in drive_executor(&store, exec_view, exec_cfg) {
+            match kind {
+                TxKind::ClaimJob { .. } => claims += 1,
+                TxKind::CompleteJob { .. } => completes += 1,
+                other => panic!("executor emitted unexpected {other:?}"),
+            }
+            txs.push(unsigned(executor, nonce(&state, executor), kind));
+        }
+
+        // Discover the drawn round-1 committee from state (populated in the CompleteJob block's
+        // apply tail) — membership is a function of block hashes, never hardcoded.
+        if committee.is_empty() {
+            if let Some(lc) = state.job_lifecycles.get(&job) {
+                let rec = lc.to_record();
+                if !rec.committee.is_empty() {
+                    assert_eq!(rec.committee.len(), 3, "k=3 committee drawn");
+                    committee = rec.committee.iter().map(|b| Address(*b)).collect();
+                }
+            }
+        }
+
+        // ROUND-1 COMMITTEE: hand-feed the 3-way split (the fraud path's colluder template) —
+        // each member commits then reveals its OWN distinct wrong hash ⇒ NoQuorum ⇒ Escalate.
+        if !committee.is_empty() {
+            if let Some(lc) = state.job_lifecycles.get(&job) {
+                match lc.phase() {
+                    Phase::Committing => {
+                        for (i, &m) in committee.iter().enumerate() {
+                            if !fed_commit[i] {
+                                fed_commit[i] = true;
+                                let c = make_commitment(
+                                    &ParticipantId(m.0), &SPLIT_HASHES[i], &SPLIT_SALT, VERIFIER_BOND,
+                                );
+                                txs.push(unsigned(m, nonce(&state, m), TxKind::Commit {
+                                    job_id: job, commit: c.commit, bond: Amount::from_raw(VERIFIER_BOND),
+                                }));
+                            }
+                        }
+                    }
+                    Phase::Revealing => {
+                        for (i, &m) in committee.iter().enumerate() {
+                            if fed_commit[i] && !fed_reveal[i] {
+                                fed_reveal[i] = true;
+                                txs.push(unsigned(m, nonce(&state, m), TxKind::Reveal {
+                                    job_id: job, result_hash: SPLIT_HASHES[i], salt: SPLIT_SALT,
+                                }));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        state.apply_block(&next_block(&state, txs)).unwrap();
+        blocks += 1;
+        assert_eq!(conserved(&state), conserved0, "money conserved after driven block {blocks} (round 1)");
+    }
+
+    // Round 1 really ran through the loops + the hand-fed split.
+    assert!(claims >= 1, "executor loop emitted a ClaimJob");
+    assert!(completes >= 1, "executor loop emitted the honest CompleteJob (real DA fetch + re-execute)");
+    assert!(
+        fed_commit.iter().all(|&x| x) && fed_reveal.iter().all(|&x| x),
+        "all three round-1 committee members were hand-fed a distinct commit+reveal"
+    );
+    assert!(state.pending_jobs.is_empty(), "no pending record left behind");
+    assert!(state.job_lifecycles.is_empty(), "primary lifecycle drained into the escalation round");
+
+    // The F2 gate PASSED and the round owns the held pot.
+    let round = state.escalation_rounds.get(&job).expect("F2 gate (6 spares >= quorum 5): round opened");
+    let rec = round.to_record();
+    let executor_hash = rec.executor_hash;
+    assert!(
+        !SPLIT_HASHES.contains(&executor_hash),
+        "all three round-1 split hashes differ from the executor's TRUE hash (all wrong-side)"
+    );
+    let panel: Vec<Address> = round.panel().iter().map(|p| Address(p.0)).collect();
+    let p = GameParams::default();
+    assert!(
+        panel.len() >= p.quorum(p.k_escalate),
+        "panel {} >= quorum(k_escalate) {}", panel.len(), p.quorum(p.k_escalate)
+    );
+    // The panel is EXACTLY the 6 spare candidates: 9 bonded verifiers minus the 3-member
+    // round-1 committee (< k_escalate=7 ⇒ select_committee takes the whole spare pool).
+    let spare: HashSet<Address> =
+        verifiers.iter().copied().filter(|v| !committee.contains(v)).collect();
+    assert_eq!(panel.len(), 6, "panel == the 6 spare candidates");
+    assert_eq!(panel.iter().copied().collect::<HashSet<_>>(), spare, "panel set == spare set");
+    // Held pot: budget + Be + the 3 round-1 revealer bonds — no money moved at open.
+    let e_bond = MIN_BUDGET; // budget.max(GameParams::default().executor_bond) — budget dominates
+    assert_eq!(
+        state.escrowed_for_job(&job),
+        MIN_BUDGET + e_bond + 3 * VERIFIER_BOND,
+        "round owns the held pot at open"
+    );
+    // Pre-panel balance baselines the tests' deltas build on.
+    assert_eq!(bal(&state, submitter), 0, "submitter's budget escrowed");
+    assert_eq!(bal(&state, executor), 0, "executor's bond escrowed");
+    for &m in &committee {
+        assert_eq!(bal(&state, m), 0, "round-1 revealer's bond held in the pot");
+    }
+    for &pm in &panel {
+        assert_eq!(bal(&state, pm), VERIFIER_BOND, "spare candidate untouched pre-panel");
+    }
+    assert_eq!(state.total_burned, 0, "nothing burned before the panel settles");
+
+    EscalationOpen {
+        state, store, salts, job, conserved0, submitter, executor, verifiers, committee, panel,
+        executor_hash, blocks,
+    }
+}
+
+/// ESCALATION (a) — the panel CONFIRMS through the REAL loops: every one of the 6 panel members
+/// is driven per block via `build_verifier_views_with_escalations` + the REAL
+/// `run_verifier_loop` — they DA-fetch the blob, RE-EXECUTE it (deriving the executor's TRUE
+/// hash), and commit+reveal it against the round. 6 agreeing reveals ≥ quorum(k_escalate)=5 and
+/// matching the executor's hash ⇒ `Verdict::Confirmed` ⇒ the frozen `settle_noquorum_confirmed`:
+/// the executor is paid 85% of the budget + bond back; the vindicated-verifier set is EMPTY (all
+/// three round-1 revealers were wrong-side) so the 10% pool burns with the 5% slice; the three
+/// slashed round-1 bonds fund the panel's escalation reward; the submitter's budget is CONSUMED.
+#[test]
+fn pouw_escalation_panel_confirms_pays_executor_and_panel() {
+    let mut h = open_escalation_round();
+    let ver_cfg = VerifierCfg { min_balance_reserve: 0 };
+    let (mut commits, mut reveals) = (0u32, 0u32);
+
+    // Drive the PANEL through the REAL verifier loops until the round settles + drains.
+    while !h.state.escalation_rounds.is_empty() && h.blocks < 60 {
+        let now = h.state.blocks.height();
+        let mut txs: Vec<Transaction> = Vec::new();
+        for (i, &v) in h.verifiers.iter().enumerate() {
+            if h.committee.contains(&v) {
+                continue; // round-1 revealers are NOT panel members (their bonds sit slashed in the pot)
+            }
+            let tick = verifier_loop::build_verifier_views_with_escalations(
+                now, v, bal(&h.state, v), &h.state.job_lifecycles, &h.state.escalation_rounds,
+            );
+            for kind in drive_verifier(&h.store, tick, &mut h.salts[i], ver_cfg, v.0) {
+                match kind {
+                    TxKind::Commit { .. } => commits += 1,
+                    TxKind::Reveal { .. } => reveals += 1,
+                    other => panic!("panel verifier emitted unexpected {other:?}"),
+                }
+                txs.push(unsigned(v, nonce(&h.state, v), kind));
+            }
+        }
+        h.state.apply_block(&next_block(&h.state, txs)).unwrap();
+        h.blocks += 1;
+        assert_eq!(conserved(&h.state), h.conserved0, "money conserved after driven block {} (panel)", h.blocks);
+    }
+
+    let s = &h.state;
+    assert!(s.escalation_rounds.is_empty(), "escalation round settled + drained within the block bound");
+    assert!(s.job_lifecycles.is_empty() && s.pending_jobs.is_empty(), "no job state left behind");
+
+    // The REAL loops drove the whole panel: 6 commits + 6 reveals of the re-executed TRUE hash.
+    let n_panel = h.panel.len() as u64; // 6 (asserted at open)
+    assert_eq!(commits, n_panel as u32, "every panel member's REAL loop committed");
+    assert_eq!(reveals, n_panel as u32, "every panel member's REAL loop revealed the TRUE hash");
+
+    // ── The EXACT settle_noquorum_confirmed split (frozen settlement.rs:247; the on-chain round
+    //    is pinned to it by the golden-oracle test). Inputs: budget = 1_000_000; Be = 1_000_000;
+    //    vindicated = [] (ALL THREE round-1 revealers wrong-side); rejected bonds = 3×20;
+    //    panel = 6 revealers; escalation_reward_bps = 1_000. ──
+    let e_bond = MIN_BUDGET;
+    let worker_share = MIN_BUDGET * WORKER_BPS / 10_000; // 850_000
+    // No vindicated original verifier ⇒ pay_even over [] pays nothing ⇒ the whole 10% pool
+    // burns with the 5% protocol slice: budget_burn = budget − worker − 0 = 15%.
+    let budget_burn = MIN_BUDGET - worker_share; // 150_000
+    let committee_slash = 3 * VERIFIER_BOND; // 60 — the slashed wrong-side round-1 bonds
+    let panel_pool = committee_slash * ESCALATION_REWARD_BPS / 10_000; // 6
+    let panel_each = panel_pool / n_panel; // 1
+    let panel_paid = panel_each * n_panel; // 6
+    let burn = budget_burn + (committee_slash - panel_paid); // 150_000 + 54 = 150_054
+    assert_eq!((worker_share, panel_each, burn), (850_000, 1, 150_054));
+
+    // EXECUTOR: bond escrowed at claim nets zero ⇒ net +85% of the budget vs its pre-submit
+    // 1_000_000 baseline (funded MIN_BUDGET → 0 at claim → worker share + bond back).
+    assert_eq!(bal(s, h.executor), worker_share + e_bond, "executor: 85% of budget + bond back");
+    // ROUND-1 COMMITTEE: all three wrong-side ⇒ each lost its verifier bond (pre-round 20 → 0).
+    for &m in &h.committee {
+        assert_eq!(bal(s, m), 0, "wrong-side round-1 revealer slashed (lost its verifier bond)");
+    }
+    // PANEL: bond back + its escalation-reward share ⇒ strictly above its pre-round balance.
+    assert!(panel_each > 0, "non-vacuous panel reward");
+    for &pm in &h.panel {
+        assert_eq!(bal(s, pm), VERIFIER_BOND + panel_each, "panel member: bond back + reward share");
+        assert!(bal(s, pm) > VERIFIER_BOND, "panel member ended above its pre-round balance");
+    }
+    // SUBMITTER: Confirmed ⇒ the budget was CONSUMED, not refunded.
+    assert_eq!(bal(s, h.submitter), 0, "submitter's budget consumed");
+    assert_eq!(s.total_burned, burn, "burn = unpaid 10% pool + 5% slice + slashed-bond remainder");
+    assert_eq!(s.escrowed_for_job(&h.job), 0, "pot drained to 0");
+    assert_eq!(conserved(s), h.conserved0, "total supply conserved");
+    // Pot fully accounted: (budget + Be + 3 slashed bonds + 6 panel bonds) in ==
+    // (worker + Be back + 6×(bond back + reward) + burn) out.
+    assert_eq!(
+        MIN_BUDGET + e_bond + committee_slash + n_panel * VERIFIER_BOND,
+        worker_share + e_bond + n_panel * (VERIFIER_BOND + panel_each) + burn,
+        "pot fully accounted (in == out)"
+    );
+    assert!(h.blocks <= 30, "converged (was {})", h.blocks);
+}
+
+/// ESCALATION (b) — the panel ALSO splits ⇒ the BOUNDED NoQuorum terminal (no third round).
+/// Same 9-verifier open, but the 6 panel members are HAND-FED commits+reveals split 2/2/2
+/// across three distinct hashes (none matching the executor's TRUE hash) ⇒ no value reaches
+/// quorum(k_escalate)=5 ⇒ `Verdict::NoQuorum` ⇒ the frozen `settle_noquorum_disputed` with
+/// honest = [] and rejected = ALL THREE round-1 revealers: the submitter is refunded the full
+/// budget; the executor's bond is CONSUMED (10% escalation share to the panel, the 90%
+/// remainder burned — the unpaid challenger-reward share burns with it); all three round-1
+/// bonds burn; the panel keeps bond + reward.
+#[test]
+fn pouw_escalation_panel_noquorum_burns_executor_bond() {
+    // 2/2/2 over three distinct hashes: the largest agreement class is 2 < quorum(7)=5.
+    const PANEL_SPLIT: [[u8; 32]; 3] = [[0xC1u8; 32], [0xC2u8; 32], [0xC3u8; 32]];
+    const PANEL_SALT: [u8; 32] = [0x77u8; 32];
+
+    let mut h = open_escalation_round();
+    assert!(
+        !PANEL_SPLIT.contains(&h.executor_hash),
+        "panel split hashes all differ from the executor's TRUE hash"
+    );
+
+    let panel = h.panel.clone();
+    let mut fed_commit = vec![false; panel.len()];
+    let mut fed_reveal = vec![false; panel.len()];
+
+    // Hand-feed the panel split, driving blocks until the round settles + drains.
+    while !h.state.escalation_rounds.is_empty() && h.blocks < 60 {
+        let mut txs: Vec<Transaction> = Vec::new();
+        if let Some(er) = h.state.escalation_rounds.get(&h.job) {
+            match er.phase() {
+                PanelPhase::Committing => {
+                    for (i, &m) in panel.iter().enumerate() {
+                        if !fed_commit[i] {
+                            fed_commit[i] = true;
+                            let c = make_commitment(
+                                &ParticipantId(m.0), &PANEL_SPLIT[i % 3], &PANEL_SALT, VERIFIER_BOND,
+                            );
+                            txs.push(unsigned(m, nonce(&h.state, m), TxKind::Commit {
+                                job_id: h.job, commit: c.commit, bond: Amount::from_raw(VERIFIER_BOND),
+                            }));
+                        }
+                    }
+                }
+                PanelPhase::Revealing => {
+                    for (i, &m) in panel.iter().enumerate() {
+                        if fed_commit[i] && !fed_reveal[i] {
+                            fed_reveal[i] = true;
+                            txs.push(unsigned(m, nonce(&h.state, m), TxKind::Reveal {
+                                job_id: h.job, result_hash: PANEL_SPLIT[i % 3], salt: PANEL_SALT,
+                            }));
+                        }
+                    }
+                }
+                PanelPhase::Settled => {}
+            }
+        }
+        h.state.apply_block(&next_block(&h.state, txs)).unwrap();
+        h.blocks += 1;
+        assert_eq!(conserved(&h.state), h.conserved0, "money conserved after driven block {} (panel)", h.blocks);
+    }
+
+    let s = &h.state;
+    assert!(s.escalation_rounds.is_empty(), "escalation round settled + drained within the block bound");
+    assert!(
+        fed_commit.iter().all(|&x| x) && fed_reveal.iter().all(|&x| x),
+        "every panel member committed + revealed its split hash"
+    );
+
+    // ── The EXACT bounded-terminal split: EscalationRound::settle's NoQuorum arm calls the
+    //    frozen settle_noquorum_disputed (settlement.rs:305) with honest = [] and rejected =
+    //    the WHOLE round-1 committee. Inputs: budget = Be = 1_000_000; challenger_reward_bps =
+    //    escalation_reward_bps = 1_000; panel = 6 revealers; rejected bonds = 3×20.
+    //    NB the brief's "burned ≥ Be" over-approximates: 10% of the slashed Be pays the panel,
+    //    so the EXACT burn is Be − panel_paid + committee bonds = 900_064 < Be. ──
+    let n_panel = panel.len() as u64; // 6
+    let e_bond = MIN_BUDGET;
+    let panel_pool = e_bond * ESCALATION_REWARD_BPS / 10_000; // 100_000
+    let panel_each = panel_pool / n_panel; // 16_666
+    let panel_paid = panel_each * n_panel; // 99_996
+    let honest_paid = 0u64; // challenger-reward share has no recipient (no honest round-1 revealer)
+    let executor_burn = e_bond - honest_paid - panel_paid; // 900_004
+    let committee_slash = 3 * VERIFIER_BOND; // 60 — all three round-1 revealers slashed
+    let burn = executor_burn + committee_slash; // 900_064
+    assert_eq!((panel_each, executor_burn, burn), (16_666, 900_004, 900_064));
+
+    // SUBMITTER made whole on the bounded terminal.
+    assert_eq!(bal(s, h.submitter), MIN_BUDGET, "submitter refunded the full budget");
+    // EXECUTOR: bond CONSUMED — no bond back, no worker pay (pre-submit 1_000_000 → 0).
+    assert_eq!(bal(s, h.executor), 0, "executor's bond consumed (no bond back, no worker pay)");
+    // ROUND-1 COMMITTEE: the whole committee is slashed on the bounded terminal.
+    for &m in &h.committee {
+        assert_eq!(bal(s, m), 0, "round-1 revealer slashed (lost its verifier bond)");
+    }
+    // PANEL: bond back + reward from the slashed executor bond ⇒ above pre-round balance.
+    for &pm in &panel {
+        assert_eq!(bal(s, pm), VERIFIER_BOND + panel_each, "panel member: bond back + reward share");
+        assert!(bal(s, pm) >= VERIFIER_BOND, "panel member ended >= its pre-round balance");
+    }
+    assert_eq!(s.total_burned, burn, "burn = Be minus the panel share, plus the 3 slashed round-1 bonds");
+    assert_eq!(s.escrowed_for_job(&h.job), 0, "pot drained to 0");
+    assert_eq!(conserved(s), h.conserved0, "total supply conserved");
+    // Pot fully accounted: (budget + Be + 3 slashed bonds + 6 panel bonds) in ==
+    // (refund + 6×(bond back + reward) + burn) out.
+    assert_eq!(
+        MIN_BUDGET + e_bond + committee_slash + n_panel * VERIFIER_BOND,
+        MIN_BUDGET + n_panel * (VERIFIER_BOND + panel_each) + burn,
+        "pot fully accounted (in == out)"
+    );
+    assert!(h.blocks <= 30, "converged (was {})", h.blocks);
 }
