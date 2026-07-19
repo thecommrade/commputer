@@ -48,10 +48,30 @@ use crate::executor_planner::{
 };
 
 // ── Default DA fetch bounds (only affect fetch liveness; the frozen facade degrades to Abstain). ──
-/// Retry-window budget (ms/ticks) a single `fetch_blob` gets before it Abstains.
+/// Retry-window budget (ms/ticks) a single `fetch_blob` gets before it Abstains. Sized against the
+/// REAL deadlines it must fit inside: the on-chain commit window is ≈20s (default
+/// `PhaseWindows::commit_blocks` = 10 blocks x `genesis.block_time_secs` = 2s;
+/// `consensus_params.rs`), and this 30s budget is itself the outer bound the go-live Task B
+/// client-side pacing (`da_transport::BridgeTransport::with_min_fetch_interval`, default 150ms)
+/// must fit inside: `SAMPLES_PER_VERIFIER` (16) x 150ms = 2.4s of pacing, negligible against both
+/// windows. Per-miss cost is asymmetric: a miss against a connected non-holder costs about one RTT
+/// (the loop just tries the next provider), while a miss against a dead/unreachable peer costs up
+/// to the per-call `fetch_timeout` (`node_config.da.fetch_timeout_ms`, plumbed into
+/// `BridgeTransport::with_timeout` in `main.rs`) before the bridge falls back to the unavailable
+/// default. NOT changed by go-live Task B — cited here only so the interplay is legible in one
+/// place.
 pub const DEFAULT_DA_RETRY_WINDOW_TICKS: u64 = 30_000;
-/// Max provider attempts per sampled chunk.
-pub const DEFAULT_DA_MAX_ATTEMPTS_PER_CHUNK: u32 = 8;
+/// Max provider attempts per sampled chunk. `find_providers` returns ALL connected peers (no
+/// discovery cost); the frozen facade XOR-sorts that list by distance-to-target and tries up to
+/// this many before giving up on a sampled chunk. Only the publisher actually HOLDS a chunk today
+/// (no re-seeding/replication yet), so a cap smaller than the connected-peer count silently drops
+/// the publisher off the tried list once peer count grows past it — hit-rate collapses toward
+/// (old cap)/P and `SAMPLES_PER_VERIFIER` (16) sampled chunks per verification starve. Attempts
+/// beyond the ACTUAL provider list length are free (the facade loop simply ends when providers run
+/// out), so there is no cost to sizing this generously: raised 8 -> 64 (go-live Task B) to cover a
+/// real alpha-testnet's full connected-peer set with headroom, comfortably exceeding the 16-sample
+/// workload it must not starve.
+pub const DEFAULT_DA_MAX_ATTEMPTS_PER_CHUNK: u32 = 64;
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // Shared DA seams (re-used by verifier_loop).
@@ -770,5 +790,30 @@ mod tests {
         assert!(view.my_claims.is_empty());
         assert_eq!(view.height, 7);
         assert_eq!(view.my_balance, 500);
+    }
+
+    /// Go-live Task B (const-sanity): the per-chunk provider-attempt ceiling was raised 8 -> 64.
+    /// `find_providers` returns ALL connected peers; the frozen facade XOR-sorts that list by
+    /// distance-to-target and tries up to this many before giving up on a sampled chunk. Only the
+    /// publisher actually HOLDS a chunk today (no re-seeding/replication yet), so a cap that's
+    /// smaller than the connected-peer count silently drops the publisher off the tried list past
+    /// ~8 peers (hit-rate collapses toward 8/P) — starving `SAMPLES_PER_VERIFIER` (16) sampled
+    /// chunks per verification. Attempts beyond the ACTUAL provider list length are free (the
+    /// facade loop simply ends when providers run out), so there's no cost to sizing the ceiling
+    /// generously; 64 covers a real alpha-testnet's full connected-peer set with headroom and, not
+    /// incidentally, comfortably exceeds the 16-sample workload it must not starve.
+    #[test]
+    fn da_max_attempts_ceiling_is_64_and_exceeds_sample_count() {
+        assert_eq!(
+            DEFAULT_DA_MAX_ATTEMPTS_PER_CHUNK, 64,
+            "ceiling raised 8 -> 64 (go-live Task B)"
+        );
+        assert!(
+            (DEFAULT_DA_MAX_ATTEMPTS_PER_CHUNK as usize) > commputer_da::params::SAMPLES_PER_VERIFIER,
+            "ceiling ({}) must exceed the {}-sample verification workload, else even a fully \
+             connected mesh can starve a late-sorted holder",
+            DEFAULT_DA_MAX_ATTEMPTS_PER_CHUNK,
+            commputer_da::params::SAMPLES_PER_VERIFIER,
+        );
     }
 }

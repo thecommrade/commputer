@@ -372,4 +372,58 @@ mod tests {
         assert_send::<BridgeAttestationSource>();
         assert_send::<BridgeDaBlobFetcher>();
     }
+
+    /// Go-live Task B: verify the EXACT production construction path actually enables client-side
+    /// fetch pacing. `main.rs` (PROTECTED, not edited by this change) builds the real
+    /// `BridgeAttestationSource`/`BridgeDaBlobFetcher` by handing `BridgeTransport::with_timeout`
+    /// straight to `DaBackedAttestationSource::new`/`BridgeBlobFetcher::new` — those two
+    /// constructors are transport-agnostic (generic over `T: DaTransport`) and never touch the
+    /// pacing knob themselves, so the only place the 150ms default can live is inside
+    /// `BridgeTransport::with_timeout` (see `da_transport.rs`). This test drives a real
+    /// `BridgeTransport` through that exact constructor (not the test-only `StoreTransport` the
+    /// other tests in this module use) and confirms two successive `fetch_chunk`s the transport
+    /// makes are paced >= 150ms apart — proving the production wiring is genuinely protected from
+    /// the server's 10/s/peer `GetChunk` rate limit without any protected-file edit.
+    #[test]
+    fn production_with_timeout_construction_enables_default_pacing() {
+        use commputer_pouw_onchain::da_transport::{BridgeTransport, DaCommand};
+
+        let chunk = [0x55u8; 32];
+        let prov = ProviderId([9u8; 32]);
+        let bytes = vec![1u8, 2, 3];
+
+        let (tx, rx) = std::sync::mpsc::channel::<DaCommand>();
+        let handle = std::thread::spawn(move || {
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    DaCommand::FetchChunk { reply, .. } => {
+                        let _ = reply.send(Some((bytes.clone(), Vec::new())));
+                    }
+                    DaCommand::FindProviders { reply, .. } => {
+                        let _ = reply.send(Vec::new());
+                    }
+                    DaCommand::HasChunk { reply, .. } => {
+                        let _ = reply.send(false);
+                    }
+                    DaCommand::Advertise { .. } => {}
+                }
+            }
+        });
+
+        // The exact call main.rs makes for the production executor/verifier loops.
+        let bridge = BridgeTransport::with_timeout(tx, std::time::Duration::from_secs(5));
+
+        let t0 = std::time::Instant::now();
+        assert!(bridge.fetch_chunk(chunk, prov).is_some());
+        assert!(bridge.fetch_chunk(chunk, prov).is_some());
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(150),
+            "production BridgeTransport::with_timeout construction must default to >=150ms \
+             fetch-pacing; only took {:?}",
+            t0.elapsed()
+        );
+
+        drop(bridge);
+        handle.join().unwrap();
+    }
 }
