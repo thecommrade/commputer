@@ -21,7 +21,7 @@ use commputer_pouw::oracle::{ChainHooks, EquivalenceOracle};
 use commputer_pouw::params::GameParams;
 use commputer_pouw::settlement::{settle_noquorum_confirmed, settle_noquorum_disputed};
 use commputer_pouw::verdict::compute_verdict;
-use crate::escrow_ledger::EscrowLedger;
+use crate::escrow_ledger::{EscrowLedger, Ledger};
 use crate::lifecycle::EscalationHandoff;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,7 +141,7 @@ impl EscalationRound {
 
     /// A panel member commits (DA-Available ⇒ they call this; Abstain ⇒ they don't). Validates
     /// phase/window/panel-membership/bond/no-double-commit, then escrows the verifier bond.
-    pub fn record_commit(&mut self, l: &mut EscrowLedger, c: Commitment, height: u64) -> EventResult {
+    pub fn record_commit(&mut self, l: &mut impl Ledger, c: Commitment, height: u64) -> EventResult {
         if self.phase != PanelPhase::Committing {
             return EventResult::Rejected(RejectReason::WrongPhase);
         }
@@ -195,7 +195,7 @@ impl EscalationRound {
 
     /// Finalize the escalation round (call at reveal_by). Idempotent (caches the outcome). Drains
     /// the held escrow + the panel bonds via the frozen settle_noquorum_* functions.
-    pub fn settle(&mut self, l: &mut EscrowLedger, eq: &dyn EquivalenceOracle) -> EscalationOutcome {
+    pub fn settle(&mut self, l: &mut impl Ledger, eq: &dyn EquivalenceOracle) -> EscalationOutcome {
         if let Some(o) = &self.settled {
             return o.clone();
         }
