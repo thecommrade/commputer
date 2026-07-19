@@ -355,18 +355,65 @@ impl CommpNetwork {
     }
 }
 
-/// Founder-operated seed nodes. Replace with real addresses at launch.
+/// Founder-operated seed nodes with a KNOWN, fixed peer identity. Empty until
+/// the real seed box is provisioned with a persistent keypair (see
+/// `seed-node-kit`) — once it is, add its full `/p2p/<PEER_ID>`-qualified
+/// address here so dials pin the expected peer identity, not just the host.
 ///
-/// TODO(seed): add the real seed once the box is provisioned, e.g.
-///   "/dns4/seed.commputer.xyz/tcp/9000"      (DNS — now resolvable via with_dns)
-///   "/dns4/seed.commputer.xyz/udp/9000/quic-v1"
-/// Blocked on the real seed box IP / DNS record. `/dns4/` forms only resolve
-/// because the transport enables `.with_dns()`.
+/// TODO(seed): add the real peer-id-qualified seed once the box is
+/// provisioned, e.g.
+///   "/dns4/seed.commputer.xyz/tcp/9000/p2p/<PEER_ID>"
+///   "/dns4/seed.commputer.xyz/udp/9000/quic-v1/p2p/<PEER_ID>"
+///
+/// This list being empty is NOT the seed-dialing gap it used to be: see
+/// `DEFAULT_TESTNET_SEED_HOSTS` below, which is dialed unconditionally by
+/// `connect_to_seeds()` even with no peer id known yet.
 pub const SEED_NODES: &[&str] = &[
     // Format: /ip4/<IP>/tcp/<PORT>/p2p/<PEER_ID>
     // Or QUIC: /ip4/<IP>/udp/<PORT>/quic-v1/p2p/<PEER_ID>
     // Or DNS:  /dns4/<HOST>/tcp/<PORT>/p2p/<PEER_ID>
 ];
+
+/// Compiled-in default testnet seed(s), as `"host:port"`.
+///
+/// This mirrors `commputer::config::DEFAULT_TESTNET_SEEDS`
+/// (`src/node/src/config.rs:9`) — the node crate's display twin, logged (not
+/// dialed) at `src/node/src/main.rs:1160`. The network crate cannot depend on
+/// the node crate (`node` depends on `network`; the reverse would be a
+/// dependency cycle), so the literal is hand-mirrored here rather than
+/// imported. Keep the two lists in sync if the seed host/port ever changes.
+///
+/// Unlike `SEED_NODES` (which expects a founder-curated, peer-id-qualified
+/// address), these entries carry no peer id — `connect_to_seeds()` dials
+/// them as bare `/dns4/<host>/tcp/<port>` (+ QUIC) multiaddrs, the same
+/// without-a-peer-id shape `connect_to_custom_seeds()`/`resolve_dns_seeds()`
+/// already dial for CLI `--seeds`/`--dns-seeds` values (see
+/// `tcp_to_quic_v1_without_peer_id`, `connect_to_custom_seeds`) — a
+/// known-working path, not a new one.
+const DEFAULT_TESTNET_SEED_HOSTS: &[&str] = &["seed.commputer.xyz:9000"];
+
+/// Convert a `"host:port"` seed literal into its `/dns4/<host>/tcp/<port>`
+/// and `/dns4/<host>/udp/<port>/quic-v1` dial forms.
+///
+/// Both forms are dialable: `.with_dns()` wraps *both* the TCP and QUIC
+/// transports in the swarm builder (see `new_with_keypair_path`), so DNS
+/// resolution isn't TCP-only.
+///
+/// Returns `None` if `host_port` isn't `host:port` shaped (no colon, empty
+/// host, or a port that doesn't parse as `u16`). Callers must treat `None`
+/// as "skip this entry, log it" — never propagate a panic — since a bad
+/// compiled-in literal must not block node startup.
+fn dns_seed_multiaddrs(host_port: &str) -> Option<(String, String)> {
+    let (host, port_str) = host_port.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    let port: u16 = port_str.parse().ok()?;
+    Some((
+        format!("/dns4/{host}/tcp/{port}"),
+        format!("/dns4/{host}/udp/{port}/quic-v1"),
+    ))
+}
 
 /// Convert a TCP multiaddr into its QUIC-v1 equivalent.
 ///
@@ -390,7 +437,17 @@ fn tcp_to_quic_v1(addr_str: &str) -> String {
 }
 
 impl CommpNetwork {
-    /// Dial all built-in seed nodes. Returns the number successfully dialed.
+    /// Dial all built-in seed nodes: the founder-curated `SEED_NODES`
+    /// literal (empty until the seed box has a fixed peer id) plus the
+    /// compiled-in DNS defaults (`DEFAULT_TESTNET_SEED_HOSTS`). Returns the
+    /// number of dials successfully queued.
+    ///
+    /// A default host that fails to resolve is NOT an error here: DNS
+    /// resolution happens later, asynchronously, inside the `.with_dns()`-
+    /// wrapped transport (see `new_with_keypair_path`), so a bad or
+    /// unreachable seed hostname surfaces only as a later
+    /// `SwarmEvent::OutgoingConnectionError` — never a panic and never a
+    /// block on startup here.
     pub fn connect_to_seeds(&mut self) -> usize {
         let mut connected = 0;
         for addr_str in SEED_NODES {
@@ -398,6 +455,28 @@ impl CommpNetwork {
                 && self.dial(addr).is_ok() {
                     connected += 1;
                 }
+        }
+        for host_port in DEFAULT_TESTNET_SEED_HOSTS {
+            match dns_seed_multiaddrs(host_port) {
+                Some((tcp_str, quic_str)) => {
+                    if let Ok(addr) = tcp_str.parse::<Multiaddr>()
+                        && self.dial(addr).is_ok() {
+                            info!("Dialed default DNS seed: {}", tcp_str);
+                            connected += 1;
+                        }
+                    if let Ok(addr) = quic_str.parse::<Multiaddr>()
+                        && self.dial(addr).is_ok() {
+                            info!("Dialed default DNS seed (QUIC): {}", quic_str);
+                            connected += 1;
+                        }
+                }
+                None => {
+                    warn!(
+                        "Default seed literal '{}' is not host:port shaped, skipping",
+                        host_port
+                    );
+                }
+            }
         }
         connected
     }
@@ -918,6 +997,86 @@ mod tests {
         let quic = tcp_to_quic_v1(tcp);
         assert_eq!(quic, "/ip4/127.0.0.1/udp/19001/quic-v1");
         assert!(quic.parse::<Multiaddr>().is_ok(), "expected valid multiaddr, got {}", quic);
+    }
+
+    // -- Task A: default seed DNS-dialing (empty-SEED_NODES gap) ------------
+
+    #[test]
+    fn dns_seed_multiaddrs_converts_host_port() {
+        let (tcp, quic) = dns_seed_multiaddrs("seed.commputer.xyz:9000")
+            .expect("well-formed host:port must convert");
+        assert_eq!(tcp, "/dns4/seed.commputer.xyz/tcp/9000");
+        assert_eq!(quic, "/dns4/seed.commputer.xyz/udp/9000/quic-v1");
+        assert!(tcp.parse::<Multiaddr>().is_ok(), "expected valid multiaddr, got {}", tcp);
+        assert!(quic.parse::<Multiaddr>().is_ok(), "expected valid multiaddr, got {}", quic);
+    }
+
+    #[test]
+    fn dns_seed_multiaddrs_rejects_missing_colon() {
+        assert_eq!(dns_seed_multiaddrs("seed.commputer.xyz"), None);
+    }
+
+    #[test]
+    fn dns_seed_multiaddrs_rejects_non_numeric_port() {
+        assert_eq!(dns_seed_multiaddrs("seed.commputer.xyz:notaport"), None);
+    }
+
+    #[test]
+    fn dns_seed_multiaddrs_rejects_empty_host() {
+        assert_eq!(dns_seed_multiaddrs(":9000"), None);
+    }
+
+    #[test]
+    fn dns_seed_multiaddrs_rejects_empty_port() {
+        assert_eq!(dns_seed_multiaddrs("seed.commputer.xyz:"), None);
+    }
+
+    #[test]
+    fn default_testnet_seed_hosts_are_well_formed() {
+        // Whatever the mirrored default-seed literal is, it must convert —
+        // catches a future typo'd literal at test time rather than at
+        // startup (where a malformed entry is merely skipped + logged).
+        for host_port in DEFAULT_TESTNET_SEED_HOSTS {
+            assert!(
+                dns_seed_multiaddrs(host_port).is_some(),
+                "default seed literal '{}' is not host:port shaped",
+                host_port
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_to_seeds_dials_default_dns_seeds() {
+        // Outbound-only (port 0) network, same construction the existing
+        // `network_builds_with_dns_transport` test uses. The default DNS
+        // seed(s) should be queued for dial (TCP + QUIC each) without
+        // requiring the hostname to actually resolve — resolution happens
+        // later, asynchronously, inside the `.with_dns()`-wrapped transport.
+        let mut net = CommpNetwork::new(0).expect("network should build");
+        let connected = net.connect_to_seeds();
+        assert!(
+            connected >= DEFAULT_TESTNET_SEED_HOSTS.len() * 2,
+            "expected at least {} dials (TCP+QUIC per default seed), got {}",
+            DEFAULT_TESTNET_SEED_HOSTS.len() * 2,
+            connected
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_of_nonresolving_dns_seed_does_not_panic_or_block() {
+        // Tolerance test (no live DNS involved): a seed hostname that will
+        // never resolve must not panic or hang the caller. DNS resolution
+        // is deferred into the async transport, so `dial()` queuing a
+        // `/dns4/` address for a bogus host must still return promptly —
+        // any resolution failure surfaces later as a swarm event, not here.
+        let mut net = CommpNetwork::new(0).expect("network should build");
+        let addr: Multiaddr = "/dns4/this-host-does-not-exist.invalid.commputer-test/tcp/9000"
+            .parse()
+            .expect("dns4 multiaddr should parse even for a bogus host");
+        // Must not panic. The Result is intentionally not asserted either
+        // way: what matters is that queuing the dial returns instead of
+        // blocking on resolution.
+        let _ = net.dial(addr);
     }
 
     // -- Peer-key hardening (finding [31]) ----------------------------------
