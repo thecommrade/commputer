@@ -141,9 +141,28 @@ impl SaltStore {
         // cannot durably persist the salt MUST NOT proceed to broadcast the Commit.
         // (Opening a directory as a File and sync_all() is the portable-enough idiom;
         // filesystems that don't need dir-fsync return Ok.)
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let dir = std::fs::File::open(parent)?;
-            dir.sync_all()?;
+        //
+        // This is a Unix-only guarantee: `File::open` on a directory requires
+        // FILE_FLAG_BACKUP_SEMANTICS, which std's `File::open` does not set, so on
+        // Windows this call fails every time (bricking every `persist()`, and hence
+        // every `insert`/`remove`, i.e. the verifier commit/reveal path). Gate it.
+        #[cfg(unix)]
+        {
+            if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                let dir = std::fs::File::open(parent)?;
+                dir.sync_all()?;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // Directory-entry fsync is a Unix guarantee; on non-Unix (Windows) we rely
+            // on the file's own `sync_all()` above (contents+metadata of the renamed
+            // file are durable) and skip the directory fsync entirely — a strictly
+            // weaker crash-durability guarantee for a freshly created/renamed salt
+            // file (a crash in the narrow rename-durability window could still lose
+            // the dir entry). Acceptable for the Windows best-effort target (founder
+            // decision 2026-07-19): a lost salt degrades to "verifier abstains and
+            // accepts forfeiture," never a corrupt/garbage reveal.
         }
         Ok(())
     }
