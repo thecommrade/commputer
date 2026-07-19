@@ -2053,6 +2053,23 @@ impl ChainState {
         if self.job_lifecycles.contains_key(&job_id) {
             match self.lifecycle_record_commit(job_id, c, height)? {
                 Some(EventResult::Accepted) => Ok(()),
+                // RETRANSMISSION class (2026-07-19; same class as the losing-ClaimJob no-op in
+                // apply_claim_job): the chain ALREADY holds this verifier's binding commitment.
+                // The verifier loop re-emits an unconfirmed Commit after its cooldown, signed at
+                // the NEXT nonce; if the first copy then applies, the duplicate carries no new
+                // information and moves no money — record_commit rejects DoubleCommit
+                // (lifecycle.rs:574-575) BEFORE its ledger escrow (lifecycle.rs:578), so the
+                // FIRST commitment stands untouched. Rejecting the block instead would
+                // phase-defer-requeue the duplicate for the round's whole life and WEDGE the
+                // sender's nonce, so its Reveal (signed one nonce later) could never apply
+                // in-window → commit-no-reveal forfeiture burns an honest bond. So: a
+                // nonce-consuming NO-OP (the caller bumps the nonce). Deterministic — reads only
+                // consensus lifecycle state. ALL other reject classes keep rejecting the block:
+                // WrongPhase/PastWindow are timing (C3 requeues them; they self-heal at drain),
+                // NotCommitteeMember/WrongBond are real invalidity.
+                Some(EventResult::Rejected(
+                    commputer_pouw_onchain::lifecycle::RejectReason::DoubleCommit,
+                )) => Ok(()),
                 Some(EventResult::Rejected(r)) => Err(StateError::InvalidBlock(format!(
                     "commit rejected: {r:?}"
                 ))),
@@ -2062,6 +2079,13 @@ impl ChainState {
             use commputer_pouw_onchain::escalation_round::EventResult as PanelEventResult;
             match self.escalation_record_commit(job_id, c, height)? {
                 Some(PanelEventResult::Accepted) => Ok(()),
+                // Retransmission no-op, escalation arm — twin of the primary arm above. The
+                // round's record_commit rejects DoubleCommit (escalation_round.rs:270-271)
+                // BEFORE its ledger escrow (escalation_round.rs:274): first commitment stands,
+                // duplicate consumes the nonce, no money moves.
+                Some(PanelEventResult::Rejected(
+                    commputer_pouw_onchain::escalation_round::RejectReason::DoubleCommit,
+                )) => Ok(()),
                 Some(PanelEventResult::Rejected(r)) => Err(StateError::InvalidBlock(format!(
                     "panel commit rejected: {r:?}"
                 ))),
@@ -2101,6 +2125,17 @@ impl ChainState {
             let r = Reveal { verifier: ParticipantId(from.0), result_hash, salt };
             match self.lifecycle_record_reveal(job_id, r, height) {
                 Some(EventResult::Accepted) => Ok(()),
+                // RETRANSMISSION class (2026-07-19; see apply_commit's DoubleCommit arm): the
+                // chain already holds this verifier's reveal. AlreadyRevealed is only reachable
+                // AFTER reveal_matches passed (lifecycle.rs:595-599) — i.e. ONLY for a
+                // byte-identical retransmission of the reveal already on chain; a DIVERGENT
+                // re-send hits RevealMismatch FIRST and still rejects the block. record_reveal
+                // mutates nothing on this path (the push at lifecycle.rs:601 is unreached; a
+                // reveal moves no money at all), so the duplicate is a nonce-consuming no-op —
+                // rejecting it would wedge the sender's nonce exactly like a duplicate Commit.
+                Some(EventResult::Rejected(
+                    commputer_pouw_onchain::lifecycle::RejectReason::AlreadyRevealed,
+                )) => Ok(()),
                 Some(EventResult::Rejected(rr)) => Err(StateError::InvalidBlock(format!(
                     "reveal rejected: {rr:?}"
                 ))),
@@ -2116,6 +2151,13 @@ impl ChainState {
             let r = Reveal { verifier: ParticipantId(from.0), result_hash, salt };
             match self.escalation_record_reveal(job_id, r, height) {
                 Some(PanelEventResult::Accepted) => Ok(()),
+                // Retransmission no-op, escalation arm — twin of the primary arm above.
+                // AlreadyRevealed only fires after reveal_matches passed
+                // (escalation_round.rs:291-295), before the push at escalation_round.rs:297:
+                // byte-identical retransmission, nothing recorded, no money moved.
+                Some(PanelEventResult::Rejected(
+                    commputer_pouw_onchain::escalation_round::RejectReason::AlreadyRevealed,
+                )) => Ok(()),
                 Some(PanelEventResult::Rejected(rr)) => Err(StateError::InvalidBlock(format!(
                     "panel reveal rejected: {rr:?}"
                 ))),
@@ -3652,11 +3694,21 @@ impl ChainState {
         // record_commit escrows c.bond from the committer (on Accepted) via the infallible ChainHooks
         // surface; pre-check the balance so that escrow cannot panic the ledger. (record_commit may
         // still Reject for phase/window/membership/double-commit — those move no money.)
+        // EXCEPTION (2026-07-19 retransmission no-op, see apply_commit): an ALREADY-COMMITTED
+        // sender is skipped — record_commit can never reach its escrow for it (every reject,
+        // incl. DoubleCommit at lifecycle.rs:574-575, returns before the escrow at :578), and
+        // the duplicate typically ARRIVES broke because the first commit escrowed the sender's
+        // bond — pre-checking it would turn the DoubleCommit no-op into an InsufficientBalance
+        // block-reject and re-open the nonce wedge. Deterministic (reads only the lifecycle).
         let committer = Address(c.verifier.0);
-        let bal = self.accounts.get(&committer).map(|a| a.balance.raw()).unwrap_or(0);
-        if bal < c.bond {
-            self.job_lifecycles.insert(job_id, life);
-            return Err(StateError::InsufficientBalance);
+        let already_committed =
+            life.to_record().commitments.iter().any(|x| x.verifier == c.verifier.0);
+        if !already_committed {
+            let bal = self.accounts.get(&committer).map(|a| a.balance.raw()).unwrap_or(0);
+            if bal < c.bond {
+                self.job_lifecycles.insert(job_id, life);
+                return Err(StateError::InsufficientBalance);
+            }
         }
         let mut view = ChainLedger::new(self);
         let r = life.record_commit(&mut view, c, height);
@@ -3892,11 +3944,19 @@ impl ChainState {
         };
         // record_commit escrows c.bond from the committer (on Accepted) via the infallible
         // ChainHooks surface; pre-check the balance so that escrow cannot panic the ledger.
+        // EXCEPTION (2026-07-19 retransmission no-op, twin of lifecycle_record_commit): an
+        // already-committed panelist is skipped — record_commit rejects DoubleCommit
+        // (escalation_round.rs:270-271) before its escrow (:274), and the duplicate typically
+        // arrives broke (first commit escrowed the bond), so the pre-check would re-open the
+        // nonce wedge as an InsufficientBalance block-reject.
         let committer = Address(c.verifier.0);
-        let bal = self.accounts.get(&committer).map(|a| a.balance.raw()).unwrap_or(0);
-        if bal < c.bond {
-            self.escalation_rounds.insert(job_id, round);
-            return Err(StateError::InsufficientBalance);
+        let already_committed = round.commitments().iter().any(|x| x.verifier == c.verifier);
+        if !already_committed {
+            let bal = self.accounts.get(&committer).map(|a| a.balance.raw()).unwrap_or(0);
+            if bal < c.bond {
+                self.escalation_rounds.insert(job_id, round);
+                return Err(StateError::InsufficientBalance);
+            }
         }
         let mut view = ChainLedger::new(self);
         let r = round.record_commit(&mut view, c, height);
@@ -7861,8 +7921,9 @@ mod tests {
         let result = [7u8; 32];
         let (mut state, job) = claimed_job_state(Some(result));
         let v_bond = GameParams::default().verifier_bond;
-        // Extra funds so the double-commit below passes the balance pre-check and reaches the
-        // lifecycle's own DoubleCommit rejection (a broke committer dies earlier, on balance).
+        // Extra funds: this test pins the FUNDED-duplicate path (the balance pre-check passes
+        // and the lifecycle's own DoubleCommit fires); the broke-duplicate path is pinned by
+        // retransmitted_duplicate_commit_is_nonce_consuming_noop.
         state.accounts.get_mut(&addr(3)).unwrap().balance = Amount::from_raw(2 * v_bond);
         let pot0 = state.escrowed_for_job(&job);
         let c: Commitment = make_commitment(&ParticipantId(addr(3).0), &result, &[0u8; 32], v_bond);
@@ -7880,14 +7941,20 @@ mod tests {
         assert_eq!(rec.commitments.len(), 1);
         assert_eq!(state.accounts.get(&addr(3)).unwrap().nonce, 1);
 
-        // Double-commit from the same verifier: rejected, zero delta.
+        // Second commit from the same verifier (2026-07-19 retransmission semantics): the
+        // lifecycle rejects it DoubleCommit and the arm maps that to a nonce-consuming NO-OP —
+        // the block applies, but zero money moves and the FIRST commitment stands.
         let c2: Commitment = make_commitment(&ParticipantId(addr(3).0), &result, &[9u8; 32], v_bond);
-        let err = state
+        state
             .apply_block(&block_with(&state, 4, vec![unsigned(addr(3), 1, TxKind::Commit {
                 job_id: job, commit: c2.commit, bond: Amount::from_raw(v_bond) })]))
-            .unwrap_err();
-        assert!(err.to_string().contains("DoubleCommit"), "got: {err}");
+            .unwrap();
         assert_eq!(state.escrowed_for_job(&job), pot0 + v_bond, "still exactly one bond");
+        assert_eq!(bal(&state, 3), v_bond, "no second debit");
+        let rec = state.job_lifecycles.get(&job).unwrap().to_record();
+        assert_eq!(rec.commitments.len(), 1, "first commitment stands");
+        assert_eq!(rec.commitments[0].commit, c.commit, "and it is the FIRST payload");
+        assert_eq!(state.accounts.get(&addr(3)).unwrap().nonce, 2, "no-op consumed the nonce");
     }
 
     #[test]
@@ -7922,22 +7989,41 @@ mod tests {
     }
 
     #[test]
-    fn b4_batch_double_commit_rejects_whole_block_and_rolls_back_first() {
+    fn b4_batch_duplicate_commit_noops_and_wrong_bond_still_rolls_back_first() {
+        // Part 1 (2026-07-19 retransmission semantics): a duplicate Commit INSIDE one Batch is
+        // the same no-op class as across blocks — the batch applies, the first op's escrow
+        // stands, the second op records nothing.
         let result = [7u8; 32];
         let (mut state, job) = claimed_job_state(Some(result));
         let v_bond = GameParams::default().verifier_bond;
-        // Enough for two bonds: op2 must reach the lifecycle's DoubleCommit (not die on balance).
+        state.accounts.get_mut(&addr(3)).unwrap().balance = Amount::from_raw(2 * v_bond);
+        let pot0 = state.escrowed_for_job(&job);
+        let c: Commitment = make_commitment(&ParticipantId(addr(3).0), &result, &[0u8; 32], v_bond);
+        let op = TxKind::Commit { job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond) };
+        state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(3), 0, TxKind::Batch {
+                operations: vec![op.clone(), op.clone()] })]))
+            .unwrap();
+        assert_eq!(state.escrowed_for_job(&job), pot0 + v_bond, "exactly ONE bond escrowed");
+        assert_eq!(bal(&state, 3), v_bond, "exactly one debit");
+        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().commitments.len(), 1);
+        assert_eq!(state.accounts.get(&addr(3)).unwrap().nonce, 1, "batch bumps the nonce once");
+
+        // Part 2 (the P1-rollback pin this test always carried, on a still-invalid vehicle):
+        // a WrongBond second op is REAL invalidity ⇒ whole block rejected and the first op's
+        // accepted escrow erased with it.
+        let (mut state, job) = claimed_job_state(Some(result));
         state.accounts.get_mut(&addr(3)).unwrap().balance = Amount::from_raw(2 * v_bond);
         let pot0 = state.escrowed_for_job(&job);
         let root = state.compute_state_root();
         let c: Commitment = make_commitment(&ParticipantId(addr(3).0), &result, &[0u8; 32], v_bond);
-        let op = TxKind::Commit { job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond) };
+        let good = TxKind::Commit { job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond) };
+        let bad = TxKind::Commit { job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond + 1) };
         let err = state
             .apply_block(&block_with(&state, 3, vec![unsigned(addr(3), 0, TxKind::Batch {
-                operations: vec![op.clone(), op] })]))
+                operations: vec![good, bad] })]))
             .unwrap_err();
-        assert!(err.to_string().contains("DoubleCommit"), "got: {err}");
-        // P1 rollback: the FIRST op's accepted escrow is erased with the block.
+        assert!(err.to_string().contains("WrongBond"), "got: {err}");
         assert_eq!(state.escrowed_for_job(&job), pot0, "first op's bond escrow rolled back");
         assert_eq!(bal(&state, 3), 2 * v_bond, "committer refunded by the rollback");
         assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().commitments.len(), 0);
@@ -8009,19 +8095,164 @@ mod tests {
         assert_eq!(rec.reveals.len(), 1, "reveal landed without any driver/advance call");
         assert_eq!(rec.phase, commputer_pouw_onchain::lifecycle::PhaseRec::Revealing);
 
-        // Replay of the same reveal: AlreadyRevealed ⇒ block rejected, zero delta.
-        let err = state
+        // Replay of the same reveal (2026-07-19 retransmission semantics): AlreadyRevealed is
+        // mapped to a nonce-consuming NO-OP — the block applies, the first reveal stands.
+        state
             .apply_block(&block_with(&state, 4, vec![unsigned(addr(10), 1, TxKind::Reveal {
                 job_id: job, result_hash: [7u8; 32], salt: [0u8; 32] })]))
-            .unwrap_err();
-        assert!(err.to_string().contains("AlreadyRevealed"), "got: {err}");
-        // Mismatched salt from the other committer: RevealMismatch ⇒ rejected.
+            .unwrap();
+        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().reveals.len(), 1);
+        assert_eq!(state.accounts.get(&addr(10)).unwrap().nonce, 2, "replay consumed the nonce");
+        // Mismatched salt from the other committer: RevealMismatch ⇒ still rejected.
         let err = state
-            .apply_block(&block_with(&state, 4, vec![unsigned(addr(11), 0, TxKind::Reveal {
+            .apply_block(&block_with(&state, 5, vec![unsigned(addr(11), 0, TxKind::Reveal {
                 job_id: job, result_hash: [7u8; 32], salt: [9u8; 32] })]))
             .unwrap_err();
         assert!(err.to_string().contains("RevealMismatch"), "got: {err}");
         assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().reveals.len(), 1);
+    }
+
+    // --- retransmission-class Commit/Reveal rejects are nonce-consuming no-ops ---------------
+    // (2026-07-19, same class as the apply_claim_job losing-claim no-op: the verifier loop
+    // re-emits an unconfirmed Commit/Reveal after its cooldown, already signed at the NEXT
+    // nonce; if the first copy then applies, the duplicate must NOT reject the block or the
+    // sender's nonce wedges and its in-window Reveal can never apply → commit-no-reveal
+    // forfeiture burns an honest bond.)
+
+    #[test]
+    fn retransmitted_duplicate_commit_is_nonce_consuming_noop() {
+        let result = [7u8; 32];
+        let (mut state, job) = claimed_job_state(Some(result));
+        let v_bond = GameParams::default().verifier_bond;
+        // Deliberately NO balance top-up: addr(3) holds exactly one bond, so the first commit
+        // leaves it BROKE — the duplicate must no-op anyway (the wrapper's balance pre-check
+        // must not fire for an already-committed sender; no second escrow can happen).
+        let pot0 = state.escrowed_for_job(&job);
+        let c: Commitment = make_commitment(&ParticipantId(addr(3).0), &result, &[0u8; 32], v_bond);
+        let kind = TxKind::Commit { job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond) };
+        state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(3), 0, kind.clone())]))
+            .unwrap();
+        assert_eq!(state.escrowed_for_job(&job), pot0 + v_bond, "first commit escrowed the bond");
+        assert_eq!(bal(&state, 3), 0, "sender broke after the first bond");
+        // The retransmitted duplicate (same commitment, signed at the next nonce) applies Ok.
+        state
+            .apply_block(&block_with(&state, 4, vec![unsigned(addr(3), 1, kind)]))
+            .unwrap();
+        assert_eq!(state.accounts.get(&addr(3)).unwrap().nonce, 2, "nonce consumed by the no-op");
+        assert_eq!(state.escrowed_for_job(&job), pot0 + v_bond, "pot unchanged — no double escrow");
+        assert_eq!(
+            state.job_lifecycles.get(&job).unwrap().to_record().commitments.len(),
+            1,
+            "the FIRST commitment stands; the duplicate recorded nothing"
+        );
+    }
+
+    #[test]
+    fn retransmitted_duplicate_reveal_is_nonce_consuming_noop() {
+        // Same out-of-band Committing lifecycle as b4_reveal_self_advances_past_commit_by_and_
+        // accepts (commit window already closed), committed by addr(10) and addr(11).
+        let v_bond = GameParams::default().verifier_bond;
+        let (budget, e_bond, _) = fuel_mins();
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.apply_block(&block_with(&state, 1, vec![])).unwrap();
+        state.apply_block(&block_with(&state, 2, vec![])).unwrap();
+        state.accounts.get_or_create(lpaddr(0)).balance = Amount::from_raw(budget);
+        state.accounts.get_or_create(lpaddr(9)).balance = Amount::from_raw(e_bond);
+        for v in [addr(10), addr(11)] {
+            let a = state.accounts.get_or_create(v);
+            a.is_validator = true;
+            a.balance = Amount::from_raw(v_bond);
+        }
+        let job = [45u8; 32];
+        state.escrow_into_job(&lpaddr(0), job, budget).unwrap();
+        state.escrow_into_job(&lpaddr(9), job, e_bond).unwrap();
+        let mut lc = JobLifecycle::open(
+            job, IDENT, IDENT, IDENT, lpid(0), lpid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(),
+            vec![ParticipantId(addr(10).0), ParticipantId(addr(11).0)],
+            PhaseDeadlines { result_by: 1, commit_by: 1, reveal_by: 30 },
+        );
+        let stake = |_: &ParticipantId| 1u64;
+        assert_eq!(lc.submit_result(lpid(9), [7u8; 32], [42u8; 32], 1, &stake), EventResult::Accepted);
+        state.job_lifecycles.insert(job, lc);
+        for (i, a) in [addr(10), addr(11)].iter().enumerate() {
+            let c = make_commitment(&ParticipantId(a.0), &[7u8; 32], &[i as u8; 32], v_bond);
+            assert_eq!(state.lifecycle_record_commit(job, c, 1).unwrap(), Some(EventResult::Accepted));
+        }
+        let kind = TxKind::Reveal { job_id: job, result_hash: [7u8; 32], salt: [0u8; 32] };
+        state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(10), 0, kind.clone())]))
+            .unwrap();
+        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().reveals.len(), 1);
+        // The retransmitted duplicate (byte-identical reveal, next nonce) applies Ok.
+        state
+            .apply_block(&block_with(&state, 4, vec![unsigned(addr(10), 1, kind)]))
+            .unwrap();
+        assert_eq!(state.accounts.get(&addr(10)).unwrap().nonce, 2, "nonce consumed by the no-op");
+        assert_eq!(
+            state.job_lifecycles.get(&job).unwrap().to_record().reveals.len(),
+            1,
+            "the FIRST reveal stands; the duplicate recorded nothing"
+        );
+    }
+
+    #[test]
+    fn reveal_mismatch_from_committed_verifier_still_rejects_the_block() {
+        // Negative control pinning that ONLY the retransmission classes were relaxed: a reveal
+        // that does NOT match the sender's commitment is real invalidity and must stay
+        // whole-block invalidating — both before and after the sender's honest reveal.
+        let v_bond = GameParams::default().verifier_bond;
+        let (budget, e_bond, _) = fuel_mins();
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        state.apply_block(&block_with(&state, 1, vec![])).unwrap();
+        state.apply_block(&block_with(&state, 2, vec![])).unwrap();
+        state.accounts.get_or_create(lpaddr(0)).balance = Amount::from_raw(budget);
+        state.accounts.get_or_create(lpaddr(9)).balance = Amount::from_raw(e_bond);
+        for v in [addr(10), addr(11)] {
+            let a = state.accounts.get_or_create(v);
+            a.is_validator = true;
+            a.balance = Amount::from_raw(v_bond);
+        }
+        let job = [46u8; 32];
+        state.escrow_into_job(&lpaddr(0), job, budget).unwrap();
+        state.escrow_into_job(&lpaddr(9), job, e_bond).unwrap();
+        let mut lc = JobLifecycle::open(
+            job, IDENT, IDENT, IDENT, lpid(0), lpid(9), e_bond, budget, v_bond,
+            GameParams::default(), ResolutionParams::default(),
+            vec![ParticipantId(addr(10).0), ParticipantId(addr(11).0)],
+            PhaseDeadlines { result_by: 1, commit_by: 1, reveal_by: 30 },
+        );
+        let stake = |_: &ParticipantId| 1u64;
+        assert_eq!(lc.submit_result(lpid(9), [7u8; 32], [42u8; 32], 1, &stake), EventResult::Accepted);
+        state.job_lifecycles.insert(job, lc);
+        for (i, a) in [addr(10), addr(11)].iter().enumerate() {
+            let c = make_commitment(&ParticipantId(a.0), &[7u8; 32], &[i as u8; 32], v_bond);
+            assert_eq!(state.lifecycle_record_commit(job, c, 1).unwrap(), Some(EventResult::Accepted));
+        }
+        // (a) Committed-but-unrevealed sender, wrong salt ⇒ RevealMismatch ⇒ block rejected.
+        let err = state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(11), 0, TxKind::Reveal {
+                job_id: job, result_hash: [7u8; 32], salt: [9u8; 32] })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("RevealMismatch"), "got: {err}");
+        assert_eq!(state.accounts.get(&addr(11)).unwrap().nonce, 0, "rejected block bumps no nonce");
+        // (b) After an honest reveal, a DIVERGENT re-send from the same sender is NOT a
+        // retransmission: reveal_matches fails BEFORE the AlreadyRevealed check
+        // (lifecycle.rs record_reveal order), so it must still reject the block.
+        state
+            .apply_block(&block_with(&state, 3, vec![unsigned(addr(10), 0, TxKind::Reveal {
+                job_id: job, result_hash: [7u8; 32], salt: [0u8; 32] })]))
+            .unwrap();
+        let err = state
+            .apply_block(&block_with(&state, 4, vec![unsigned(addr(10), 1, TxKind::Reveal {
+                job_id: job, result_hash: [8u8; 32], salt: [0u8; 32] })]))
+            .unwrap_err();
+        assert!(err.to_string().contains("RevealMismatch"), "got: {err}");
+        assert_eq!(state.job_lifecycles.get(&job).unwrap().to_record().reveals.len(), 1);
+        assert_eq!(state.accounts.get(&addr(10)).unwrap().nonce, 1, "divergent re-send consumed no nonce");
     }
 
     // --- pending-job expiry ------------------------------------------------------------------
@@ -9605,6 +9836,60 @@ mod tests {
             1,
             "the round recorded the reveal"
         );
+    }
+
+    /// Retransmission no-ops on the ESCALATION arm (see the primary-lifecycle twin tests at
+    /// `retransmitted_duplicate_commit_is_nonce_consuming_noop`): a panel member's re-emitted
+    /// Commit/Reveal, signed at the next nonce, applies as a nonce-consuming no-op instead of
+    /// rejecting the block. Panelists hold EXACTLY one bond here (onchain_claimed_n), so the
+    /// duplicate commit also pins the broke-sender path (balance pre-check must not fire).
+    #[test]
+    fn escalation_panel_duplicate_commit_and_reveal_are_nonce_consuming_noops() {
+        let ids: Vec<u8> = (3u8..15).collect(); // 12 bonded verifiers ⇒ viable 7-member panel
+        let (mut state, job) = onchain_claimed_n(&ids);
+        drive_round1_split(&mut [&mut state], job);
+        let b8 = block_with(&state, 8, vec![]);
+        state.apply_block(&b8).unwrap();
+        let round = state.escalation_rounds.get(&job).expect("round opened");
+        let panel: Vec<ParticipantId> = round.panel().to_vec();
+        let v_bond = GameParams::default().verifier_bond;
+        let pot0 = state.escrowed_for_job(&job);
+        let p0 = panel[0];
+        // b9: p0's panel commit applies (escrows its whole v_bond balance ⇒ p0 is now broke).
+        let c = make_commitment(&p0, &[7u8; 32], &[0x77u8; 32], v_bond);
+        let kind = TxKind::Commit { job_id: job, commit: c.commit, bond: Amount::from_raw(v_bond) };
+        state
+            .apply_block(&block_with(&state, 9, vec![unsigned(Address(p0.0), 0, kind.clone())]))
+            .unwrap();
+        assert_eq!(state.escrowed_for_job(&job), pot0 + v_bond, "panel bond escrowed once");
+        assert_eq!(state.accounts.get(&Address(p0.0)).unwrap().balance.raw(), 0, "p0 broke");
+        // b10: the retransmitted duplicate (parent height 9 == commit_by ⇒ still in-window).
+        state
+            .apply_block(&block_with(&state, 10, vec![unsigned(Address(p0.0), 1, kind)]))
+            .unwrap();
+        assert_eq!(state.accounts.get(&Address(p0.0)).unwrap().nonce, 2, "nonce consumed");
+        assert_eq!(state.escrowed_for_job(&job), pot0 + v_bond, "pot unchanged — no double escrow");
+        assert_eq!(
+            state.escalation_rounds.get(&job).unwrap().commitments().len(),
+            1,
+            "the FIRST panel commitment stands; the duplicate recorded nothing"
+        );
+        // b10's own tail flipped the round to Revealing (10 > commit_by 9). b11: reveal applies.
+        assert_eq!(state.escalation_rounds.get(&job).unwrap().phase(), PanelPhase::Revealing);
+        let rk = TxKind::Reveal { job_id: job, result_hash: [7u8; 32], salt: [0x77u8; 32] };
+        state
+            .apply_block(&block_with(&state, 11, vec![unsigned(Address(p0.0), 2, rk.clone())]))
+            .unwrap();
+        assert_eq!(state.escalation_rounds.get(&job).unwrap().reveals().len(), 1);
+        // b12: the duplicate reveal (parent height 11 == reveal_by ⇒ in-window) no-ops; the
+        // round then settles in b12's OWN tail (12 > reveal_by) — the duplicate must not
+        // block settlement.
+        state
+            .apply_block(&block_with(&state, 12, vec![unsigned(Address(p0.0), 3, rk)]))
+            .unwrap();
+        assert_eq!(state.accounts.get(&Address(p0.0)).unwrap().nonce, 4, "reveal duplicate consumed the nonce");
+        assert!(state.escalation_rounds.is_empty(), "round settled + drained in the same block's tail");
+        assert_eq!(state.escrowed_for_job(&job), 0, "pot drained by the settle");
     }
 
     /// Task 6 (S7): a panel Commit trial-applied during Revealing (or a Reveal during Committing)
