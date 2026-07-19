@@ -225,19 +225,19 @@ fn phase_from_rec(p: PhaseRec) -> Phase {
         PhaseRec::Settled => Phase::Settled,
     }
 }
-fn commit_to_rec(c: &Commitment) -> CommitmentRec {
+pub(crate) fn commit_to_rec(c: &Commitment) -> CommitmentRec {
     CommitmentRec { verifier: c.verifier.0, commit: c.commit, bond: c.bond }
 }
-fn commit_from_rec(c: &CommitmentRec) -> Commitment {
+pub(crate) fn commit_from_rec(c: &CommitmentRec) -> Commitment {
     Commitment { verifier: ParticipantId(c.verifier), commit: c.commit, bond: c.bond }
 }
-fn reveal_to_rec(r: &Reveal) -> RevealRec {
+pub(crate) fn reveal_to_rec(r: &Reveal) -> RevealRec {
     RevealRec { verifier: r.verifier.0, result_hash: r.result_hash, salt: r.salt }
 }
-fn reveal_from_rec(r: &RevealRec) -> Reveal {
+pub(crate) fn reveal_from_rec(r: &RevealRec) -> Reveal {
     Reveal { verifier: ParticipantId(r.verifier), result_hash: r.result_hash, salt: r.salt }
 }
-fn outcome_to_rec(o: &SettlementOutcome) -> SettlementOutcomeRec {
+pub(crate) fn outcome_to_rec(o: &SettlementOutcome) -> SettlementOutcomeRec {
     SettlementOutcomeRec {
         worker_paid: o.worker_paid,
         verifiers_paid: o.verifiers_paid,
@@ -249,7 +249,7 @@ fn outcome_to_rec(o: &SettlementOutcome) -> SettlementOutcomeRec {
         slashed: o.slashed.iter().map(|(p, a)| (p.0, *a)).collect(),
     }
 }
-fn outcome_from_rec(o: &SettlementOutcomeRec) -> SettlementOutcome {
+pub(crate) fn outcome_from_rec(o: &SettlementOutcomeRec) -> SettlementOutcome {
     SettlementOutcome {
         worker_paid: o.worker_paid,
         verifiers_paid: o.verifiers_paid,

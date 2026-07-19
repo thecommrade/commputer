@@ -13,6 +13,7 @@
 //! block-hash/VRF. The panel re-executes the job (DA-fetched program) off-chain and submits
 //! commit/reveal txs that map to `record_commit`/`record_reveal`.
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use commputer_pouw::commit_reveal::reveal_matches;
 use commputer_pouw::committee::select_committee;
 use commputer_pouw::ids::ParticipantId;
@@ -22,6 +23,10 @@ use commputer_pouw::params::GameParams;
 use commputer_pouw::settlement::{settle_noquorum_confirmed, settle_noquorum_disputed};
 use commputer_pouw::verdict::compute_verdict;
 use crate::escrow_ledger::{EscrowLedger, Ledger};
+use crate::lifecycle::{
+    commit_from_rec, commit_to_rec, outcome_from_rec, outcome_to_rec, reveal_from_rec,
+    reveal_to_rec, CommitmentRec, RevealRec, SettlementOutcomeRec,
+};
 use crate::lifecycle::EscalationHandoff;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,10 +68,91 @@ pub enum EscalationOutcome {
     NoQuorum(SettlementOutcome),  // bounded terminal: panel split / too few available
 }
 
+// ── PoUW S2: persistable DTO for RocksDB persistence + state-root folding (mirrors the
+// JobLifecycleRecord pattern in lifecycle.rs verbatim) ───────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum PanelPhaseRec { Committing, Revealing, Settled }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct PanelDeadlinesRec { pub commit_by: u64, pub reveal_by: u64 }
+
+#[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
+pub enum EscalationOutcomeRec {
+    Confirmed(SettlementOutcomeRec),
+    Disputed(SettlementOutcomeRec),
+    NoQuorum(SettlementOutcomeRec),
+}
+
+/// Persistable, borsh-canonical mirror of `EscalationRound`. Omits `params` (genesis-anchored,
+/// re-injected in `from_record` — the C1 discipline). STABLE on-disk schema once the alpha reset
+/// ships — version it if the fields ever grow. Only Vec/Option/primitive/array fields ⇒ borsh is
+/// canonical ⇒ deterministic for the state-root fold.
+#[derive(Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
+pub struct EscalationRoundRecord {
+    pub job_id: [u8; 32],
+    pub program_hash: [u8; 32],
+    pub input_hash: [u8; 32],
+    pub da_root: [u8; 32],
+    pub budget: u64,
+    pub submitter: [u8; 32],
+    pub executor: [u8; 32],
+    pub executor_hash: [u8; 32],
+    pub executor_bond: u64,
+    pub verifier_bond: u64,
+    pub committee_reveals: Vec<RevealRec>,
+    pub committee_bonds: Vec<u64>,
+    pub deadlines: PanelDeadlinesRec,
+    pub panel: Vec<[u8; 32]>,
+    pub phase: PanelPhaseRec,
+    pub commitments: Vec<CommitmentRec>,
+    pub reveals: Vec<RevealRec>,
+    pub settled: Option<EscalationOutcomeRec>,
+}
+
+fn panel_phase_to_rec(p: PanelPhase) -> PanelPhaseRec {
+    match p {
+        PanelPhase::Committing => PanelPhaseRec::Committing,
+        PanelPhase::Revealing => PanelPhaseRec::Revealing,
+        PanelPhase::Settled => PanelPhaseRec::Settled,
+    }
+}
+fn panel_phase_from_rec(p: PanelPhaseRec) -> PanelPhase {
+    match p {
+        PanelPhaseRec::Committing => PanelPhase::Committing,
+        PanelPhaseRec::Revealing => PanelPhase::Revealing,
+        PanelPhaseRec::Settled => PanelPhase::Settled,
+    }
+}
+fn esc_outcome_to_rec(o: &EscalationOutcome) -> EscalationOutcomeRec {
+    match o {
+        EscalationOutcome::Confirmed(x) => EscalationOutcomeRec::Confirmed(outcome_to_rec(x)),
+        EscalationOutcome::Disputed(x) => EscalationOutcomeRec::Disputed(outcome_to_rec(x)),
+        EscalationOutcome::NoQuorum(x) => EscalationOutcomeRec::NoQuorum(outcome_to_rec(x)),
+    }
+}
+fn esc_outcome_from_rec(o: &EscalationOutcomeRec) -> EscalationOutcome {
+    match o {
+        EscalationOutcomeRec::Confirmed(x) => EscalationOutcome::Confirmed(outcome_from_rec(x)),
+        EscalationOutcomeRec::Disputed(x) => EscalationOutcome::Disputed(outcome_from_rec(x)),
+        EscalationOutcomeRec::NoQuorum(x) => EscalationOutcome::NoQuorum(outcome_from_rec(x)),
+    }
+}
+
+/// The program identity the panel needs to DA-fetch + re-execute the job. Carried from the
+/// settling lifecycle's record at open (lifecycle.rs P9/D8 put it there for exactly this handoff).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobIdentity {
+    pub program_hash: [u8; 32],
+    pub input_hash: [u8; 32],
+    pub da_root: [u8; 32],
+}
+
 /// The `k_escalate` panel re-execution round for one escalated job, as a deterministic multi-block
-/// state machine. Holds only plain data; `stake_of`/`eq`/`&mut EscrowLedger` are passed to methods.
+/// state machine. Holds only plain data; `stake_of`/`eq`/`&mut impl Ledger` are passed to methods.
 pub struct EscalationRound {
     job_id: [u8; 32],
+    identity: JobIdentity,
     // from the handoff
     budget: u64,
     submitter: ParticipantId,
@@ -94,6 +180,7 @@ impl EscalationRound {
     pub fn open(
         handoff: EscalationHandoff,
         job_id: [u8; 32],
+        identity: JobIdentity,
         candidates: Vec<ParticipantId>,
         seed: [u8; 32],
         params: GameParams,
@@ -113,6 +200,7 @@ impl EscalationRound {
         let panel = select_committee(&seed, &candidates, &executor, params.k_escalate, stake_of);
         Self {
             job_id,
+            identity,
             budget,
             submitter,
             executor,
@@ -137,6 +225,30 @@ impl EscalationRound {
 
     pub fn panel(&self) -> &[ParticipantId] {
         &self.panel
+    }
+
+    pub fn job_id(&self) -> [u8; 32] { self.job_id }
+    pub fn identity(&self) -> JobIdentity { self.identity }
+    pub fn deadlines(&self) -> PanelDeadlines { self.deadlines }
+    pub fn verifier_bond(&self) -> u64 { self.verifier_bond }
+    pub fn commitments(&self) -> &[Commitment] { &self.commitments }
+    pub fn reveals(&self) -> &[Reveal] { &self.reveals }
+    pub fn is_settled(&self) -> bool { self.settled.is_some() }
+    /// Due once the reveal window closes (mirror of JobLifecycle::should_settle).
+    pub fn should_settle(&self, height: u64) -> bool {
+        !self.is_settled() && height > self.deadlines.reveal_by
+    }
+    pub(crate) fn committee_bonds_total(&self) -> u64 {
+        self.committee_bonds.iter().sum()
+    }
+    /// The exact pot this round owns right now: the handoff-held sum (budget + Be +
+    /// round-1 revealers' bonds) plus every bond escrowed by a panel commit. The settle
+    /// preflight guard (state.rs) asserts `escrowed_for_job == expected_escrow()`.
+    pub fn expected_escrow(&self) -> u64 {
+        self.budget
+            + self.executor_bond
+            + self.committee_bonds_total()
+            + (self.commitments.len() as u64) * self.verifier_bond
     }
 
     /// A panel member commits (DA-Available ⇒ they call this; Abstain ⇒ they don't). Validates
@@ -270,6 +382,53 @@ impl EscalationRound {
         self.settled = Some(outcome.clone());
         outcome
     }
+
+    pub fn to_record(&self) -> EscalationRoundRecord {
+        EscalationRoundRecord {
+            job_id: self.job_id,
+            program_hash: self.identity.program_hash,
+            input_hash: self.identity.input_hash,
+            da_root: self.identity.da_root,
+            budget: self.budget,
+            submitter: self.submitter.0,
+            executor: self.executor.0,
+            executor_hash: self.executor_hash,
+            executor_bond: self.executor_bond,
+            verifier_bond: self.verifier_bond,
+            committee_reveals: self.committee_reveals.iter().map(reveal_to_rec).collect(),
+            committee_bonds: self.committee_bonds.clone(),
+            deadlines: PanelDeadlinesRec { commit_by: self.deadlines.commit_by, reveal_by: self.deadlines.reveal_by },
+            panel: self.panel.iter().map(|p| p.0).collect(),
+            phase: panel_phase_to_rec(self.phase),
+            commitments: self.commitments.iter().map(commit_to_rec).collect(),
+            reveals: self.reveals.iter().map(reveal_to_rec).collect(),
+            settled: self.settled.as_ref().map(esc_outcome_to_rec),
+        }
+    }
+
+    /// Rebuild from the DTO, RE-INJECTING the genesis-anchored `GameParams` (C1 discipline —
+    /// params are never persisted; settling a reloaded round with wrong params would fork).
+    pub fn from_record(rec: EscalationRoundRecord, params: GameParams) -> Self {
+        Self {
+            job_id: rec.job_id,
+            identity: JobIdentity { program_hash: rec.program_hash, input_hash: rec.input_hash, da_root: rec.da_root },
+            budget: rec.budget,
+            submitter: ParticipantId(rec.submitter),
+            executor: ParticipantId(rec.executor),
+            executor_hash: rec.executor_hash,
+            executor_bond: rec.executor_bond,
+            verifier_bond: rec.verifier_bond,
+            committee_reveals: rec.committee_reveals.iter().map(reveal_from_rec).collect(),
+            committee_bonds: rec.committee_bonds.clone(),
+            params,
+            deadlines: PanelDeadlines { commit_by: rec.deadlines.commit_by, reveal_by: rec.deadlines.reveal_by },
+            panel: rec.panel.iter().map(|b| ParticipantId(*b)).collect(),
+            phase: panel_phase_from_rec(rec.phase),
+            commitments: rec.commitments.iter().map(commit_from_rec).collect(),
+            reveals: rec.reveals.iter().map(reveal_from_rec).collect(),
+            settled: rec.settled.as_ref().map(esc_outcome_from_rec),
+        }
+    }
 }
 
 /// Partition `reveals` (with matching `bonds`) by whether each value is equivalent to `decided`.
@@ -309,6 +468,10 @@ mod tests {
         PanelDeadlines { commit_by: 20, reveal_by: 30 }
     }
 
+    fn test_identity() -> JobIdentity {
+        JobIdentity { program_hash: [0xAA; 32], input_hash: [0xBB; 32], da_root: [0xCC; 32] }
+    }
+
     /// 7 panel candidates (ids 20..27) — exactly k_escalate ⇒ the whole pool is the panel.
     fn panel7() -> Vec<ParticipantId> {
         (20u8..27).map(pid).collect()
@@ -336,7 +499,7 @@ mod tests {
     fn opens_in_committing_with_full_panel() {
         let h = handoff_3way(3960, 3960, 1650);
         let stake = |_: &ParticipantId| 1u64;
-        let r = EscalationRound::open(h, [1u8; 32], panel7(), [42u8; 32], GameParams::default(), deadlines(), &stake);
+        let r = EscalationRound::open(h, [1u8; 32], test_identity(), panel7(), [42u8; 32], GameParams::default(), deadlines(), &stake);
         assert_eq!(r.phase(), PanelPhase::Committing);
         assert_eq!(r.panel().len(), 7); // pool of exactly k_escalate=7 ⇒ whole pool
     }
@@ -377,7 +540,7 @@ mod tests {
 
     fn opened(job: [u8; 32], budget: u64, e_bond: u64, v_bond: u64) -> EscalationRound {
         let stake = |_: &ParticipantId| 1u64;
-        EscalationRound::open(handoff_3way(budget, e_bond, v_bond), job, panel7(), [42u8; 32], GameParams::default(), deadlines(), &stake)
+        EscalationRound::open(handoff_3way(budget, e_bond, v_bond), job, test_identity(), panel7(), [42u8; 32], GameParams::default(), deadlines(), &stake)
     }
 
     #[test]
@@ -619,7 +782,7 @@ mod tests {
         assert_eq!(l.total_supply(), total0);
 
         // --- Escalation round: the k_escalate=7 panel re-executes and confirms the executor ([7]). ---
-        let mut er = EscalationRound::open(handoff, job, panel.clone(), [99u8; 32], GameParams::default(), deadlines(), &stake);
+        let mut er = EscalationRound::open(handoff, job, test_identity(), panel.clone(), [99u8; 32], GameParams::default(), deadlines(), &stake);
         for (i, p) in panel.iter().enumerate() {
             assert_eq!(er.record_commit(&mut l, commit_of(*p, [7u8; 32], [i as u8; 32], v_bond), 15), EventResult::Accepted);
         }
@@ -632,5 +795,57 @@ mod tests {
         // The originally-held escrow now drains to 0 across the whole two-round lifecycle; conserved.
         assert_eq!(l.escrowed_for(&job), 0, "held escrow fully resolved by the escalation round");
         assert_eq!(l.total_supply(), total0, "supply invariant across both rounds");
+    }
+
+    #[test]
+    fn record_round_trips_through_dto_and_settles_identically() {
+        let (budget, e_bond, v_bond) = min_funding();
+        let job = [9u8; 32];
+        let committers = panel7();
+        let (mut l1, _t0) = held_ledger(job, budget, e_bond, v_bond);
+        let (mut l2, _t0b) = held_ledger(job, budget, e_bond, v_bond);
+        let mut r = opened(job, budget, e_bond, v_bond);
+        for (i, c) in committers.iter().enumerate() {
+            assert_eq!(r.record_commit(&mut l1, commit_of(*c, [7u8; 32], [i as u8; 32], v_bond), 15), EventResult::Accepted);
+        }
+        // Mirror the same bond escrows onto l2 (the ledger r2 will settle against). In production
+        // there is one persisted ChainState the reloaded round replays against, so its escrow
+        // already reflects every accepted commit at the moment of reload; l1/l2 here stand in for
+        // that single ledger, kept in lock-step so the two independent `EscalationRound` values
+        // settle against equivalent escrowed state.
+        l2.for_job(job);
+        for c in &committers {
+            l2.escrow(*c, v_bond);
+        }
+        // Round-trip mid-flight (Committing, with commitments) — the hard case.
+        let rec = r.to_record();
+        let mut r2 = EscalationRound::from_record(rec.clone(), GameParams::default());
+        assert_eq!(r2.to_record(), rec, "DTO round-trip is lossless");
+        // Both settle identically after identical reveals.
+        assert_eq!(r.advance(21), PanelPhase::Revealing);
+        assert_eq!(r2.advance(21), PanelPhase::Revealing);
+        for (i, c) in committers.iter().enumerate() {
+            assert_eq!(r.record_reveal(reveal_of(*c, [7u8; 32], [i as u8; 32]), 25), EventResult::Accepted);
+            assert_eq!(r2.record_reveal(reveal_of(*c, [7u8; 32], [i as u8; 32]), 25), EventResult::Accepted);
+        }
+        let o1 = r.settle(&mut l1, &ByteEq);
+        let o2 = r2.settle(&mut l2, &ByteEq);
+        assert_eq!(o1, o2, "reloaded round settles byte-identically");
+    }
+
+    #[test]
+    fn accessors_expose_identity_deadlines_and_expected_escrow() {
+        let (budget, e_bond, v_bond) = min_funding();
+        let job = [10u8; 32];
+        let mut l = EscrowLedger::new();
+        let r = opened(job, budget, e_bond, v_bond);
+        assert_eq!(r.job_id(), job);
+        assert_eq!(r.identity().program_hash, [0xAAu8; 32]); // whatever `opened` passes
+        assert!(r.should_settle(r.deadlines().reveal_by + 1));
+        assert!(!r.should_settle(r.deadlines().reveal_by));
+        // expected_escrow at open == handoff-held sum (no panel commitments yet).
+        let held = budget + e_bond /* + committee bonds per `opened`'s handoff */;
+        assert_eq!(r.expected_escrow(), held + r.committee_bonds_total());
+        let _ = &mut l;
     }
 }
