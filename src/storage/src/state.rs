@@ -956,13 +956,7 @@ impl ChainState {
             unbonding_stake: self.unbonding_stake.clone(),
             job_lifecycles: self.job_lifecycles.clone(),
             pending_jobs: self.pending_jobs.clone(),
-            // EscalationRound does not derive Clone (unlike JobLifecycle) — rebuild each round
-            // through its own DTO round-trip instead. Lossless (`to_record`/`from_record` are
-            // mutually inverse — see `record_round_trips_through_dto_and_settles_identically` in
-            // escalation_round.rs) and never runs game logic, exactly like a real clone would.
-            escalation_rounds: self.escalation_rounds.iter()
-                .map(|(id, er)| (*id, EscalationRound::from_record(er.to_record(), self.game_params.clone())))
-                .collect(),
+            escalation_rounds: self.escalation_rounds.clone(),
             total_emitted: self.total_emitted,
             total_burned: self.total_burned,
             current_epoch: self.current_epoch,

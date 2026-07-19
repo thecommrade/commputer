@@ -150,6 +150,7 @@ pub struct JobIdentity {
 
 /// The `k_escalate` panel re-execution round for one escalated job, as a deterministic multi-block
 /// state machine. Holds only plain data; `stake_of`/`eq`/`&mut impl Ledger` are passed to methods.
+#[derive(Clone)]
 pub struct EscalationRound {
     job_id: [u8; 32],
     identity: JobIdentity,
