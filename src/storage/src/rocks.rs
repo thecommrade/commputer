@@ -8,6 +8,7 @@ use tracing::info;
 use crate::account::Account;
 use crate::state::{PendingJobRecord, UnbondingChunk};
 use commputer_pouw_onchain::lifecycle::JobLifecycleRecord;
+use commputer_pouw_onchain::escalation_round::EscalationRoundRecord;
 
 const CF_BLOCKS: &str = "blocks";
 const CF_BLOCK_HEIGHTS: &str = "block_heights";
@@ -27,6 +28,10 @@ const CF_LIFECYCLE: &str = "job_lifecycles";
 // value per raw 32-byte job_id key). Carries (submitter, budget, program identity, claim deadline)
 // from SubmitJobV2 to ClaimJob. Auto-created on existing DBs.
 const CF_PENDING: &str = "pending_jobs";
+// EscalationRound (2026-07-19): dedicated CF for the second-panel escalation rounds (borsh
+// EscalationRoundRecord DTO value per raw 32-byte job_id key). The 6th consensus map. Auto-created
+// on existing DBs (create_missing_column_families).
+const CF_ESCALATION: &str = "escalation_rounds";
 
 pub const META_TOTAL_EMITTED: &str = "total_emitted";
 pub const META_TOTAL_BURNED: &str = "total_burned";
@@ -76,7 +81,7 @@ impl RocksStore {
 
         let cf_names = [
             CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
-            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING,
+            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING, CF_ESCALATION,
         ];
         let cfs: Vec<ColumnFamilyDescriptor> = cf_names
             .iter()
@@ -379,7 +384,7 @@ impl RocksStore {
         let mut batch = rocksdb::WriteBatch::default();
         for cf_name in &[
             CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
-            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING,
+            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING, CF_ESCALATION,
         ] {
             let cf = self.cf(cf_name);
             batch.delete_range_cf(&cf, range_start, range_end);
@@ -627,7 +632,57 @@ impl RocksStore {
         batch.delete_cf(&cf, job_id);
     }
 
-    /// Wipe ONLY the five PoUW consensus-map CFs (standalone commit). `try_reorg` uses the
+    // EscalationRound (2026-07-19): second-panel escalation-round persistence (borsh
+    // EscalationRoundRecord per raw 32-byte job_id).
+    pub fn put_escalation(&self, job_id: &[u8; 32], rec: &EscalationRoundRecord) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_ESCALATION);
+        let encoded = borsh::to_vec(rec).expect("escalation record borsh serialization should not fail");
+        self.db.put_cf(&cf, job_id, &encoded)
+    }
+    pub fn delete_escalation(&self, job_id: &[u8; 32]) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_ESCALATION);
+        self.db.delete_cf(&cf, job_id)
+    }
+    /// M1: fail-HARD load of the escalation-round consensus map (see `all_escrow`).
+    pub fn all_escalation(&self) -> Result<HashMap<[u8; 32], EscalationRoundRecord>, String> {
+        let cf = self.cf(CF_ESCALATION);
+        let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        let mut map = HashMap::new();
+        for item in iter {
+            match item {
+                Ok((key, value)) if key.len() == 32 => {
+                    match borsh::from_slice::<EscalationRoundRecord>(&value) {
+                        Ok(rec) => {
+                            let mut k = [0u8; 32];
+                            k.copy_from_slice(&key);
+                            map.insert(k, rec);
+                        }
+                        Err(e) => return Err(format!(
+                            "un-decodable CF_ESCALATION row — consensus state is unreadable; \
+                             resync from a fresh data dir: {e}"
+                        )),
+                    }
+                }
+                Ok((key, _)) => return Err(format!(
+                    "corrupt CF_ESCALATION row (key {}B) — consensus state is unreadable; \
+                     resync from a fresh data dir", key.len()
+                )),
+                Err(e) => return Err(format!("CF_ESCALATION iterator error: {e}")),
+            }
+        }
+        Ok(map)
+    }
+    pub fn batch_put_escalation(&self, batch: &mut WriteBatch, job_id: &[u8; 32], rec: &EscalationRoundRecord) {
+        let cf = self.cf(CF_ESCALATION);
+        let encoded = borsh::to_vec(rec).expect("escalation record borsh serialization should not fail");
+        batch.put_cf(&cf, job_id, &encoded);
+    }
+    pub fn batch_delete_escalation(&self, batch: &mut WriteBatch, job_id: &[u8; 32]) {
+        let cf = self.cf(CF_ESCALATION);
+        batch.delete_cf(&cf, job_id);
+    }
+
+    /// Wipe ONLY the six PoUW consensus-map CFs (standalone commit). `try_reorg` uses the
     /// batch variant below so its clear+rewrite is a single atomic WriteBatch.
     pub fn clear_consensus_maps(&self) -> Result<(), rocksdb::Error> {
         let mut batch = WriteBatch::default();
@@ -645,12 +700,12 @@ impl RocksStore {
         batch.delete_range_cf(&cf, range_start, range_end);
     }
 
-    /// Append full-range deletes of all five consensus-map CFs to `batch` (same atomicity
+    /// Append full-range deletes of all six consensus-map CFs to `batch` (same atomicity
     /// contract as `batch_clear_accounts`).
     pub fn batch_clear_consensus_maps(&self, batch: &mut WriteBatch) {
         let range_start: &[u8] = &[];
         let range_end: &[u8] = &[0xFF; 128];
-        for cf_name in &[CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING] {
+        for cf_name in &[CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING, CF_ESCALATION] {
             let cf = self.cf(cf_name);
             batch.delete_range_cf(&cf, range_start, range_end);
         }
@@ -672,7 +727,7 @@ impl RocksStore {
         let mut total: u64 = 0;
         for cf_name in &[
             CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
-            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING,
+            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING, CF_ESCALATION,
         ] {
             if let Some(cf) = self.db.cf_handle(cf_name)
                 && let Ok(Some(size_str)) = self.db.property_value_cf(&cf, "rocksdb.estimate-live-data-size")
@@ -823,6 +878,18 @@ mod tests {
         store.db.put_cf(&cf2, [1u8; 7], b"x").unwrap();
         let err2 = store.all_pending().unwrap_err();
         assert!(err2.contains("corrupt CF_PENDING"), "got: {err2}");
+    }
+
+    #[test]
+    fn m1_all_escalation_fails_hard_on_undecodable_row() {
+        // M1: an undecodable borsh value in a consensus CF fails hard (not warn-skip).
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksStore::open(dir.path()).unwrap();
+        assert!(store.all_escalation().unwrap().is_empty(), "empty CF loads Ok");
+        let cf = store.cf(CF_ESCALATION);
+        store.db.put_cf(&cf, [7u8; 32], b"not-a-borsh-record").unwrap();
+        let err = store.all_escalation().unwrap_err();
+        assert!(err.contains("un-decodable CF_ESCALATION"), "got: {err}");
     }
 
     #[test]
