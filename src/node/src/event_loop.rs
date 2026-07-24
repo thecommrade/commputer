@@ -4031,6 +4031,16 @@ fn extract_ip_from_multiaddr(addr: &str) -> Option<String> {
         if (*part == "ip4" || *part == "ip6") && i + 1 < parts.len() {
             return Some(parts[i + 1].to_string());
         }
+        // Connections dialed via the compiled-in DNS seed default carry a
+        // /dns4-style remote address, not /ip4. The hostname is a valid peer
+        // identifier for tracking: without it a DNS-dialed node never enters
+        // peer_ips, the sync driver never queries heights, and the 30s solo
+        // fallback wedges the node at height 0 (observed live, 2026-07-24).
+        if (*part == "dns4" || *part == "dns6" || *part == "dns" || *part == "dnsaddr")
+            && i + 1 < parts.len()
+        {
+            return Some(parts[i + 1].to_string());
+        }
     }
     None
 }
@@ -4083,4 +4093,46 @@ pub fn bootstrap_note() {
 #[allow(dead_code)]
 pub fn config_reload_note() {
     tracing::info!("Feature 20: Config hot reload — send SIGHUP to reload log level");
+}
+
+#[cfg(test)]
+mod multiaddr_ip_tests {
+    use super::extract_ip_from_multiaddr;
+
+    #[test]
+    fn extracts_ip4_and_ip6() {
+        assert_eq!(
+            extract_ip_from_multiaddr("/ip4/174.138.35.16/tcp/9000/p2p/12D3KooWabc"),
+            Some("174.138.35.16".to_string())
+        );
+        assert_eq!(
+            extract_ip_from_multiaddr("/ip6/::1/udp/9000/quic-v1"),
+            Some("::1".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_dns_seed_hostname() {
+        // The exact remote-address shape of a compiled-DNS-default dial — the
+        // 2026-07-24 launch-night wedge: this returning None kept the seed out
+        // of peer_ips, so sync never started and the node stuck at height 0.
+        assert_eq!(
+            extract_ip_from_multiaddr("/dns4/seed.commputer.xyz/udp/9000/quic-v1"),
+            Some("seed.commputer.xyz".to_string())
+        );
+        assert_eq!(
+            extract_ip_from_multiaddr("/dns4/seed.commputer.xyz/tcp/9000"),
+            Some("seed.commputer.xyz".to_string())
+        );
+        assert_eq!(
+            extract_ip_from_multiaddr("/dnsaddr/seed.commputer.xyz"),
+            Some("seed.commputer.xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn no_address_component_returns_none() {
+        assert_eq!(extract_ip_from_multiaddr("/p2p/12D3KooWabc"), None);
+        assert_eq!(extract_ip_from_multiaddr(""), None);
+    }
 }
