@@ -225,18 +225,30 @@ async function refresh() {
     }
 }
 
-// OS detection for download
-// No prebuilt release assets are published yet — keep the button pointed at the
-// source repo until the first tagged release ships, then restore per-OS asset links.
+// OS detection for download — points the button at the matching asset of the
+// latest tagged release (GitHub's /releases/latest/download/ URLs are stable
+// across versions, so this needs no per-release updates).
 function detectOS() {
     const ua = navigator.userAgent.toLowerCase();
     const el = document.getElementById('detected-os');
+    const btn = document.getElementById('download-btn');
 
+    const base = 'https://github.com/thecommrade/commputer/releases/latest/download/';
     let os = 'your platform';
-    if (ua.includes('mac')) os = 'macOS';
-    else if (ua.includes('linux')) os = 'Linux';
-    else if (ua.includes('win')) os = 'Windows';
+    let asset = null;
+    if (ua.includes('mac')) { os = 'macOS'; asset = 'commputer-macos-aarch64'; }
+    else if (ua.includes('win')) { os = 'Windows'; asset = 'commputer-windows-x86_64.exe'; }
+    else if (ua.includes('linux')) { os = 'Linux'; asset = 'commputer-linux-x86_64'; }
     if (el) el.textContent = os;
+    if (btn) {
+        if (asset) {
+            btn.href = base + asset;
+            btn.textContent = 'Download for ' + os;
+        } else {
+            btn.href = 'https://github.com/thecommrade/commputer/releases/latest';
+            btn.textContent = 'View all releases';
+        }
+    }
 }
 
 // Copy text to clipboard

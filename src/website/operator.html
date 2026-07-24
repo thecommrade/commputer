@@ -6,7 +6,7 @@
     <title>Commputer — Run a Node</title>
     <meta name="description" content="5-minute operator guide: how to run a Commputer node, register as a validator, and earn block rewards.">
     <meta property="og:title" content="Commputer — Run a Node">
-    <meta property="og:description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources. Local testnet running; mainnet not yet launched.">
+    <meta property="og:description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources. Public alpha testnet live; mainnet not yet launched.">
     <meta property="og:image" content="https://commputer.xyz/og-image.png">
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -45,13 +45,13 @@
             <div class="steps">
                 <div class="step">
                     <span class="step-num">01</span>
-                    <h3>Build the Binary</h3>
-                    <p>Prebuilt binaries ship with the first tagged release. For now, build from source &mdash; install Rust (rustup.rs), then:</p>
+                    <h3>Install the Binary</h3>
+                    <p>One command downloads the latest release for your platform and verifies its SHA-256 checksum (Linux/macOS):</p>
                     <div class="code-block">
-                        <code>git clone https://github.com/thecommrade/commputer &amp;&amp; cd commputer &amp;&amp; cargo build --release</code>
-                        <button class="copy-btn" onclick="copyText('git clone https://github.com/thecommrade/commputer &amp;&amp; cd commputer &amp;&amp; cargo build --release')">copy</button>
+                        <code>curl -sSf https://commputer.xyz/install.sh | sh</code>
+                        <button class="copy-btn" onclick="copyText('curl -sSf https://commputer.xyz/install.sh | sh')">copy</button>
                     </div>
-                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">The binary lands at <code style="color: var(--accent);">target/release/commputer</code>. Copy it somewhere on your PATH (e.g. <code style="color: var(--accent);">~/.local/bin</code>).</p>
+                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">Prefer to build from source? Install Rust (rustup.rs), then <code style="color: var(--accent);">git clone https://github.com/thecommrade/commputer &amp;&amp; cd commputer &amp;&amp; cargo build --release</code> &mdash; the binary lands at <code style="color: var(--accent);">target/release/commputer</code>. Direct downloads for every platform are on the <a href="https://github.com/thecommrade/commputer/releases/latest" style="color: var(--accent);">releases page</a>.</p>
                 </div>
 
                 <div class="step">
@@ -163,7 +163,7 @@
 
                 <details>
                     <summary>What's the testnet vs mainnet difference?</summary>
-                    <p>Testnet will be the public proving ground for Commputer — consensus is currently verified in local multi-node testing, with a wider public testnet as the next milestone. Run a node to learn how the system works. Mainnet launches May 2027 or sooner, with real economic value. Testnet coins are worthless. Plan to migrate your validator to mainnet when it launches.</p>
+                    <p>The public alpha testnet is live now — it is Commputer's proving ground, anchored by a public seed node with bonded validators finalizing blocks. Run a node to learn how the system works and help harden the network. Mainnet launches May 2027 or sooner, with real economic value. Testnet coins are worthless. Plan to migrate your validator to mainnet when it launches.</p>
                 </details>
 
                 <details>

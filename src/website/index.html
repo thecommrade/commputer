@@ -104,10 +104,10 @@
             </div>
             <div style="background: var(--bg-card); border: 1px solid var(--border); padding: 24px; margin-bottom: 32px;">
                 <h3 style="color: var(--accent); margin-bottom: 12px;">What's Live Right Now</h3>
-                <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px;"><strong style="color: var(--text);">Update — June 10, 2026:</strong> Multi-node consensus verified in local testing — independent node instances finalize blocks and stay in agreement on the same chain, with no crashes. Anti-scale detection (datacenter / colocation) tightened. Next: a wider public testnet.</p>
+                <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px;"><strong style="color: var(--text);">Update — July 24, 2026:</strong> The public alpha testnet is LIVE. A public seed node anchors the network, the live API (api.commputer.xyz) feeds the dashboard below, the faucet dispenses testnet coins, and bonded validators finalize blocks around the clock. Prebuilt binaries for Linux, macOS, and Windows ship with every tagged release. Formation hardening is in progress — alpha means rough edges.</p>
                 <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px;"><strong style="color: var(--text);">Phase 1: Consensus Stability (Live)</strong></p>
                 <ul style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px; padding-left: 24px;">
-                    <li>Local testnet running: consensus works, blocks finalize, coins are mined and burned</li>
+                    <li>Public alpha testnet running: consensus works, blocks finalize, coins are mined and burned</li>
                     <li>Real network stats: peer count, block height, circulating supply, epoch number</li>
                     <li>Validator registration (testnet): run a node, stake 0.01 COMME, earn block rewards</li>
                     <li>Block explorer: search blocks by height, view transactions, trace accounts</li>
@@ -164,20 +164,28 @@
         <section id="download">
             <h2>// Download</h2>
             <div class="content-block">
+                <p style="font-size: 13px; color: var(--text-dim); margin-bottom: 16px;">Public <strong style="color: var(--text);">alpha</strong> testnet &mdash; expect rough edges; your node may occasionally need a restart while formation hardening lands. Testnet coins have no monetary value.</p>
                 <div id="download-detected">
                     <p>Detected: <strong id="detected-os">Unknown</strong></p>
-                    <a href="https://github.com/thecommrade/commputer" class="btn-primary" id="download-btn">Binaries coming soon &mdash; build from source</a>
+                    <a href="https://github.com/thecommrade/commputer/releases/latest" class="btn-primary" id="download-btn">Download</a>
                 </div>
                 <div class="install-command">
-                    <p>Build from source (requires Rust &mdash; rustup.rs):</p>
+                    <p>Or install with one command (Linux/macOS):</p>
                     <div class="code-block">
-                        <code>git clone https://github.com/thecommrade/commputer &amp;&amp; cd commputer &amp;&amp; cargo build --release</code>
-                        <button class="copy-btn" onclick="copyText('git clone https://github.com/thecommrade/commputer &amp;&amp; cd commputer &amp;&amp; cargo build --release')">copy</button>
+                        <code>curl -sSf https://commputer.xyz/install.sh | sh</code>
+                        <button class="copy-btn" onclick="copyText('curl -sSf https://commputer.xyz/install.sh | sh')">copy</button>
                     </div>
                 </div>
                 <details class="other-platforms">
-                    <summary>All platforms</summary>
-                    <p style="font-size: 13px; color: var(--text-dim); padding: 8px 0;">Prebuilt binaries (Linux/macOS, x86_64 + aarch64) with SHA-256 checksums will be published with the first tagged release. Until then, build from source with the command above.</p>
+                    <summary>All platforms &amp; checksums</summary>
+                    <ul style="font-size: 13px; color: var(--text-dim); padding: 8px 0 8px 24px;">
+                        <li><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-linux-x86_64" style="color: var(--accent);">Linux x86_64</a></li>
+                        <li><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-macos-aarch64" style="color: var(--accent);">macOS Apple Silicon</a></li>
+                        <li><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-macos-x86_64" style="color: var(--accent);">macOS Intel</a></li>
+                        <li><a href="https://github.com/thecommrade/commputer/releases/latest/download/commputer-windows-x86_64.exe" style="color: var(--accent);">Windows x86_64 (experimental)</a></li>
+                        <li><a href="https://github.com/thecommrade/commputer/releases/latest/download/checksums-sha256.txt" style="color: var(--accent);">SHA-256 checksums</a></li>
+                    </ul>
+                    <p style="font-size: 13px; color: var(--text-dim); padding: 8px 0;">Prefer source? Install Rust (rustup.rs), then:<br><code style="color: var(--accent);">git clone https://github.com/thecommrade/commputer &amp;&amp; cd commputer &amp;&amp; cargo build --release</code></p>
                 </details>
             </div>
         </section>
