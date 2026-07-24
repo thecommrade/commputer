@@ -36,7 +36,7 @@ function timeAgo(timestamp) {
 
 // Item 48: Show loading skeleton
 function showLoading() {
-    const ids = ['stat-height', 'stat-validators', 'stat-epoch', 'stat-circulating', 'stat-burned', 'stat-remaining', 'stat-pending'];
+    const ids = ['stat-height', 'stat-validators', 'stat-epoch', 'stat-circulating', 'stat-burned', 'stat-remaining', 'stat-pending', 'stat-accounts'];
     ids.forEach(id => {
         const el = document.getElementById(id);
         if (el && el.textContent === '—') {
@@ -53,12 +53,14 @@ function hideLoading() {
 function updateDashboard(data, source) {
     hideLoading();
     document.getElementById('stat-height').textContent = formatNumber(data.height);
-    document.getElementById('stat-validators').textContent = formatNumber(data.validators || data.accounts || '—');
+    document.getElementById('stat-validators').textContent = (data.validators == null) ? '—' : formatNumber(data.validators);
     document.getElementById('stat-epoch').textContent = formatNumber(data.epoch);
     document.getElementById('stat-circulating').textContent = formatComme(data.circulating);
     document.getElementById('stat-burned').textContent = formatComme(data.burned);
     document.getElementById('stat-remaining').textContent = formatComme(data.remaining);
     document.getElementById('stat-pending').textContent = formatNumber(data.pending_txs);
+    const accountsEl = document.getElementById('stat-accounts'); // only the stats page has this tile
+    if (accountsEl) accountsEl.textContent = formatNumber(data.accounts);
 
     const badge = document.getElementById('status-badge');
     const dot = badge.querySelector('.status-dot');
@@ -134,9 +136,21 @@ async function fetchFallback() {
 }
 
 // Item 39: Fetch and display recent blocks
+// Columns match the static table in stats.html (Height/Hash/Time/Txs, class blocks-table).
+// On stats.html, fill only #blocks-tbody so the heading and table survive; the homepage
+// container has no tbody, so render the whole table there.
 async function fetchRecentBlocks() {
     const container = document.getElementById('recent-blocks');
     if (!container) return;
+    const tbody = document.getElementById('blocks-tbody');
+
+    const renderMessage = (msg) => {
+        if (tbody) {
+            tbody.innerHTML = `<tr><td colspan="4" class="empty">${msg}</td></tr>`;
+        } else {
+            container.innerHTML = `<h3>Recent Blocks</h3><p style="color: var(--text-dim); text-align: center;">${msg}</p>`;
+        }
+    };
 
     try {
         const res = await fetch(RPC_ENDPOINT + '/blocks?limit=10', { signal: AbortSignal.timeout(5000) });
@@ -144,25 +158,28 @@ async function fetchRecentBlocks() {
         const data = await res.json();
 
         if (!data.blocks || data.blocks.length === 0) {
-            container.innerHTML = '<p style="color: var(--text-dim); text-align: center;">No blocks yet — waiting for network...</p>';
+            renderMessage('No blocks yet — waiting for network...');
             return;
         }
 
-        let html = '<table class="block-table"><thead><tr><th>Height</th><th>Txs</th><th>Time</th><th>Producer</th></tr></thead><tbody>';
+        let rows = '';
         for (const block of data.blocks) {
-            const time = block.timestamp ? new Date(block.timestamp * 1000).toLocaleTimeString() : '—';
-            const producer = block.producer ? truncAddr(JSON.stringify(block.producer)) : 'genesis';
-            html += `<tr>
+            const time = block.timestamp ? new Date(block.timestamp * 1000).toLocaleString() : '—';
+            const hash = block.hash ? truncAddr(String(block.hash)) : '—';
+            rows += `<tr>
                 <td><a href="#" onclick="searchBlock(${block.height}); return false;">${block.height}</a></td>
-                <td>${block.tx_count || 0}</td>
+                <td class="mono">${hash}</td>
                 <td>${time}</td>
-                <td class="mono">${producer}</td>
+                <td>${block.tx_count || 0}</td>
             </tr>`;
         }
-        html += '</tbody></table>';
-        container.innerHTML = html;
+        if (tbody) {
+            tbody.innerHTML = rows;
+        } else {
+            container.innerHTML = '<h3>Recent Blocks</h3><table class="blocks-table"><thead><tr><th>Height</th><th>Hash</th><th>Time</th><th>Txs</th></tr></thead><tbody>' + rows + '</tbody></table>';
+        }
     } catch (e) {
-        container.innerHTML = '<p style="color: var(--text-dim); text-align: center;">Block data unavailable</p>';
+        renderMessage('Block data unavailable');
     }
 }
 
@@ -208,33 +225,29 @@ async function refresh() {
     }
 }
 
-// OS detection for download
+// OS detection for download — points the button at the matching asset of the
+// latest tagged release (GitHub's /releases/latest/download/ URLs are stable
+// across versions, so this needs no per-release updates).
 function detectOS() {
     const ua = navigator.userAgent.toLowerCase();
     const el = document.getElementById('detected-os');
     const btn = document.getElementById('download-btn');
 
     const base = 'https://github.com/thecommrade/commputer/releases/latest/download/';
-    if (ua.includes('mac')) {
-        if (el) el.textContent = 'macOS';
-        if (btn) {
-            btn.textContent = 'Download for macOS';
-            btn.href = base + (ua.includes('arm') || ua.includes('aarch64') ? 'commputer-macos-aarch64' : 'commputer-macos-x86_64');
+    let os = 'your platform';
+    let asset = null;
+    if (ua.includes('mac')) { os = 'macOS'; asset = 'commputer-macos-aarch64'; }
+    else if (ua.includes('win')) { os = 'Windows'; asset = 'commputer-windows-x86_64.exe'; }
+    else if (ua.includes('linux')) { os = 'Linux'; asset = 'commputer-linux-x86_64'; }
+    if (el) el.textContent = os;
+    if (btn) {
+        if (asset) {
+            btn.href = base + asset;
+            btn.textContent = 'Download for ' + os;
+        } else {
+            btn.href = 'https://github.com/thecommrade/commputer/releases/latest';
+            btn.textContent = 'View all releases';
         }
-    } else if (ua.includes('linux')) {
-        if (el) el.textContent = 'Linux';
-        if (btn) {
-            btn.textContent = 'Download for Linux';
-            btn.href = base + 'commputer-linux-x86_64';
-        }
-    } else if (ua.includes('win')) {
-        if (el) el.textContent = 'Windows';
-        if (btn) {
-            btn.textContent = 'Download for Windows (coming soon)';
-            btn.style.opacity = '0.5';
-        }
-    } else {
-        if (el) el.textContent = 'your platform';
     }
 }
 

@@ -6,7 +6,7 @@
     <title>Commputer — Run a Node</title>
     <meta name="description" content="5-minute operator guide: how to run a Commputer node, register as a validator, and earn block rewards.">
     <meta property="og:title" content="Commputer — Run a Node">
-    <meta property="og:description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources.">
+    <meta property="og:description" content="A Layer 1 blockchain that builds a distributed supercomputer from regular people's idle desktop resources. Public alpha testnet live; mainnet not yet launched.">
     <meta property="og:image" content="https://commputer.xyz/og-image.png">
     <link rel="icon" href="favicon.svg" type="image/svg+xml">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -46,12 +46,12 @@
                 <div class="step">
                     <span class="step-num">01</span>
                     <h3>Install the Binary</h3>
-                    <p>Download the Commputer node for your platform. One file, no dependencies.</p>
+                    <p>One command downloads the latest release for your platform and verifies its SHA-256 checksum (Linux/macOS):</p>
                     <div class="code-block">
                         <code>curl -sSf https://commputer.xyz/install.sh | sh</code>
                         <button class="copy-btn" onclick="copyText('curl -sSf https://commputer.xyz/install.sh | sh')">copy</button>
                     </div>
-                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">This downloads the latest binary and places it in <code style="color: var(--accent);">~/.local/bin/commputer</code>. If that directory isn't in your PATH, the installer will tell you how to add it.</p>
+                    <p style="font-size: 12px; color: var(--text-dim); margin-top: 8px;">Prefer to build from source? Install Rust (rustup.rs), then <code style="color: var(--accent);">git clone https://github.com/thecommrade/commputer &amp;&amp; cd commputer &amp;&amp; cargo build --release</code> &mdash; the binary lands at <code style="color: var(--accent);">target/release/commputer</code>. Direct downloads for every platform are on the <a href="https://github.com/thecommrade/commputer/releases/latest" style="color: var(--accent);">releases page</a>.</p>
                 </div>
 
                 <div class="step">
@@ -143,7 +143,7 @@
 
                 <details>
                     <summary>How often do I earn rewards?</summary>
-                    <p>Block rewards are awarded per block (~every 2 seconds) and credited to your account automatically. The first reward comes at the next epoch boundary (which occurs roughly every 1800 blocks, or ~1 hour). All rewards are final and can't be taken away.</p>
+                    <p>Block rewards are awarded per block (~every 2 seconds) and credited to your account automatically. The first reward comes at the next epoch boundary (which occurs roughly every 1800 blocks, or ~1 hour). Earned block rewards are final and can't be taken away. (Separately, once compute jobs go live, bonds staked on job verification can be slashed for dishonest verdicts &mdash; that never touches block rewards already earned.)</p>
                 </details>
 
                 <details>
@@ -163,7 +163,7 @@
 
                 <details>
                     <summary>What's the testnet vs mainnet difference?</summary>
-                    <p>Testnet will be the public proving ground for Commputer — consensus is currently verified in local multi-node testing, with a wider public testnet as the next milestone. Run a node to learn how the system works. Mainnet launches May 2027 or sooner, with real economic value. Testnet coins are worthless. Plan to migrate your validator to mainnet when it launches.</p>
+                    <p>The public alpha testnet is live now — it is Commputer's proving ground, anchored by a public seed node with bonded validators finalizing blocks. Run a node to learn how the system works and help harden the network. Mainnet launches May 2027 or sooner, with real economic value. Testnet coins are worthless. Plan to migrate your validator to mainnet when it launches.</p>
                 </details>
 
                 <details>
@@ -194,7 +194,7 @@
                 <div class="footer-links">
                     <a href="https://github.com/thecommrade/commputer">GitHub</a>
                     <a href="index.html#whitepaper">Whitepaper</a>
-                    <a href="#">Twitter</a>
+                    <a href="https://x.com/CommputerCoin">Twitter</a>
                     <a href="mailto:commrade@commputer.xyz">Contact</a>
                 </div>
                 <p class="footer-copy">$COMME &middot; 2B supply &middot; burn-heavy &middot; scale hurts</p>
