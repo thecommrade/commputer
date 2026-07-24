@@ -1007,6 +1007,11 @@ async fn run_node(
             state.blocks.height(),
             state.accounts.len(),
         );
+        // E1 continuity (founder-approved 2026-07-24): re-inject the compiled
+        // genesis side-credit list on RESUME — the credits are already on disk,
+        // but try_reorg's reset-and-replay needs the recipe in memory or any
+        // post-restart reorg silently erases the faucet account.
+        state.set_genesis_accounts(&testnet_genesis::alpha_genesis_accounts());
     }
 
     // B8 (C6): thread the genesis-anchored PoUW consensus params into ChainState. Pragmatic path —

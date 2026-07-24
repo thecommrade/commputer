@@ -159,6 +159,13 @@ pub struct ChainState {
     pub cumulative_score: u64,
     /// Optional RocksDB persistent layer. None = in-memory only (tests).
     rocks: Option<RocksStore>,
+    /// Compiled genesis side-credits (E1 alpha faucet). Remembered by
+    /// `apply_genesis_accounts` (fresh chain) or re-injected by
+    /// `set_genesis_accounts` (resumed chain — main.rs) so `try_reorg`'s
+    /// reset-and-replay can re-apply them: the credits live in no block, so a
+    /// blocks-only replay silently erases them from memory AND, via the
+    /// post-reorg reconcile, from disk (observed live 2026-07-24).
+    genesis_accounts: Vec<(String, u64)>,
     /// Feature 181: State diffs keyed by block height.
     pub state_diffs: HashMap<u64, StateDiff>,
     /// Feature 183: Archived accounts (cold storage, in-memory fallback).
@@ -295,6 +302,7 @@ impl ChainState {
             history: AccountHistoryIndex::new(),
             cumulative_score: 0,
             rocks: None,
+            genesis_accounts: Vec::new(),
             state_diffs: HashMap::new(),
             archived_accounts: HashMap::new(),
             retention_policy: RetentionPolicy::default(),
@@ -448,6 +456,7 @@ impl ChainState {
             history: AccountHistoryIndex::new(),
             cumulative_score: 0,
             rocks: Some(rocks),
+            genesis_accounts: Vec::new(),
             state_diffs: HashMap::new(),
             archived_accounts: HashMap::new(),
             retention_policy: RetentionPolicy::default(),
@@ -894,7 +903,19 @@ impl ChainState {
             })?;
         }
         self.total_emitted = new_emitted;
+        // Remember the list so try_reorg's reset-and-replay can re-apply it —
+        // these credits exist in no block and a blocks-only replay erases them.
+        self.genesis_accounts = accounts.to_vec();
         Ok(())
+    }
+
+    /// Re-inject the compiled genesis side-credit list WITHOUT crediting —
+    /// for the RESUMED-chain boot path (accounts already hold the credits on
+    /// disk; only the in-memory replay recipe is missing after a restart).
+    /// Without this, a node that restarts and later reorgs still loses the
+    /// genesis accounts. Call site: PROTECTED main.rs resumed branch.
+    pub fn set_genesis_accounts(&mut self, accounts: &[(String, u64)]) {
+        self.genesis_accounts = accounts.to_vec();
     }
 
     /// P1+P8 shared core of ALL THREE apply paths (`apply_block` / `apply_block_validated` /
@@ -2813,7 +2834,15 @@ impl ChainState {
         self.cumulative_score = 0;
         self.state_diffs.clear();
 
+        // The compiled genesis side-credits (E1 faucet) live in NO block: the
+        // reset above erased them and the blocks-only replay below cannot
+        // rebuild them. Re-apply them FIRST, exactly as the fresh-boot path
+        // does — all of apply_genesis_accounts' guards hold here (height back
+        // to 0, total_emitted back to 0). Clone: the call also re-remembers
+        // the list, and the borrow must not alias the iteration below.
+        let genesis_accounts = self.genesis_accounts.clone();
         let replay_result: Result<(), StateError> = (|| {
+            self.apply_genesis_accounts(&genesis_accounts)?;
             // Re-apply pre-fork blocks, then the new competing chain.
             for block in &pre_fork_blocks {
                 self.apply_block(block)?;
@@ -7443,6 +7472,47 @@ mod tests {
         );
         assert_eq!(re.total_emitted, emitted);
         assert_eq!(re.compute_state_root(), root, "root matches the winning chain exactly");
+    }
+
+    /// 2026-07-24 launch-night regression: genesis side-credits (the compiled
+    /// alpha faucet) live in NO block, so try_reorg's blocks-only replay used
+    /// to erase them from memory AND — via the post-reorg reconcile's
+    /// clear+rewrite — from disk. The replay must re-apply them first.
+    #[test]
+    fn reorg_preserves_genesis_side_credits() {
+        let dir = tempfile::tempdir().unwrap();
+        let faucet = addr(9);
+        let faucet_hex = hex::encode(faucet.0);
+        const CREDIT: u64 = 5_000_000;
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state
+                .apply_genesis_accounts(&[(faucet_hex.clone(), CREDIT)])
+                .unwrap();
+            let genesis = genesis_block();
+            state.apply_block(&genesis).unwrap();
+
+            // Losing chain (1 block), then a longer winning chain.
+            let b1 = raw_block(1, genesis.hash(), addr(1), 2001, vec![]);
+            state.apply_block(&b1).unwrap();
+            let c1 = raw_block(1, genesis.hash(), addr(1), 3001, vec![]);
+            let c2 = raw_block(2, c1.hash(), addr(1), 3002, vec![]);
+            state.try_reorg(vec![c1, c2], 1).unwrap();
+
+            assert_eq!(
+                state.accounts.get(&faucet).map(|a| a.balance),
+                Some(Amount::from_raw(CREDIT)),
+                "genesis side-credit survives the reorg in memory"
+            );
+            // DROP WITHOUT flush — the post-reorg reconcile must have covered disk.
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(re.blocks.height(), 2);
+        assert_eq!(
+            re.accounts.get(&faucet).map(|a| a.balance),
+            Some(Amount::from_raw(CREDIT)),
+            "genesis side-credit survives the reorg on disk"
+        );
     }
 
     fn unsigned_with_fee(from: Address, nonce: u64, kind: TxKind, fee: u64) -> Transaction {
