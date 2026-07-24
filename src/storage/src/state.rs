@@ -3153,6 +3153,17 @@ impl ChainState {
         self.persisted_pending_keys.clear();
         self.persisted_escalation_keys.clear();
 
+        // Re-apply genesis side-credits — they live in NO block, so the resync's
+        // blocks-only replay would otherwise land on a state missing them and
+        // wedge on the first block that spends them (2026-07-24 live seed:
+        // "Sync: failed to apply block … at height 5: insufficient balance",
+        // forever). Height and total_emitted are both zero here, so the
+        // genesis-only guards in apply_genesis_accounts hold. The credited
+        // account rows persist with the next per-block write batch, matching
+        // the fresh-boot path.
+        let genesis_accounts = self.genesis_accounts.clone();
+        self.apply_genesis_accounts(&genesis_accounts)?;
+
         info!("Chain state reset to genesis complete");
         Ok(())
     }
@@ -7512,6 +7523,55 @@ mod tests {
             re.accounts.get(&faucet).map(|a| a.balance),
             Some(Amount::from_raw(CREDIT)),
             "genesis side-credit survives the reorg on disk"
+        );
+    }
+
+    /// 2026-07-24 formation-stall regression (finding #3): the stall-triggered
+    /// chain resync (`initiate_chain_resync`) calls `reset_to_genesis`, then
+    /// sync re-applies blocks 1..N from peers — but genesis side-credits live
+    /// in NO block, so a reset that drops them bricks the node on the first
+    /// block that spends them ("Sync: failed to apply block … insufficient
+    /// balance", retried forever — the live 2026-07-24 seed wedge at height 4).
+    /// `reset_to_genesis` must leave state exactly as a fresh genesis:
+    /// side-credits applied.
+    #[test]
+    fn reset_to_genesis_preserves_genesis_side_credits() {
+        let dir = tempfile::tempdir().unwrap();
+        let faucet = addr(9);
+        let faucet_hex = hex::encode(faucet.0);
+        const CREDIT: u64 = 5_000_000;
+        let mut state = ChainState::open(dir.path()).unwrap();
+        state.apply_genesis_accounts(&[(faucet_hex, CREDIT)]).unwrap();
+        let genesis = genesis_block();
+        state.apply_block(&genesis).unwrap();
+        let b1 = raw_block(1, genesis.hash(), addr(1), 2001, vec![]);
+        state.apply_block(&b1).unwrap();
+
+        state.reset_to_genesis().unwrap();
+
+        assert_eq!(
+            state.accounts.get(&faucet).map(|a| a.balance),
+            Some(Amount::from_raw(CREDIT)),
+            "genesis side-credit survives the resync reset"
+        );
+        assert_eq!(state.total_emitted, CREDIT);
+
+        // The resync replays the network's chain on top of the reset state; a
+        // block spending the credit must apply (the live brick: the faucet
+        // dispense in block 5 could never apply once the credit vanished).
+        state.apply_block(&genesis).unwrap();
+        let spend = unsigned_with_fee(
+            faucet,
+            0,
+            TxKind::Transfer { to: addr(1), amount: Amount::from_raw(1_000_000) },
+            1_000_000, // account-creation cost: addr(1) does not exist post-reset
+        );
+        let b1 = raw_block(1, genesis.hash(), addr(1), 2001, vec![spend]);
+        state.apply_block(&b1).unwrap();
+        assert_eq!(
+            state.accounts.get(&faucet).map(|a| a.balance),
+            Some(Amount::from_raw(CREDIT - 2_000_000)),
+            "replayed block can spend the re-applied credit"
         );
     }
 
