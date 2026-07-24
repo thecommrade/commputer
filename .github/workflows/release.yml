@@ -1,0 +1,389 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Commputer — RELEASE workflow (GitHub Actions)
+#
+# WHAT THIS IS
+#   Tag-triggered release pipeline. On a `v*` tag push it builds the stripped
+#   `commputer` alpha binaries, checksums them, and publishes a GitHub Release
+#   with the binaries + a combined SHA-256 manifest attached as assets.
+#
+# INSTALL TO
+#   .github/workflows/release.yml  — in the PUBLIC (airlocked) repo
+#   (github.com/thecommrade/commputer). It is NOT wired into the working repo;
+#   this file lives in src/staging/ops/ as the reviewable source.
+#
+# COMPLEMENTS (does not replace)
+#   - .github/workflows/ci.yml   → per-push/PR test CI (build + test + clippy + fmt)
+#   - scripts/build-release.sh   → local multi-arch release build (`-p commputer`,
+#                                  same `commputer-linux-<arch>` asset naming +
+#                                  `checksums-sha256.txt`)
+#   - scripts/cross-build.sh     → local cross-compile helper (linux + darwin)
+#   - scripts/release.sh         → local one-shot release tarball builder
+#   This workflow is the CI-hosted equivalent of build-release.sh, driven by tags.
+#
+# ⚠ AIRLOCK PRECONDITION (read before you tag anything)
+#   The public repo this runs in MUST ALREADY CONTAIN THE POST-FLIP CODE. Commputer
+#   is a COORDINATED-UPGRADE network with no cross-version compatibility. If you tag
+#   a release from a public tree that predates the PoUW flip / current genesis, the
+#   binary it produces is UNJOINABLE (wrong consensus params / borsh layout) and
+#   peers will reject it. Scrub + publish the post-flip code via the airlock first
+#   (see src/staging/ops/history_scrub_and_push_airlock.md and scrub_and_mirror.sh),
+#   THEN cut the tag. The `verify-version` job below guards the tag<->crate version
+#   match but CANNOT detect a stale-code tree — that is on the operator.
+#
+# HONEST ALPHA FRAMING (surfaced in the release notes below, keep it truthful)
+#   L1 consensus is LIVE, and as of 2026-07-18 PoUW PAYS OUT on a live multi-node
+#   testbed (executor/verifier/DA actors landed; on-chain EscalationRound landed
+#   2026-07-19). Consensus resets to chain-id `commputer-testnet-3` for this
+#   release. Expect genesis RESETS / state wipes between versions regardless —
+#   this is still an untested alpha. Do not oversell, do not treat it as money.
+#
+# VERSION SOURCE OF TRUTH
+#   src/Cargo.toml  →  [workspace.package] version = "0.1.0-alpha.1"
+#   First alpha tag: v0.1.0-alpha.1  (tag == "v" + that version; enforced below).
+#
+# CRATE / BIN
+#   Package + binary name: `commputer` (src/node/Cargo.toml). Workspace root is
+#   `src/Cargo.toml`, so every cargo/cross invocation runs from `src/`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"          # e.g. v0.1.0-alpha.1
+
+# Creating a Release and uploading assets needs write access to repo contents.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: commputer
+
+jobs:
+  # ── Preflight: the pushed tag MUST equal the workspace version ───────────────
+  # Prevents shipping a binary that self-reports a different version than its tag.
+  # (Bumping the tag therefore requires bumping src/Cargo.toml first — intended.)
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Tag must equal src/Cargo.toml workspace version
+        run: |
+          set -euo pipefail
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CRATE_VER="$(grep -m1 -E '^version' src/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "tag=${GITHUB_REF_NAME} (=$TAG_VER)   workspace=$CRATE_VER"
+          if [ "$TAG_VER" != "$CRATE_VER" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match [workspace.package] version $CRATE_VER in src/Cargo.toml. Bump the crate version to match the tag (or fix the tag) and re-push."
+            exit 1
+          fi
+
+  # ── Build: stripped release binaries per target ─────────────────────────────
+  build:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    # aarch64 is best-effort for the alpha: if the cross build fails, the x86_64
+    # release still ships (continue-on-error is gated on matrix.optional).
+    continue-on-error: ${{ matrix.optional }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Primary target — native GNU/Linux build (matches build-release.sh).
+          - target: x86_64-unknown-linux-gnu
+            asset: commputer-linux-x86_64
+            use_cross: false
+            strip: strip
+            optional: false
+          # Optional target — aarch64 via `cross` (Docker-backed). Best-effort.
+          - target: aarch64-unknown-linux-gnu
+            asset: commputer-linux-aarch64
+            use_cross: true
+            strip: aarch64-linux-gnu-strip
+            optional: true
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/target
+          key: ${{ runner.os }}-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-${{ matrix.target }}-
+
+      # aarch64 `strip` lives in binutils-aarch64-linux-gnu (host-side stripping of
+      # the cross-built ELF). Not needed for the native x86_64 leg.
+      - name: Install aarch64 binutils (for strip)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-aarch64-linux-gnu
+
+      # `cross` cross-compiles inside a target container — no host cross-linker
+      # setup required. Pinned for reproducibility.
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Build release (cargo, native)
+        if: ${{ !matrix.use_cross }}
+        working-directory: src
+        run: cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.BIN_NAME }}
+
+      - name: Build release (cross)
+        if: matrix.use_cross
+        working-directory: src
+        run: cross build --release --locked --target ${{ matrix.target }} -p ${{ env.BIN_NAME }}
+
+      - name: Strip, stage, and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          BIN="src/target/${{ matrix.target }}/release/${BIN_NAME}"
+          test -f "$BIN" || { echo "::error::expected binary not found: $BIN"; exit 1; }
+          "${{ matrix.strip }}" "$BIN"
+          cp "$BIN" "dist/${{ matrix.asset }}"
+          ( cd dist && sha256sum "${{ matrix.asset }}" | tee "${{ matrix.asset }}.sha256" )
+          ls -lh "dist/${{ matrix.asset }}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}*
+          if-no-files-found: error
+
+  # ── Release: gather artifacts, build the combined manifest, publish ─────────
+  release:
+    needs: [build, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      # Checkout so we can also attach the operator deploy files (mirrors the
+      # local scripts/release.sh, which bundles the unit + config).
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true      # flatten every matrix asset into dist/
+
+      - name: Build combined SHA-256 manifest
+        run: |
+          set -euo pipefail
+          cd dist
+          : > checksums-sha256.txt
+          # Only real binaries in the combined manifest (skip per-asset .sha256).
+          # macOS/Windows are best-effort (continue-on-error) — guard with -f so a
+          # missing optional asset never fails this step.
+          for f in commputer-linux-x86_64 commputer-linux-aarch64 \
+                   commputer-macos-x86_64 commputer-macos-aarch64 \
+                   commputer-windows-x86_64.exe; do
+            [ -f "$f" ] && sha256sum "$f" >> checksums-sha256.txt
+          done
+          echo "── release assets ──"
+          ls -lh
+          echo "── checksums-sha256.txt ──"
+          cat checksums-sha256.txt
+
+      - name: Create GitHub Release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+
+          # Mark semver pre-release tags (…-alpha / -beta / -rc) as pre-releases.
+          PRERELEASE=""
+          case "$TAG" in
+            *-alpha*|*-beta*|*-rc*) PRERELEASE="--prerelease" ;;
+          esac
+
+          # Assemble the asset list; the optional aarch64/macOS/Windows binaries
+          # may be absent (best-effort, continue-on-error targets).
+          ASSETS=(dist/checksums-sha256.txt)
+          for f in dist/commputer-linux-x86_64 dist/commputer-linux-aarch64 \
+                   dist/commputer-macos-x86_64 dist/commputer-macos-aarch64 \
+                   dist/commputer-windows-x86_64.exe; do
+            [ -f "$f" ] && ASSETS+=("$f")
+          done
+          # Operator convenience files (present in the airlocked repo tree).
+          for f in deploy/commputer.service deploy/commputer.toml scripts/install.sh; do
+            [ -f "$f" ] && ASSETS+=("$f")
+          done
+
+          cat > release-notes.md <<EOF
+          # Commputer ${TAG}
+
+          Automated alpha release built from tag \`${TAG}\`.
+
+          ## ⚠ Honest alpha status — read before you join
+          - **Coordinated-upgrade network.** No cross-version compatibility. Expect
+            **genesis RESETS / state wipes** between versions — balances do not carry over.
+            This release resets consensus to chain-id \`commputer-testnet-3\`.
+          - **L1 consensus is LIVE, and PoUW now PAYS OUT.** Live multi-node payout was
+            proven 2026-07-18 (executor / verifier / DA actors landed) and the on-chain
+            EscalationRound (second-round dispute resolution) landed 2026-07-19. PoUW
+            jobs submit, claim, verify, and settle for real — this is still an
+            **untested alpha network**, not production money.
+          - Some RPC/P2P hardening (producer-signature enforcement, vote aggregator,
+            mempool quota, faucet) lands at the reset — before that the surface is
+            partially unhardened. This is a test network. Do not treat it as money.
+
+          ## Assets
+          - \`commputer-linux-x86_64\` — GNU/Linux x86_64 (primary, required)
+          - \`commputer-linux-aarch64\` — GNU/Linux aarch64 (optional / best-effort)
+          - \`commputer-macos-x86_64\` — macOS Intel (best-effort / **untested**)
+          - \`commputer-macos-aarch64\` — macOS Apple Silicon (best-effort / **untested**)
+          - \`commputer-windows-x86_64.exe\` — Windows x86_64 (best-effort / **untested**;
+            some hardening, e.g. wallet/keystore file-permission enforcement, is a
+            silent no-op on Windows — see the operator guide)
+          - \`checksums-sha256.txt\` — SHA-256 of the binaries (verify before running)
+          - \`commputer.service\`, \`commputer.toml\`, \`install.sh\` — operator deploy helpers
+
+          ## Verify + run
+          \`\`\`sh
+          sha256sum -c checksums-sha256.txt          # confirm the download
+          chmod +x commputer-linux-x86_64
+          # Seed/validator run (password via COMMPUTER_WALLET_PASSWORD env, never argv):
+          ./commputer-linux-x86_64 run --testnet --port 9000 --rpc-port 9944 --rpc-bind 127.0.0.1
+          \`\`\`
+          P2P port **9000** (TCP + UDP), RPC port **9944**. The seed's P2P hostname must be
+          a **grey-cloud / DNS-only** A record straight to the VPS IP (an orange-cloud
+          Cloudflare proxy cannot carry raw libp2p traffic); only the RPC HTTP endpoint
+          may sit behind a proxy/TLS.
+          EOF
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Commputer $TAG" \
+            --notes-file release-notes.md \
+            --verify-tag \
+            $PRERELEASE \
+            "${ASSETS[@]}"
+
+  # ── macOS build (ENABLED 2026-07-19, founder decision — best-effort) ─────────
+  # macOS binaries need a macOS runner (GitHub-hosted `macos-latest`); they cannot
+  # be produced on ubuntu without an Apple SDK. `continue-on-error: true` because
+  # this target is untested — a failure here must never block the required Linux
+  # release. `strip` on macOS takes no args (`strip <bin>`), and Apple Silicon vs
+  # Intel are separate targets (aarch64-apple-darwin / x86_64-apple-darwin).
+  #
+  # Asset names MUST match src/website/install.sh's OS/ARCH mapping (`Darwin` ->
+  # `macos`; `uname -m` `arm64` AND `aarch64` -> `aarch64`) — hence
+  # `commputer-macos-aarch64`, NOT `commputer-macos-arm64`.
+  build-macos:
+    needs: verify-version
+    runs-on: macos-latest
+    continue-on-error: true        # best-effort / untested platform
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin   # Apple Silicon
+            asset: commputer-macos-aarch64
+          - target: x86_64-apple-darwin    # Intel
+            asset: commputer-macos-x86_64
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release
+        working-directory: src
+        run: cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.BIN_NAME }}
+
+      - name: Strip, stage, and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          BIN="src/target/${{ matrix.target }}/release/${BIN_NAME}"
+          test -f "$BIN" || { echo "::error::expected binary not found: $BIN"; exit 1; }
+          strip "$BIN"                       # macOS strip: no flags
+          cp "$BIN" "dist/${{ matrix.asset }}"
+          ( cd dist && shasum -a 256 "${{ matrix.asset }}" | tee "${{ matrix.asset }}.sha256" )
+          ls -lh "dist/${{ matrix.asset }}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}*
+          if-no-files-found: error
+
+  # ── Windows build (BEST-EFFORT, UNTESTED — founder decision 2026-07-19) ──────
+  # No GitHub-hosted or CI Windows runner has ever exercised this job; it ships
+  # so a Windows binary EXISTS, not because Windows has been validated.
+  # `continue-on-error: true` so a Windows build failure never blocks the
+  # required Linux release. KNOWN SILENT DEGRADATIONS vs Linux/macOS (do not
+  # treat Windows as parity):
+  #   - src/node/src/salt_store.rs directory-fsync durability guarantee is a
+  #     Unix-only construct (#[cfg(unix)]); on Windows persist() relies on the
+  #     file-level sync_all() alone — a slightly weaker durability guarantee
+  #     across a crash that also loses the directory entry.
+  #   - Unix-mode file-permission hardening (0600-style perms on the
+  #     wallet/keystore) is a silent no-op on Windows ACLs — it does NOT harden
+  #     the file the way it does on Linux/macOS. Operators on Windows must rely
+  #     on filesystem/user-account isolation instead.
+  #   - No `strip`-equivalent step is run here (MSVC binaries aren't stripped
+  #     the same way as ELF/Mach-O; no PDBs are generated or published).
+  build-windows:
+    needs: verify-version
+    runs-on: windows-latest
+    continue-on-error: true        # best-effort / untested platform
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release
+        working-directory: src
+        shell: pwsh
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p ${{ env.BIN_NAME }}
+
+      - name: Stage and checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $bin = "src/target/x86_64-pc-windows-msvc/release/${{ env.BIN_NAME }}.exe"
+          if (-not (Test-Path $bin)) {
+            Write-Error "expected binary not found: $bin"
+            exit 1
+          }
+          $asset = "commputer-windows-x86_64.exe"
+          Copy-Item $bin "dist/$asset"
+          # sha256sum-compatible "<lowercase-hex>  <filename>" format.
+          $hash = (Get-FileHash "dist/$asset" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $asset" | Out-File -Encoding ascii -NoNewline "dist/$asset.sha256"
+          Get-ChildItem "dist/$asset*"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: commputer-windows-x86_64.exe
+          path: dist/commputer-windows-x86_64.exe*
+          if-no-files-found: error
