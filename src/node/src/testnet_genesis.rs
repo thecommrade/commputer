@@ -89,7 +89,8 @@ pub fn generate_testnet_genesis(num_accounts: usize, output_path: &str) -> Resul
 /// check in `rpc::provision_faucet_from_env` refuses to bind unless this equals
 /// the address derived from `COMMPUTER_FAUCET_SEED`, so the funded/exempted
 /// identity and the live signing wallet can never diverge.
-pub const ALPHA_FAUCET_ADDRESS_HEX: Option<&str> = None;
+pub const ALPHA_FAUCET_ADDRESS_HEX: Option<&str> =
+    Some("6d6cc3f5e53e672b9f565b2e538dedcabf74791a4ee9eef12bda087082771eff");
 
 /// Genesis balance credited to the faucet address, in raw base units.
 /// 100,000 COMME = 100_000 * UNITS_PER_COMME = 1e13 raw units.
@@ -159,10 +160,17 @@ mod tests {
     }
 
     #[test]
-    fn alpha_genesis_accounts_empty_when_address_unset() {
-        // Shipped default: address is None ⇒ no genesis credit ⇒ byte-identical
-        // genesis (apply_genesis_accounts treats an empty slice as a no-op).
-        assert!(ALPHA_FAUCET_ADDRESS_HEX.is_none());
-        assert!(alpha_genesis_accounts().is_empty());
+    fn alpha_genesis_accounts_fund_the_faucet() {
+        // Alpha-reset state (set 2026-07-19): the founder's faucet address is
+        // compiled in ⇒ genesis credits exactly one account with the full
+        // faucet allocation.
+        let addr = ALPHA_FAUCET_ADDRESS_HEX.expect("faucet address is set for the alpha reset");
+        assert_eq!(addr.len(), 64);
+        assert!(addr.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        let accounts = alpha_genesis_accounts();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].0, addr);
+        assert_eq!(accounts[0].1, ALPHA_FAUCET_ALLOCATION);
     }
 }
