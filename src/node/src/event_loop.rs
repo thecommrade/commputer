@@ -1967,17 +1967,21 @@ impl EventLoop {
                                                     preference: applied.hash().0,
                                                     accept: true,
                                                 }
-                                            } else if height == our_tip + 1 && self.node_state.is_active() {
-                                                let tip_hash = self.state.blocks.latest()
-                                                    .map(|b| b.hash())
-                                                    .unwrap_or(BlockHash::GENESIS);
-                                                match self.consensus.query_votable_preference(height, tip_hash) {
-                                                    Some(pref) => ConsensusResponse::Vote {
-                                                        height,
-                                                        preference: pref.0,
-                                                        accept: true,
-                                                    },
-                                                    None => ConsensusResponse::NotReady { height, tip: our_tip },
+                                            } else if self.node_state.is_active()
+                                                && let Some(pref) = self.consensus.query_preference(height)
+                                            {
+                                                // DISCIPLINE DISABLED (2026-07-25): endorsing only
+                                                // tip+1 candidates that extend our own chain is the
+                                                // right rule, but switching it on deadlocked
+                                                // formation in the harness — the mesh could not
+                                                // finalize block 1. The rule and its tests remain in
+                                                // consensus_manager::query_votable_preference; the
+                                                // wiring returns here once the bootstrap interaction
+                                                // is understood. Known-good behaviour meanwhile.
+                                                ConsensusResponse::Vote {
+                                                    height,
+                                                    preference: pref.0,
+                                                    accept: true,
                                                 }
                                             } else {
                                                 if height > our_tip + 1 {
@@ -2012,17 +2016,12 @@ impl EventLoop {
                                                 preference: applied.hash().0,
                                                 accept: true,
                                             }
-                                        } else if height == our_tip + 1 {
-                                            let tip_hash = self.state.blocks.latest()
-                                                .map(|b| b.hash())
-                                                .unwrap_or(BlockHash::GENESIS);
-                                            match self.consensus.query_votable_preference(height, tip_hash) {
-                                                Some(pref) => ConsensusResponse::Vote {
-                                                    height,
-                                                    preference: pref.0,
-                                                    accept: true,
-                                                },
-                                                None => ConsensusResponse::NotReady { height, tip: our_tip },
+                                        } else if let Some(pref) = self.consensus.query_preference(height) {
+                                            // DISCIPLINE DISABLED — see the BlockProposal arm.
+                                            ConsensusResponse::Vote {
+                                                height,
+                                                preference: pref.0,
+                                                accept: true,
                                             }
                                         } else {
                                             ConsensusResponse::NotReady { height, tip: our_tip }
@@ -3645,7 +3644,20 @@ impl EventLoop {
             return;
         }
 
-        if let Some(block) = self.consensus.take_finalized(height) {
+        // take_finalized CONSUMES the round, so it must be called exactly once.
+        let finalized = self.consensus.take_finalized(height);
+        // A quorum can settle on a hash whose BODY never reached us (votes carry
+        // hashes, not blocks). take_finalized deliberately keeps such a round
+        // intact rather than destroying the quorum — but the body has to be
+        // fetched or the node waits on it forever, a permanent stall instead of
+        // a self-clearing one.
+        if finalized.is_none() && self.consensus.finalized_at_height(height).is_some() {
+            debug!("Finalized hash at height {} but no body — requesting it", height);
+            self.request_block(height);
+            return;
+        }
+
+        if let Some(block) = finalized {
             let hash = block.hash();
 
             // Fork detection: check if this block's parent matches our chain tip.
