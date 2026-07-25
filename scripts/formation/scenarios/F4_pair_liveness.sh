@@ -32,11 +32,23 @@ assert_converged 2 60 1 2
 assert_no_private_fork 1 2
 assert_no_panic 1 2
 
-# The view-change clock must be armed from boot; if a node reports zero
-# production skips but the chain still froze, the gate is elsewhere.
-log "leader rotation evidence: node1 produced=$(scrape 1 'Produced block candidate'), node2 produced=$(scrape 2 'Produced block candidate')"
-if (( $(scrape 1 'Produced block candidate') == 0 )) || (( $(scrape 2 'Produced block candidate') == 0 )); then
-    fail "one node never produced — leadership did not rotate"
+# Under a healthy leader the peer correctly DEFERS (a node does not propose
+# when a candidate already exists at the next height and it has waited < 6s),
+# so one-sided production is expected here — it is not a freeze. What must
+# hold is FAILOVER: kill the producer and the survivor takes over.
+log "production so far: node1=$(scrape 1 'Produced block candidate') node2=$(scrape 2 'Produced block candidate')"
+SURVIVOR_BEFORE="$(scrape 2 'Produced block candidate')"
+TIP_BEFORE="$(get_height 2)"
+log "killing node1 — node2 must take over via view change"
+kill_node 1 KILL
+
+if wait_height 2 $(( TIP_BEFORE + 3 )) 120; then
+    pass "survivor took over: height ${TIP_BEFORE} -> $(get_height 2), produced $(( $(scrape 2 'Produced block candidate') - SURVIVOR_BEFORE )) blocks"
+else
+    fail "FAILOVER DEAD: node2 stuck at $(get_height 2) for 120s after the leader died"
+    log "node2 skip reasons:"
+    grep -aoE "Skipping block production — [^\"]{0,60}" "$(log_file 2)" | sed 's/height [0-9]*/height N/;s/[0-9]\+s/Ns/' | sort | uniq -c | sort -rn | head -4
 fi
+assert_height_monotonic 2 "${TIP_BEFORE}"
 
 scenario_result

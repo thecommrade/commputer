@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
-use tracing::{info, warn, debug, error};
+use tracing::{info, warn, debug, error, trace};
 use futures::{StreamExt, FutureExt};
 
 use commputer_core::block::{Block, BlockHeader, BlockHash};
@@ -3104,6 +3104,7 @@ impl EventLoop {
     }
 
     fn handle_block_tick(&mut self) {
+        trace!("block tick: height={} state={:?}", self.state.blocks.height(), self.node_state.state());
         // Item 51: Expire mempool transactions older than 1 hour.
         let now = std::time::Instant::now();
         let expiry_threshold = Duration::from_secs(3600);

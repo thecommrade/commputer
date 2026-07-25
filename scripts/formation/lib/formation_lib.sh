@@ -24,7 +24,12 @@ FORMATION_ROOT="$(cd "${FORMATION_LIB_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${FORMATION_ROOT}/../.." && pwd)"
 SRC_DIR="${REPO_ROOT}/src"
 
-NODE_BIN="${FORMATION_NODE_BIN:-${SRC_DIR}/target/release/commputer}"
+# Default to the FORMATION build (target/formation, built with --features
+# formation-test), never the deploy binary at target/release. Scenarios and
+# ad-hoc diagnostics both source this file directly, and pointing at
+# target/release silently tests a stale, pin-enabled binary — which looks
+# exactly like "only the bootstrap node ever produces".
+NODE_BIN="${FORMATION_NODE_BIN:-${SRC_DIR}/target/formation/release/commputer}"
 BASE_P2P="${FORMATION_BASE_P2P:-19100}"   # offset from multinode_smoke's 19000
 BASE_RPC="${FORMATION_BASE_RPC:-19144}"   # offset from multinode_smoke's 19944
 TMPROOT="${FORMATION_TMPROOT:-/tmp/formation}"
@@ -60,6 +65,14 @@ log_file() { echo "${LOG_DIR}/${SCENARIO_NAME}-node$1.log"; }
 # Refuse to run outside the network namespace: an unisolated run would dial the
 # live public seed and merge test nodes into the real chain.
 assert_isolated() {
+    # A missing or wrong binary is the difference between testing the change
+    # you just made and testing last week's; fail loudly rather than silently.
+    [[ -x "${NODE_BIN}" ]] || {
+        echo "REFUSING TO RUN: no harness binary at ${NODE_BIN}" >&2
+        echo "Build it: cd src && CARGO_TARGET_DIR=target/formation cargo build --release -p commputer --bin commputer --features formation-test" >&2
+        exit 2
+    }
+    log "binary: ${NODE_BIN} (built $(date -r "${NODE_BIN}" '+%H:%M:%S'))"
     if [[ "${FORMATION_ISOLATED:-0}" != "1" ]]; then
         echo "REFUSING TO RUN: not inside the formation network namespace." >&2
         echo "Run via scripts/formation/run_formation.sh (it re-execs under 'unshare -r -n')." >&2
