@@ -399,6 +399,48 @@ impl ConsensusManager {
         self.heights.get(&height).and_then(|s| s.voter.preference())
     }
 
+    /// VOTE-HEIGHT DISCIPLINE (alpha.6): the preference we may legitimately
+    /// endorse at `height`, given our own applied tip hash — i.e. only a
+    /// candidate that BUILDS ON THE CHAIN WE ACTUALLY HOLD.
+    ///
+    /// Previously a node answered accept-votes using `query_preference` at any
+    /// height it had a candidate for, including heights above its applied tip.
+    /// Those votes are unbacked: the voter has not applied the parent and
+    /// cannot know the block is valid. A producer could therefore reach quorum
+    /// on rubber-stamps and finalize far ahead of everyone who would have to
+    /// apply the result — live 2026-07-25, one node finalized 107..123 alone
+    /// while its two peers sat at 106.
+    ///
+    /// Returns the Snowball preference when that candidate extends our tip
+    /// (so normal fork resolution is untouched), else the lowest-hash
+    /// candidate that does extend it (matching the deterministic tie-break),
+    /// else None — meaning "cannot endorse", which the caller answers with
+    /// NotReady rather than a vote.
+    pub fn query_votable_preference(
+        &self,
+        height: u64,
+        tip_hash: BlockHash,
+    ) -> Option<BlockHash> {
+        let state = self.heights.get(&height)?;
+        let extends_tip = |h: &BlockHash| -> bool {
+            state
+                .candidates
+                .get(h)
+                .is_some_and(|b| b.header.parent_hash == tip_hash)
+        };
+        if let Some(pref) = state.voter.preference()
+            && extends_tip(&pref)
+        {
+            return Some(pref);
+        }
+        state
+            .candidates
+            .iter()
+            .filter(|(_, b)| b.header.parent_hash == tip_hash)
+            .map(|(h, _)| *h)
+            .min()
+    }
+
     /// Get the preferred candidate block at a height (for re-proposing).
     pub fn get_candidate_block(&self, height: u64) -> Option<Block> {
         let state = self.heights.get(&height)?;
@@ -1787,6 +1829,67 @@ mod tests {
             super::MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT,
             "distinct checkpoint validators at one height must be capped"
         );
+    }
+
+    /// Vote-height discipline: a node may only endorse a candidate that builds
+    /// on the chain it has actually applied. Endorsing anything else is a
+    /// rubber-stamp — the voter cannot have validated a block whose parent it
+    /// does not hold — and that is what let a producer finalize 17 blocks
+    /// ahead of its quorum live.
+    #[test]
+    fn votable_preference_requires_parent_to_be_our_tip() {
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4);
+        let our_tip = BlockHash([7u8; 32]);
+
+        // A candidate at tip+1 that extends OUR tip: votable.
+        let mut good = make_test_block_with_producer(5, addr(1));
+        good.header.parent_hash = our_tip;
+        cm.add_candidate(good.clone());
+        assert_eq!(
+            cm.query_votable_preference(5, our_tip),
+            Some(good.hash()),
+            "a candidate building on our tip is votable"
+        );
+
+        // A candidate built on somebody else's chain: NOT votable, even though
+        // the plain preference would happily return something.
+        let foreign_tip = BlockHash([9u8; 32]);
+        assert_eq!(
+            cm.query_votable_preference(5, foreign_tip),
+            None,
+            "no candidate extends that tip — must answer NotReady, not a vote"
+        );
+        assert!(
+            cm.query_preference(5).is_some(),
+            "the old unconditional path would still have voted here"
+        );
+    }
+
+    /// Among several candidates that all extend our tip, the votable choice is
+    /// deterministic (lowest hash) so a symmetric set converges instead of
+    /// splitting — same rule as the initial-preference tie-break.
+    #[test]
+    fn votable_preference_is_deterministic_across_candidates() {
+        let our_tip = BlockHash([7u8; 32]);
+        let mut a = make_test_block_with_producer(5, addr(1));
+        a.header.parent_hash = our_tip;
+        let mut b = make_test_block_with_producer(5, addr(2));
+        b.header.parent_hash = our_tip;
+        let lowest = a.hash().min(b.hash());
+
+        let mut ab = ConsensusManager::new();
+        ab.cleanup_below(4);
+        ab.add_candidate(a.clone());
+        ab.add_candidate(b.clone());
+
+        let mut ba = ConsensusManager::new();
+        ba.cleanup_below(4);
+        ba.add_candidate(b);
+        ba.add_candidate(a);
+
+        assert_eq!(ab.query_votable_preference(5, our_tip), Some(lowest));
+        assert_eq!(ba.query_votable_preference(5, our_tip), Some(lowest));
     }
 
     /// A quorum can form around a hash whose block BODY we never received

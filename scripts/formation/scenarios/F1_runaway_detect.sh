@@ -11,8 +11,24 @@
 # height may exceed the height a MAJORITY actually agree on (fingerprint-
 # identical) by more than a small tolerance.
 #
-# EXPECTED TO FAIL until vote-height discipline lands — this scenario is the
-# executable definition of "Phase 2 is done".
+# ⚠ STATUS: REGRESSION GUARD, NOT A REPRODUCTION.
+# Run against the PRE-vote-discipline binary (2026-07-25) this scenario PASSED:
+# cycling one node's link makes it fall behind and rejoin, but the other two
+# stay in lockstep, so the majority height tracks the producer and no runaway
+# is measurable. The live failure had TWO nodes stuck below a producer that
+# kept reaching quorum on their unbacked votes, and this fault injection does
+# not recreate that.
+#
+# It is kept because assert_no_runaway is the right invariant and this is a
+# cheap way to watch it under churn — but it must NOT be cited as proof that
+# vote-height discipline works. A test that passes before the fix proves
+# nothing about the fix. The mechanism is proven at the unit level instead:
+# consensus_manager::tests::votable_preference_requires_parent_to_be_our_tip
+# asserts the old path WOULD have voted where the new one refuses.
+#
+# TODO: a real reproduction needs two voters held below the producer while
+# still answering — e.g. body-delivery suppression, or a fault-injection hook
+# that drops block bodies while leaving the consensus channel up.
 
 SCENARIO_NAME="F1_runaway_detect"
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/formation_lib.sh"

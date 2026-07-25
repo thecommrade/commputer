@@ -70,8 +70,22 @@ pub enum ConsensusRequest {
 pub enum ConsensusResponse {
     /// Peer validates and votes.
     Vote { height: u64, preference: [u8; 32], accept: bool },
-    /// Peer is not ready (still syncing).
-    NotReady { height: u64 },
+    /// Peer is not ready: it cannot endorse this height right now.
+    ///
+    /// `tip` is the responder's applied height, so the asker can tell a peer
+    /// that is genuinely BEHIND (and will catch up) from one that is level or
+    /// ahead (and is refusing, or forked). Without it, an unbounded "peer is
+    /// syncing, be patient" reset let a permanently-wedged node suppress its
+    /// neighbours' stall recovery forever.
+    ///
+    /// Additive and `#[serde(default)]`: pre-alpha.6 peers send no `tip` and
+    /// decode as 0 ("unknown"), and they ignore the field we send, so mixed
+    /// versions interoperate.
+    NotReady {
+        height: u64,
+        #[serde(default)]
+        tip: u64,
+    },
 }
 
 /// Codec for the consensus protocol — serializes/deserializes with JSON + length prefix.

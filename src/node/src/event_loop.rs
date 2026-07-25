@@ -1937,7 +1937,7 @@ impl EventLoop {
                                         if !self.consensus_rate_limiter.check(commputer::peer_hash::peer_bucket(&peer), height) {
                                             debug!("Rate limited consensus request from {} at height {}", peer, height);
                                             let _ = self.network.swarm.behaviour_mut().consensus.send_response(
-                                                channel, ConsensusResponse::NotReady { height });
+                                                channel, ConsensusResponse::NotReady { height, tip: self.state.blocks.height() });
                                             return;
                                         }
                                         if let Ok(block) = serde_json::from_slice::<commputer_core::block::Block>(&block_bytes) {
@@ -1952,29 +1952,45 @@ impl EventLoop {
                                                 self.consensus.try_finalize_round(height, self.peer_ips.len());
                                                 self.try_apply_finalized(height);
                                             }
-                                            // Respond with our vote.
-                                            // Priority: (1) if chain already has a block at this height,
-                                            // vote for that hash (helps peer converge on the canonical block).
-                                            // (2) else use consensus preference if active.
-                                            // (3) else NotReady.
+                                            // VOTE-HEIGHT DISCIPLINE (alpha.6).
+                                            // (1) height already applied: echo the applied hash — this is
+                                            //     the catch-up path that helps a lagging proposer converge.
+                                            // (2) exactly our tip+1, and we are Active: endorse ONLY a
+                                            //     candidate that builds on the chain we hold.
+                                            // (3) anything above tip+1: we cannot have validated it, so
+                                            //     NotReady + a bounded fetch of the gap. Voting here was
+                                            //     the rubber-stamp that let a producer finalize alone.
+                                            let our_tip = self.state.blocks.height();
                                             let response = if let Some(applied) = self.state.blocks.get_by_height(height) {
                                                 ConsensusResponse::Vote {
                                                     height,
                                                     preference: applied.hash().0,
                                                     accept: true,
                                                 }
-                                            } else if self.node_state.is_active() {
-                                                if let Some(pref) = self.consensus.query_preference(height) {
-                                                    ConsensusResponse::Vote {
+                                            } else if height == our_tip + 1 && self.node_state.is_active() {
+                                                let tip_hash = self.state.blocks.latest()
+                                                    .map(|b| b.hash())
+                                                    .unwrap_or(BlockHash::GENESIS);
+                                                match self.consensus.query_votable_preference(height, tip_hash) {
+                                                    Some(pref) => ConsensusResponse::Vote {
                                                         height,
                                                         preference: pref.0,
                                                         accept: true,
-                                                    }
-                                                } else {
-                                                    ConsensusResponse::NotReady { height }
+                                                    },
+                                                    None => ConsensusResponse::NotReady { height, tip: our_tip },
                                                 }
                                             } else {
-                                                ConsensusResponse::NotReady { height }
+                                                if height > our_tip + 1 {
+                                                    // Pull ONLY the immediate next block, not the whole
+                                                    // gap: this request fires on every proposal (and every
+                                                    // 500ms re-proposal), and fanning out ten heights per
+                                                    // proposal is how a catch-up previously turned into
+                                                    // 66k requests with 39k rate-limited rejections. One
+                                                    // block is all that is needed to become votable again;
+                                                    // bulk catch-up is the sync machine's job.
+                                                    self.request_block(our_tip + 1);
+                                                }
+                                                ConsensusResponse::NotReady { height, tip: our_tip }
                                             };
                                             let _ = self.network.swarm.behaviour_mut().consensus.send_response(channel, response);
                                         }
@@ -1983,24 +1999,33 @@ impl EventLoop {
                                         // SECURITY(E9/[20]): full-PeerId bucket key (was ~16-bit grindable).
                                         if !self.consensus_rate_limiter.check(commputer::peer_hash::peer_bucket(&peer), height) {
                                             let _ = self.network.swarm.behaviour_mut().consensus.send_response(
-                                                channel, ConsensusResponse::NotReady { height });
+                                                channel, ConsensusResponse::NotReady { height, tip: self.state.blocks.height() });
                                             return;
                                         }
-                                        // Priority: if chain already has a block at this height, vote for it.
+                                        // Same discipline as the BlockProposal path: echo an applied
+                                        // height, endorse only a tip+1 candidate that extends our
+                                        // chain, otherwise NotReady with our tip.
+                                        let our_tip = self.state.blocks.height();
                                         let response = if let Some(applied) = self.state.blocks.get_by_height(height) {
                                             ConsensusResponse::Vote {
                                                 height,
                                                 preference: applied.hash().0,
                                                 accept: true,
                                             }
-                                        } else if let Some(pref) = self.consensus.query_preference(height) {
-                                            ConsensusResponse::Vote {
-                                                height,
-                                                preference: pref.0,
-                                                accept: true,
+                                        } else if height == our_tip + 1 {
+                                            let tip_hash = self.state.blocks.latest()
+                                                .map(|b| b.hash())
+                                                .unwrap_or(BlockHash::GENESIS);
+                                            match self.consensus.query_votable_preference(height, tip_hash) {
+                                                Some(pref) => ConsensusResponse::Vote {
+                                                    height,
+                                                    preference: pref.0,
+                                                    accept: true,
+                                                },
+                                                None => ConsensusResponse::NotReady { height, tip: our_tip },
                                             }
                                         } else {
-                                            ConsensusResponse::NotReady { height }
+                                            ConsensusResponse::NotReady { height, tip: our_tip }
                                         };
                                         let _ = self.network.swarm.behaviour_mut().consensus.send_response(channel, response);
                                     }
@@ -2021,19 +2046,32 @@ impl EventLoop {
                                             self.health_monitor.record_vote(commputer::peer_hash::peer_bucket(&peer));
                                         }
                                     }
-                                    ConsensusResponse::NotReady { height } => {
-                                        // Peer is alive but syncing — damp the stall
-                                        // timer, but only within the per-peer budget:
-                                        // an unbounded reset let one permanently-wedged
-                                        // peer suppress every neighbor's recovery
-                                        // forever (live 2026-07-24: the whole net froze
-                                        // at height 11 in mutual NotReady politeness).
+                                    ConsensusResponse::NotReady { height, tip } => {
+                                        // Damp the stall timer only for a peer that is
+                                        // genuinely BEHIND us and therefore will catch
+                                        // up. A peer level with or ahead of us is
+                                        // refusing or forked, and waiting on it forever
+                                        // is how the whole net froze at height 11 in
+                                        // mutual NotReady politeness. tip == 0 means an
+                                        // older peer that sends no tip: keep the
+                                        // budgeted behaviour for those.
+                                        let behind = tip > 0 && tip < self.state.blocks.height();
+                                        let unknown_tip = tip == 0;
                                         if self.stall_start.is_some()
+                                            && (behind || unknown_tip)
                                             && self.consensus.allow_notready_stall_reset(peer)
                                         {
                                             self.stall_start = None;
                                         }
-                                        debug!("Received NotReady from {} at height {}", peer, height);
+                                        // Self-reported, same trust level as the GetHeight
+                                        // replies already recorded; clamped downstream.
+                                        if tip > 0 {
+                                            self.node_state.record_peer_height(
+                                                commputer::peer_hash::peer_bucket(&peer),
+                                                tip,
+                                            );
+                                        }
+                                        debug!("Received NotReady from {} at height {} (their tip {})", peer, height, tip);
                                     }
                                 }
                             }
