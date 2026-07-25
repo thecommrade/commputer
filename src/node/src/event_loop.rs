@@ -3154,11 +3154,13 @@ impl EventLoop {
 
         // Don't produce blocks until node is Active (synced with network).
         if !self.node_state.is_active() {
+            debug!("Skipping block production — node_state is {:?}, not Active", self.node_state.state());
             return;
         }
 
         // Only produce blocks if we're a registered validator.
         if self.validator.status() != ValidatorStatus::Active {
+            debug!("Skipping block production — local validator status is {:?}", self.validator.status());
             return;
         }
 
@@ -3216,6 +3218,13 @@ impl EventLoop {
             // View change fallback handles leader unavailability (6s intervals).
             // If consensus stalls, the stall timer in handle_consensus_tick handles it.
             if !commputer::leader::is_valid_leader(next_height, &our_addr, &validators, seconds_waiting) {
+                // Silent until now: this return is the most common reason a
+                // node produces nothing, and with no log a stalled network
+                // could not be diagnosed without a source-level bisect.
+                debug!(
+                    "Skipping block production — not leader for height {} (waiting {}s, {} validators)",
+                    next_height, seconds_waiting, validators.len()
+                );
                 return;
             }
         } else if self.is_seed_connector {
@@ -3228,6 +3237,7 @@ impl EventLoop {
         // The view change bypass (6s) allows a DIFFERENT validator to produce,
         // not the same one to produce again.
         if self.consensus.we_produced_at(next_height, &our_addr) {
+            debug!("Skipping block production — we already produced at height {}", next_height);
             return;
         }
 
@@ -3236,6 +3246,10 @@ impl EventLoop {
         if seconds_waiting < 6
             && (self.consensus.has_active_vote(next_height) || self.consensus.has_height(next_height))
         {
+            debug!(
+                "Skipping block production — deferring at height {} (waiting {}s < 6, candidate/vote present)",
+                next_height, seconds_waiting
+            );
             return;
         }
 

@@ -13,8 +13,13 @@ assert_isolated
 
 boot_node 1 cold           # the seed (seed-less bootstrap leader)
 wait_rpc 1
-boot_node 2 cold 1
-boot_node 3 cold 1
+# The validators know the seed AND each other. Booting them seed-only would
+# leave both at zero peers the moment the seed dies — which is what the LIVE
+# topology did, and why that outage wedged: with no peers a node cannot form
+# quorum at all, so the scenario would be testing the topology rather than the
+# failover it means to exercise.
+boot_node 2 cold 1 3
+boot_node 3 cold 1 2
 wait_rpc 2; wait_rpc 3
 
 if ! wait_all_height 20 240 1 2 3; then
