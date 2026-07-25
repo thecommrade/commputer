@@ -1034,8 +1034,17 @@ impl EventLoop {
                         let our_height = self.state.blocks.height();
 
                         // Solo node timeout: if no peers have blocks after 30s, start producing.
+                        // Requires actually being ALONE. Without the peer check this
+                        // fires on a node that has peers but has not yet learned a
+                        // network height, marking it sync_complete and resetting the
+                        // sync machine — and because every re-engage is undone the same
+                        // way, a freshly-wiped node can never join a running chain. Live
+                        // 2026-07-25: a rejoining validator sat at height 0 for ten
+                        // minutes, connected, reporting "synced", while its peers were
+                        // at 1265. The log line already claims this condition.
                         if self.event_loop_start.elapsed().as_secs() >= 30
-                            && self.network_height == 0 {
+                            && self.network_height == 0
+                            && self.peer_ips.is_empty() {
                             info!("No network blocks found after 30s — starting block production");
                             self.sync_complete = true;
                             self.sync_machine.reset();

@@ -34,6 +34,7 @@ FAST_SET=(
     F10_mass_restart
     seed_restart
     F_isolation_solo_gate
+    F8_fresh_join
     F1_runaway_detect
 )
 SOAK_SET=( soak_30min )
