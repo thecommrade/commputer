@@ -1233,6 +1233,26 @@ h1 {{ color: #e94560; }}
 
 // ── Feature 15: RPC API key authentication middleware ──
 
+/// Alpha.5 (R1): env var consulted for the admin key when no `--rpc-key` /
+/// config key was provided. CLI/config always wins; an empty value counts as
+/// unset (an empty-string "key" would be satisfiable by an empty header).
+pub const RPC_KEY_ENV: &str = "COMMPUTER_RPC_KEY";
+
+/// Admin-key precedence: the explicitly configured key first, else a NON-EMPTY
+/// env-supplied value. Pure (the env value is passed in) so the precedence is
+/// testable without process-global env mutation.
+fn resolve_admin_key(configured: Option<String>, env_val: Option<String>) -> Option<String> {
+    configured.or_else(|| env_val.filter(|v| !v.is_empty()))
+}
+
+/// The key the auth gate and bind guard actually enforce: `--rpc-key` else
+/// `COMMPUTER_RPC_KEY`. Read per call — an env lookup is negligible next to
+/// any handler, and skipping a process-wide cache keeps the value observable
+/// under test.
+fn effective_api_key(state: &RpcState) -> Option<String> {
+    resolve_admin_key(state.api_key.clone(), std::env::var(RPC_KEY_ENV).ok())
+}
+
 /// A4-auth-loopback: code-level opt-out for the legacy loopback auth bypass.
 ///
 /// `false` (default, secure) — when an API key is configured the key is
@@ -1253,6 +1273,9 @@ const ALLOW_LOOPBACK_BYPASS: bool = false;
 ///
 /// If no key is configured, all requests pass (unchanged default).
 ///
+/// Alpha.5 (R1): "configured" means `--rpc-key`/config OR the `COMMPUTER_RPC_KEY`
+/// env fallback (`effective_api_key`) — CLI/config wins when both are set.
+///
 /// A4-auth-loopback: if a key IS configured, the key is required for every
 /// caller. Loopback no longer bypasses auth unless `ALLOW_LOOPBACK_BYPASS` is
 /// set to `true` at build time. When the bypass is disabled (default) a caller
@@ -1263,7 +1286,7 @@ async fn auth_middleware(
     req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if let Some(ref expected_key) = state.api_key {
+    if let Some(ref expected_key) = effective_api_key(&state) {
         // A4-auth-loopback: by default, enforce for everyone. Only when the
         // build-time opt-out is enabled do we exempt loopback callers.
         let exempt = if ALLOW_LOOPBACK_BYPASS {
@@ -1815,6 +1838,18 @@ async fn submit_job(
 /// cors_middleware is applied as the OUTERMOST layer (over the whole merged app)
 /// so OPTIONS preflight is answered before auth/rate-limit.
 pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
+    // Alpha.5 (R1): surface the unkeyed-admin condition loudly at build time.
+    // rpc_bind_guard only inspects the node's OWN bind — behind a reverse proxy
+    // a loopback bind passes the guard while the proxy exposes the keyless
+    // admin tier (and /submit_job) to the internet.
+    if effective_api_key(&rpc_state).is_none() {
+        warn!(
+            "RPC admin endpoints (including /submit_job) are UNKEYED — anyone who can reach \
+             this RPC (including via a reverse proxy) can submit jobs; set --rpc-key or \
+             COMMPUTER_RPC_KEY"
+        );
+    }
+
     // PUBLIC tier — rate-limited, no auth.
     let public = Router::new()
         .route("/", get(block_explorer))
@@ -1916,8 +1951,10 @@ pub async fn start_rpc_server(
 ) {
     // W5.7 F-4: refuse to start if bound to a non-loopback address with auth
     // disabled (no API key). This prevents an unauthenticated RPC surface from
-    // being silently exposed to the network.
-    if let Err(reason) = rpc_bind_guard(&rpc_bind, rpc_state.api_key.is_some()) {
+    // being silently exposed to the network. Alpha.5 (R1): the guard consults
+    // the EFFECTIVE key — an env-only key (COMMPUTER_RPC_KEY, no --rpc-key)
+    // must permit a non-loopback bind exactly as a CLI key does.
+    if let Err(reason) = rpc_bind_guard(&rpc_bind, effective_api_key(&rpc_state).is_some()) {
         tracing::error!("{}", reason);
         return;
     }
@@ -2461,6 +2498,9 @@ mod tests {
     /// This pins that the patch does not regress the unauthenticated default.
     #[tokio::test]
     async fn loopback_passes_through_when_no_key_set() {
+        // Alpha.5 (R1): "no key" now also means "no COMMPUTER_RPC_KEY in env" —
+        // hold the env lock so the fallback tests cannot set it concurrently.
+        let _env = lock_rpc_key_env();
         // make_rpc_state() defaults api_key = None.
         let (state, _rx) = make_rpc_state();
         assert!(state.api_key.is_none(), "helper default must be no-key");
@@ -2656,6 +2696,139 @@ mod tests {
             returned[0].ip.as_deref(),
             Some("198.51.100.7"),
             "/peers/full MUST return the un-redacted IP once authorized"
+        );
+    }
+
+    // ── Alpha.5 (R1): admin-key env fallback (COMMPUTER_RPC_KEY) tests ──
+
+    /// Serializes every test that sets OR depends on the absence of
+    /// COMMPUTER_RPC_KEY — process env is global across the parallel test
+    /// threads. Poison-tolerant: a failed env test must not cascade.
+    static RPC_KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_rpc_key_env() -> std::sync::MutexGuard<'static, ()> {
+        RPC_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Removes COMMPUTER_RPC_KEY on drop so a failing assertion cannot leak
+    /// the var into later tests.
+    struct RpcKeyEnvGuard;
+    impl Drop for RpcKeyEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: process-global env mutation, serialized by RPC_KEY_ENV_LOCK
+            // (held by every test that touches or observes this var).
+            unsafe { std::env::remove_var(RPC_KEY_ENV) };
+        }
+    }
+
+    /// Precedence is pure and pinned without env mutation: CLI/config wins,
+    /// env fills the gap, an empty env value counts as unset.
+    #[test]
+    fn resolve_admin_key_precedence() {
+        assert_eq!(
+            resolve_admin_key(Some("cli-key".into()), Some("env-key".into())),
+            Some("cli-key".to_string()),
+            "an explicitly configured key MUST win over the env fallback"
+        );
+        assert_eq!(
+            resolve_admin_key(None, Some("env-key".into())),
+            Some("env-key".to_string()),
+            "with no configured key, a non-empty env value supplies the key"
+        );
+        assert_eq!(
+            resolve_admin_key(None, Some(String::new())),
+            None,
+            "an empty env value MUST count as unset, not as an empty-string key"
+        );
+        assert_eq!(resolve_admin_key(None, None), None);
+    }
+
+    /// With NO CLI/config key but COMMPUTER_RPC_KEY exported, the admin tier
+    /// MUST enforce the env-supplied key: keyless request 401s, the correct
+    /// header reaches the handler.
+    #[tokio::test]
+    async fn env_fallback_supplies_admin_key() {
+        let _env = lock_rpc_key_env();
+        let _cleanup = RpcKeyEnvGuard;
+        // SAFETY: serialized by RPC_KEY_ENV_LOCK; removed by RpcKeyEnvGuard.
+        unsafe { std::env::set_var(RPC_KEY_ENV, "env-admin-key") };
+
+        let (state, _rx) = make_rpc_state();
+        assert!(state.api_key.is_none(), "helper default must be no-key");
+        let app = build_router(state);
+
+        let unauth = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(unauth).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "with COMMPUTER_RPC_KEY set and no CLI key, admin routes MUST require the env key"
+        );
+
+        let authed = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .header("X-API-Key", "env-admin-key")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(authed).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the env-supplied key MUST be accepted on admin routes"
+        );
+    }
+
+    /// /submit_job is ADMIN-tier: with a key configured, a keyless POST MUST
+    /// 401 before the handler runs; the correct key reaches the handler (503
+    /// here — DA is off in the test state — which proves auth passed).
+    #[tokio::test]
+    async fn submit_job_requires_key_when_configured() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "program_hex": "00",
+            "input_hex": "00",
+            "budget": 1u64,
+            "submitter_seed": "not-a-real-seed",
+        })
+        .to_string();
+
+        let unauth = Request::builder()
+            .method("POST")
+            .uri("/submit_job")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let resp = app.clone().oneshot(unauth).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "/submit_job MUST be key-gated — it accepts a submitter seed"
+        );
+
+        let authed = Request::builder()
+            .method("POST")
+            .uri("/submit_job")
+            .header("content-type", "application/json")
+            .header("X-API-Key", "s3cret-key")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(authed).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "with the correct key the request MUST reach the handler (DA off ⇒ 503)"
         );
     }
 

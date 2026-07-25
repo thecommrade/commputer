@@ -216,6 +216,11 @@ pub struct EventLoop {
     pub fork_detector: commputer::fork_detector::ForkDetector,
     /// Timestamp of the first consensus stall signal. None if no stall.
     pub stall_start: Option<std::time::Instant>,
+    /// Local height at the last stall-triggered NON-destructive sync re-engage.
+    /// One re-engage attempt per height: a second stall at the same height means
+    /// sync gained nothing (fork shape) and recovery escalates to the
+    /// destructive resync. u64::MAX = no attempt yet.
+    pub stall_reengage_height: u64,
     /// Cooldown: when the last chain resync completed. Prevents resync loops from DoS.
     pub last_resync: Option<std::time::Instant>,
     /// Last time any message was received from each peer (for online/staleness checks).
@@ -310,6 +315,7 @@ impl EventLoop {
             network_height: 0,
             fork_detector: commputer::fork_detector::ForkDetector::new(),
             stall_start: None,
+            stall_reengage_height: u64::MAX,
             last_resync: None,
             peer_last_seen: HashMap::new(),
             health_monitor: ChainHealthMonitor::new(),
@@ -996,6 +1002,29 @@ impl EventLoop {
                     // is_active), so a wedged node can always climb back to Active.
                     self.node_state.recompute_network_height();
 
+                    // Catch-up is a permanent capability, not an initial-sync
+                    // one-shot: when the network's tip has moved sustainably
+                    // above ours, clear the sync_complete latch and re-engage.
+                    // Rate-limiting/backoff live in should_reengage. Without
+                    // this, a node that completes a round to a stale target
+                    // goes dormant below a moving tip (live: nodes sat 9-335
+                    // blocks behind for hours; far-behind nodes never even
+                    // stall because no candidates form at their next height).
+                    if self.sync_complete
+                        && self.sync_machine.should_reengage(
+                            self.state.blocks.height(),
+                            self.node_state.network_height(),
+                        )
+                    {
+                        info!(
+                            "Sync re-engage: local {} vs network {} — resuming catch-up",
+                            self.state.blocks.height(),
+                            self.node_state.network_height()
+                        );
+                        self.sync_complete = false;
+                        self.sync_machine.reset();
+                    }
+
                     if !self.sync_complete {
                         let our_height = self.state.blocks.height();
 
@@ -1031,8 +1060,14 @@ impl EventLoop {
                                             self.sync_complete = true;
                                             self.sync_machine.reset();
                                             self.node_state.force_active();
-                                        } else if target > 0 && our_height + 2 >= target {
-                                            // Already close enough — skip to complete.
+                                        } else if target > 0 && our_height >= target {
+                                            // AT target — complete. The old "+2 close enough"
+                                            // tolerance deadlocked with leader election: a
+                                            // 2-block-behind node whose turn it is to produce
+                                            // can neither sync (gap swallowed here) nor
+                                            // produce (not at tip) — and re-engage fires at
+                                            // exactly gap>=2, looping forever (live
+                                            // 2026-07-25: solar at 30, tip 32, leader for 33).
                                             info!("Initial sync complete at height {} (network at {})", our_height, target);
                                             self.sync_complete = true;
                                             self.sync_machine.reset();
@@ -1507,6 +1542,11 @@ impl EventLoop {
                 );
             }
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                // Teach the seed keepalive this peer's identity if the remote
+                // address is one of our seed targets (first statement so it
+                // runs before the banned/duplicate early-returns).
+                let remote_addr = endpoint.get_remote_address().clone();
+                self.network.note_seed_connection(&peer_id, &remote_addr, &self.custom_seeds);
                 // Mark that we've connected to at least one peer.
                 if !self.has_ever_connected {
                     info!("First peer connection established — node is now eligible to produce blocks");
@@ -1977,10 +2017,17 @@ impl EventLoop {
                                         }
                                     }
                                     ConsensusResponse::NotReady { height } => {
-                                        // Peer is alive but syncing. Reset stall timer --
-                                        // a syncing peer will be ready soon. Only true
-                                        // silence (no response) should trigger resync.
-                                        self.stall_start = None;
+                                        // Peer is alive but syncing — damp the stall
+                                        // timer, but only within the per-peer budget:
+                                        // an unbounded reset let one permanently-wedged
+                                        // peer suppress every neighbor's recovery
+                                        // forever (live 2026-07-24: the whole net froze
+                                        // at height 11 in mutual NotReady politeness).
+                                        if self.stall_start.is_some()
+                                            && self.consensus.allow_notready_stall_reset(peer)
+                                        {
+                                            self.stall_start = None;
+                                        }
                                         debug!("Received NotReady from {} at height {}", peer, height);
                                     }
                                 }
@@ -3035,7 +3082,11 @@ impl EventLoop {
             nerfed_count,
         });
 
-        self.state.current_epoch = epoch + 1;
+        // Ratchet, never regress: sync-applied blocks can carry the chain's
+        // epoch ahead of this node's wall-clock tick counter; the tick must
+        // not roll a synced epoch back (live: /status epochs diverged 0 vs 2
+        // across nodes after resyncs).
+        self.state.current_epoch = self.state.current_epoch.max(epoch + 1);
         self.epoch_state = EpochState::new(epoch + 1, 0);
         self.epoch_state.difficulty_multiplier = next_difficulty;
         self.epoch_state.snapshot_validators(next_active_validators);
@@ -3366,6 +3417,12 @@ impl EventLoop {
 
         let peer_count = self.peer_ips.len();
         self.consensus.update_params_for_network_size(peer_count);
+        // A wall-clock stall accumulated with nobody to talk to is meaningless —
+        // without this, a node that rejoins after a 0-peer stretch fires an
+        // immediate (destructive) recovery off stale timing.
+        if peer_count == 0 {
+            self.stall_start = None;
+        }
 
         // Only vote/finalize for the NEXT height (tip+1).
         let next_height = self.state.blocks.height() + 1;
@@ -3441,11 +3498,46 @@ impl EventLoop {
                         // Multi-node: start or check stall timer.
                         let stall_start = *self.stall_start.get_or_insert_with(std::time::Instant::now);
                         let elapsed = stall_start.elapsed().as_secs();
-                        if elapsed >= 60 {
-                            self.initiate_chain_resync(&format!(
-                                "consensus stall for {}s at height {}",
-                                elapsed, next_height
-                            ));
+                        // Per-node jitter: a shared network event must not make
+                        // every node fire recovery in the same second (live
+                        // 2026-07-24: synchronized destructive resyncs would
+                        // truncate the chain to the slowest peer's height).
+                        let jitter = (self.network.local_peer_id.to_bytes().last().copied().unwrap_or(0) as u64) % 30;
+                        if elapsed >= 60 + jitter {
+                            let local = self.state.blocks.height();
+                            let target = self.node_state.network_height();
+                            // The FIRST stall at any height is never destructive:
+                            // re-engage (a no-op when there is no gap) and record.
+                            // Destructive recovery requires a REPEAT stall at the
+                            // same height — a mis-read height signal must not be
+                            // able to wipe state on one bad sample (live
+                            // 2026-07-25: a fresh peer's low sample turned
+                            // "behind" into "at-tip fork" and truncated the chain).
+                            if self.stall_reengage_height != local {
+                                // Merely behind: non-destructive recovery — restart
+                                // the sync machine and let it pull the gap. A plain
+                                // stall must never wipe state (reset_to_genesis is
+                                // stranger-triggerable via induced quorum
+                                // starvation); the destructive path is reserved for
+                                // the fork detector and the escalation below.
+                                warn!(
+                                    "Consensus stall for {}s at height {} with network at {} — re-engaging sync (non-destructive)",
+                                    elapsed, next_height, target
+                                );
+                                self.stall_reengage_height = local;
+                                self.sync_complete = false;
+                                self.sync_machine.reset();
+                                self.stall_start = None;
+                            } else {
+                                // A prior re-engage at this same height gained
+                                // nothing (at-tip fork, or a gap sync cannot
+                                // close): destructive last resort — the only
+                                // remaining cross-fork recovery.
+                                self.initiate_chain_resync(&format!(
+                                    "consensus stall for {}s at height {}",
+                                    elapsed, next_height
+                                ));
+                            }
                             return;
                         }
                     }
@@ -3557,15 +3649,15 @@ impl EventLoop {
                             }
                         }
 
-                    // Auto-snapshot every 100 blocks.
-                    if height.is_multiple_of(100) && height > 0 {
-                        let snap_path = std::path::PathBuf::from(
-                            format!("snapshot-{}.json", height)
-                        );
-                        if let Err(e) = self.state.save_snapshot(&snap_path) {
-                            warn!("Failed to save snapshot at height {}: {}", height, e);
+                    // Auto-snapshot every 100 blocks — into the data dir (CWD is
+                    // read-only under systemd ProtectSystem=strict).
+                    if height.is_multiple_of(100) && height > 0
+                        && let Some(ref dir) = self.data_dir {
+                            let snap_path = dir.join(format!("snapshot-{}.json", height));
+                            if let Err(e) = self.state.save_snapshot(&snap_path) {
+                                warn!("Failed to save snapshot at height {}: {}", height, e);
+                            }
                         }
-                    }
 
                     // Feature 127: Check for orphaned blocks that can now be processed.
                     self.process_orphans(hash);
@@ -3666,6 +3758,10 @@ impl EventLoop {
             Ok(()) => {
                 info!("Sync: applied block {} at height {}", hash, height);
                 self.last_block_seen_time = Some(std::time::Instant::now());
+                // A sync-applied block is chain progress: without this the 62s
+                // consensus-stall timer fires mid-catch-up (live 2026-07-24: it
+                // triggered a destructive resync 6s after block 9 applied).
+                self.stall_start = None;
                 self.print_status();
 
                 // Broadcast to WebSocket clients.
@@ -3925,51 +4021,17 @@ impl EventLoop {
 
     /// Feature 178: Reconnect to seed nodes when we have no peers.
     fn reconnect_seeds(&mut self) {
-        if self.custom_seeds.is_empty() {
-            return;
-        }
-        // Only attempt reconnection when we have zero peers.
-        let peer_count = self.network.swarm.connected_peers().count();
-        if peer_count > 0 {
-            return;
-        }
-        info!("No peers connected — attempting seed reconnection");
-        let seeds = self.custom_seeds.clone();
-        let mut reconnected = 0;
-        let mut parse_failures = 0;
-        let mut dial_failures = 0;
-        for addr_str in &seeds {
-            match addr_str.parse::<libp2p::Multiaddr>() {
-                Ok(addr) => match self.network.dial(addr) {
-                    Ok(()) => {
-                        reconnected += 1;
-                    }
-                    Err(e) => {
-                        // Common transient: DialError::DialPeerConditionFalse
-                        // (libp2p already has a pending dial for this peer).
-                        // Visible as debug so the periodic retry doesn't spam
-                        // the log, but no longer fully silent.
-                        debug!("Reconnect dial to {} failed: {}", addr_str, e);
-                        dial_failures += 1;
-                    }
-                },
-                Err(e) => {
-                    // Parse failures are likely config issues — warn so
-                    // they're surfaced at default log level.
-                    warn!("Reconnect skipped malformed seed '{}': {}", addr_str, e);
-                    parse_failures += 1;
-                }
-            }
-        }
-        if reconnected > 0 {
-            info!("Dialed {} seed nodes for reconnection", reconnected);
-        } else if dial_failures > 0 || parse_failures > 0 {
-            // Surface the all-failed case so operators don't assume a silent
-            // success when no peers ever come back.
-            info!(
-                "Seed reconnection: 0 succeeded, {} dial errors, {} parse errors (out of {} seeds)",
-                dial_failures, parse_failures, seeds.len()
-            );
+        // Seed keepalive, NOT a last-resort sweep: runs regardless of current
+        // peer count and covers the compiled-in default seeds, not just
+        // --seeds. The old zero-peers-only + custom-seeds-only guards meant a
+        // validator holding any peer never re-dialed a restarted seed, and a
+        // default-seed node had no re-dial path at all (live 2026-07-24: the
+        // star topology never re-knit around the returned seed). Dedupe
+        // against live connections, per-seed backoff, and self-dial skip all
+        // live in the network crate.
+        let dialed = self.network.ensure_seed_connections(&self.custom_seeds);
+        if dialed > 0 {
+            info!("Seed keepalive: dialed {} seed(s)", dialed);
         }
     }
 

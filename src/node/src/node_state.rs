@@ -164,19 +164,35 @@ impl NodeStateMachine {
     /// permanent. Once the bad sample ages out (or is out-voted by honest peers)
     /// the target falls back to the true tip and the node can return to `Active`.
     ///
-    /// Target = median of the recent samples (robust to a minority of inflated
-    /// readings under an honest-majority sample set), never below `our_height`,
-    /// and clamped to `our_height + SANE_MAX_GAP`. With no samples the target
-    /// collapses to `our_height`. Re-evaluates state afterwards.
+    /// Target = LOWER median of the recent samples: `hs[(len-1)/2]`, so raising
+    /// the target requires a STRICT majority of samples above it — an even-split
+    /// (or smaller) set of inflated readings cannot move it (the upper median
+    /// `hs[len/2]` hands the even-split case to the liars). Never below
+    /// `our_height`, and clamped to `our_height + SANE_MAX_GAP`. With no samples
+    /// the target collapses to `our_height`. Re-evaluates state afterwards.
     pub fn recompute_network_height(&mut self) {
         let ceiling = self.our_height.saturating_add(SANE_MAX_GAP);
-        let target = if self.peer_heights.is_empty() {
-            self.our_height
-        } else {
-            let mut hs: Vec<u64> = self.peer_heights.iter().map(|(_, h)| *h).collect();
-            hs.sort_unstable();
-            let median = hs[hs.len() / 2];
-            median.max(self.our_height).min(ceiling)
+        // Peers BELOW our own height cannot be sync sources — drop them before
+        // the median. Without this, one fresh-syncing peer drags the lower
+        // median under our height, which reads as "network is behind us" and
+        // (live 2026-07-25) escalated a merely-behind node into a destructive
+        // resync that truncated the public chain from 1655 to 30. A peer must
+        // claim AT LEAST our height to influence the target, which is exactly
+        // the direction the existing raise-attack clamps already bound.
+        let target = {
+            let mut hs: Vec<u64> = self
+                .peer_heights
+                .iter()
+                .map(|(_, h)| *h)
+                .filter(|h| *h >= self.our_height)
+                .collect();
+            if hs.is_empty() {
+                self.our_height
+            } else {
+                hs.sort_unstable();
+                let median = hs[(hs.len() - 1) / 2];
+                median.max(self.our_height).min(ceiling)
+            }
         };
         // Deliberately bypasses the monotonic gate: this is the ONLY path that may
         // lower network_height, which is what un-pins a poisoned target.
@@ -395,15 +411,35 @@ mod tests {
     fn recompute_median_ignores_minority_poison() {
         let mut sm = NodeStateMachine::new();
         sm.set_our_height(100);
-        // Four honest peers at 100, one liar at the clamp ceiling.
+        // Three honest peers at 100, two liars at the clamp ceiling — a minority.
         sm.record_peer_height(1, 100);
         sm.record_peer_height(2, 100);
         sm.record_peer_height(3, 100);
-        sm.record_peer_height(4, 100);
+        sm.record_peer_height(4, u64::MAX); // stored clamped to 100 + SANE_MAX_GAP
         sm.record_peer_height(5, u64::MAX); // stored clamped to 100 + SANE_MAX_GAP
         sm.recompute_network_height();
-        // Median of [100,100,100,100, 100+GAP] = 100. A minority liar cannot move it.
+        // LOWER median of [100,100,100, 100+GAP, 100+GAP] = hs[(5-1)/2] = 100.
+        // A minority of liars cannot raise the target.
         assert_eq!(sm.network_height(), 100);
+    }
+
+    #[test]
+    fn lower_median_requires_majority() {
+        let mut sm = NodeStateMachine::new();
+        sm.set_our_height(100);
+        // Exactly half the samples inflated: with the LOWER median, a 50% split
+        // cannot raise the target — raising requires a STRICT majority. (The
+        // upper median hs[len/2] would hand the even-split case to the liars.)
+        sm.record_peer_height(1, 100);
+        sm.record_peer_height(2, 100);
+        sm.record_peer_height(3, 500);
+        sm.record_peer_height(4, 500);
+        sm.recompute_network_height();
+        assert_eq!(sm.network_height(), 100);
+        // A strict majority of samples (3 of 5) may raise it.
+        sm.record_peer_height(5, 500);
+        sm.recompute_network_height();
+        assert_eq!(sm.network_height(), 500);
     }
 
     #[test]

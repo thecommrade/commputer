@@ -75,6 +75,25 @@ pub const MAX_SYNC_GAP: u64 = SYNC_BATCH_SIZE;
 /// recorded — the reset must therefore trigger on that same failure, not later.
 pub const MAX_STALL_BATCH_FAILURES: u32 = MAX_PEER_FAILURES;
 
+/// Re-engagement: minimum blocks behind the network tip before the standing
+/// re-sync check arms. A 1-block lag is normal gossip skew around a moving
+/// tip; a sustained lag of 2+ means we are genuinely falling behind.
+pub const MIN_REENGAGE_LAG: u64 = 2;
+
+/// Re-engagement: the lag must persist this long (from first observation)
+/// before a fire, so a transient spike — a block observed while its gossip is
+/// still mid-flight to us — never triggers a resync round.
+pub const REENGAGE_GRACE_SECS: u64 = 5;
+
+/// Re-engagement backoff ladder base: seconds required between the 1st and 2nd
+/// fire; doubles per subsequent fire (30s, 60s, 120s, …).
+pub const REENGAGE_BACKOFF_BASE_SECS: u64 = 30;
+
+/// Re-engagement backoff ladder cap: fires are never spaced more than this far
+/// apart, so a persistently-lagging node keeps retrying at a bounded,
+/// non-spammy rate instead of backing off forever.
+pub const REENGAGE_BACKOFF_CAP_SECS: u64 = 300;
+
 /// States of the sync lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncState {
@@ -113,6 +132,23 @@ pub struct SyncMachine {
     /// current target was committed). Reset to 0 whenever our height advances.
     /// Drives the `MAX_STALL_BATCH_FAILURES` watchdog reset.
     consecutive_stall_failures: u32,
+    /// Re-engagement: when the qualifying lag (`network >= local +
+    /// MIN_REENGAGE_LAG`) was first observed, and the local height at that
+    /// observation. Cleared whenever the lag breaks, the local height changes,
+    /// or the machine leaves `Idle`. Survives `reset()`.
+    reengage_lag_since: Option<(Instant, u64)>,
+    /// Re-engagement: time and local height of the last fire. Cleared (with
+    /// `reengage_fires`) once the local height advances past the recorded
+    /// height. Survives `reset()` — see the note there.
+    reengage_last_fire: Option<(Instant, u64)>,
+    /// Fires since the last progress reset; exponent for the backoff ladder.
+    reengage_fires: u32,
+    /// Round contact evidence: true once at least one height probe attempt has
+    /// been reported (`record_probes_sent`) or one peer height response has
+    /// arrived (`record_height`) since the round started. Gates the
+    /// "nothing to do" conclusions — see `begin_downloading` /
+    /// `complete_verification`.
+    contacted_this_round: bool,
 }
 
 impl SyncMachine {
@@ -128,6 +164,10 @@ impl SyncMachine {
             exhausted_peers: HashSet::new(),
             last_progress_height: 0,
             consecutive_stall_failures: 0,
+            reengage_lag_since: None,
+            reengage_last_fire: None,
+            reengage_fires: 0,
+            contacted_this_round: false,
         }
     }
 
@@ -150,6 +190,8 @@ impl SyncMachine {
             SyncState::Idle | SyncState::Complete => {
                 info!("[sync] starting — entering QueryHeight");
                 self.height_responses.clear();
+                // New round: no probes attempted, no responses heard yet.
+                self.contacted_this_round = false;
                 self.state = SyncState::QueryHeight;
                 self.state_entered_at = Instant::now();
             }
@@ -160,9 +202,30 @@ impl SyncMachine {
     }
 
     /// Record a height response from a peer during `QueryHeight`.
+    ///
+    /// Also counts as round contact for the zero-contact guard: a peer that
+    /// answered is proof the round actually reached the network.
     pub fn record_height(&mut self, height: u64) {
         debug!("[sync] received height response: {}", height);
         self.height_responses.push(height);
+        self.contacted_this_round = true;
+    }
+
+    /// Report that `count` height probes (`GetHeight` requests) were sent to
+    /// peers for the current round.
+    ///
+    /// Wiring: the (protected) event loop should call this wherever it sends
+    /// `SyncRequest::GetHeight` (the `Idle`-start and `Verifying` re-check
+    /// probe loops), passing the number of peers actually probed. A round that
+    /// probed at least one peer may conclude "nothing to do" on silence (we
+    /// tried; nobody answered); a round with zero probes and zero responses may
+    /// not — it is forced back through the driver's existing `target == 0`
+    /// re-query path instead (see `begin_downloading`). Until wired, responses
+    /// recorded via `record_height` are the only accepted contact evidence.
+    pub fn record_probes_sent(&mut self, count: usize) {
+        if count > 0 {
+            self.contacted_this_round = true;
+        }
     }
 
     /// Returns `true` when we should stop collecting heights and move on.
@@ -183,7 +246,21 @@ impl SyncMachine {
     /// Returns the computed target height.
     pub fn begin_downloading(&mut self, our_height: u64) -> u64 {
         let raw_target = if self.height_responses.is_empty() {
-            our_height
+            // Zero-contact guard (empty-round race): a round that never probed a
+            // peer and never heard a response has no evidence the network is at
+            // our height — synthesizing `target = our_height` here is what the
+            // driver latches as "already close enough — skip to complete",
+            // going permanently dormant. Commit target 0 instead: the driver's
+            // existing `Downloading`/`target == 0` arm resets and re-queries
+            // with fresh probes (or falls back to its solo-node timeout).
+            if !self.contacted_this_round {
+                warn!(
+                    "[sync] height round ended with zero probes and zero responses — refusing to conclude, forcing re-query"
+                );
+                0
+            } else {
+                our_height
+            }
         } else {
             let mut sorted = self.height_responses.clone();
             sorted.sort_unstable();
@@ -313,6 +390,23 @@ impl SyncMachine {
     /// Otherwise, updates `target_height` to the new median and transitions back
     /// to `Downloading`, returning `false`.
     pub fn complete_verification(&mut self, our_height: u64) -> bool {
+        // Zero-contact guard (empty-round race): never conclude `Complete` from
+        // a round with zero probes and zero responses — total silence is not
+        // evidence of being caught up. Tear the attempt down to target 0 so the
+        // driver's existing `target == 0` arm re-queries with fresh probes.
+        if self.height_responses.is_empty() && !self.contacted_this_round {
+            warn!(
+                "[sync] verification round ended with zero probes and zero responses — refusing to complete, forcing re-query"
+            );
+            self.target_height = 0;
+            self.state = SyncState::Downloading;
+            self.state_entered_at = Instant::now();
+            self.current_batch = None;
+            self.last_progress_height = our_height;
+            self.consecutive_stall_failures = 0;
+            return false;
+        }
+
         let raw_target = if self.height_responses.is_empty() {
             our_height
         } else {
@@ -362,7 +456,106 @@ impl SyncMachine {
         None
     }
 
+    /// Re-engagement probe for the (protected) event loop's sync-timer tick.
+    ///
+    /// The initial sync is one-shot: once the driver latches `sync_complete`
+    /// the machine is reset to `Idle` and never consulted again, so a node that
+    /// later falls behind a moving tip stays behind forever (2026-07-24
+    /// formation wedge: nodes 9–335 blocks below tip for hours). This method is
+    /// the standing re-arm check.
+    ///
+    /// EVENT-LOOP CONTRACT: call once per sync tick — OUTSIDE the
+    /// `!sync_complete` gate, so a latched node is still checked — with the
+    /// local chain height and the node_state network height. When it returns
+    /// `true`, the driver must clear its `sync_complete` latch and `reset()`
+    /// this machine, so the next tick's `Idle` arm starts a fresh `QueryHeight`
+    /// round.
+    ///
+    /// Fires only when ALL hold:
+    /// - the machine is `Idle` (an active round is left alone);
+    /// - `network_height >= local_height + MIN_REENGAGE_LAG`;
+    /// - the lag has persisted for `REENGAGE_GRACE_SECS`, measured from first
+    ///   observation (the observation resets when the lag breaks, the local
+    ///   height changes, or the machine leaves `Idle`);
+    /// - the per-fire exponential backoff allows it: the first fire needs only
+    ///   the grace, then `REENGAGE_BACKOFF_BASE_SECS` (30s), 60s, … capped at
+    ///   `REENGAGE_BACKOFF_CAP_SECS` (300s) between fires. The ladder fully
+    ///   resets once the local height advances past the height recorded at the
+    ///   last fire.
+    ///
+    /// A `true` return records the fire (time + local height) for the backoff.
+    pub fn should_reengage(&mut self, local_height: u64, network_height: u64) -> bool {
+        // Progress past the last fire's height means the fired round worked:
+        // fully reset the backoff ladder.
+        if let Some((_, fired_height)) = self.reengage_last_fire {
+            if local_height > fired_height {
+                self.reengage_last_fire = None;
+                self.reengage_fires = 0;
+            }
+        }
+
+        // (i) Only an Idle machine may re-engage; any active state voids the
+        // current lag observation.
+        if self.state != SyncState::Idle {
+            self.reengage_lag_since = None;
+            return false;
+        }
+
+        // (ii) Minimum lag.
+        if network_height < local_height.saturating_add(MIN_REENGAGE_LAG) {
+            self.reengage_lag_since = None;
+            return false;
+        }
+
+        // (iii) Grace: the lag must persist from first observation; the
+        // observation restarts whenever the local height changes.
+        let now = Instant::now();
+        match self.reengage_lag_since {
+            Some((since, observed_height)) if observed_height == local_height => {
+                if now.duration_since(since).as_secs() < REENGAGE_GRACE_SECS {
+                    return false;
+                }
+            }
+            _ => {
+                self.reengage_lag_since = Some((now, local_height));
+                return false;
+            }
+        }
+
+        // (iv) Backoff ladder between fires: 30s, 60s, … capped at 300s.
+        if let Some((fired_at, _)) = self.reengage_last_fire {
+            if now.duration_since(fired_at).as_secs() < self.reengage_backoff_secs() {
+                return false;
+            }
+        }
+
+        info!(
+            "[sync] re-engaging: local height {} behind network height {} for >= {}s",
+            local_height, network_height, REENGAGE_GRACE_SECS
+        );
+        self.reengage_last_fire = Some((now, local_height));
+        self.reengage_fires = self.reengage_fires.saturating_add(1);
+        true
+    }
+
+    /// Seconds the backoff ladder requires between the last fire and the next:
+    /// `BASE * 2^(fires-1)`, capped at `REENGAGE_BACKOFF_CAP_SECS`. The shift
+    /// clamp keeps the shl far below u64 overflow (a wrapped shl could yield a
+    /// value UNDER the cap — even 0 — silently voiding the backoff); any shift
+    /// >= 4 already exceeds the cap (30 << 4 = 480 > 300), so clamping loses
+    /// nothing.
+    fn reengage_backoff_secs(&self) -> u64 {
+        let shift = self.reengage_fires.saturating_sub(1).min(32);
+        (REENGAGE_BACKOFF_BASE_SECS << shift).min(REENGAGE_BACKOFF_CAP_SECS)
+    }
+
     /// Reset the machine back to `Idle`, clearing all transient state.
+    ///
+    /// Deliberately does NOT clear the re-engagement tracker (lag observation,
+    /// fire record, backoff ladder): the driver resets the machine on every
+    /// `sync_complete` latch AND on every re-engagement fire, so wiping the
+    /// ladder here would let a persistently-lagging node re-fire every grace
+    /// period, defeating the backoff.
     pub fn reset(&mut self) {
         info!("[sync] reset to Idle");
         self.state = SyncState::Idle;
@@ -374,6 +567,7 @@ impl SyncMachine {
         self.exhausted_peers.clear();
         self.last_progress_height = 0;
         self.consecutive_stall_failures = 0;
+        self.contacted_this_round = false;
     }
 }
 
@@ -616,5 +810,156 @@ mod tests {
         machine.record_height(5_000);
         let target = machine.begin_downloading(0);
         assert_eq!(target, 5_000);
+    }
+
+    // ---- Re-engagement (2026-07-24 formation wedge) ----
+    //
+    // Time control: the tracker keys off `Instant`s captured at observation/fire
+    // time; tests age them by subtracting from the stored value. `checked_sub`
+    // guards the (theoretical) case of a test host whose monotonic clock is
+    // younger than the backdate.
+
+    fn backdate_lag(m: &mut SyncMachine, secs: u64) {
+        if let Some((t, _)) = m.reengage_lag_since.as_mut() {
+            *t = t
+                .checked_sub(std::time::Duration::from_secs(secs))
+                .expect("test host monotonic clock too young to backdate");
+        }
+    }
+
+    fn backdate_fire(m: &mut SyncMachine, secs: u64) {
+        if let Some((t, _)) = m.reengage_last_fire.as_mut() {
+            *t = t
+                .checked_sub(std::time::Duration::from_secs(secs))
+                .expect("test host monotonic clock too young to backdate");
+        }
+    }
+
+    #[test]
+    fn reengage_fires_after_sustained_lag() {
+        let mut m = SyncMachine::new();
+        // First qualifying call only arms the grace timer — never fires at once.
+        assert!(!m.should_reengage(10, 20));
+        // Grace not yet elapsed.
+        assert!(!m.should_reengage(10, 20));
+        backdate_lag(&mut m, REENGAGE_GRACE_SECS);
+        assert!(m.should_reengage(10, 20), "sustained lag past grace must fire");
+        // Fire recorded: an immediate repeat is gated by the backoff ladder.
+        assert!(!m.should_reengage(10, 20));
+    }
+
+    #[test]
+    fn reengage_respects_min_lag() {
+        let mut m = SyncMachine::new();
+        // Lag of 1 (< MIN_REENGAGE_LAG) never arms, never fires.
+        assert!(!m.should_reengage(10, 11));
+        backdate_lag(&mut m, REENGAGE_GRACE_SECS * 10); // no-op: nothing armed
+        assert!(!m.should_reengage(10, 11));
+        // Exactly MIN_REENGAGE_LAG arms and (after grace) fires.
+        assert!(!m.should_reengage(10, 12));
+        backdate_lag(&mut m, REENGAGE_GRACE_SECS);
+        assert!(m.should_reengage(10, 12));
+    }
+
+    #[test]
+    fn reengage_grace_resets_when_lag_clears() {
+        let mut m = SyncMachine::new();
+        assert!(!m.should_reengage(10, 20)); // arm
+        backdate_lag(&mut m, REENGAGE_GRACE_SECS); // ripe: a lagging call would fire
+        // Lag clears — the observation must reset.
+        assert!(!m.should_reengage(20, 20));
+        // Lag returns: this is a FRESH observation; had the ripe one survived
+        // the clear, this call would (wrongly) fire.
+        assert!(!m.should_reengage(20, 30));
+    }
+
+    #[test]
+    fn reengage_backoff_grows_then_resets_on_progress() {
+        let mut m = SyncMachine::new();
+        // Fire #1 needs only the grace.
+        assert!(!m.should_reengage(10, 20));
+        backdate_lag(&mut m, REENGAGE_GRACE_SECS);
+        assert!(m.should_reengage(10, 20));
+        // Fire #2 requires BASE (30s) since fire #1.
+        backdate_fire(&mut m, REENGAGE_BACKOFF_BASE_SECS - 1);
+        assert!(!m.should_reengage(10, 20));
+        backdate_fire(&mut m, 1); // 30s total
+        assert!(m.should_reengage(10, 20));
+        // Fire #3 requires 60s.
+        backdate_fire(&mut m, REENGAGE_BACKOFF_BASE_SECS); // only 30s
+        assert!(!m.should_reengage(10, 20));
+        backdate_fire(&mut m, REENGAGE_BACKOFF_BASE_SECS); // 60s total
+        assert!(m.should_reengage(10, 20));
+        // The ladder caps at 300s: however many fires accumulate, a 300s wait
+        // always suffices...
+        for _ in 0..6 {
+            backdate_fire(&mut m, REENGAGE_BACKOFF_CAP_SECS);
+            assert!(m.should_reengage(10, 20));
+        }
+        // ...and (one second under the cap) is still not enough.
+        backdate_fire(&mut m, REENGAGE_BACKOFF_CAP_SECS - 1);
+        assert!(!m.should_reengage(10, 20));
+        backdate_fire(&mut m, 1);
+        assert!(m.should_reengage(10, 20));
+        // Local height advances past the last fire's height: the ladder fully
+        // resets — the next fire needs only the grace again, not 300s.
+        assert!(!m.should_reengage(11, 20)); // fresh observation at new height
+        backdate_lag(&mut m, REENGAGE_GRACE_SECS);
+        assert!(m.should_reengage(11, 20), "backoff must reset after progress");
+    }
+
+    #[test]
+    fn reengage_only_when_idle() {
+        let mut m = SyncMachine::new();
+        // Arm and ripen the lag while Idle.
+        assert!(!m.should_reengage(10, 20));
+        backdate_lag(&mut m, REENGAGE_GRACE_SECS);
+        // Machine becomes active: must not fire, and the observation is voided.
+        m.start();
+        assert!(!m.should_reengage(10, 20));
+        // Back to Idle: a fresh grace period is required before firing.
+        m.reset();
+        assert!(!m.should_reengage(10, 20));
+        backdate_lag(&mut m, REENGAGE_GRACE_SECS);
+        assert!(m.should_reengage(10, 20));
+    }
+
+    // ---- Empty-round race: no conclusion without contact ----
+
+    /// A round that never probed a peer and never heard a height response has
+    /// zero evidence about the network — it must NOT conclude "nothing to do"
+    /// (which the driver latches as sync-complete, going permanently dormant).
+    /// Against the pre-fix code, `begin_downloading` on total silence
+    /// synthesizes `target = our_height` and `complete_verification` reaches
+    /// `Complete` — both latch paths for a node whose probes were all lost.
+    #[test]
+    fn empty_round_requires_probe() {
+        // Zero contact: the query round must force a re-query (target 0 flows
+        // into the driver's existing target==0 reset/re-probe path)...
+        let mut m = SyncMachine::new();
+        m.start();
+        let target = m.begin_downloading(7);
+        assert_eq!(target, 0, "zero-contact round must re-query, not conclude");
+        // ...and even if driven to Verifying, total silence must not Complete.
+        m.next_batch(7); // our_height >= target(0) → Verifying
+        assert_eq!(*m.state(), SyncState::Verifying);
+        assert!(!m.complete_verification(7));
+        assert_ne!(*m.state(), SyncState::Complete);
+
+        // With a probe attempt on record, an empty (silent) round MAY conclude:
+        // we tried, nobody answered — same behavior as before the guard.
+        let mut m = SyncMachine::new();
+        m.start();
+        m.record_probes_sent(3);
+        assert_eq!(m.begin_downloading(7), 7);
+        m.next_batch(7); // → Verifying
+        assert!(m.complete_verification(7));
+        assert_eq!(*m.state(), SyncState::Complete);
+
+        // A peer height response also counts as contact.
+        let mut m = SyncMachine::new();
+        m.start();
+        m.record_height(7);
+        assert_eq!(m.begin_downloading(7), 7);
     }
 }

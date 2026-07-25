@@ -1174,9 +1174,39 @@ async fn run_node(
     // Set up network with persistent peer identity (Item 3).
     // Include genesis hash in identify agent_version for peer chain verification.
     let peer_key = peer_key_path();
-    let genesis_hash_hex = state.blocks.get_by_height(0)
-        .map(|b| hex::encode(&b.hash().0[..8]))
-        .expect("genesis block must exist at this point");
+    let genesis_hash_hex = match state.blocks.get_by_height(0) {
+        Some(b) => hex::encode(&b.hash().0[..8]),
+        None => {
+            // A store whose early blocks arrived via sync can lack block 0
+            // (pre-alpha.5 reset_to_genesis wiped it; this was a panic loop
+            // that kept the live seed from surviving a plain restart).
+            // Recover from block 1's parent — but only if it matches the
+            // compiled genesis: adopting an arbitrary parent would let a
+            // substituted store impersonate the chain to identify-verified
+            // peers.
+            let expected = create_genesis_for_dir(Some(&dir)).hash();
+            match state.blocks.get_by_height(1).map(|b| b.header.parent_hash) {
+                Some(parent) if parent == expected => {
+                    tracing::warn!(
+                        "Genesis block missing from store (sync-born chain) — derived genesis hash from block 1's parent"
+                    );
+                    hex::encode(&parent.0[..8])
+                }
+                Some(parent) => {
+                    return Err(anyhow::anyhow!(
+                        "genesis block missing and block 1's parent {} does not match the compiled genesis {} — data dir corrupt; archive it and re-sync",
+                        hex::encode(&parent.0[..8]),
+                        hex::encode(&expected.0[..8])
+                    ));
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "no genesis block and no block 1 in the store — data dir corrupt or empty; archive it and re-sync"
+                    ));
+                }
+            }
+        }
+    };
     let mut network = CommpNetwork::new_with_keypair_path(port, Some(&peer_key), &genesis_hash_hex)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     info!("P2P peer ID: {}", network.local_peer_id);
@@ -1310,6 +1340,10 @@ async fn run_node(
 
     // Create event loop and attach RPC channel (shares status with RPC server).
     let mut event_loop = EventLoop::new(state, wallet, network, hardware);
+    // data_dir gates auto-snapshots, job-pool and mempool persistence — all
+    // silently dead while this stayed None (and snapshots fell back to CWD,
+    // which is read-only under systemd ProtectSystem=strict).
+    event_loop.data_dir = Some(data_dir(testnet));
     event_loop.attach_rpc(tx_receiver, rpc_state.clone());
     event_loop.auto_register_validator(contribution_percent);
 

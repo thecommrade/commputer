@@ -67,6 +67,16 @@ pub const MAX_CANDIDATES_PER_HEIGHT: usize = 64;
 /// height. Far above any realistic validator-set size for an alpha testnet.
 pub const MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT: usize = 1024;
 
+/// Per-peer budget for NotReady-driven stall-timer resets since the last
+/// chain-tip advancement. See `ConsensusManager::allow_notready_stall_reset`.
+pub const MAX_NOTREADY_STALL_RESETS: u32 = 5;
+
+/// Security bound: maximum distinct peers tracked in the NotReady stall-reset
+/// budget map. When full, an unseen peer is DENIED rather than evicting an
+/// existing entry — eviction would let a rotating-PeerId attacker launder a
+/// fresh budget through churn; denial only ever fails closed.
+pub const MAX_NOTREADY_STALL_RESET_PEERS: usize = 64;
+
 /// Feature 121: View change state — tracks when a view change is triggered.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -202,8 +212,19 @@ pub struct ConsensusManager {
     pub checkpoint_votes: HashMap<u64, HashMap<Address, [u8; 32]>>,
     /// Security: last applied chain tip, updated by `cleanup_below`. Bounds how
     /// far ahead of the tip candidate/checkpoint heights may be tracked so a
-    /// remote peer cannot flood arbitrary heights and exhaust memory.
+    /// remote peer cannot flood arbitrary heights and exhaust memory. Retained
+    /// across `clear()` — a resync must not reopen the solo-bootstrap window.
     applied_tip: u64,
+    /// Reserved for explicit ceremony bootstrap wiring: when true, the
+    /// zero-peer solo-finalize gate in `try_finalize_round` is bypassed and a
+    /// node may finalize with no peers at any height. Defaults to false;
+    /// nothing sets it yet.
+    pub allow_solo: bool,
+    /// Per-peer count of stall-timer resets granted because that peer reported
+    /// NotReady/Syncing (see `allow_notready_stall_reset`). Bounded at
+    /// MAX_NOTREADY_STALL_RESET_PEERS; replenished on tip advancement in
+    /// `cleanup_below` and on `clear`.
+    notready_stall_resets: HashMap<PeerId, u32>,
 }
 
 impl ConsensusManager {
@@ -223,11 +244,13 @@ impl ConsensusManager {
             last_block_time: HashMap::new(),
             checkpoint_votes: HashMap::new(),
             applied_tip: 0,
+            allow_solo: false,
+            notready_stall_resets: HashMap::new(),
         }
     }
 
     /// Scale Snowball parameters to current network size.
-    /// Stepped curve from solo-bootstrap (1,1,1) up to full production
+    /// Stepped curve from solo-bootstrap (1,1,3) up to full production
     /// (20,14,20) at peer_count >= 21. Each rung satisfies the validate()
     /// invariant `quorum > sample_size / 2`. The (3,2,5) rung at
     /// peer_count in [3,5] preserves the bbbed4f-validated 3-node stress
@@ -235,7 +258,10 @@ impl ConsensusManager {
     /// `src/consensus/src/config.rs` for the parameter envelope.
     pub fn update_params_for_network_size(&mut self, peer_count: usize) {
         let (sample, quorum, threshold): (usize, usize, u32) = match peer_count {
-            0 => (1, 1, 1),
+            // β=3 at 0 peers: defense in depth behind the zero-peer gate in
+            // try_finalize_round — a stale-params race must not be able to
+            // one-shot finalize a private block.
+            0 => (1, 1, 3),
             1 => (1, 1, 3),
             2 => (2, 2, 3),
             3..=5 => (3, 2, 5),
@@ -273,6 +299,8 @@ impl ConsensusManager {
             last_block_time: HashMap::new(),
             checkpoint_votes: HashMap::new(),
             applied_tip: 0,
+            allow_solo: false,
+            notready_stall_resets: HashMap::new(),
         }
     }
 
@@ -352,8 +380,17 @@ impl ConsensusManager {
         }
 
         state.candidates.insert(hash, block);
-        // Set initial preference so Snowball queries can start immediately.
-        state.voter.set_initial_preference(hash);
+        // Deterministic symmetric tie-break: converge every node's INITIAL
+        // preference on the lowest candidate hash. A fully-meshed set of
+        // competing producers otherwise deadlocks — each node prefers its own
+        // (first-arrived) block and no (q,q,β) quorum ever forms (live
+        // 2026-07-25: the all-alpha.5 triangle froze at height 31 with three
+        // producers). Only the un-voted initial preference moves; once
+        // sampling starts, preference changes belong to Snowball's quorum
+        // dynamics alone.
+        if let Some(lowest) = state.candidates.keys().min().copied() {
+            state.voter.reset_initial_preference_if_unvoted(lowest);
+        }
         debug!("Candidate added at height {}: {} (total: {})", height, hash, state.candidates.len());
     }
 
@@ -416,6 +453,20 @@ impl ConsensusManager {
     /// `peer_count` is used to scale the timeout to network size.
     /// Returns a `ConsensusRoundResult` indicating the outcome.
     pub fn try_finalize_round(&mut self, height: u64, peer_count: usize) -> ConsensusRoundResult {
+        // Zero-peer solo-finalize gate: at 0 peers the solo rung would let a
+        // node self-vote its own candidate to finalization every stall timeout,
+        // minting a private fork (observed 4x live, 2026-07-24). Only the
+        // genesis ceremony — block 1 on a virgin chain (applied_tip == 0) —
+        // may finalize alone. Checked BEFORE the tally and BEFORE the timeout
+        // so no Stalled can escape and, critically, the aggregator's pending
+        // votes are NOT consumed: the round resumes when a peer reconnects.
+        if peer_count == 0
+            && !(height <= 1 && self.applied_tip == 0)
+            && !self.allow_solo
+        {
+            return ConsensusRoundResult::NotReady;
+        }
+
         if let Some(state) = self.heights.get_mut(&height) {
             if state.voter.is_finalized() {
                 return ConsensusRoundResult::NotReady;
@@ -495,6 +546,12 @@ impl ConsensusManager {
         // this the attacker-keyed (height, validator) map is never bounded and
         // grows without limit → OOM.
         self.checkpoint_votes.retain(|h, _| *h > applied_height);
+        // Tip advancement means the chain is making progress again — replenish
+        // every peer's NotReady stall-reset budget (see
+        // allow_notready_stall_reset). Must run before the tip update below.
+        if applied_height > self.applied_tip {
+            self.notready_stall_resets.clear();
+        }
         // Security: record the applied tip so add_candidate / record_checkpoint_vote
         // can bound how far ahead of it they will track heights. Monotonic — the
         // chain tip only advances.
@@ -502,6 +559,8 @@ impl ConsensusManager {
     }
 
     /// Clear all consensus state. Used during chain resync.
+    /// `applied_tip` is deliberately retained: a resync on an established
+    /// chain must not reopen the zero-peer solo-bootstrap window.
     pub fn clear(&mut self) {
         self.heights.clear();
         self.height_start_time.clear();
@@ -510,6 +569,32 @@ impl ConsensusManager {
         self.view_changes.clear();
         self.last_block_time.clear();
         self.checkpoint_votes.clear();
+        self.notready_stall_resets.clear();
+    }
+
+    /// Budgeted permission for a peer's NotReady/Syncing status to reset the
+    /// local stall timer. Bounds how long a permanently-Syncing (or hostile)
+    /// peer can suppress a neighbor's stall recovery: each distinct peer may
+    /// cause at most MAX_NOTREADY_STALL_RESETS resets since the last chain-tip
+    /// advancement. Per-peer so one hostile peer cannot drain the shield that
+    /// protects honest syncing peers. Returns true (and spends one unit of the
+    /// peer's budget) while under budget; false once exhausted, or when the
+    /// tracking map is full and the peer is unseen (deny, never evict — the
+    /// safe direction). Budgets replenish in `cleanup_below` on tip
+    /// advancement and in `clear`.
+    pub fn allow_notready_stall_reset(&mut self, peer: PeerId) -> bool {
+        if let Some(count) = self.notready_stall_resets.get_mut(&peer) {
+            if *count >= MAX_NOTREADY_STALL_RESETS {
+                return false;
+            }
+            *count += 1;
+            return true;
+        }
+        if self.notready_stall_resets.len() >= MAX_NOTREADY_STALL_RESET_PEERS {
+            return false;
+        }
+        self.notready_stall_resets.insert(peer, 1);
+        true
     }
 
     /// How many candidates exist at a given height.
@@ -1495,7 +1580,9 @@ mod tests {
 
     #[test]
     fn scaling_curve_solo_bootstrap() {
-        assert_curve(0, 1, 1, 1);
+        // β=3 at 0 peers: defense in depth behind the zero-peer gate — a
+        // stale-params race must not be able to one-shot finalize.
+        assert_curve(0, 1, 1, 3);
     }
 
     #[test]
@@ -1686,5 +1773,165 @@ mod tests {
             super::MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT,
             "distinct checkpoint validators at one height must be capped"
         );
+    }
+
+    /// Deterministic symmetric tie-break: whatever order candidates arrive,
+    /// the un-voted initial preference converges on the LOWEST hash — a
+    /// fully-meshed set of competing producers otherwise deadlocks with each
+    /// node preferring its own first-arrived block (live 2026-07-25: the
+    /// all-alpha.5 triangle froze at height 31).
+    #[test]
+    fn initial_preference_converges_on_lowest_candidate_hash() {
+        // Distinct producers ⇒ distinct hashes at the same height.
+        let a = make_test_block_with_producer(5, addr(1));
+        let b = make_test_block_with_producer(5, addr(2));
+        let lowest = a.hash().min(b.hash());
+
+        let mut first_ab = ConsensusManager::new();
+        first_ab.cleanup_below(4);
+        first_ab.add_candidate(a.clone());
+        first_ab.add_candidate(b.clone());
+        assert_eq!(first_ab.query_preference(5), Some(lowest));
+
+        // Reverse arrival order must land on the same preference.
+        let mut first_ba = ConsensusManager::new();
+        first_ba.cleanup_below(4);
+        first_ba.add_candidate(b);
+        first_ba.add_candidate(a);
+        assert_eq!(first_ba.query_preference(5), Some(lowest));
+    }
+
+    // ---- Zero-peer solo-finalize gate (alpha.5 formation hardening) ----
+    // At 0 peers the solo rung let a node self-vote its own candidate to
+    // finalization every stall timeout, minting a private fork (observed 4x
+    // live, 2026-07-24). Only the genesis ceremony — block 1 on a virgin
+    // chain (applied_tip == 0) — may finalize alone.
+
+    #[test]
+    fn established_node_zero_peers_returns_not_ready_not_stalled() {
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4); // established chain: applied_tip = 4
+        cm.add_candidate(make_test_block(5));
+        // Backdate so the stall timeout would otherwise fire.
+        cm.height_start_time
+            .insert(5, Instant::now() - std::time::Duration::from_secs(60));
+        assert_eq!(cm.try_finalize_round(5, 0), ConsensusRoundResult::NotReady);
+        assert!(cm.finalized_at_height(5).is_none());
+    }
+
+    #[test]
+    fn zero_peer_gate_preserves_pending_votes_for_reconnect() {
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4);
+        let block = make_test_block(5);
+        let hash = block.hash();
+        cm.add_candidate(block);
+
+        let peer = PeerId::random();
+        assert!(cm.record_peer_response(5, hash, peer));
+        // Gate fires at 0 peers but must NOT consume the pending round.
+        assert_eq!(cm.try_finalize_round(5, 0), ConsensusRoundResult::NotReady);
+        // Same peer re-voting is still deduped -> aggregator survived the gate.
+        assert!(!cm.record_peer_response(5, hash, peer));
+
+        // Peer connectivity returns: preserved + fresh votes finalize normally.
+        for _ in 0..5 {
+            cm.record_response(5, hash);
+            cm.record_response(5, hash);
+            cm.try_finalize_round(5, 3);
+        }
+        assert_eq!(cm.finalized_at_height(5), Some(hash));
+    }
+
+    #[test]
+    fn genesis_bootstrap_still_solo_finalizes_block_1() {
+        // Virgin chain (applied_tip == 0), height 1: the ceremony path must
+        // still reach Stalled — the event loop's self-vote trigger.
+        let mut cm = ConsensusManager::new();
+        cm.add_candidate(make_test_block(1));
+        cm.height_start_time
+            .insert(1, Instant::now() - std::time::Duration::from_secs(60));
+        assert_eq!(cm.try_finalize_round(1, 0), ConsensusRoundResult::Stalled);
+    }
+
+    #[test]
+    fn resync_clear_does_not_reopen_solo_bootstrap() {
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4); // chain had advanced before the resync
+        cm.clear();
+        cm.add_candidate(make_test_block(5));
+        cm.height_start_time
+            .insert(5, Instant::now() - std::time::Duration::from_secs(60));
+        // applied_tip survives clear(): still an established node, still gated.
+        assert_eq!(cm.try_finalize_round(5, 0), ConsensusRoundResult::NotReady);
+    }
+
+    #[test]
+    fn allow_solo_override_restores_stalled_at_zero_peers() {
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4);
+        cm.allow_solo = true; // explicit ceremony bootstrap wiring
+        cm.add_candidate(make_test_block(5));
+        cm.height_start_time
+            .insert(5, Instant::now() - std::time::Duration::from_secs(60));
+        assert_eq!(cm.try_finalize_round(5, 0), ConsensusRoundResult::Stalled);
+    }
+
+    // ---- Per-peer NotReady stall-reset budget ----
+
+    #[test]
+    fn notready_budget_per_peer_exhausts_at_5() {
+        let mut cm = ConsensusManager::new();
+        let peer = PeerId::random();
+        for _ in 0..MAX_NOTREADY_STALL_RESETS {
+            assert!(cm.allow_notready_stall_reset(peer));
+        }
+        assert!(!cm.allow_notready_stall_reset(peer));
+        assert!(!cm.allow_notready_stall_reset(peer)); // stays exhausted
+    }
+
+    #[test]
+    fn notready_budget_second_peer_has_own_budget() {
+        let mut cm = ConsensusManager::new();
+        let hostile = PeerId::random();
+        for _ in 0..MAX_NOTREADY_STALL_RESETS {
+            assert!(cm.allow_notready_stall_reset(hostile));
+        }
+        assert!(!cm.allow_notready_stall_reset(hostile));
+        // A different (honest, syncing) peer keeps its own full budget.
+        let honest = PeerId::random();
+        for _ in 0..MAX_NOTREADY_STALL_RESETS {
+            assert!(cm.allow_notready_stall_reset(honest));
+        }
+        assert!(!cm.allow_notready_stall_reset(honest));
+    }
+
+    #[test]
+    fn notready_budget_replenished_on_tip_advance() {
+        let mut cm = ConsensusManager::new();
+        let peer = PeerId::random();
+        for _ in 0..MAX_NOTREADY_STALL_RESETS {
+            assert!(cm.allow_notready_stall_reset(peer));
+        }
+        assert!(!cm.allow_notready_stall_reset(peer));
+        // A cleanup at the same tip is not an advancement -> no replenish.
+        cm.cleanup_below(0);
+        assert!(!cm.allow_notready_stall_reset(peer));
+        // Tip advances -> the chain is making progress; budget replenished.
+        cm.cleanup_below(1);
+        assert!(cm.allow_notready_stall_reset(peer));
+    }
+
+    #[test]
+    fn notready_budget_cap_denies_65th_peer() {
+        let mut cm = ConsensusManager::new();
+        for _ in 0..MAX_NOTREADY_STALL_RESET_PEERS {
+            assert!(cm.allow_notready_stall_reset(PeerId::random()));
+        }
+        // Map full: an unseen peer is denied rather than evicting an entry.
+        assert!(!cm.allow_notready_stall_reset(PeerId::random()));
+        // clear() (resync path) replenishes the map.
+        cm.clear();
+        assert!(cm.allow_notready_stall_reset(PeerId::random()));
     }
 }

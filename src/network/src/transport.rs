@@ -137,6 +137,22 @@ pub struct CommpNetwork {
     pub upnp_status: UpnpStatus,
     /// Item 104: Whether this node is running in relay mode.
     pub relay_mode: bool,
+    /// Task T (seed keepalive): seed-key (`"host:port"`) -> peer id learned
+    /// from an established connection, so later keepalive ticks can ask the
+    /// swarm "still connected?" instead of blind re-dialing.
+    pub seed_peer_ids: std::collections::HashMap<String, Libp2pPeerId>,
+    /// Task T: exponential dial backoff per seed key. Only its failure
+    /// counter is consulted; scheduling goes through `seed_next_allowed_ms`,
+    /// which clamps seed waits to `SEED_MAX_BACKOFF_SECS` (60s) — the
+    /// generic 300s cap is too long for the network's rendezvous point.
+    pub seed_backoff: crate::peer::ConnectionBackoff,
+    /// Task T: seed keys learned to be OUR OWN address (the public seed box
+    /// runs this same binary) — permanently skipped by the keepalive.
+    pub seed_self_keys: std::collections::HashSet<String>,
+    /// Task T: seed-key -> earliest next dial attempt (unix ms). Carries both
+    /// the clamped failure backoff and the provisional hold after an
+    /// unanswered dial-initiation.
+    seed_next_allowed_ms: std::collections::HashMap<String, u64>,
 }
 
 /// Combined libp2p behaviour.
@@ -339,6 +355,10 @@ impl CommpNetwork {
             observed_addrs: Vec::new(),
             upnp_status: UpnpStatus::NotAttempted,
             relay_mode: false,
+            seed_peer_ids: std::collections::HashMap::new(),
+            seed_backoff: crate::peer::ConnectionBackoff::new(),
+            seed_self_keys: std::collections::HashSet::new(),
+            seed_next_allowed_ms: std::collections::HashMap::new(),
         };
 
         for topic in crate::topics::all_topics() {
@@ -355,23 +375,20 @@ impl CommpNetwork {
     }
 }
 
-/// Founder-operated seed nodes with a KNOWN, fixed peer identity. Empty until
-/// the real seed box is provisioned with a persistent keypair (see
-/// `seed-node-kit`) — once it is, add its full `/p2p/<PEER_ID>`-qualified
-/// address here so dials pin the expected peer identity, not just the host.
+/// Founder-operated seed nodes with a KNOWN, fixed peer identity. Pinned
+/// `/p2p/<PEER_ID>`-qualified addresses let libp2p verify the expected peer
+/// identity on dial (and dedupe against an existing connection), not just
+/// the host. The public seed's peer key is persisted server-side (see
+/// `seed-node-kit`) and survives data wipes, so the pin is stable.
 ///
-/// TODO(seed): add the real peer-id-qualified seed once the box is
-/// provisioned, e.g.
-///   "/dns4/seed.commputer.xyz/tcp/9000/p2p/<PEER_ID>"
-///   "/dns4/seed.commputer.xyz/udp/9000/quic-v1/p2p/<PEER_ID>"
-///
-/// This list being empty is NOT the seed-dialing gap it used to be: see
-/// `DEFAULT_TESTNET_SEED_HOSTS` below, which is dialed unconditionally by
-/// `connect_to_seeds()` even with no peer id known yet.
+/// `seed_targets()` prefers these pinned forms over the bare
+/// `DEFAULT_TESTNET_SEED_HOSTS` forms of the same host.
 pub const SEED_NODES: &[&str] = &[
     // Format: /ip4/<IP>/tcp/<PORT>/p2p/<PEER_ID>
     // Or QUIC: /ip4/<IP>/udp/<PORT>/quic-v1/p2p/<PEER_ID>
     // Or DNS:  /dns4/<HOST>/tcp/<PORT>/p2p/<PEER_ID>
+    "/dns4/seed.commputer.xyz/tcp/9000/p2p/12D3KooWLvTRavtUp4q4cNidc2tWcVty6vzoMtAELeqCcmJhVs5t",
+    "/dns4/seed.commputer.xyz/udp/9000/quic-v1/p2p/12D3KooWLvTRavtUp4q4cNidc2tWcVty6vzoMtAELeqCcmJhVs5t",
 ];
 
 /// Compiled-in default testnet seed(s), as `"host:port"`.
@@ -434,6 +451,190 @@ fn tcp_to_quic_v1(addr_str: &str) -> String {
     } else {
         format!("{}/quic-v1", addr_str.replace("/tcp/", "/udp/"))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task T: seed keepalive — the 2026-07-24 formation wedge happened because
+// compiled-in seeds were dialed exactly once at boot and never again (the
+// event-loop reconnect only re-dials CLI --seeds, and only at 0 peers). The
+// machinery below re-dials any seed we are not visibly connected to, on a
+// periodic tick, with a seed-specific backoff cap.
+// ---------------------------------------------------------------------------
+
+/// Seeds are the network's rendezvous point: never wait longer than this
+/// between re-dial attempts of a seed, regardless of the generic
+/// `ConnectionBackoff` 300s cap.
+const SEED_MAX_BACKOFF_SECS: u64 = 60;
+
+/// Provisional hold after initiating a dial: an unanswered dial must not be
+/// re-fired on every maintenance tick (~30s), but a dead seed must be
+/// retried within a minute.
+const SEED_DIAL_HOLD_MS: u64 = 60_000;
+
+/// `"host:port"` grouping key for a seed multiaddr — first host component
+/// (dns/dns4/dns6/ip4/ip6) plus first port (tcp/udp). All transport forms
+/// (TCP, QUIC) and pinned/un-pinned variants of one seed share one key.
+fn seed_key_of(addr: &Multiaddr) -> Option<String> {
+    use libp2p::multiaddr::Protocol;
+    let mut host: Option<String> = None;
+    let mut port: Option<u16> = None;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Dns(h) | Protocol::Dns4(h) | Protocol::Dns6(h) => {
+                host.get_or_insert(h.to_string());
+            }
+            Protocol::Ip4(ip) => {
+                host.get_or_insert(ip.to_string());
+            }
+            Protocol::Ip6(ip) => {
+                host.get_or_insert(ip.to_string());
+            }
+            Protocol::Tcp(p) | Protocol::Udp(p) => {
+                port.get_or_insert(p);
+            }
+            _ => {}
+        }
+        if host.is_some() && port.is_some() {
+            break;
+        }
+    }
+    Some(format!("{}:{}", host?, port?))
+}
+
+/// The peer id embedded in a `/p2p/<id>` component, if any.
+fn embedded_peer_id(addr: &Multiaddr) -> Option<Libp2pPeerId> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|proto| match proto {
+        Protocol::P2p(id) => Some(id),
+        _ => None,
+    })
+}
+
+/// `addr` with any `/p2p/<id>` component removed.
+fn strip_p2p(addr: &Multiaddr) -> Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    addr.iter()
+        .filter(|proto| !matches!(proto, Protocol::P2p(_)))
+        .collect()
+}
+
+/// Equality ignoring any trailing `/p2p/<id>` component: a connection's
+/// remote address may carry (or omit) the peer id relative to the seed
+/// target we dialed.
+pub fn addr_matches_seed(remote: &Multiaddr, target: &Multiaddr) -> bool {
+    strip_p2p(remote) == strip_p2p(target)
+}
+
+/// Union of all seed sources, grouped by stable seed key:
+/// `SEED_NODES` (pinned) + `DEFAULT_TESTNET_SEED_HOSTS` (bare TCP + QUIC)
+/// + each CLI custom seed as given plus its QUIC twin. When a key has any
+/// pinned (`/p2p`) form, only pinned forms are kept — the pin lets libp2p
+/// verify identity and dedupe against an existing connection.
+pub fn seed_targets(custom_seeds: &[String]) -> Vec<(String, Vec<Multiaddr>)> {
+    fn push_addr(
+        order: &mut Vec<String>,
+        groups: &mut std::collections::HashMap<String, Vec<Multiaddr>>,
+        addr: Multiaddr,
+    ) {
+        let Some(key) = seed_key_of(&addr) else { return };
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+        }
+        let entry = groups.entry(key).or_default();
+        if !entry.contains(&addr) {
+            entry.push(addr);
+        }
+    }
+
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Vec<Multiaddr>> =
+        std::collections::HashMap::new();
+
+    for addr_str in SEED_NODES {
+        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+            push_addr(&mut order, &mut groups, addr);
+        }
+    }
+    for host_port in DEFAULT_TESTNET_SEED_HOSTS {
+        if let Some((tcp_str, quic_str)) = dns_seed_multiaddrs(host_port) {
+            if let Ok(addr) = tcp_str.parse::<Multiaddr>() {
+                push_addr(&mut order, &mut groups, addr);
+            }
+            if let Ok(addr) = quic_str.parse::<Multiaddr>() {
+                push_addr(&mut order, &mut groups, addr);
+            }
+        }
+    }
+    for addr_str in custom_seeds {
+        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+            push_addr(&mut order, &mut groups, addr);
+            if addr_str.contains("/tcp/") {
+                if let Ok(quic) = tcp_to_quic_v1(addr_str).parse::<Multiaddr>() {
+                    push_addr(&mut order, &mut groups, quic);
+                }
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .map(|key| {
+            let mut addrs = groups.remove(&key).unwrap_or_default();
+            if addrs.iter().any(|a| embedded_peer_id(a).is_some()) {
+                addrs.retain(|a| embedded_peer_id(a).is_some());
+            }
+            (key, addrs)
+        })
+        .collect()
+}
+
+/// Outcome of the per-seed keepalive decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedDialDecision {
+    Dial,
+    SkipSelf,
+    SkipConnected,
+    SkipBackoff,
+}
+
+/// Pure skip/dial decision for one seed key — computed from snapshots and an
+/// `is_connected` probe so it is unit-testable without a live swarm.
+#[allow(clippy::too_many_arguments)]
+fn plan_seed_dial(
+    key: &str,
+    addrs: &[Multiaddr],
+    seed_self_keys: &HashSet<String>,
+    seed_peer_ids: &std::collections::HashMap<String, Libp2pPeerId>,
+    next_allowed_ms: &std::collections::HashMap<String, u64>,
+    is_connected: impl Fn(&Libp2pPeerId) -> bool,
+    local_peer: &Libp2pPeerId,
+    now_ms: u64,
+) -> SeedDialDecision {
+    if seed_self_keys.contains(key) {
+        return SeedDialDecision::SkipSelf;
+    }
+    // A pinned form naming our own id is the seed box looking at itself.
+    if addrs.iter().filter_map(embedded_peer_id).any(|id| id == *local_peer) {
+        return SeedDialDecision::SkipSelf;
+    }
+    if addrs.iter().filter_map(embedded_peer_id).any(|id| is_connected(&id)) {
+        return SeedDialDecision::SkipConnected;
+    }
+    if let Some(id) = seed_peer_ids.get(key) {
+        if is_connected(id) {
+            return SeedDialDecision::SkipConnected;
+        }
+    }
+    match next_allowed_ms.get(key) {
+        Some(next) if now_ms < *next => SeedDialDecision::SkipBackoff,
+        _ => SeedDialDecision::Dial,
+    }
+}
+
+/// Failure wait for a seed key: the generic exponential backoff value,
+/// clamped to `SEED_MAX_BACKOFF_SECS`.
+fn clamped_seed_wait_ms(backoff_secs: u64) -> u64 {
+    backoff_secs.clamp(1, SEED_MAX_BACKOFF_SECS) * 1000
 }
 
 impl CommpNetwork {
@@ -521,6 +722,108 @@ impl CommpNetwork {
             }
         }
         connected
+    }
+
+    /// Task T: record an established connection against the seed table.
+    /// Wire-in point: the (PROTECTED) event loop's `ConnectionEstablished`
+    /// arm, with the endpoint's remote address and the same `custom_seeds`
+    /// slice passed to `ensure_seed_connections`. Learns the seed's peer id
+    /// so keepalive ticks can ask the swarm "still connected?" instead of
+    /// blind re-dialing; a seed that answers with OUR OWN peer id (the
+    /// public seed box runs this same binary) is permanently skipped.
+    pub fn note_seed_connection(
+        &mut self,
+        peer_id: &Libp2pPeerId,
+        remote: &Multiaddr,
+        custom_seeds: &[String],
+    ) {
+        for (key, addrs) in seed_targets(custom_seeds) {
+            if !addrs.iter().any(|target| addr_matches_seed(remote, target)) {
+                continue;
+            }
+            if *peer_id == self.local_peer_id {
+                info!(seed = %key, "seed address is our own — keepalive will skip it permanently");
+                self.seed_self_keys.insert(key);
+                continue;
+            }
+            debug!(seed = %key, peer = %peer_id, "seed connection established — learned peer id");
+            self.seed_peer_ids.insert(key.clone(), *peer_id);
+            self.seed_backoff.record_success(&key);
+            self.seed_next_allowed_ms.remove(&key);
+        }
+    }
+
+    /// Task T: keepalive tick — re-dial every seed we are not visibly
+    /// connected to. Wire-in point: the (PROTECTED) event loop's periodic
+    /// maintenance tick (~30s), unconditionally — NOT only at 0 peers, which
+    /// is exactly how the star topology wedged: compiled-in seeds were never
+    /// re-dialed after the boot attempt. Returns the number of seed keys for
+    /// which a dial was initiated.
+    pub fn ensure_seed_connections(&mut self, custom_seeds: &[String]) -> usize {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut dialed = 0;
+        for (key, addrs) in seed_targets(custom_seeds) {
+            let decision = {
+                let swarm = &self.swarm;
+                plan_seed_dial(
+                    &key,
+                    &addrs,
+                    &self.seed_self_keys,
+                    &self.seed_peer_ids,
+                    &self.seed_next_allowed_ms,
+                    |id| swarm.is_connected(id),
+                    &self.local_peer_id,
+                    now_ms,
+                )
+            };
+            match decision {
+                SeedDialDecision::SkipSelf | SeedDialDecision::SkipConnected => {}
+                SeedDialDecision::SkipBackoff => {
+                    debug!(seed = %key, "seed re-dial suppressed by backoff");
+                }
+                SeedDialDecision::Dial => {
+                    info!(seed = %key, "seed not connected — re-dialing all address forms");
+                    let mut initiated = false;
+                    let mut immediate_err = false;
+                    let mut self_hit = false;
+                    for addr in &addrs {
+                        match self.swarm.dial(addr.clone()) {
+                            Ok(()) => initiated = true,
+                            Err(libp2p::swarm::DialError::LocalPeerId { .. }) => {
+                                self_hit = true;
+                                break;
+                            }
+                            Err(e) => {
+                                debug!(seed = %key, addr = %addr, error = %e, "seed dial failed to initiate");
+                                immediate_err = true;
+                            }
+                        }
+                    }
+                    if self_hit {
+                        info!(seed = %key, "seed is our own identity — keepalive will skip it permanently");
+                        self.seed_self_keys.insert(key);
+                        continue;
+                    }
+                    if immediate_err {
+                        self.seed_backoff.record_failure(&key, now_ms);
+                    }
+                    if initiated {
+                        dialed += 1;
+                        // Provisional hold: an unanswered dial must not be
+                        // re-fired every maintenance tick.
+                        self.seed_next_allowed_ms.insert(key, now_ms + SEED_DIAL_HOLD_MS);
+                    } else {
+                        let wait_ms =
+                            clamped_seed_wait_ms(self.seed_backoff.current_backoff_secs(&key));
+                        self.seed_next_allowed_ms.insert(key, now_ms + wait_ms);
+                    }
+                }
+            }
+        }
+        dialed
     }
 
     /// Resolve DNS seed domains (A records) and construct multiaddrs.
@@ -1077,6 +1380,207 @@ mod tests {
         // way: what matters is that queuing the dial returns instead of
         // blocking on resolution.
         let _ = net.dial(addr);
+    }
+
+    // -- Task T: seed keepalive machinery -----------------------------------
+
+    #[test]
+    fn seed_targets_include_defaults_and_custom() {
+        let custom = vec!["/ip4/10.1.2.3/tcp/9100".to_string()];
+        let targets = seed_targets(&custom);
+
+        let (_, seed_addrs) = targets
+            .iter()
+            .find(|(k, _)| k == "seed.commputer.xyz:9000")
+            .expect("default seed key present");
+        // Pinned forms are preferred: every addr carries the pinned peer id,
+        // and both TCP and QUIC transports are covered.
+        assert!(
+            seed_addrs.iter().all(|a| embedded_peer_id(a).is_some()),
+            "default seed group must keep only pinned forms, got {:?}",
+            seed_addrs
+        );
+        assert!(seed_addrs.iter().any(|a| a.to_string().contains("/tcp/9000")));
+        assert!(seed_addrs.iter().any(|a| a.to_string().contains("/quic-v1")));
+
+        let (_, custom_addrs) = targets
+            .iter()
+            .find(|(k, _)| k == "10.1.2.3:9100")
+            .expect("custom seed key present");
+        assert!(custom_addrs.iter().any(|a| a.to_string() == "/ip4/10.1.2.3/tcp/9100"));
+        assert!(custom_addrs.iter().any(|a| a.to_string() == "/ip4/10.1.2.3/udp/9100/quic-v1"));
+    }
+
+    #[test]
+    fn addr_matches_seed_ignores_p2p_suffix() {
+        let id = libp2p::PeerId::random();
+        let bare: Multiaddr = "/dns4/seed.commputer.xyz/tcp/9000".parse().unwrap();
+        let pinned: Multiaddr = format!("/dns4/seed.commputer.xyz/tcp/9000/p2p/{id}")
+            .parse()
+            .unwrap();
+        assert!(addr_matches_seed(&bare, &pinned));
+        assert!(addr_matches_seed(&pinned, &bare));
+        assert!(addr_matches_seed(&pinned, &pinned));
+        let other: Multiaddr = "/dns4/other.example/tcp/9000".parse().unwrap();
+        assert!(!addr_matches_seed(&other, &pinned));
+    }
+
+    #[tokio::test]
+    async fn note_seed_connection_learns_mapping_and_self_key() {
+        let mut net = CommpNetwork::new(0).expect("network should build");
+        let custom = vec!["/ip4/10.0.0.7/tcp/9100".to_string()];
+
+        // Learned mapping: remote matches the default seed (p2p suffix ignored).
+        let seed_peer = libp2p::PeerId::random();
+        let remote: Multiaddr = "/dns4/seed.commputer.xyz/tcp/9000".parse().unwrap();
+        net.note_seed_connection(&seed_peer, &remote, &custom);
+        assert_eq!(
+            net.seed_peer_ids.get("seed.commputer.xyz:9000"),
+            Some(&seed_peer)
+        );
+        assert!(net.seed_self_keys.is_empty());
+
+        // Self key: a seed address that answers with OUR OWN peer id is
+        // recorded as self, not as a learned mapping.
+        let local = net.local_peer_id;
+        let custom_remote: Multiaddr = "/ip4/10.0.0.7/tcp/9100".parse().unwrap();
+        net.note_seed_connection(&local, &custom_remote, &custom);
+        assert!(net.seed_self_keys.contains("10.0.0.7:9100"));
+        assert!(!net.seed_peer_ids.contains_key("10.0.0.7:9100"));
+    }
+
+    #[test]
+    fn plan_skips_connected_seed() {
+        let local = libp2p::PeerId::random();
+        let seed_id = libp2p::PeerId::random();
+        let key = "seed.example:9000".to_string();
+        let pinned: Vec<Multiaddr> =
+            vec![format!("/dns4/seed.example/tcp/9000/p2p/{seed_id}").parse().unwrap()];
+        let empty_self = HashSet::new();
+        let no_learned = std::collections::HashMap::new();
+        let no_sched = std::collections::HashMap::new();
+
+        // Connected via the pinned id embedded in the addr.
+        let d = plan_seed_dial(
+            &key, &pinned, &empty_self, &no_learned, &no_sched,
+            |id| *id == seed_id, &local, 0,
+        );
+        assert_eq!(d, SeedDialDecision::SkipConnected);
+
+        // Connected via a learned mapping on an un-pinned addr.
+        let bare: Vec<Multiaddr> = vec!["/dns4/seed.example/tcp/9000".parse().unwrap()];
+        let mut learned = std::collections::HashMap::new();
+        learned.insert(key.clone(), seed_id);
+        let d = plan_seed_dial(
+            &key, &bare, &empty_self, &learned, &no_sched,
+            |id| *id == seed_id, &local, 0,
+        );
+        assert_eq!(d, SeedDialDecision::SkipConnected);
+
+        // Same learned mapping but no longer connected: dial again.
+        let d = plan_seed_dial(
+            &key, &bare, &empty_self, &learned, &no_sched,
+            |_| false, &local, 0,
+        );
+        assert_eq!(d, SeedDialDecision::Dial);
+    }
+
+    #[test]
+    fn plan_skips_self_seed() {
+        let local = libp2p::PeerId::random();
+        let key = "seed.example:9000".to_string();
+        let bare: Vec<Multiaddr> = vec!["/dns4/seed.example/tcp/9000".parse().unwrap()];
+        let no_learned = std::collections::HashMap::new();
+        let no_sched = std::collections::HashMap::new();
+
+        // Key previously learned to be our own address.
+        let mut self_keys = HashSet::new();
+        self_keys.insert(key.clone());
+        let d = plan_seed_dial(
+            &key, &bare, &self_keys, &no_learned, &no_sched,
+            |_| false, &local, 0,
+        );
+        assert_eq!(d, SeedDialDecision::SkipSelf);
+
+        // Pinned form naming our own peer id (the seed box itself).
+        let pinned_self: Vec<Multiaddr> =
+            vec![format!("/dns4/seed.example/tcp/9000/p2p/{local}").parse().unwrap()];
+        let d = plan_seed_dial(
+            &key, &pinned_self, &HashSet::new(), &no_learned, &no_sched,
+            |_| false, &local, 0,
+        );
+        assert_eq!(d, SeedDialDecision::SkipSelf);
+    }
+
+    #[test]
+    fn plan_rate_limits_per_seed_with_60s_cap() {
+        let local = libp2p::PeerId::random();
+        let key = "seed.example:9000".to_string();
+        let bare: Vec<Multiaddr> = vec!["/dns4/seed.example/tcp/9000".parse().unwrap()];
+        let empty_self = HashSet::new();
+        let no_learned = std::collections::HashMap::new();
+
+        // A seed with a deep generic backoff (300s) still gets scheduled at
+        // most 60s out — the write side clamps before storing next-allowed.
+        let mut backoff = crate::peer::ConnectionBackoff::new();
+        for i in 0..12 {
+            backoff.record_failure(&key, i * 1000);
+        }
+        assert_eq!(backoff.current_backoff_secs(&key), 300, "generic cap");
+        assert_eq!(clamped_seed_wait_ms(backoff.current_backoff_secs(&key)), 60_000);
+
+        let mut sched = std::collections::HashMap::new();
+        sched.insert(
+            key.clone(),
+            10_000 + clamped_seed_wait_ms(backoff.current_backoff_secs(&key)),
+        );
+
+        // Suppressed strictly before the 60s mark...
+        let d = plan_seed_dial(
+            &key, &bare, &empty_self, &no_learned, &sched,
+            |_| false, &local, 10_000 + 59_999,
+        );
+        assert_eq!(d, SeedDialDecision::SkipBackoff);
+
+        // ...allowed at the 60s mark, even though the generic 300s backoff
+        // would have held until 310_000.
+        let d = plan_seed_dial(
+            &key, &bare, &empty_self, &no_learned, &sched,
+            |_| false, &local, 10_000 + 60_000,
+        );
+        assert_eq!(d, SeedDialDecision::Dial);
+    }
+
+    #[test]
+    fn plan_dials_unconnected_default_seed() {
+        let targets = seed_targets(&[]);
+        let (key, addrs) = targets
+            .iter()
+            .find(|(k, _)| k == "seed.commputer.xyz:9000")
+            .expect("default seed key present");
+        let d = plan_seed_dial(
+            key,
+            addrs,
+            &HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            |_| false,
+            &libp2p::PeerId::random(),
+            0,
+        );
+        assert_eq!(d, SeedDialDecision::Dial);
+    }
+
+    #[tokio::test]
+    async fn ensure_seed_connections_holds_off_second_tick() {
+        // First tick dials the (unconnected) default seed; the immediate
+        // second tick must be suppressed by the provisional hold — an
+        // unanswered dial is not re-fired every ~30s maintenance tick.
+        let mut net = CommpNetwork::new(0).expect("network should build");
+        let dialed = net.ensure_seed_connections(&[]);
+        assert!(dialed >= 1, "expected at least the default seed dialed, got {dialed}");
+        let again = net.ensure_seed_connections(&[]);
+        assert_eq!(again, 0, "unanswered seed dial must be held, not re-fired");
     }
 
     // -- Peer-key hardening (finding [31]) ----------------------------------

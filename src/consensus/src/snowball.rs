@@ -80,6 +80,17 @@ impl SnowballVoter {
         }
     }
 
+    /// Re-point the initial preference, but ONLY while no voting has happened
+    /// (no confidence recorded, no consecutive rounds, not finalized). Lets
+    /// the candidate set converge on a deterministic tie-break (lowest hash)
+    /// before sampling starts; once real responses arrive, preference moves
+    /// exclusively through Snowball's own quorum dynamics.
+    pub fn reset_initial_preference_if_unvoted(&mut self, hash: BlockHash) {
+        if !self.finalized && self.consecutive_count == 0 && self.confidence.is_empty() {
+            self.preference = Some(hash);
+        }
+    }
+
     /// The finalized block hash, if decided.
     pub fn finalized_hash(&self) -> Option<BlockHash> {
         if self.finalized {

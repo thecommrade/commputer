@@ -28,19 +28,25 @@ if [ -n "$STATUS" ]; then
     echo "Accounts: ${ACCOUNTS}"
 fi
 
-# Check metrics
-METRICS=$(curl -s "${BASE_URL}/metrics" 2>/dev/null)
-if [ -n "$METRICS" ]; then
-    PEERS=$(echo "$METRICS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('peers_connected', 0))" 2>/dev/null || echo "0")
-    PENDING=$(echo "$METRICS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('pending_txs', 0))" 2>/dev/null || echo "0")
-    BANNED=$(echo "$METRICS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('peers_banned', 0))" 2>/dev/null || echo "0")
-    echo "Peers:    ${PEERS}"
-    echo "Pending:  ${PENDING}"
-    echo "Banned:   ${BANNED}"
+# Peer/pending counts come from the PUBLIC /health probe above — /metrics sits
+# on the keyed ADMIN tier and 401s once an RPC key (--rpc-key / COMMPUTER_RPC_KEY)
+# is set. peers_banned is admin-only detail: fetched keyed, only when
+# COMMPUTER_RPC_KEY is exported to this script.
+PEERS=$(echo "$HEALTH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('peers', 0))" 2>/dev/null || echo "0")
+PENDING=$(echo "$HEALTH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('pending_txs', 0))" 2>/dev/null || echo "0")
+echo "Peers:    ${PEERS}"
+echo "Pending:  ${PENDING}"
 
-    if [ "$PEERS" -eq 0 ]; then
-        echo "WARNING: No peers connected!"
+if [ -n "${COMMPUTER_RPC_KEY:-}" ]; then
+    METRICS=$(curl -s -H "X-API-Key: ${COMMPUTER_RPC_KEY}" "${BASE_URL}/metrics" 2>/dev/null)
+    if [ -n "$METRICS" ]; then
+        BANNED=$(echo "$METRICS" | python3 -c "import sys,json; print(json.load(sys.stdin).get('peers_banned', 0))" 2>/dev/null || echo "0")
+        echo "Banned:   ${BANNED}"
     fi
+fi
+
+if [ "$PEERS" -eq 0 ] 2>/dev/null; then
+    echo "WARNING: No peers connected!"
 fi
 
 echo ""

@@ -25,6 +25,18 @@ use crate::blockstore::BlockStore;
 use crate::receipt::{AccountHistoryIndex, ReceiptStore, TxReceipt};
 use crate::rocks::{self, RocksStore};
 
+// ── 2026-07-24 formation hardening: epoch plausibility-clamp anchors ──
+//
+// Core carries these only as `default_genesis()` field values — no named consts exist to
+// import — so they are pinned here and tied back by `epoch_clamp_anchors_match_core_genesis`.
+// The deployed genesis.json omits `genesis_timestamp` (first boot uses wall clock, which is
+// >= this alpha-reset instant), so the pinned anchor only ever OVER-estimates elapsed epochs —
+// the safe direction for an upper bound.
+/// 2026-07-19 00:00:00 UTC — the alpha reset epoch (`default_genesis().genesis_timestamp`).
+const GENESIS_TIMESTAMP: u64 = 1_784_419_200;
+/// The node's hourly epoch tick == genesis `epoch_duration_secs`.
+const EPOCH_SECONDS: u64 = 3_600;
+
 // ── Feature 181: State diff per block ──
 
 /// Diff for a single account within a block.
@@ -614,7 +626,10 @@ impl ChainState {
         })
     }
 
-    /// Save a state snapshot to a file.
+    /// Save a state snapshot to a file. A successful `snapshot-{height}.json` write prunes
+    /// older `snapshot-*.json` siblings, keeping the newest `SNAPSHOT_RETENTION` by the height
+    /// in the filename (mtime lies after copies/restores). Prune failures are non-fatal — the
+    /// snapshot that just landed wins.
     pub fn save_snapshot(&self, path: &std::path::Path) -> Result<(), StateError> {
         let snap = self.snapshot();
         let json = serde_json::to_string_pretty(&snap)
@@ -622,6 +637,7 @@ impl ChainState {
         std::fs::write(path, json)
             .map_err(|e| StateError::StorageError(e.to_string()))?;
         info!("State snapshot saved to {} at height {}", path.display(), self.blocks.height());
+        prune_snapshot_siblings(path);
         Ok(())
     }
 
@@ -1223,6 +1239,21 @@ impl ChainState {
         // equality risks bricking sync given the producer's pre-reward snapshot convention). See
         // the security addendum before enabling. TODO(F25).
 
+        // Epoch convergence on the network-facing apply path (2026-07-24 formation wedge: a
+        // resynced node otherwise sits at epoch 0 forever while epoch-gated logic — e.g. the
+        // public faucet's per-epoch claims — believes no time has passed). header.epoch is
+        // attacker-controlled and unvalidated, so naive adoption would let one hostile
+        // producer ratchet current_epoch to u64::MAX and freeze that same logic permanently.
+        // The timestamp IS upstream-validated (<= now + 30s drift) before a synced block
+        // reaches here, so the clamp caps the ratchet at the wall-clock-plausible epoch count
+        // (+2 slack for boundary/drift). max(): monotonic — an old header never rewinds the
+        // local clock-driven counter. Sits after the rollback-on-Err core (a rejected block
+        // returned Err above and never moves it) and before persist_applied_block so the
+        // adopted epoch rides this block's atomic WriteBatch (META_CURRENT_EPOCH). Plain
+        // apply_block is the trusted genesis/replay path and stays clamp-free.
+        let plausible = block.header.timestamp.saturating_sub(GENESIS_TIMESTAMP) / EPOCH_SECONDS + 2;
+        self.current_epoch = self.current_epoch.max(block.header.epoch.min(plausible));
+
         // Generate receipts + history ONLY for an accepted block (P1: a rejected block must
         // leave no trace — receipts for its prefix would claim success for txs that never
         // landed).
@@ -1388,8 +1419,19 @@ impl ChainState {
                     )));
                 }
                 sender.is_validator = true;
-                // Feature 5: Record registration height for cooldown.
-                sender.validator_registered_height = Some(self.blocks.height());
+                // Feature 5: Record registration height for cooldown — but only
+                // on FIRST registration. Nodes re-broadcast ValidatorRegister on
+                // every restart; letting a re-register overwrite the height
+                // re-serves the anti-churn cooldown to a standing validator, and
+                // when every validator restarts in one window (live 2026-07-25:
+                // txs landed at h31-33) ALL producers enter cooldown at once —
+                // cooldown ends only when the height advances, and the height
+                // cannot advance while everyone is in cooldown. Permanent chain
+                // freeze. First-registration semantics keep the cooldown's
+                // anti-churn purpose intact for genuinely new validators.
+                if sender.validator_registered_height.is_none() {
+                    sender.validator_registered_height = Some(self.blocks.height());
+                }
                 sender.nonce += 1;
             }
 
@@ -3117,6 +3159,13 @@ impl ChainState {
     pub fn reset_to_genesis(&mut self) -> Result<(), StateError> {
         info!("Resetting chain state to genesis");
 
+        // Capture block 0 BEFORE the wipe — memory first, then the RocksDB fallback that can
+        // still see pruned blocks (`clear_all` below erases both copies). Without this the
+        // reset store carries credits + meta but NO genesis block, and the node's next plain
+        // restart resumes a height-0 store missing block 0 — the 2026-07-24 live seed
+        // restart panic (main.rs resume path).
+        let genesis = self.get_block_by_height(0);
+
         // Clear in-memory stores.
         self.accounts = AccountStore::new();
         self.blocks = BlockStore::new();
@@ -3164,6 +3213,20 @@ impl ChainState {
         let genesis_accounts = self.genesis_accounts.clone();
         self.apply_genesis_accounts(&genesis_accounts)?;
 
+        // Re-apply the captured genesis block AFTER the side-credits — the credits require
+        // height()==0 && total_emitted==0, and `reorg_preserves_genesis_side_credits` proves
+        // the accounts-then-genesis-block order — so block 0 + credited accounts + meta land
+        // in ONE per-block batch, exactly the fresh-boot layout. This also re-arms the
+        // block-1 parent-hash check for the resync refill. A store that never held block 0
+        // (born mid-sync) still resets: recovery must not be refused for a missing genesis.
+        match genesis {
+            Some(genesis) => self.apply_block(&genesis)?,
+            None => warn!(
+                "reset_to_genesis: no genesis block in memory or on disk; \
+                 resetting without block 0 (resync must refill it)"
+            ),
+        }
+
         info!("Chain state reset to genesis complete");
         Ok(())
     }
@@ -3197,6 +3260,49 @@ where
     K: Eq + std::hash::Hash,
 {
     mirror.iter().filter(move |k| !current.contains_key(k))
+}
+
+/// Rotating snapshots kept on disk per directory (2026-07-24 formation hardening: the
+/// unbounded `snapshot-{height}.json` series filled the seed's disk over a long run).
+const SNAPSHOT_RETENTION: usize = 3;
+
+/// Height encoded in a `snapshot-{height}.json` file name; `None` for anything else.
+fn snapshot_height_of(name: &str) -> Option<u64> {
+    name.strip_prefix("snapshot-")?.strip_suffix(".json")?.parse().ok()
+}
+
+/// Delete `snapshot-*.json` siblings of a just-written snapshot, keeping the newest
+/// `SNAPSHOT_RETENTION` by the height in the filename. No-op unless `written` itself is a
+/// `snapshot-{height}.json` — callers may snapshot to arbitrary paths; only the node's
+/// rotating series is pruned. Best-effort throughout: a failed scan/delete must never fail
+/// the snapshot that already landed.
+fn prune_snapshot_siblings(written: &Path) {
+    let Some(name) = written.file_name().and_then(|n| n.to_str()) else { return };
+    if snapshot_height_of(name).is_none() {
+        return;
+    }
+    let dir = written.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!("snapshot retention: cannot scan {}: {}", dir.display(), e);
+            return;
+        }
+    };
+    let mut snaps: Vec<(u64, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let height = snapshot_height_of(entry.file_name().to_str()?)?;
+            Some((height, entry.path()))
+        })
+        .collect();
+    snaps.sort_by(|a, b| b.0.cmp(&a.0));
+    for (height, stale) in snaps.into_iter().skip(SNAPSHOT_RETENTION) {
+        match std::fs::remove_file(&stale) {
+            Ok(()) => info!("snapshot retention: deleted snapshot-{}.json", height),
+            Err(e) => warn!("snapshot retention: failed to delete {}: {}", stale.display(), e),
+        }
+    }
 }
 
 /// Whether `tx` (including ops nested in a `Batch`) is of a kind that mutates the PoUW
@@ -7526,6 +7632,43 @@ mod tests {
         );
     }
 
+    /// 2026-07-25 cooldown-deadlock regression: a re-register from an already-
+    /// registered validator must NOT reset validator_registered_height — every
+    /// node re-broadcasts ValidatorRegister on restart, and a same-window
+    /// restart of all validators put every producer in cooldown at once
+    /// (cooldown ends when the height advances; the height cannot advance
+    /// while every producer is in cooldown).
+    #[test]
+    fn revalidator_register_keeps_original_registration_height() {
+        let mut state = ChainState::new();
+        let genesis = genesis_block();
+        state.apply_block(&genesis).unwrap();
+
+        let reg = |nonce: u64| {
+            unsigned_with_fee(
+                addr(1),
+                nonce,
+                TxKind::ValidatorRegister {
+                    hardware_fingerprint_hash: [0u8; 32],
+                    contribution_percent: 100,
+                },
+                0,
+            )
+        };
+        let b1 = raw_block(1, genesis.hash(), addr(1), 2001, vec![reg(0)]);
+        state.apply_block(&b1).unwrap();
+        let first = state.accounts.get(&addr(1)).unwrap().validator_registered_height;
+        assert_eq!(first, Some(0), "first registration records the pre-block height");
+
+        let b2 = raw_block(2, b1.hash(), addr(1), 2002, vec![reg(1)]);
+        state.apply_block(&b2).unwrap();
+        assert_eq!(
+            state.accounts.get(&addr(1)).unwrap().validator_registered_height,
+            first,
+            "re-registration must not reset the cooldown clock"
+        );
+    }
+
     /// 2026-07-24 formation-stall regression (finding #3): the stall-triggered
     /// chain resync (`initiate_chain_resync`) calls `reset_to_genesis`, then
     /// sync re-applies blocks 1..N from peers — but genesis side-credits live
@@ -7586,6 +7729,155 @@ mod tests {
             memo: None,
             timelock: None,
         }
+    }
+
+    // ── 2026-07-24 formation hardening (alpha.5): reset keeps block 0 ──
+
+    /// 2026-07-24 seed restart-panic regression: `reset_to_genesis` dropped block 0 (the wipe
+    /// cleared both the memory and RocksDB copies; only the side-credits were re-applied), so
+    /// the reset node's NEXT plain restart resumed a store whose meta said height 0 but held
+    /// no genesis block — the main.rs resume path panics. Reset must leave the store exactly
+    /// like a fresh boot: side-credits AND block 0, in memory and on disk.
+    #[test]
+    fn reset_to_genesis_preserves_genesis_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let faucet = addr(9);
+        const CREDIT: u64 = 5_000_000;
+        let genesis = genesis_block();
+        {
+            let mut state = ChainState::open(dir.path()).unwrap();
+            state.apply_genesis_accounts(&[(hex::encode(faucet.0), CREDIT)]).unwrap();
+            state.apply_block(&genesis).unwrap();
+            let b1 = raw_block(1, genesis.hash(), addr(1), 2001, vec![]);
+            state.apply_block(&b1).unwrap();
+
+            state.reset_to_genesis().unwrap();
+
+            assert_eq!(
+                state.get_block_by_height(0).map(|b| b.hash()),
+                Some(genesis.hash()),
+                "block 0 survives the reset in memory"
+            );
+            // Block-1 parent-hash check re-armed for the resync refill.
+            assert_eq!(state.blocks.latest().map(|b| b.hash()), Some(genesis.hash()));
+            assert_eq!(state.blocks.height(), 0);
+            // DROP WITHOUT flush — the reset's own per-block batch must have covered disk.
+        }
+        let re = ChainState::open(dir.path()).unwrap();
+        assert_eq!(re.blocks.height(), 0);
+        assert_eq!(
+            re.get_block_by_height(0).map(|b| b.hash()),
+            Some(genesis.hash()),
+            "block 0 survives the reset on disk (a restart after reset must not panic)"
+        );
+        assert_eq!(
+            re.accounts.get(&faucet).map(|a| a.balance),
+            Some(Amount::from_raw(CREDIT)),
+            "side-credit and block 0 persisted together"
+        );
+    }
+
+    /// A sync-born store (resumed mid-sync, never held block 0) must still reset — recovery
+    /// is never refused for a missing genesis; the reset warns and continues credits-only.
+    #[test]
+    fn reset_to_genesis_on_genesis_less_store_is_nonfatal() {
+        let mut state = ChainState::new();
+        state.total_emitted = 1_000;
+        state.reset_to_genesis().unwrap();
+        assert!(state.get_block_by_height(0).is_none());
+        assert_eq!(state.blocks.height(), 0);
+        assert_eq!(state.total_emitted, 0);
+    }
+
+    // ── 2026-07-24 formation hardening (alpha.5): epoch convergence on sync ──
+
+    /// The pinned clamp anchors must track core's genesis values.
+    #[test]
+    fn epoch_clamp_anchors_match_core_genesis() {
+        let g = commputer_core::genesis::default_genesis();
+        assert_eq!(GENESIS_TIMESTAMP, g.genesis_timestamp, "alpha-reset timestamp drifted");
+        assert_eq!(EPOCH_SECONDS, g.epoch_duration_secs, "epoch duration drifted");
+    }
+
+    /// Formation wedge: a resynced node sat at epoch 0 forever (nothing on the sync path
+    /// moved `current_epoch`), so epoch-gated logic believed no time had passed. The
+    /// network-facing apply path must adopt a plausible chain epoch.
+    #[test]
+    fn sync_applied_chain_adopts_header_epoch() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let mut b1 = validated_block(&state, 1, addr(1), vec![]);
+        b1.header.timestamp = GENESIS_TIMESTAMP + 3 * EPOCH_SECONDS;
+        b1.header.epoch = 3;
+        state.apply_block_validated(&b1).unwrap();
+        assert_eq!(state.current_epoch, 3, "sync adopts the chain's plausible epoch");
+    }
+
+    /// SECURITY: header.epoch is attacker-controlled — a hostile producer claiming
+    /// `u64::MAX` must be clamped to the wall-clock-plausible bound derived from the
+    /// (upstream-validated) timestamp, not adopted verbatim.
+    #[test]
+    fn epoch_ratchet_clamps_implausible_header() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let mut b1 = validated_block(&state, 1, addr(1), vec![]);
+        b1.header.timestamp = GENESIS_TIMESTAMP + EPOCH_SECONDS; // plausible = 1 + 2
+        b1.header.epoch = u64::MAX;
+        state.apply_block_validated(&b1).unwrap();
+        assert_eq!(state.current_epoch, 3, "hostile epoch clamped to timestamp-plausible bound");
+    }
+
+    /// A rejected block must leave `current_epoch` untouched (the ratchet sits after the
+    /// rollback-on-Err core).
+    #[test]
+    fn epoch_never_ratchets_from_failed_block() {
+        let mut state = ChainState::new();
+        state.apply_block(&genesis_block()).unwrap();
+        let wallet = Wallet::generate();
+        // Unfunded sender: valid signature, fails at apply (insufficient balance).
+        let tx = signed_tx(
+            &wallet,
+            0,
+            TxKind::Transfer { to: addr(1), amount: Amount::from_raw(1_000_000) },
+            1_000_000,
+        );
+        let mut b1 = validated_block(&state, 1, addr(1), vec![tx]);
+        b1.header.timestamp = GENESIS_TIMESTAMP + 3 * EPOCH_SECONDS;
+        b1.header.epoch = 3;
+        assert!(state.apply_block_validated(&b1).is_err());
+        assert_eq!(state.current_epoch, 0, "failed block must not move the epoch");
+    }
+
+    // ── 2026-07-24 formation hardening (alpha.5): snapshot retention ──
+
+    /// `save_snapshot` prunes older `snapshot-{height}.json` siblings, keeping the newest 3
+    /// by the HEIGHT in the filename (write order below makes mtime disagree with height, and
+    /// numeric order disagree with lexicographic) — non-snapshot siblings untouched.
+    #[test]
+    fn snapshot_retention_keeps_newest_three() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ChainState::new();
+        std::fs::write(dir.path().join("notes.txt"), b"keep").unwrap();
+        std::fs::write(dir.path().join("snapshot-bogus.json"), b"keep").unwrap();
+        for h in [100u64, 9, 11, 10] {
+            state.save_snapshot(&dir.path().join(format!("snapshot-{h}.json"))).unwrap();
+        }
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "notes.txt",
+                "snapshot-10.json",
+                "snapshot-100.json",
+                "snapshot-11.json",
+                "snapshot-bogus.json",
+            ],
+            "keeps heights 100/11/10, deletes 9, leaves non-snapshot files alone"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════════

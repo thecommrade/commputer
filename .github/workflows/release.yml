@@ -208,11 +208,11 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
 
-          # Mark semver pre-release tags (…-alpha / -beta / -rc) as pre-releases.
-          PRERELEASE=""
-          case "$TAG" in
-            *-alpha*|*-beta*|*-rc*) PRERELEASE="--prerelease" ;;
-          esac
+          # Alpha.5 (R2): releases are published with --latest (NOT --prerelease).
+          # The curl|sh installer (src/website/install.sh) resolves assets via
+          # /releases/latest, which skips prereleases — a --prerelease alpha
+          # leaves /releases/latest at 404/stale and the installer broken. The
+          # alpha framing lives in the release notes above, not the release flag.
 
           # Assemble the asset list; the optional aarch64/macOS/Windows binaries
           # may be absent (best-effort, continue-on-error targets).
@@ -274,7 +274,7 @@ jobs:
             --title "Commputer $TAG" \
             --notes-file release-notes.md \
             --verify-tag \
-            $PRERELEASE \
+            --latest \
             "${ASSETS[@]}"
 
   # ── macOS build (ENABLED 2026-07-19, founder decision — best-effort) ─────────
