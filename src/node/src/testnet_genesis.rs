@@ -96,6 +96,38 @@ pub const ALPHA_FAUCET_ADDRESS_HEX: Option<&str> =
 /// 100,000 COMME = 100_000 * UNITS_PER_COMME = 1e13 raw units.
 pub const ALPHA_FAUCET_ALLOCATION: u64 = 100_000 * UNITS_PER_COMME;
 
+/// Alpha CONSENSUS validator allowlist. While the public installer is live,
+/// registration is free and automatic (`auto_register_validator` fires at every
+/// boot with a zero-fee tx), and leader rotation + the receive-side leader
+/// check hang off `is_validator` — so an unpinned set lets any stranger's
+/// laptop enter consensus math. The pin restricts the CONSENSUS set to these
+/// addresses; registration stays open and `is_validator` still drives
+/// telemetry/display. An EMPTY list disables the pin (pre-pin behavior).
+/// Founder-operated nodes, alpha reset of 2026-07-24:
+pub const ALPHA_PINNED_VALIDATORS: &[&str] = &[
+    // solarplexus
+    "0d9b5d0af6fe4f84f47cc23dcd39e0c5d86e425224276328d271b9702ead9c9a",
+    // optiplex
+    "1d6983ec9740143dfc839833c977ebed5304742981f61899f731bb690c7b33a5",
+    // public seed
+    "7322fd8c301299a430369d5609a46f29975b185ee30e991cffad6495e9e4e5d3",
+];
+
+/// Whether `addr` may participate in CONSENSUS (leader rotation, validator-set
+/// quorum math). True for every address when the pin list is empty.
+pub fn is_pinned_validator(addr: &commputer_core::identity::Address) -> bool {
+    is_pinned_in(ALPHA_PINNED_VALIDATORS, addr)
+}
+
+/// Testable core of `is_pinned_validator`.
+fn is_pinned_in(list: &[&str], addr: &commputer_core::identity::Address) -> bool {
+    if list.is_empty() {
+        return true;
+    }
+    let hex = hex::encode(addr.0);
+    list.iter().any(|p| *p == hex)
+}
+
 /// The height-0 credits for the alpha reset: exactly the faucet entry when
 /// `ALPHA_FAUCET_ADDRESS_HEX` is set, or an EMPTY vec otherwise (⇒ a no-op in
 /// `ChainState::apply_genesis_accounts`, keeping today's genesis byte-identical).
@@ -114,6 +146,28 @@ pub fn alpha_genesis_accounts() -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_validator_list_is_wellformed_and_matches() {
+        use commputer_core::identity::Address;
+        assert_eq!(ALPHA_PINNED_VALIDATORS.len(), 3, "the three founder nodes");
+        for p in ALPHA_PINNED_VALIDATORS {
+            let bytes = hex::decode(p).expect("pinned entry is valid hex");
+            assert_eq!(bytes.len(), 32, "pinned entry is a 32-byte address");
+            assert_eq!(*p, p.to_lowercase(), "pinned entry is lowercase hex");
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&bytes);
+            assert!(is_pinned_validator(&Address(a)), "pinned address matches itself");
+        }
+        // An unlisted address is excluded while the pin is active.
+        assert!(!is_pinned_validator(&Address([0x42u8; 32])));
+    }
+
+    #[test]
+    fn empty_pin_list_admits_everyone() {
+        use commputer_core::identity::Address;
+        assert!(is_pinned_in(&[], &Address([0x42u8; 32])));
+    }
 
     #[test]
     fn generate_testnet_genesis_creates_file() {

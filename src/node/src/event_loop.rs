@@ -286,7 +286,12 @@ impl EventLoop {
             block_seen_times: HashMap::new(),
             propagation_delays: Vec::new(),
             producer_blocks: HashMap::new(),
-            last_block_seen_time: None,
+            // Some(now), not None: seconds_waiting computes as 0 while this is
+            // None (unwrap_or(0)), which freezes leader view-change rotation on
+            // any node that boots into a chain that is not currently producing
+            // — only the primary may ever produce, and if the primary is the
+            // stuck one the network stays frozen (alpha.6 panel, F4 candidate).
+            last_block_seen_time: Some(std::time::Instant::now()),
             observed_external_addr: None,
             peer_subnets: HashMap::new(),
             peer_rtts: HashMap::new(),
@@ -2301,8 +2306,11 @@ impl EventLoop {
         // converge across nodes, and strict rejection causes banning during
         // bootstrap. Enable strict rejection once the network is stable.
         // TODO: re-enable rejection after mainnet stabilizes
+        // Alpha pin: same allowlist restriction as the production-side list —
+        // both sides of the leader check must derive the same schedule.
         let validators: Vec<Address> = self.state.accounts.iter()
             .filter(|a| a.is_validator)
+            .filter(|a| crate::testnet_genesis::is_pinned_validator(&a.address))
             .map(|a| a.address)
             .collect();
         if validators.len() >= 2 {
@@ -3190,8 +3198,12 @@ impl EventLoop {
         // Leader election: only produce if we're the elected leader for this height.
         // Round-robin with view change fallback every 6 seconds.
         // Skip leader check during bootstrap (< 2 known validators on-chain).
+        // Alpha pin: the CONSENSUS set is restricted to the compiled allowlist —
+        // registration is free+automatic while the public installer is live, and
+        // an unpinned set lets any stranger's node enter (and reorder) rotation.
         let validators: Vec<Address> = self.state.accounts.iter()
             .filter(|a| a.is_validator)
+            .filter(|a| crate::testnet_genesis::is_pinned_validator(&a.address))
             .map(|a| a.address)
             .collect();
         let our_addr = *self.wallet.address();

@@ -529,8 +529,22 @@ impl ConsensusManager {
 
     /// Take the finalized block out of the manager, cleaning up that height's state.
     /// Returns None if not yet finalized or height unknown.
+    ///
+    /// If the winning hash's block BODY is not among our candidates (a quorum
+    /// can form around a hash we only ever saw in votes), the height state is
+    /// left INTACT and None is returned — removing it would destroy the round
+    /// and strand the quorum, locking the producer out until resync (free
+    /// producer-lockout; alpha.6 panel finding). The body arrives later via
+    /// gossip/sync and a subsequent take succeeds.
     pub fn take_finalized(&mut self, height: u64) -> Option<Block> {
         let hash = self.finalized_at_height(height)?;
+        if !self
+            .heights
+            .get(&height)
+            .is_some_and(|s| s.candidates.contains_key(&hash))
+        {
+            return None;
+        }
         let state = self.heights.remove(&height)?;
         state.candidates.into_values().find(|b| b.hash() == hash)
     }
@@ -1773,6 +1787,30 @@ mod tests {
             super::MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT,
             "distinct checkpoint validators at one height must be capped"
         );
+    }
+
+    /// A quorum can form around a hash whose block BODY we never received
+    /// (votes carry hashes, not bodies). take_finalized must then leave the
+    /// round intact — destroying it strands the quorum and locks the producer
+    /// out until resync (alpha.6 panel: free producer-lockout).
+    #[test]
+    fn take_finalized_preserves_round_when_body_absent() {
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4);
+        let ours = make_test_block_with_producer(5, addr(1));
+        cm.add_candidate(ours.clone());
+        // Drive the voter to finalize on a FOREIGN hash we hold no body for.
+        let foreign = make_test_block_with_producer(5, addr(9)).hash();
+        let (pa, pb) = (PeerId::random(), PeerId::random());
+        for _ in 0..10 {
+            cm.record_peer_response(5, foreign, pa);
+            cm.record_peer_response(5, foreign, pb);
+            cm.try_finalize_round(5, 2);
+        }
+        if cm.finalized_at_height(5) == Some(foreign) {
+            assert!(cm.take_finalized(5).is_none(), "no body -> no block");
+            assert!(cm.has_height(5), "round state survives for the late-arriving body");
+        }
     }
 
     /// Deterministic symmetric tie-break: whatever order candidates arrive,
