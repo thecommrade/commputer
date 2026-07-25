@@ -104,6 +104,12 @@ pub const ALPHA_FAUCET_ALLOCATION: u64 = 100_000 * UNITS_PER_COMME;
 /// addresses; registration stays open and `is_validator` still drives
 /// telemetry/display. An EMPTY list disables the pin (pre-pin behavior).
 /// Founder-operated nodes, alpha reset of 2026-07-24:
+///
+/// The `formation-test` cargo feature empties this list so the local formation
+/// harness (whose nodes generate random wallets) can exercise multi-producer
+/// consensus. It is a COMPILE-TIME switch that no runtime input can flip, and
+/// release builds never enable it.
+#[cfg(not(feature = "formation-test"))]
 pub const ALPHA_PINNED_VALIDATORS: &[&str] = &[
     // solarplexus
     "0d9b5d0af6fe4f84f47cc23dcd39e0c5d86e425224276328d271b9702ead9c9a",
@@ -112,6 +118,11 @@ pub const ALPHA_PINNED_VALIDATORS: &[&str] = &[
     // public seed
     "7322fd8c301299a430369d5609a46f29975b185ee30e991cffad6495e9e4e5d3",
 ];
+
+/// Formation-harness builds: no pin, so randomly-generated test wallets can
+/// take part in leader rotation.
+#[cfg(feature = "formation-test")]
+pub const ALPHA_PINNED_VALIDATORS: &[&str] = &[];
 
 /// Whether `addr` may participate in CONSENSUS (leader rotation, validator-set
 /// quorum math). True for every address when the pin list is empty.
@@ -147,6 +158,17 @@ pub fn alpha_genesis_accounts() -> Vec<(String, u64)> {
 mod tests {
     use super::*;
 
+    /// The harness build must ship an EMPTY pin (random test wallets have to
+    /// be able to take part in leader rotation) — and, just as importantly,
+    /// a production build must NOT be empty. Each side is asserted under its
+    /// own cfg so neither can regress silently.
+    #[cfg(feature = "formation-test")]
+    #[test]
+    fn formation_test_build_has_no_pin() {
+        assert!(ALPHA_PINNED_VALIDATORS.is_empty());
+    }
+
+    #[cfg(not(feature = "formation-test"))]
     #[test]
     fn pinned_validator_list_is_wellformed_and_matches() {
         use commputer_core::identity::Address;

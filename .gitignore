@@ -50,3 +50,6 @@ docs/superpowers/
 # Wrangler / Cloudflare
 .wrangler/
 .worktrees/
+
+# formation harness artifacts
+scripts/formation/logs/
