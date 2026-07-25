@@ -1967,21 +1967,25 @@ impl EventLoop {
                                                     preference: applied.hash().0,
                                                     accept: true,
                                                 }
-                                            } else if self.node_state.is_active()
-                                                && let Some(pref) = self.consensus.query_preference(height)
-                                            {
-                                                // DISCIPLINE DISABLED (2026-07-25): endorsing only
-                                                // tip+1 candidates that extend our own chain is the
-                                                // right rule, but switching it on deadlocked
-                                                // formation in the harness — the mesh could not
-                                                // finalize block 1. The rule and its tests remain in
-                                                // consensus_manager::query_votable_preference; the
-                                                // wiring returns here once the bootstrap interaction
-                                                // is understood. Known-good behaviour meanwhile.
-                                                ConsensusResponse::Vote {
-                                                    height,
-                                                    preference: pref.0,
-                                                    accept: true,
+                                            } else if height == our_tip + 1 && self.node_state.is_active() {
+                                                let tip_hash = self.state.blocks.latest()
+                                                    .map(|b| b.hash())
+                                                    .unwrap_or(BlockHash::GENESIS);
+                                                match self.consensus.query_votable_preference(height, tip_hash) {
+                                                    Some(pref) => ConsensusResponse::Vote {
+                                                        height,
+                                                        preference: pref.0,
+                                                        accept: true,
+                                                    },
+                                                    None => {
+                                                        debug!(
+                                                            "VOTE-REFUSE h={} our_tip={} tip={} pref={:?} candidates={:?}",
+                                                            height, our_tip, tip_hash,
+                                                            self.consensus.query_preference(height),
+                                                            self.consensus.candidate_parents(height)
+                                                        );
+                                                        ConsensusResponse::NotReady { height, tip: our_tip }
+                                                    }
                                                 }
                                             } else {
                                                 if height > our_tip + 1 {

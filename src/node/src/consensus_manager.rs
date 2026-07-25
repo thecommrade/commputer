@@ -399,6 +399,21 @@ impl ConsensusManager {
         self.heights.get(&height).and_then(|s| s.voter.preference())
     }
 
+    /// Diagnostic: (candidate hash, its parent hash) for every candidate at a
+    /// height, so a refusal to vote can say WHY — which parent each candidate
+    /// claims versus the tip the voter actually holds.
+    pub fn candidate_parents(&self, height: u64) -> Vec<(BlockHash, BlockHash)> {
+        self.heights
+            .get(&height)
+            .map(|s| {
+                s.candidates
+                    .iter()
+                    .map(|(h, b)| (*h, b.header.parent_hash))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// VOTE-HEIGHT DISCIPLINE (alpha.6): the preference we may legitimately
     /// endorse at `height`, given our own applied tip hash — i.e. only a
     /// candidate that BUILDS ON THE CHAIN WE ACTUALLY HOLD.
