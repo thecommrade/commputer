@@ -535,8 +535,24 @@ impl ConsensusManager {
             // the old `mem::take` on round_responses, so Snowball's
             // beta-consecutive-round semantics are preserved) before feeding the
             // round into the voter.
-            let tally = state.aggregator.tally(height, &mut rand::thread_rng());
+            let mut tally = state.aggregator.tally(height, &mut rand::thread_rng());
             if !tally.is_empty() {
+                // Count OUR OWN vote. The aggregator only holds peer responses,
+                // so a quorum of q previously meant "q PEERS agree" — with two
+                // peers and quorum 2 that is unanimity, and any single peer
+                // being slow, restarting, or refusing freezes every round. We
+                // are a validator too and our preference IS our vote, so
+                // counting it makes quorum q mean "q of the n=peers+1 voters",
+                // i.e. a real majority: 2-of-3 tolerates one node down.
+                //
+                // Added INSIDE the non-empty branch on purpose: a round is
+                // still driven by peer responses. Adding it unconditionally
+                // would make every tick a round, and a round that misses quorum
+                // resets Snowball's consecutive-round counter — which would
+                // stop confidence ever reaching beta.
+                if let Some(ours) = state.voter.preference() {
+                    *tally.entry(ours).or_insert(0) += 1;
+                }
                 state.aggregator = VoteAggregator::new(self.params.sample_size);
                 let finalized = state.voter.record_round(&tally);
                 if finalized {
@@ -1844,6 +1860,59 @@ mod tests {
             super::MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT,
             "distinct checkpoint validators at one height must be capped"
         );
+    }
+
+    /// A quorum must count OUR OWN vote, not just peers'. The aggregator holds
+    /// peer responses only, so with two peers a quorum of 2 demanded unanimity
+    /// and one slow or restarting peer froze every round — the shape behind the
+    /// live 2026-07-25 fork/stall. Counting ourselves makes it a 2-of-3
+    /// majority that tolerates one node being down.
+    #[test]
+    fn quorum_counts_our_own_vote_so_one_peer_suffices_at_three_nodes() {
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4);
+        cm.update_params_for_network_size(2); // 2 peers ⇒ quorum 2
+        assert_eq!(cm.params.quorum, 2);
+
+        let block = make_test_block_with_producer(5, addr(1));
+        cm.add_candidate(block.clone());
+
+        // ONE peer votes (the other is down). Our own preference is the same
+        // candidate, so the pair of us is a majority of the three validators.
+        let only_peer = PeerId::random();
+        let mut finalized = false;
+        for _ in 0..10 {
+            cm.record_peer_response(5, block.hash(), only_peer);
+            if cm.try_finalize_round(5, 2) == ConsensusRoundResult::Finalized {
+                finalized = true;
+                break;
+            }
+        }
+        assert!(
+            finalized,
+            "one peer plus our own vote must reach quorum 2; before this fix \
+             the tally held only the peer's vote and the round never finalized"
+        );
+        assert_eq!(cm.finalized_at_height(5), Some(block.hash()));
+    }
+
+    /// The self-vote must not manufacture a quorum on its own: with no peer
+    /// responses there is no round at all, so an isolated node cannot count
+    /// itself to finality.
+    #[test]
+    fn self_vote_alone_never_finalizes() {
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4);
+        cm.update_params_for_network_size(2);
+        cm.add_candidate(make_test_block_with_producer(5, addr(1)));
+        for _ in 0..10 {
+            assert_ne!(
+                cm.try_finalize_round(5, 2),
+                ConsensusRoundResult::Finalized,
+                "no peer votes ⇒ no round ⇒ no finalization"
+            );
+        }
+        assert!(cm.finalized_at_height(5).is_none());
     }
 
     /// Vote-height discipline: a node may only endorse a candidate that builds
