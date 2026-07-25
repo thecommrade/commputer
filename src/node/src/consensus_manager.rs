@@ -261,10 +261,17 @@ impl ConsensusManager {
             // β=3 at 0 peers: defense in depth behind the zero-peer gate in
             // try_finalize_round — a stale-params race must not be able to
             // one-shot finalize a private block.
-            0 => (1, 1, 3),
-            1 => (1, 1, 3),
-            2 => (2, 2, 3),
-            3..=5 => (3, 2, 5),
+            // Quorum is a MAJORITY OF THE VOTERS, and the voters are
+            // peers + ourselves (try_finalize_round counts our own preference).
+            // Sizing these against peers alone left every rung one vote short:
+            // at one peer, quorum 1 meant a single peer reply finalized a block,
+            // and live 2026-07-25 a node with one visible peer finalized its own
+            // block 4 while the other two finalized a different one — a fork at
+            // the fourth block of a fresh chain.
+            0 => (1, 1, 3),          // n=1: solo; the zero-peer gate blocks it anyway
+            1 => (2, 2, 3),          // n=2: both must agree
+            2 => (3, 2, 5),          // n=3: 2 of 3 — tolerates one node down
+            3..=5 => (4, 3, 5),      // n=4..6: 3 — still a majority at n=4
             6..=10 => (5, 4, 8),
             11..=20 => (10, 7, 14),
             _ => (20, 14, 20),
@@ -1674,23 +1681,27 @@ mod tests {
 
     #[test]
     fn scaling_curve_one_peer() {
-        assert_curve(1, 1, 1, 3);
+        // n=2 voters (the peer and us): both must agree.
+        assert_curve(1, 2, 2, 3);
     }
 
     #[test]
     fn scaling_curve_two_peers() {
-        assert_curve(2, 2, 2, 3);
+        // n=3 voters: quorum 2 is a majority, so one node may be down.
+        assert_curve(2, 3, 2, 5);
     }
 
     #[test]
     fn scaling_curve_three_peers_matches_testing_profile() {
-        // bbbed4f-validated 3-node stress rung — must stay (3,2,5).
-        assert_curve(3, 3, 2, 5);
+        // n=4 voters: quorum 3 is the majority. Formerly (3,2,5), which was a
+        // majority of PEERS but only 2 of 4 actual voters once our own vote is
+        // counted — a tie, not a quorum.
+        assert_curve(3, 4, 3, 5);
     }
 
     #[test]
     fn scaling_curve_five_peers_still_testing_profile() {
-        assert_curve(5, 3, 2, 5);
+        assert_curve(5, 4, 3, 5);
     }
 
     #[test]
