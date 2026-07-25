@@ -216,6 +216,9 @@ pub struct EventLoop {
     pub fork_detector: commputer::fork_detector::ForkDetector,
     /// Timestamp of the first consensus stall signal. None if no stall.
     pub stall_start: Option<std::time::Instant>,
+    /// Height → when we last asked a peer for it, so `request_block` does not
+    /// re-ask every tick. Pruned in place; bounded by the 30s retention.
+    pub block_request_at: HashMap<u64, std::time::Instant>,
     /// Local height at the last stall-triggered NON-destructive sync re-engage.
     /// One re-engage attempt per height: a second stall at the same height means
     /// sync gained nothing (fork shape) and recovery escalates to the
@@ -320,6 +323,7 @@ impl EventLoop {
             network_height: 0,
             fork_detector: commputer::fork_detector::ForkDetector::new(),
             stall_start: None,
+            block_request_at: HashMap::new(),
             stall_reengage_height: u64::MAX,
             last_resync: None,
             peer_last_seen: HashMap::new(),
@@ -1997,14 +2001,21 @@ impl EventLoop {
                                                     }
                                                 }
                                             } else {
-                                                if height > our_tip + 1 {
-                                                    // Pull ONLY the immediate next block, not the whole
-                                                    // gap: this request fires on every proposal (and every
-                                                    // 500ms re-proposal), and fanning out ten heights per
-                                                    // proposal is how a catch-up previously turned into
-                                                    // 66k requests with 39k rate-limited rejections. One
-                                                    // block is all that is needed to become votable again;
-                                                    // bulk catch-up is the sync machine's job.
+                                                // Pull the immediate next block ONLY when we are barely
+                                                // behind (missing a single block), which is the case this
+                                                // fetch exists for: it lets a node one block short become
+                                                // votable again immediately.
+                                                //
+                                                // Deliberately NOT fired when far behind. This runs on
+                                                // every proposal and every 500ms re-proposal, so a node
+                                                // with a large gap generates several requests per second
+                                                // that compete with the sync machine's bulk batches for
+                                                // the same per-peer rate-limit budget — and starve them.
+                                                // Live 2026-07-25: a rejoining node at height 0 with the
+                                                // tip near 1800 produced 1417 rate-limit rejections in
+                                                // four minutes and never synced a single block. Bulk
+                                                // catch-up belongs to the sync machine alone.
+                                                if height == our_tip + 2 {
                                                     self.request_block(our_tip + 1);
                                                 }
                                                 ConsensusResponse::NotReady { height, tip: our_tip }
@@ -3605,15 +3616,32 @@ impl EventLoop {
                                 self.sync_complete = false;
                                 self.sync_machine.reset();
                                 self.stall_start = None;
-                            } else {
+                            } else if target > local {
                                 // A prior re-engage at this same height gained
-                                // nothing (at-tip fork, or a gap sync cannot
-                                // close): destructive last resort — the only
+                                // nothing and the network is genuinely AHEAD of
+                                // us: destructive last resort — the only
                                 // remaining cross-fork recovery.
                                 self.initiate_chain_resync(&format!(
                                     "consensus stall for {}s at height {}",
                                     elapsed, next_height
                                 ));
+                            } else {
+                                // We are at or AHEAD of every peer. A stall here
+                                // means the others are behind and cannot vote for
+                                // our next height — under vote-height discipline a
+                                // lagging peer must refuse — so waiting is correct
+                                // and destroying our chain is exactly wrong: we
+                                // hold the longest one.
+                                //
+                                // Live 2026-07-25: the seed stalled at 2004 with
+                                // peers at 1931 and 0, escalated, and wiped a
+                                // 2004-block chain. The node with the most history
+                                // deleted it because the others were lagging.
+                                warn!(
+                                    "Consensus stall for {}s at height {} but network is at {} (not ahead) — holding chain, waiting for peers",
+                                    elapsed, next_height, target
+                                );
+                                self.stall_start = None;
                             }
                             return;
                         }
@@ -3774,6 +3802,23 @@ impl EventLoop {
     /// Request a block via the dedicated sync protocol (direct peer-to-peer).
     /// Falls back to gossipsub BlockRequest if no peers support sync.
     pub fn request_block(&mut self, height: u64) {
+        // Deduplicate by height. Callers include two gap loops that each fire
+        // up to MAX_SYNC_GAP requests per received proposal, with no backoff —
+        // un-deduplicated that is ~18 requests/second at a single peer, which
+        // exhausts its sync rate limit and starves the sync machine's own bulk
+        // batches, so the node never actually receives the chain. Live
+        // 2026-07-25: a rejoining validator sent 1360 requests in 75s, got zero
+        // blocks back, and sat at height 0 while the tip passed 1900.
+        let now = std::time::Instant::now();
+        self.block_request_at
+            .retain(|_, t| now.duration_since(*t) < Duration::from_secs(30));
+        if let Some(prev) = self.block_request_at.get(&height)
+            && now.duration_since(*prev) < Duration::from_secs(5)
+        {
+            return;
+        }
+        self.block_request_at.insert(height, now);
+
         // Try the sync protocol first — direct request to a connected peer.
         let peers: Vec<libp2p::PeerId> = self.peer_ips.keys().copied().collect();
         if let Some(&peer) = peers.first() {
