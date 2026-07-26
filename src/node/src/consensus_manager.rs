@@ -444,17 +444,19 @@ impl ConsensusManager {
         tip_hash: BlockHash,
     ) -> Option<BlockHash> {
         let state = self.heights.get(&height)?;
-        let extends_tip = |h: &BlockHash| -> bool {
-            state
-                .candidates
-                .get(h)
-                .is_some_and(|b| b.header.parent_hash == tip_hash)
-        };
-        if let Some(pref) = state.voter.preference()
-            && extends_tip(&pref)
-        {
-            return Some(pref);
-        }
+        // DETERMINISTIC: always the lowest-hash candidate extending our tip —
+        // never "whichever we happened to prefer first".
+        //
+        // Answering with our own preference splits the vote when several
+        // producers are live: each node endorses its own candidate, no hash
+        // reaches quorum, and at small peer counts (where quorum equals the
+        // number of voters) the chain halts outright. The initial-preference
+        // tie-break does not save it, because that only re-points while no
+        // votes have been recorded. Live 2026-07-26: two nodes at the same tip
+        // each voted for their own block at height 897 and the chain stopped.
+        //
+        // A pure function of (candidate set, our tip) makes every honest node
+        // answer identically, so the tally concentrates instead of splitting.
         state
             .candidates
             .iter()
