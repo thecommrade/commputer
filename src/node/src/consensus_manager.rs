@@ -184,6 +184,17 @@ struct HeightState {
     aggregator: VoteAggregator<PeerId>,
     /// Whether the full block proposal has been sent at least once for this height.
     proposal_sent: bool,
+    /// The candidate we have committed to at this height, fixed at our first
+    /// vote and never changed afterwards.
+    ///
+    /// This is the classic BFT lock, and it is what makes a one-round decision
+    /// (beta = 1, used at small validator counts) SAFE. Without it a node that
+    /// answered with "lowest candidate hash" would switch its vote the moment a
+    /// lower-hash candidate arrived, so the same node could contribute to two
+    /// different majorities at one height and two conflicting blocks could each
+    /// gather a quorum. Locking the choice means each node contributes to
+    /// exactly one majority per height, and majorities intersect.
+    locked_choice: Option<BlockHash>,
 }
 
 /// Manages Snowball consensus across active heights.
@@ -268,10 +279,26 @@ impl ConsensusManager {
             // and live 2026-07-25 a node with one visible peer finalized its own
             // block 4 while the other two finalized a different one — a fork at
             // the fourth block of a fresh chain.
-            0 => (1, 1, 3),          // n=1: solo; the zero-peer gate blocks it anyway
-            1 => (2, 2, 3),          // n=2: both must agree
-            2 => (3, 2, 5),          // n=3: 2 of 3 — tolerates one node down
-            3..=5 => (4, 3, 5),      // n=4..6: 3 — still a majority at n=4
+            // SMALL-n: DETERMINISTIC, not sampled (beta = 1).
+            //
+            // Snowball's guarantees are asymptotic in validator count — its
+            // safety bound is exponential in the sample size k, and k <= n. At
+            // n<=6 we broadcast to everyone and count everyone, so the "sample"
+            // IS the network: we pay the full cost of an all-to-all BFT round
+            // and get a probabilistic guarantee that means nothing at this
+            // size. Worse, beta>1 requires that many CONSECUTIVE quorum rounds
+            // and resets on any miss, so a single slow tick discards all
+            // progress — the source of repeated live stalls.
+            //
+            // With a majority quorum, deterministic vote selection, and a
+            // locked per-height choice, one quorum certificate is final. That
+            // is ordinary BFT and it is strictly stronger here than repeating
+            // a degenerate sample. Sampling resumes at 6+ peers, where it
+            // begins to buy something.
+            0 => (1, 1, 1),          // n=1: solo; the zero-peer gate blocks it anyway
+            1 => (2, 2, 1),          // n=2: both must agree
+            2 => (3, 2, 1),          // n=3: 2 of 3 — tolerates one node down
+            3..=5 => (4, 3, 1),      // n=4..6: 3 is a majority at n=4
             6..=10 => (5, 4, 8),
             11..=20 => (10, 7, 14),
             _ => (20, 14, 20),
@@ -379,6 +406,7 @@ impl ConsensusManager {
             candidates: HashMap::new(),
             aggregator: VoteAggregator::new(self.params.sample_size),
             proposal_sent: false,
+            locked_choice: None,
         });
 
         // Don't re-add duplicates.
@@ -439,10 +467,19 @@ impl ConsensusManager {
     /// else None — meaning "cannot endorse", which the caller answers with
     /// NotReady rather than a vote.
     pub fn query_votable_preference(
-        &self,
+        &mut self,
         height: u64,
         tip_hash: BlockHash,
     ) -> Option<BlockHash> {
+        let state = self.heights.get_mut(&height)?;
+        // Locked: keep voting for what we already committed to, as long as it
+        // still builds on our tip. Changing our vote mid-height would let one
+        // node contribute to two different majorities (see `locked_choice`).
+        if let Some(locked) = state.locked_choice
+            && state.candidates.get(&locked).is_some_and(|b| b.header.parent_hash == tip_hash)
+        {
+            return Some(locked);
+        }
         let state = self.heights.get(&height)?;
         // DETERMINISTIC: always the lowest-hash candidate extending our tip —
         // never "whichever we happened to prefer first".
@@ -457,12 +494,19 @@ impl ConsensusManager {
         //
         // A pure function of (candidate set, our tip) makes every honest node
         // answer identically, so the tally concentrates instead of splitting.
-        state
+        let choice = state
             .candidates
             .iter()
             .filter(|(_, b)| b.header.parent_hash == tip_hash)
             .map(|(h, _)| *h)
-            .min()
+            .min();
+        // Commit to it: from here on this height, this is our vote.
+        if let Some(c) = choice
+            && let Some(st) = self.heights.get_mut(&height)
+        {
+            st.locked_choice = Some(c);
+        }
+        choice
     }
 
     /// Get the preferred candidate block at a height (for re-proposing).
@@ -567,7 +611,12 @@ impl ConsensusManager {
                 // one dissenting self-vote deadlocks the height forever. Live
                 // 2026-07-26: 435 votes arrived at height 897 and nothing ever
                 // finalized.
-                if let Some(ours) = state.candidates.keys().min().copied() {
+                // Our locked choice if we have one, else the deterministic
+                // lowest hash. Same rule as the vote we send peers.
+                if let Some(ours) = state
+                    .locked_choice
+                    .or_else(|| state.candidates.keys().min().copied())
+                {
                     *tally.entry(ours).or_insert(0) += 1;
                 }
                 state.aggregator = VoteAggregator::new(self.params.sample_size);
@@ -1686,19 +1735,19 @@ mod tests {
     fn scaling_curve_solo_bootstrap() {
         // β=3 at 0 peers: defense in depth behind the zero-peer gate — a
         // stale-params race must not be able to one-shot finalize.
-        assert_curve(0, 1, 1, 3);
+        assert_curve(0, 1, 1, 1);
     }
 
     #[test]
     fn scaling_curve_one_peer() {
         // n=2 voters (the peer and us): both must agree.
-        assert_curve(1, 2, 2, 3);
+        assert_curve(1, 2, 2, 1);
     }
 
     #[test]
     fn scaling_curve_two_peers() {
         // n=3 voters: quorum 2 is a majority, so one node may be down.
-        assert_curve(2, 3, 2, 5);
+        assert_curve(2, 3, 2, 1);
     }
 
     #[test]
@@ -1706,12 +1755,12 @@ mod tests {
         // n=4 voters: quorum 3 is the majority. Formerly (3,2,5), which was a
         // majority of PEERS but only 2 of 4 actual voters once our own vote is
         // counted — a tie, not a quorum.
-        assert_curve(3, 4, 3, 5);
+        assert_curve(3, 4, 3, 1);
     }
 
     #[test]
     fn scaling_curve_five_peers_still_testing_profile() {
-        assert_curve(5, 4, 3, 5);
+        assert_curve(5, 4, 3, 1);
     }
 
     #[test]
@@ -1880,6 +1929,45 @@ mod tests {
             tracked,
             super::MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT,
             "distinct checkpoint validators at one height must be capped"
+        );
+    }
+
+    /// The per-height vote LOCK is what makes one-round finality (beta=1) safe.
+    /// Without it, a node answering "lowest candidate hash" would switch its
+    /// vote the moment a lower-hash candidate arrived — so one node could help
+    /// two different blocks reach a majority at the same height. Once we have
+    /// voted, our answer must not move.
+    #[test]
+    fn vote_choice_locks_and_does_not_switch_to_a_lower_hash() {
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4);
+        let tip = BlockHash([7u8; 32]);
+
+        let mut first = make_test_block_with_producer(5, addr(9));
+        first.header.parent_hash = tip;
+        cm.add_candidate(first.clone());
+        let locked = cm.query_votable_preference(5, tip).expect("votes for the only candidate");
+        assert_eq!(locked, first.hash());
+
+        // A second candidate arrives; find one that hashes LOWER so the
+        // unlocked rule would prefer it.
+        let mut lower: Option<Block> = None;
+        for n in 1..40u8 {
+            let mut b = make_test_block_with_producer(5, addr(n));
+            b.header.parent_hash = tip;
+            if b.hash() < first.hash() {
+                lower = Some(b);
+                break;
+            }
+        }
+        let lower = lower.expect("a lower-hash candidate exists");
+        cm.add_candidate(lower.clone());
+        assert!(lower.hash() < first.hash());
+
+        assert_eq!(
+            cm.query_votable_preference(5, tip),
+            Some(first.hash()),
+            "must keep voting for the locked choice even though a lower hash arrived"
         );
     }
 
