@@ -559,7 +559,15 @@ impl ConsensusManager {
                 // would make every tick a round, and a round that misses quorum
                 // resets Snowball's consecutive-round counter — which would
                 // stop confidence ever reaching beta.
-                if let Some(ours) = state.voter.preference() {
+                // Our self-vote must use the SAME deterministic rule we answer
+                // peers with (lowest candidate hash), not the voter's internal
+                // preference. The internal preference is whichever candidate
+                // arrived first, so it can permanently disagree with what every
+                // peer is voting for — and where quorum equals the voter count,
+                // one dissenting self-vote deadlocks the height forever. Live
+                // 2026-07-26: 435 votes arrived at height 897 and nothing ever
+                // finalized.
+                if let Some(ours) = state.candidates.keys().min().copied() {
                     *tally.entry(ours).or_insert(0) += 1;
                 }
                 state.aggregator = VoteAggregator::new(self.params.sample_size);
