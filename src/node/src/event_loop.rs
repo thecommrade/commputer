@@ -3930,6 +3930,31 @@ impl EventLoop {
             }
             Err(e) => {
                 warn!("Sync: failed to apply block {} at height {}: {}", hash, height, e);
+                // A parent mismatch on the SYNC path means this block builds on
+                // a chain we do not have — we are on a divergent fork. Only the
+                // consensus path fed the fork detector, and a forked node is by
+                // definition BEHIND, so the majority's blocks arrive here
+                // instead: the divergence was invisible, the node retried the
+                // same block forever, and rejoining required archiving its data
+                // directory by hand. Live 2026-07-25/26 a validator stranded
+                // three times this way, and a harness node that finalized a
+                // different block 26 after a mass restart never came back.
+                //
+                // Repeated mismatches while peers keep handing us blocks is
+                // EVIDENCE of a fork, which is the one case reset_to_genesis is
+                // reserved for (a plain stall is silence, and silence is not
+                // evidence — see the stall path).
+                if matches!(&e, commputer_storage::state::StateError::InvalidBlock(m)
+                    if m.contains("parent hash mismatch"))
+                {
+                    self.fork_detector.record_mismatch();
+                    if self.fork_detector.should_resync() {
+                        self.initiate_chain_resync(&format!(
+                            "fork detector: {} consecutive parent mismatches syncing height {}",
+                            self.fork_detector.consecutive_mismatches(), height
+                        ));
+                    }
+                }
             }
         }
     }
