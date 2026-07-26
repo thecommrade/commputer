@@ -3617,14 +3617,27 @@ impl EventLoop {
                                 self.sync_machine.reset();
                                 self.stall_start = None;
                             } else if target > local {
-                                // A prior re-engage at this same height gained
-                                // nothing and the network is genuinely AHEAD of
-                                // us: destructive last resort — the only
-                                // remaining cross-fork recovery.
-                                self.initiate_chain_resync(&format!(
-                                    "consensus stall for {}s at height {}",
-                                    elapsed, next_height
-                                ));
+                                // Behind and a previous re-engage did not close the
+                                // gap. Re-engage AGAIN rather than wiping: being
+                                // behind is sync's problem, and reset_to_genesis
+                                // "fixes" it by re-downloading the entire chain —
+                                // the most expensive possible response, and one that
+                                // destroys any block only we hold.
+                                //
+                                // A plain stall is NEVER destructive now. Live
+                                // 2026-07-25 this path wiped two chains: 2004 blocks
+                                // when peers lagged, then ~805 when the seed itself
+                                // fell behind. reset_to_genesis belongs solely to the
+                                // fork detector, which has actual evidence of
+                                // divergence (consecutive parent mismatches) rather
+                                // than mere silence.
+                                warn!(
+                                    "Consensus stall for {}s at height {} (network {}) — re-engaging sync again, not resetting",
+                                    elapsed, next_height, target
+                                );
+                                self.sync_complete = false;
+                                self.sync_machine.reset();
+                                self.stall_start = None;
                             } else {
                                 // We are at or AHEAD of every peer. A stall here
                                 // means the others are behind and cannot vote for
