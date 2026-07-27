@@ -219,6 +219,12 @@ pub struct EventLoop {
     /// Height → when we last asked a peer for it, so `request_block` does not
     /// re-ask every tick. Pruned in place; bounded by the 30s retention.
     pub block_request_at: HashMap<u64, std::time::Instant>,
+    /// Remaining requeue-validation budget for THIS event-loop turn.
+    /// A per-CALL cap is not enough: one turn can apply a 10-block sync batch,
+    /// walk a 200-deep orphan cascade, or drain a run of finalized heights, and
+    /// each of those calls would otherwise get a fresh cap. Reset at the top of
+    /// the loop; see `requeue_lost_txs`.
+    requeue_budget: usize,
     /// Local height at the last stall-triggered NON-destructive sync re-engage.
     /// One re-engage attempt per height: a second stall at the same height means
     /// sync gained nothing (fork shape) and recovery escalates to the
@@ -324,6 +330,7 @@ impl EventLoop {
             fork_detector: commputer::fork_detector::ForkDetector::new(),
             stall_start: None,
             block_request_at: HashMap::new(),
+            requeue_budget: Self::REQUEUE_BUDGET_PER_TURN,
             stall_reengage_height: u64::MAX,
             last_resync: None,
             peer_last_seen: HashMap::new(),
@@ -905,6 +912,9 @@ impl EventLoop {
         let mut sigterm: Option<NoopSignal> = None;
 
         loop {
+            // One requeue-validation budget per turn, shared by every apply
+            // this turn performs (sync batch, orphan cascade, finalized run).
+            self.requeue_budget = Self::REQUEUE_BUDGET_PER_TURN;
             // Take the RPC receiver out to satisfy the borrow checker in select!
             let rpc_recv = async {
                 if let Some(ref mut rx) = self.rpc_rx {
@@ -2607,8 +2617,59 @@ impl EventLoop {
 
     /// Validate a transaction for mempool admission: signature, nonce, dedup.
     fn validate_tx_for_mempool(&self, tx: &Transaction) -> Result<(), &'static str> {
+        // Reject duplicates (already in mempool or finalized) before paying
+        // for signature verification. Kept OUT of validate_tx_content: a tx
+        // being re-admitted by requeue_lost_txs is legitimately in seen.
+        if self.seen_tx_hashes.contains(&tx.hash()) {
+            return Err("duplicate transaction");
+        }
+        self.validate_tx_content(tx)
+    }
+
+    /// Every mempool ingress check EXCEPT the seen-hash dedup. Shared by
+    /// fresh ingress (RPC/gossip, via validate_tx_for_mempool) and by
+    /// requeue_lost_txs, which re-admits txs that are already seen but must
+    /// still pass every content gate — a losing candidate is attacker-
+    /// suppliable (any peer's proposal is accepted as a candidate, and
+    /// zero-from txs skip signature checks at candidate ingest), so requeue
+    /// without these gates would launder unsigned/unfunded garbage into the
+    /// pool.
+    fn validate_tx_content(&self, tx: &Transaction) -> Result<(), &'static str> {
+        self.validate_tx_content_inner(tx, true)
+    }
+
+    /// `append_nonce_rule = true` for fresh ingress (tx queues behind its
+    /// sender's pooled txs); `false` for a restore, which only rejects a nonce
+    /// already consumed on-chain. See `validate_tx_for_requeue`.
+    fn validate_tx_content_inner(
+        &self,
+        tx: &Transaction,
+        append_nonce_rule: bool,
+    ) -> Result<(), &'static str> {
         if tx.from.0 == [0u8; 32] {
             return Err("null sender");
+        }
+        // CHEAP DETERMINISTIC REJECTS FIRST. Signature verification (~34us) and
+        // the two O(mempool) scans below dominate this function, and the
+        // requeue path re-runs it on attacker-suppliable txs, so anything
+        // decidable from a single map lookup belongs ahead of them: a
+        // zero-balance flood then costs ~1us per tx instead of ~60us.
+        // Must reproduce the LATER gates' verdicts exactly, including their
+        // exemptions — the faucet is exempt from fee-payability because
+        // rejecting its tx at ingress strands the already-consumed
+        // faucet_next_nonce and bricks dispensing until restart.
+        {
+            let on_chain = self.state.accounts.get(&tx.from);
+            if tx.nonce < on_chain.map(|a| a.nonce).unwrap_or(0) {
+                return Err("stale nonce");
+            }
+            let exempt = commputer::requeue_rules::payability_exempt(
+                self.is_faucet_sender(tx),
+                matches!(tx.kind, commputer_core::transaction::TxKind::ValidatorRegister { .. }),
+            );
+            if !exempt && on_chain.map(|a| a.balance.raw()).unwrap_or(0) < tx.fee {
+                return Err("sender cannot cover fee");
+            }
         }
         // Storage follow-up (findings [3]/[5]/[6] MultiSig, [11]/[22] StorageWill):
         // enforce the core structural caps at INGRESS so oversized MultiSig /
@@ -2620,11 +2681,6 @@ impl EventLoop {
         tx.validate_shape()?;
         if !tx.verify() {
             return Err("signature verification failed");
-        }
-        // Reject duplicates (already in mempool or finalized).
-        let hash = tx.hash();
-        if self.seen_tx_hashes.contains(&hash) {
-            return Err("duplicate transaction");
         }
         // Feature 251: Validate memo length.
         if let Some(ref memo) = tx.memo
@@ -2677,9 +2733,7 @@ impl EventLoop {
         // fee-payability floor: an admission rejection would strand faucet_next_nonce
         // (already consumed on try_send) and brick the faucet until node restart.
         // If the const is None (faucet disabled) this is always false — correct.
-        let faucet_exempt = commputer::testnet_genesis::ALPHA_FAUCET_ADDRESS_HEX
-            .and_then(|h| commputer_core::identity::Address::from_hex(h).ok())
-            .is_some_and(|fa| fa == tx.from);
+        let faucet_exempt = self.is_faucet_sender(tx);
 
         // F-3 per-account mempool quota (independent gate; composes with the C7
         // kind-aware ingress filter above). REJECT (never evict — eviction would
@@ -2709,11 +2763,48 @@ impl EventLoop {
             }
         }
 
-        let expected_nonce = on_chain_nonce + pending_from_sender as u64;
-        if tx.nonce != expected_nonce {
-            return Err("invalid nonce");
+        if append_nonce_rule {
+            if !commputer::requeue_rules::append_nonce_ok(
+                tx.nonce,
+                on_chain_nonce,
+                pending_from_sender,
+            ) {
+                return Err("invalid nonce");
+            }
+        } else if !commputer::requeue_rules::nonce_ok_for_requeue(tx.nonce, on_chain_nonce) {
+            return Err("stale nonce");
         }
         Ok(())
+    }
+
+    /// The compiled faucet address is a trusted internal issuer whose nonce is
+    /// serialized in rpc.rs. It is exempt from the mempool quota and the
+    /// fee-payability floor: rejecting a dispense at ingress strands
+    /// `faucet_next_nonce` (already consumed on try_send) and bricks the faucet
+    /// until restart. Every payability gate must consult this.
+    fn is_faucet_sender(&self, tx: &Transaction) -> bool {
+        commputer::testnet_genesis::ALPHA_FAUCET_ADDRESS_HEX
+            .and_then(|h| commputer_core::identity::Address::from_hex(h).ok())
+            .is_some_and(|fa| fa == tx.from)
+    }
+
+    /// Content gates for a tx being RESTORED to the pool by `requeue_lost_txs`,
+    /// as opposed to newly arriving. Everything `validate_tx_content` checks,
+    /// except the nonce rule is staleness-only.
+    ///
+    /// The append rule (`nonce == on_chain + pending_from_sender`) is correct
+    /// for fresh ingress — a new tx queues behind its sender's pooled txs — but
+    /// WRONG for a restore, and applying it here silently discards exactly the
+    /// tx this whole mechanism exists to save. Block production reads the
+    /// expected nonce fresh from chain state per tx, so it packs only
+    /// `nonce == on_chain` and returns the sender's higher nonces to the pool
+    /// (see the 3-bucket filter). When that candidate loses, the restored tx
+    /// has `nonce == on_chain` while its siblings sit pooled, so the append
+    /// rule computes a strictly larger expectation and rejects it. Ordering is
+    /// enforced by that same 3-bucket filter at the next pack, so all a restore
+    /// must prove is that the tx is not already applied.
+    fn validate_tx_for_requeue(&self, tx: &Transaction) -> Result<(), &'static str> {
+        self.validate_tx_content_inner(tx, false)
     }
 
     fn handle_new_transaction(&mut self, tx: Transaction, source: libp2p::PeerId) {
@@ -2753,6 +2844,138 @@ impl EventLoop {
         self.mempool_added_at.insert(hash, std::time::Instant::now());
         self.pending_txs.push(tx);
         self.enforce_mempool_limit();
+    }
+
+    /// Validated re-admission of txs surrendered by LOSING candidates — fed by
+    /// both the consensus apply path (take_finalized_with_lost) and the sync
+    /// apply path (surrender_lost_at). Without requeue, a tx packed into a
+    /// losing proposal is destroyed (the proposer mem::take'd it out of its
+    /// mempool and no other pool prunes it back in).
+    ///
+    /// Hardened per review before first deploy:
+    /// - CONTENT-VALIDATED: candidates are attacker-suppliable, and candidate
+    ///   ingest skips signature checks for zero-from txs — every requeued tx
+    ///   re-runs the ingress gates via `validate_tx_for_requeue` (restore
+    ///   nonce rule; the seen-dedup is skipped because a restored tx is
+    ///   legitimately already seen).
+    /// - CAPPED PER TURN, on work EXAMINED: a height can hold 64 candidates ×
+    ///   500 txs and validation is the expensive part, so the budget bounds
+    ///   validations, not admissions. It is a per-TURN budget because one turn
+    ///   can requeue many times (10-block sync batch, 200-deep orphan cascade,
+    ///   a run of finalized heights); a per-call cap would hand each of those a
+    ///   fresh 500.
+    /// - HIGHEST-FEE FIRST: when the budget cannot cover everything surrendered,
+    ///   examine in the same order the producer would pack. Truncating in
+    ///   HashMap order would let a flood crowd out the genuine tx this exists to
+    ///   save, converting a cost attack into silent loss of the property.
+    /// - LAZY pool index: the O(mempool) hash set is built only once a tx is
+    ///   actually worth checking, so an all-duplicate batch costs nothing.
+    /// - EXPIRY-PRESERVING: entry().or_insert keeps the tx's original 1-hour
+    ///   deadline. (A tx whose expiry swept while it rode an unresolved
+    ///   candidate does get one fresh lease — bounded by the cap and by having
+    ///   to keep losing races; alpha.7 item.)
+    fn requeue_lost_txs(
+        &mut self,
+        winner_tx_hashes: &HashSet<TxHash>,
+        lost_txs: Vec<Transaction>,
+    ) {
+        if lost_txs.is_empty() {
+            return;
+        }
+        if self.requeue_budget == 0 {
+            warn!(
+                "requeue: turn budget exhausted — {} lost txs not considered",
+                lost_txs.len()
+            );
+            return;
+        }
+        // Rank by BACKED fee: can the sender actually pay it, then how much.
+        //
+        // Ranking on `fee` alone inverts the protection it looks like it
+        // provides. At sort time a fee is an unbacked CLAIM — the payability
+        // check runs later, and the budget is charged per EXAMINATION, so a
+        // fabricated `fee: u64::MAX` from a zero-balance key wins its slot for
+        // free even though it is rejected a microsecond later. The tx this
+        // mechanism exists to save (a faucet dispense) pays exactly
+        // MINIMUM_FEE, i.e. the floor of that ordering — so fee-only ranking
+        // hands a costless attacker deterministic priority over it.
+        //
+        // The affordability flag is one map lookup and makes the claim cost
+        // something: unfunded txs sort last regardless of what they claim, and
+        // outranking honest traffic requires really holding the balance. The
+        // faucet is exempt for the same reason it is exempt at ingress.
+        let mut ranked: Vec<(bool, u64, Transaction)> = lost_txs
+            .into_iter()
+            // Zero-from txs are the one class candidate ingest does NOT
+            // signature-check, so they are free to fabricate in bulk. They can
+            // never be admitted here (validate_tx_content_inner rejects null
+            // senders), so dropping them before ranking denies a costless
+            // flood any purchase on the budget at all.
+            .filter(|tx| tx.from.0 != [0u8; 32])
+            .map(|tx| {
+                let affordable = self.is_faucet_sender(&tx)
+                    || self.state.accounts.get(&tx.from)
+                        .is_some_and(|a| a.balance.raw() >= tx.fee);
+                let (a, f) = commputer::requeue_rules::requeue_rank(affordable, tx.fee);
+                (a, f, tx)
+            })
+            .collect();
+        ranked.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+        let lost_txs: Vec<Transaction> = ranked.into_iter().map(|(_, _, tx)| tx).collect();
+        // Only txs we never looked at count as unexamined — a batch that was
+        // entirely duplicates cost nothing and lost nothing, and reporting it
+        // as loss would train operators to ignore the warn.
+        let budget_at_entry = self.requeue_budget;
+        let surrendered = lost_txs.len();
+        let mut pooled: Option<HashSet<TxHash>> = None;
+        let mut admitted = 0usize;
+        // Iterate all, stopping when the BUDGET runs out — not `take(budget)`.
+        // Skips that cost nothing (already in the winner, already pooled) must
+        // not consume the window: competing producers pack overlapping
+        // mempools, so under load the leading entries are mostly duplicates,
+        // and a `take` window would be spent on them before ever reaching the
+        // txs that were genuinely lost. That failure needs no attacker and is
+        // silent.
+        for tx in lost_txs {
+            if self.requeue_budget == 0 {
+                break;
+            }
+            let h = tx.hash();
+            if winner_tx_hashes.contains(&h) {
+                continue;
+            }
+            let pooled = pooled.get_or_insert_with(|| {
+                self.pending_txs.iter().map(|p| p.hash()).collect()
+            });
+            if pooled.contains(&h) {
+                continue;
+            }
+            self.requeue_budget = self.requeue_budget.saturating_sub(1);
+            if let Err(reason) = self.validate_tx_for_requeue(&tx) {
+                debug!("requeue: dropping lost tx {}: {}", hex::encode(h.0), reason);
+                continue;
+            }
+            self.seen_tx_hashes.insert(h);
+            self.mempool_added_at
+                .entry(h)
+                .or_insert_with(std::time::Instant::now);
+            self.process_job_tx(&tx);
+            pooled.insert(h);
+            self.pending_txs.push(tx);
+            admitted += 1;
+        }
+        let examined = budget_at_entry.saturating_sub(self.requeue_budget);
+        let unexamined = surrendered.saturating_sub(examined);
+        if unexamined > 0 && self.requeue_budget == 0 {
+            warn!(
+                "requeue: turn budget exhausted — up to {} surrendered txs not examined",
+                unexamined
+            );
+        }
+        if admitted > 0 {
+            debug!("requeue: re-admitted {} txs from losing candidates", admitted);
+            self.enforce_mempool_limit();
+        }
     }
 
     /// Item 18-20: Process compute job transactions and update the job pool.
@@ -2845,29 +3068,48 @@ impl EventLoop {
     /// Maximum number of transactions in the mempool.
     const MAX_MEMPOOL_SIZE: usize = 5000;
 
+    /// Requeue validations allowed per event-loop turn (one block's worth).
+    /// Bounds the synchronous cost an attacker-supplied pile of losing
+    /// candidates can impose on the block-apply path. See `requeue_lost_txs`.
+    const REQUEUE_BUDGET_PER_TURN: usize = commputer_core::block::MAX_TRANSACTIONS_PER_BLOCK;
+
     /// Enforce mempool size limit. Finding [18]: evict fee-UNAFFORDABLE txs first
     /// (sender's on-chain balance cannot cover the tx fee), then lowest-fee — so a
     /// flood of unpayable high-fee txs cannot capture the pool by out-surviving
     /// honest lower-fee txs under a pure lowest-fee eviction.
     fn enforce_mempool_limit(&mut self) {
-        while self.pending_txs.len() > Self::MAX_MEMPOOL_SIZE {
-            // `(affordable, fee)` sorts unaffordable (false) first, then lowest fee.
-            let victim = self.pending_txs.iter()
-                .enumerate()
-                .min_by_key(|(_, tx)| {
-                    let bal = self.state.accounts.get(&tx.from)
-                        .map(|a| a.balance.raw())
-                        .unwrap_or(0);
-                    (bal >= tx.fee, tx.fee)
-                })
-                .map(|(idx, _)| idx);
-            if let Some(min_idx) = victim {
-                let evicted = self.pending_txs.remove(min_idx);
-                debug!("Evicted tx from mempool (affordable-first): fee={}", evicted.fee);
-            } else {
-                break;
-            }
+        let excess = self.pending_txs.len().saturating_sub(Self::MAX_MEMPOOL_SIZE);
+        if excess == 0 {
+            return;
         }
+        // AMORTIZED: rank once, drop the worst `excess` in a single pass.
+        // The previous shape was a full min_by_key scan (with a per-element
+        // account lookup) plus an O(n) Vec::remove PER EVICTION — fine when
+        // every caller inserted one tx, but requeue can admit a block's worth
+        // at once, which turned it quadratic on the block-apply path.
+        // Eviction ORDER is unchanged: `(affordable, fee)` ascending, so
+        // fee-unaffordable txs go first, then lowest fee — a flood of unpayable
+        // high-fee txs still cannot capture the pool.
+        let mut ranked: Vec<(bool, u64, usize)> = self
+            .pending_txs
+            .iter()
+            .enumerate()
+            .map(|(idx, tx)| {
+                let bal = self.state.accounts.get(&tx.from)
+                    .map(|a| a.balance.raw())
+                    .unwrap_or(0);
+                (bal >= tx.fee, tx.fee, idx)
+            })
+            .collect();
+        ranked.sort_unstable();
+        let doomed: HashSet<usize> = ranked.into_iter().take(excess).map(|(_, _, i)| i).collect();
+        let mut idx = 0usize;
+        self.pending_txs.retain(|_| {
+            let keep = !doomed.contains(&idx);
+            idx += 1;
+            keep
+        });
+        debug!("Evicted {} txs from mempool (affordable-first, lowest-fee)", doomed.len());
     }
 
     pub fn auto_register_validator(&mut self, contribution_percent: u8) {
@@ -3699,7 +3941,11 @@ impl EventLoop {
         }
 
         // take_finalized CONSUMES the round, so it must be called exactly once.
-        let finalized = self.consensus.take_finalized(height);
+        // The _with_lost variant also surrenders every tx that was packed into
+        // a LOSING candidate at this height — without requeueing those, a tx
+        // that rode a losing proposal is destroyed (the proposer mem::take'd
+        // it out of its mempool and no other pool prunes it back in).
+        let finalized = self.consensus.take_finalized_with_lost(height);
         // A quorum can settle on a hash whose BODY never reached us (votes carry
         // hashes, not blocks). take_finalized deliberately keeps such a round
         // intact rather than destroying the quorum — but the body has to be
@@ -3711,7 +3957,7 @@ impl EventLoop {
             return;
         }
 
-        if let Some(block) = finalized {
+        if let Some((block, lost_txs)) = finalized {
             let hash = block.hash();
 
             // Fork detection: check if this block's parent matches our chain tip.
@@ -3790,19 +4036,27 @@ impl EventLoop {
                             }
                         }
 
+                    // Prune finalized txs from the local mempool, and requeue
+                    // this height's losing-candidate txs (capped + re-validated;
+                    // see requeue_lost_txs). BOTH must run before
+                    // process_orphans: that call recurses into try_apply_finalized
+                    // for H+1, whose own requeue validates against this pool —
+                    // if H's applied txs were still sitting here, they would
+                    // inflate the sender's pending count and cause H+1's restore
+                    // to be rejected.
+                    let block_tx_hashes: HashSet<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
+                    self.pending_txs.retain(|tx| !block_tx_hashes.contains(&tx.hash()));
+                    for h in &block_tx_hashes {
+                        self.mempool_added_at.remove(h);
+                    }
+                    self.requeue_lost_txs(&block_tx_hashes, lost_txs);
+
                     // Feature 127: Check for orphaned blocks that can now be processed.
                     self.process_orphans(hash);
 
                     // Track-2 (Phase B): feed the PoUW loops the just-applied state (no-op unless attached + bonded).
                     self.push_executor_snapshot();
                     self.push_verifier_snapshot();
-
-                    // Prune finalized txs from the local mempool.
-                    let block_tx_hashes: HashSet<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
-                    self.pending_txs.retain(|tx| !block_tx_hashes.contains(&tx.hash()));
-                    for h in &block_tx_hashes {
-                        self.mempool_added_at.remove(h);
-                    }
                 }
                 Err(e) => {
                     warn!("Rejected finalized block {}: {}", hash, e);
@@ -3921,7 +4175,27 @@ impl EventLoop {
                     "timestamp": block.header.timestamp,
                 }));
 
-                // Process any orphans that can now be applied.
+                // Prune this block's txs from the mempool. The consensus path
+                // has always done this; the sync path never did, so an applied
+                // tx could linger in the pool — inflating its sender's pending
+                // count and making the requeue below reject that sender's
+                // restored txs.
+                let block_tx_hashes: HashSet<TxHash> =
+                    block.transactions.iter().map(|tx| tx.hash()).collect();
+                self.pending_txs.retain(|tx| !block_tx_hashes.contains(&tx.hash()));
+                for h in &block_tx_hashes {
+                    self.mempool_added_at.remove(h);
+                }
+
+                // Requeue-on-loss, sync twin: a height applied via sync never
+                // goes through take_finalized, so cleanup_below would destroy
+                // any losing candidates still held here — the loss path a
+                // WAN-lagged node hits most, since its recovery IS sync.
+                let lost_txs = self.consensus.surrender_lost_at(height, &hash);
+                self.requeue_lost_txs(&block_tx_hashes, lost_txs);
+
+                // Process any orphans that can now be applied (after the prune
+                // + requeue above, for the same reason as the consensus path).
                 self.process_orphans(hash);
 
                 // Track-2 (Phase B): feed the PoUW loops the just-applied state.

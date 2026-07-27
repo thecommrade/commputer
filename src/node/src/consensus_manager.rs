@@ -6,6 +6,7 @@ use tracing::{info, debug, warn};
 
 use commputer_core::block::{Block, BlockHash, BlockHeader};
 use commputer_core::identity::Address;
+use commputer_core::transaction::Transaction;
 use commputer_consensus::snowball::{SnowballParams, SnowballVoter};
 use commputer_consensus::VoteAggregator;
 use libp2p::PeerId;
@@ -676,6 +677,31 @@ impl ConsensusManager {
     /// producer-lockout; alpha.6 panel finding). The body arrives later via
     /// gossip/sync and a subsequent take succeeds.
     pub fn take_finalized(&mut self, height: u64) -> Option<Block> {
+        self.take_finalized_with_lost(height).map(|(block, _)| block)
+    }
+
+    /// Like `take_finalized`, but also returns every transaction that was
+    /// packed into a LOSING candidate at this height.
+    ///
+    /// A proposer moves txs OUT of its mempool and INTO its candidate when it
+    /// produces (`std::mem::take` in block production). When that candidate
+    /// loses the round, those txs exist nowhere except the dropped block —
+    /// so without this, any tx that rode a losing proposal is silently
+    /// destroyed, network-wide once every pool's copy has lost a race.
+    /// (Live finding: every faucet dispense died this way within ~3s — the
+    /// WAN-lagged seed loses essentially every proposal race to the LAN pair,
+    /// which lock each other's candidates first.)
+    ///
+    /// Losers from ALL producers are returned, not just our own: every node
+    /// that saw a losing proposal can resurrect its txs, so inclusion no
+    /// longer depends on the losing proposer ever winning a round. The caller
+    /// requeues them (minus any the winner already included); duplicates and
+    /// stale copies die in the producer's nonce filter or the post-apply
+    /// mempool prune.
+    pub fn take_finalized_with_lost(
+        &mut self,
+        height: u64,
+    ) -> Option<(Block, Vec<Transaction>)> {
         let hash = self.finalized_at_height(height)?;
         if !self
             .heights
@@ -685,7 +711,36 @@ impl ConsensusManager {
             return None;
         }
         let state = self.heights.remove(&height)?;
-        state.candidates.into_values().find(|b| b.hash() == hash)
+        let mut winner = None;
+        let mut lost_txs = Vec::new();
+        for block in state.candidates.into_values() {
+            if block.hash() == hash {
+                winner = Some(block);
+            } else {
+                lost_txs.extend(block.transactions);
+            }
+        }
+        winner.map(|block| (block, lost_txs))
+    }
+
+    /// Surrender the txs of every candidate at `height` that is NOT the
+    /// applied block — the SYNC-apply twin of `take_finalized_with_lost`.
+    /// A height applied via sync never goes through `take_finalized` (we were
+    /// behind; the round may not even be finalized locally), so `cleanup_below`
+    /// would destroy the losing candidates and every tx inside them — exactly
+    /// the loss path a WAN-lagged node hits most, since its recovery IS sync.
+    /// Consumes the height's round state, matching take semantics.
+    pub fn surrender_lost_at(&mut self, height: u64, applied: &BlockHash) -> Vec<Transaction> {
+        let Some(state) = self.heights.remove(&height) else {
+            return Vec::new();
+        };
+        let mut lost_txs = Vec::new();
+        for block in state.candidates.into_values() {
+            if block.hash() != *applied {
+                lost_txs.extend(block.transactions);
+            }
+        }
+        lost_txs
     }
 
     /// Remove consensus state for heights at or below the applied chain tip.
@@ -1930,6 +1985,103 @@ mod tests {
             super::MAX_CHECKPOINT_VALIDATORS_PER_HEIGHT,
             "distinct checkpoint validators at one height must be capped"
         );
+    }
+
+    /// A tx packed into a LOSING candidate must be surrendered by the take so
+    /// the caller can requeue it — otherwise it is destroyed with the dropped
+    /// candidate (live finding: every seed-submitted faucet dispense died this
+    /// way, because the WAN-lagged seed loses essentially every proposal race).
+    #[test]
+    fn take_finalized_with_lost_surrenders_losing_candidates_txs() {
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4);
+        let tip = BlockHash([7u8; 32]);
+
+        let mut winner = make_test_block_with_producer(5, addr(1));
+        winner.header.parent_hash = tip;
+        let mut loser = make_test_block_with_producer(5, addr(2));
+        loser.header.parent_hash = tip;
+        loser.transactions.push(Transaction {
+            from: addr(9),
+            nonce: 0,
+            kind: commputer_core::transaction::TxKind::Transfer {
+                to: addr(8),
+                amount: commputer_core::token::Amount::from_raw(1),
+            },
+            fee: commputer_core::transaction::MINIMUM_FEE,
+            signature: vec![],
+            public_key: vec![],
+            memo: None,
+            timelock: None,
+        });
+        let lost_tx_hash = loser.transactions[0].hash();
+
+        cm.add_candidate(winner.clone());
+        cm.add_candidate(loser.clone());
+        // Finalize the WINNER via peer votes (quorum 2, beta drives itself).
+        let (pa, pb) = (PeerId::random(), PeerId::random());
+        for _ in 0..10 {
+            cm.record_peer_response(5, winner.hash(), pa);
+            cm.record_peer_response(5, winner.hash(), pb);
+            cm.try_finalize_round(5, 2);
+        }
+        assert_eq!(cm.finalized_at_height(5), Some(winner.hash()));
+
+        let (block, lost) = cm
+            .take_finalized_with_lost(5)
+            .expect("winner has a body, take must succeed");
+        assert_eq!(block.hash(), winner.hash());
+        assert_eq!(
+            lost.iter().map(|t| t.hash()).collect::<Vec<_>>(),
+            vec![lost_tx_hash],
+            "the losing candidate's tx must be surrendered for requeue, not dropped"
+        );
+
+        // The round is consumed either way — a second take yields nothing.
+        assert!(cm.take_finalized_with_lost(5).is_none());
+    }
+
+    /// The SYNC twin: a height applied via sync never goes through
+    /// take_finalized, so its losing candidates' txs must be surrendered
+    /// explicitly before cleanup_below destroys them.
+    #[test]
+    fn surrender_lost_at_returns_losers_txs_and_consumes_the_round() {
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4);
+        let tip = BlockHash([7u8; 32]);
+
+        let mut applied = make_test_block_with_producer(5, addr(1));
+        applied.header.parent_hash = tip;
+        let mut loser = make_test_block_with_producer(5, addr(2));
+        loser.header.parent_hash = tip;
+        loser.transactions.push(Transaction {
+            from: addr(9),
+            nonce: 0,
+            kind: commputer_core::transaction::TxKind::Transfer {
+                to: addr(8),
+                amount: commputer_core::token::Amount::from_raw(1),
+            },
+            fee: commputer_core::transaction::MINIMUM_FEE,
+            signature: vec![],
+            public_key: vec![],
+            memo: None,
+            timelock: None,
+        });
+        let lost_tx_hash = loser.transactions[0].hash();
+
+        cm.add_candidate(applied.clone());
+        cm.add_candidate(loser);
+
+        // No finalization required — sync applies the block regardless of the
+        // local round state.
+        let lost = cm.surrender_lost_at(5, &applied.hash());
+        assert_eq!(
+            lost.iter().map(|t| t.hash()).collect::<Vec<_>>(),
+            vec![lost_tx_hash]
+        );
+        assert!(!cm.has_height(5), "round state consumed, matching take semantics");
+        // A height we never tracked surrenders nothing.
+        assert!(cm.surrender_lost_at(99, &applied.hash()).is_empty());
     }
 
     /// The per-height vote LOCK is what makes one-round finality (beta=1) safe.
