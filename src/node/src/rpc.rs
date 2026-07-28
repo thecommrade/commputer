@@ -808,9 +808,23 @@ pub struct FaucetRequest {
 }
 
 /// A-batch item 6: build + sign a faucet Transfer of exactly 1 COMME to `to`,
-/// using `nonce` as the tx nonce. Fee is MINIMUM_FEE because Transfers are not
-/// fee-exempt in the mempool. Signed with `sign_transaction` (no chain_id — the
-/// signature form `tx.verify()` checks), so a faucet tx passes the mempool gate.
+/// using `nonce` as the tx nonce. Signed with `sign_transaction` (no chain_id —
+/// the signature form `tx.verify()` checks), so a faucet tx passes the mempool
+/// gate.
+///
+/// FEE = ACCOUNT_CREATION_FEE, not MINIMUM_FEE. A faucet dispense goes to a
+/// wallet the chain has never seen — that is what a faucet IS — and
+/// `apply_transaction` requires `fee >= ACCOUNT_CREATION_FEE` for a transfer to
+/// a non-existent recipient (storage/src/state.rs, "transfer to new account
+/// requires fee"). MINIMUM_FEE is 10x too small, so EVERY dispense was doomed.
+///
+/// It failed invisibly: the mempool gate only checks `fee >= MINIMUM_FEE`, so
+/// the tx was accepted everywhere, gossiped, and selected into a block — then
+/// discarded by `select_applicable_txs`, which (until this was found) dropped
+/// trial-apply failures with no log at all. The dispenser had already consumed
+/// its in-memory nonce, so the faucet then rejected every later claim as
+/// "invalid nonce" until the node restarted. No faucet dispense had ever landed
+/// on the chain.
 ///
 /// INERT SUBSTRATE: this is the money-path builder the D6 faucet dispenser will
 /// call once a faucet wallet is provisioned. It is NOT yet reachable from a
@@ -836,7 +850,7 @@ fn build_faucet_transfer(
                 commputer_core::token::UNITS_PER_COMME,
             ),
         },
-        fee: commputer_core::transaction::MINIMUM_FEE,
+        fee: commputer_core::transaction::ACCOUNT_CREATION_FEE,
         signature: vec![],
         public_key: vec![],
         memo: None,
@@ -2996,9 +3010,21 @@ mod tests {
         assert!(tx.verify(), "faucet tx must carry a valid signature");
         assert_eq!(tx.from, *faucet.address());
         assert_eq!(tx.nonce, 7);
+        // The fee must cover ACCOUNT CREATION, not merely MINIMUM_FEE. A faucet
+        // dispense always goes to a wallet the chain has never seen, and
+        // apply_transaction rejects a transfer to a non-existent recipient
+        // whose fee is below ACCOUNT_CREATION_FEE.
+        //
+        // This assertion used to read `>= MINIMUM_FEE`, which the broken value
+        // satisfied — so the suite stayed green while every dispense on the live
+        // chain was rejected at block-apply and silently dropped. Assert the
+        // condition the CONSENSUS rule imposes, not the weaker one the mempool
+        // gate happens to check.
         assert!(
-            tx.fee >= commputer_core::transaction::MINIMUM_FEE,
-            "Transfer is not fee-exempt; fee must cover MINIMUM_FEE"
+            tx.fee >= commputer_core::transaction::ACCOUNT_CREATION_FEE,
+            "faucet always creates a new account; fee {} must cover ACCOUNT_CREATION_FEE {}",
+            tx.fee,
+            commputer_core::transaction::ACCOUNT_CREATION_FEE,
         );
         match tx.kind {
             TxKind::Transfer { to, amount } => {

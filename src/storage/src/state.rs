@@ -4236,6 +4236,23 @@ impl ChainState {
     /// the P1 pre-validation contract (the same contract `apply_txs_with_rollback` already relies
     /// on). The caller therefore sees `self` byte-identical to entry — post-call state root ==
     /// pre-call root, no smear (the class P1 rollback fixed).
+    /// Short kind label for diagnostics (the full Debug of a TxKind can carry
+    /// whole payloads into the log).
+    fn tx_kind_label(kind: &TxKind) -> &'static str {
+        match kind {
+            TxKind::Transfer { .. } => "Transfer",
+            TxKind::Bond { .. } => "Bond",
+            TxKind::RequestUnbond { .. } => "RequestUnbond",
+            TxKind::ValidatorRegister { .. } => "ValidatorRegister",
+            TxKind::SubmitJobV2 { .. } => "SubmitJobV2",
+            TxKind::ClaimJob { .. } => "ClaimJob",
+            TxKind::Commit { .. } => "Commit",
+            TxKind::Reveal { .. } => "Reveal",
+            TxKind::CompleteJob { .. } => "CompleteJob",
+            _ => "other",
+        }
+    }
+
     pub fn select_applicable_txs(
         &mut self,
         candidates: Vec<Transaction>,
@@ -4253,8 +4270,23 @@ impl ChainState {
                     self.rollback_to_pre_block(per_tx);
                     if self.tx_is_phase_deferred(&tx, &e) {
                         requeue.push(tx);
+                    } else {
+                        // A DROP HERE IS PERMANENT AND WAS PREVIOUSLY SILENT.
+                        // This is the only place a well-formed, mempool-accepted
+                        // tx can disappear without a trace: it is selected for a
+                        // block, fails trial-apply, and is discarded with no log,
+                        // no receipt, and no counter. An operator sees only that
+                        // their tx never landed. Name the tx and the reason.
+                        warn!(
+                            "Dropped tx {} from block candidates — trial-apply failed: {:?} \
+                             (from={} nonce={} kind={})",
+                            hex::encode(tx.hash().0),
+                            e,
+                            tx.from,
+                            tx.nonce,
+                            Self::tx_kind_label(&tx.kind),
+                        );
                     }
-                    // else: permanently doomed at this committed state — drop.
                 }
             }
         }
