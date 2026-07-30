@@ -858,11 +858,36 @@ async fn cmd_bond(amount: u64, testnet: bool, rpc_port: u16) -> Result<()> {
         }
     };
 
+    // Apply deducts the FEE FIRST and only then requires the post-fee balance
+    // to cover the bond, so "bond everything I have" is always rejected
+    // on-chain — and /tx answers 200 before validation, so the CLI would print
+    // success for a bond that silently never happened. This is the third
+    // builder in this codebase to carry that shape; check it here where the
+    // user can act on it.
+    let bond_amount = Amount::from_comme(amount);
+    let fee = commputer_core::transaction::MINIMUM_FEE;
+    let bal_url = format!("http://127.0.0.1:{}/balance/{}", rpc_port, from_hex);
+    if let Ok(resp) = client.get(&bal_url).send().await
+        && resp.status().is_success()
+    {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if let Some(bal) = body["balance"].as_u64() {
+            let required = bond_amount.raw().saturating_add(fee);
+            if bal < required {
+                anyhow::bail!(
+                    "Insufficient balance to bond. Have {} raw, need {} COMME + {} fee ({} raw). \
+                     The fee is deducted before the bond, so you cannot bond your entire balance.",
+                    bal, amount, fee, required,
+                );
+            }
+        }
+    }
+
     let mut tx = Transaction {
         from: from_addr,
         nonce,
-        kind: TxKind::Bond { amount: Amount::from_comme(amount) },
-        fee: commputer_core::transaction::MINIMUM_FEE,
+        kind: TxKind::Bond { amount: bond_amount },
+        fee,
         signature: vec![],
         public_key: vec![],
         memo: None,
