@@ -44,6 +44,27 @@ pub fn requeue_rank(affordable: bool, fee: u64) -> (bool, u64) {
     (affordable, fee)
 }
 
+/// The fee a Transfer must carry, given whether the chain already knows the
+/// recipient.
+///
+/// Consensus rejects a transfer to a non-existent account whose fee is below
+/// `ACCOUNT_CREATION_FEE`; the mempool only enforces `MINIMUM_FEE`. A builder
+/// that pays the mempool's floor therefore produces a transaction that is
+/// accepted everywhere, gossiped, selected into a block — and then dropped at
+/// apply. This has already happened twice: the faucet (every dispense in the
+/// project's history) and `commputer send` (nearly every send on a young chain,
+/// where most recipients are new).
+///
+/// When recipient existence is UNKNOWN, callers should pass `false`:
+/// overpaying lands, underpaying vanishes silently.
+pub fn transfer_fee(recipient_exists: bool) -> u64 {
+    if recipient_exists {
+        commputer_core::transaction::MINIMUM_FEE
+    } else {
+        commputer_core::transaction::ACCOUNT_CREATION_FEE
+    }
+}
+
 /// Is this sender exempt from fee-payability gating?
 ///
 /// The faucet is a trusted internal issuer whose nonce is serialized in the
@@ -82,6 +103,29 @@ mod tests {
     fn among_affordable_txs_higher_fee_wins() {
         assert!(requeue_rank(true, 500_000) > requeue_rank(true, 100_000));
         assert!(requeue_rank(false, 500_000) > requeue_rank(false, 100_000));
+    }
+
+    /// A transfer to an unknown recipient must pay the account-creation fee.
+    /// Paying MINIMUM_FEE produces a tx the mempool accepts and consensus
+    /// rejects — accepted everywhere, then dropped at apply. Two shipped
+    /// builders had this bug (the faucet, and `commputer send`).
+    #[test]
+    fn transfer_to_a_new_account_pays_the_creation_fee() {
+        assert_eq!(
+            transfer_fee(false),
+            commputer_core::transaction::ACCOUNT_CREATION_FEE,
+            "new recipient must pay the creation fee"
+        );
+        assert_eq!(
+            transfer_fee(true),
+            commputer_core::transaction::MINIMUM_FEE,
+            "known recipient pays the ordinary floor"
+        );
+        assert!(
+            commputer_core::transaction::ACCOUNT_CREATION_FEE
+                > commputer_core::transaction::MINIMUM_FEE,
+            "the whole hazard is that the creation fee is strictly larger"
+        );
     }
 
     /// The faucet must never be rejected by a payability gate — its nonce is

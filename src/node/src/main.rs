@@ -681,6 +681,16 @@ async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result
     to_arr.copy_from_slice(&to_bytes);
     let to_addr = Address(to_arr);
 
+    // Amount is whole COMME, so 0 is the only sub-dust value expressible here —
+    // and DUST_LIMIT is enforced ONLY at apply, with no mempool check. A
+    // 0-amount transfer would therefore be accepted by every node, gossiped,
+    // selected into a block and dropped at trial-apply: the same
+    // mempool-accepts/consensus-rejects divergence as the fee bug this
+    // function was just fixed for. Reject it here, where the user can see it.
+    if amount == 0 {
+        anyhow::bail!("Amount must be at least 1 COMME (a 0-value transfer is rejected on-chain).");
+    }
+
     let password = read_password("Password: ");
     let wallet = Keystore::load(&path, &password)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -703,20 +713,65 @@ async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result
         }
     };
 
-    // Verify balance from local state.
-    let state = open_chain_state(testnet)?;
-    let balance = state
-        .accounts
-        .get(&from_addr)
-        .map(|a| a.balance)
-        .unwrap_or(Amount::ZERO);
+    // Balance over RPC, like the nonce above — opening the local DB fails with
+    // a RocksDB lock error whenever the node is actually running, which is the
+    // normal case for a send.
+    let balance_url = format!("http://127.0.0.1:{}/balance/{}", rpc_port, from_hex);
+    let balance = match client.get(&balance_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            body["balance"].as_u64().map(Amount::from_raw)
+        }
+        // The node answered that it has never seen this account: that is a
+        // definitive zero, not a failure to reach the node. Falling through to
+        // the local-DB path here would report a RocksDB lock error to a user
+        // whose real problem is an empty wallet.
+        Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => Some(Amount::ZERO),
+        _ => None,
+    };
+    let balance = match balance {
+        Some(b) => b,
+        None => {
+            // No node reachable — fall back to reading the chain directly.
+            let state = open_chain_state(testnet)?;
+            state
+                .accounts
+                .get(&from_addr)
+                .map(|a| a.balance)
+                .unwrap_or(Amount::ZERO)
+        }
+    };
 
+    // A transfer to an account the chain has never seen must pay
+    // ACCOUNT_CREATION_FEE; MINIMUM_FEE is rejected at apply. On a young chain
+    // most recipients are new, so defaulting to MINIMUM_FEE meant nearly every
+    // send failed — and it failed INVISIBLY, because the tx is accepted by the
+    // mempool (which only checks MINIMUM_FEE) and then dropped during block
+    // production. Ask the node whether the recipient exists; when we cannot
+    // reach it, pay the higher fee, since overpaying lands and underpaying
+    // vanishes.
+    let recipient_url = format!("http://127.0.0.1:{}/balance/{}", rpc_port, hex::encode(to_addr.0));
+    let recipient_exists = match client.get(&recipient_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            body.get("balance").is_some()
+        }
+        _ => false,
+    };
+    let fee = commputer::requeue_rules::transfer_fee(recipient_exists);
+
+    // The fee is deducted BEFORE the transfer at apply, so the balance has to
+    // cover amount + fee. Checking the amount alone let a send of the exact
+    // full balance pass here and then fail on-chain.
     let send_amount = Amount::from_comme(amount);
-    if balance.raw() < send_amount.raw() {
+    let required = send_amount.raw().saturating_add(fee);
+    if balance.raw() < required {
         anyhow::bail!(
-            "Insufficient balance. Have {}, need {} COMME.",
+            "Insufficient balance. Have {}, need {} COMME + {} fee ({} raw total).",
             balance,
             amount,
+            fee,
+            required,
         );
     }
 
@@ -728,7 +783,7 @@ async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result
             to: to_addr,
             amount: send_amount,
         },
-        fee: commputer_core::transaction::MINIMUM_FEE,
+        fee,
         signature: vec![],
         public_key: vec![],
         memo: None,
@@ -743,6 +798,7 @@ async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result
     println!("  From:   {}", from_addr);
     println!("  To:     {}", to_addr);
     println!("  Amount: {} COMME", amount);
+    println!("  Fee:    {} raw{}", fee, if recipient_exists { "" } else { " (includes account creation)" });
     println!("  Nonce:  {}", nonce);
     println!("  TxHash: {}", hex::encode(tx_hash.0));
 
@@ -751,7 +807,6 @@ async fn cmd_send(to: &str, amount: u64, testnet: bool, rpc_port: u16) -> Result
     println!();
     println!("Broadcasting to node at {}...", url);
 
-    let client = reqwest::Client::new();
     match client.post(&url).json(&tx).send().await {
         Ok(resp) => {
             let status = resp.status();

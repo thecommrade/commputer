@@ -1,4 +1,26 @@
 // ============================================================================
+// ⚠⚠ SUPERSEDED AND WRONG — DO NOT COPY FROM THIS FILE. ⚠⚠
+//
+// The real faucet shipped long ago and lives at src/node/src/rpc.rs
+// (`faucet()` + `build_faucet_transfer`). Read THAT.
+//
+// This blueprint teaches a rule that is FALSE and that cost this project
+// months of a silently dead faucet. Below it asserts:
+//     "Transfer is NOT fee-exempt: fee must be >= MINIMUM_FEE (=100_000)"
+// and builds the dispense with `fee: MINIMUM_FEE`. Consensus rejects a
+// Transfer to an account that does not yet exist unless the fee is at least
+// ACCOUNT_CREATION_FEE (1_000_000) — and a faucet dispense is ALWAYS to a new
+// account. The mempool only checks MINIMUM_FEE, so such a tx is accepted by
+// every node, gossiped, selected into a block, and then dropped at apply.
+// Until 2026-07-28 that drop was completely unlogged, so EVERY dispense in the
+// project's history failed invisibly. The test at the bottom of this file
+// asserts `tx.fee >= MINIMUM_FEE`, which the broken value satisfies — that is
+// precisely why the suite stayed green.
+//
+// Kept only as a record of the mistake. Not in the workspace members list, so
+// it never compiles.
+// ============================================================================
+//
 // A3-real-faucet — staged faucet dispense handler (REVIEW ONLY, do not compile
 // as-is). This file is reference material for the founder; it targets the
 // POST-EDIT shape of RpcState described in src/staging/docs/real_faucet_blueprint.md.
