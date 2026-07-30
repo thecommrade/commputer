@@ -74,10 +74,35 @@ pub struct ChainStatus {
 /// handler, either follow this order or take one lock, copy out what you need, drop
 /// the guard, then take the next.
 ///
+/// A transaction handed to the event loop, optionally carrying a reply channel
+/// for the caller to receive the REAL mempool-admission verdict.
+///
+/// `POST /tx` sets `reply` and awaits it, so a submitter learns whether the tx
+/// was actually ACCEPTED (passed `validate_tx_for_mempool`) or REJECTED and
+/// why — instead of the old contract, which answered `accepted: true` the
+/// instant the tx was queued and dropped every real rejection to a log line the
+/// submitter never sees. That gap is the structural root of this project's
+/// silent-loss bugs; closing it is what lets the CLI tell users the truth.
+///
+/// Internal issuers (the faucet, `/submit_job`) leave `reply` None and keep
+/// fire-and-forget semantics — they manage their own outcome separately.
+pub struct RpcTxRequest {
+    pub tx: Transaction,
+    pub reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+}
+
+impl RpcTxRequest {
+    /// Fire-and-forget submission (internal issuers): no verdict wanted.
+    pub fn fire(tx: Transaction) -> Self {
+        Self { tx, reply: None }
+    }
+}
+
 /// Shared state for the RPC server.
 pub struct RpcState {
-    /// Channel to send submitted transactions to the event loop.
-    pub tx_sender: mpsc::Sender<Transaction>,
+    /// Channel to send submitted transactions to the event loop, each with an
+    /// optional reply channel for the real admission verdict.
+    pub tx_sender: mpsc::Sender<RpcTxRequest>,
     /// Latest chain status snapshot (updated by event loop).
     pub status: Mutex<ChainStatus>,
     /// Connected peer information (updated by event loop).
@@ -187,29 +212,67 @@ async fn submit_tx(
 
     let tx_hash = hex::encode(tx.hash().0);
 
-    match state.tx_sender.try_send(tx) {
-        Ok(()) => (
+    // Send WITH a reply channel and await the event loop's real verdict, so
+    // `accepted` means the tx passed the mempool gate — not merely that it was
+    // queued. Shape-identical response; only its truthfulness changes.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if let Err(e) = state.tx_sender.try_send(RpcTxRequest { tx, reply: Some(reply_tx) }) {
+        let (code, msg) = match e {
+            mpsc::error::TrySendError::Full(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Transaction queue full, try again later",
+            ),
+            mpsc::error::TrySendError::Closed(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Node is shutting down")
+            }
+        };
+        return (
+            code,
+            Json(SubmitTxResponse { accepted: false, tx_hash, error: Some(msg.into()) }),
+        );
+    }
+
+    // Bounded wait for the real verdict. The event loop drains this channel
+    // every iteration, so a verdict normally lands in milliseconds — but a
+    // single select! arm body runs to completion first, and a heavy body (a
+    // sync batch, an orphan cascade) can hold the loop for seconds during
+    // catch-up. The window is generous so that does not misreport an accepted
+    // tx as failed; if it still fires, the answer is an honest "queued, not yet
+    // confirmed" (HTTP 202), NEVER a rejection — a resubmit is idempotent
+    // (handle_rpc_transaction reports a duplicate as accepted).
+    match tokio::time::timeout(std::time::Duration::from_secs(15), reply_rx).await {
+        Ok(Ok(Ok(()))) => (
             StatusCode::OK,
-            Json(SubmitTxResponse {
-                accepted: true,
-                tx_hash,
-                error: None,
-            }),
+            Json(SubmitTxResponse { accepted: true, tx_hash, error: None }),
         ),
-        Err(mpsc::error::TrySendError::Full(_)) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(SubmitTxResponse {
-                accepted: false,
-                tx_hash,
-                error: Some("Transaction queue full, try again later".into()),
-            }),
+        Ok(Ok(Err(reason))) => (
+            // The mempool gate rejected it. This is the verdict that used to be
+            // silently dropped to a log line.
+            StatusCode::BAD_REQUEST,
+            Json(SubmitTxResponse { accepted: false, tx_hash, error: Some(reason) }),
         ),
-        Err(mpsc::error::TrySendError::Closed(_)) => (
+        Ok(Err(_recv_err)) => (
+            // The event loop dropped the reply without answering (shutdown).
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(SubmitTxResponse {
                 accepted: false,
                 tx_hash,
-                error: Some("Node is shutting down".into()),
+                error: Some("Node stopped before confirming the transaction".into()),
+            }),
+        ),
+        Err(_timeout) => (
+            // 202 Accepted: queued for processing, outcome not yet known. NOT a
+            // rejection — the tx is in the channel and will very likely be
+            // admitted; the client can resubmit (idempotent) or poll /balance.
+            StatusCode::ACCEPTED,
+            Json(SubmitTxResponse {
+                accepted: false,
+                tx_hash,
+                error: Some(
+                    "Queued but not yet confirmed (node busy); it may still be admitted — \
+                     resubmit or check /balance"
+                        .into(),
+                ),
             }),
         ),
     }
@@ -1134,7 +1197,7 @@ async fn faucet(
         }
 
         let tx = build_faucet_transfer(wallet, to, *next_nonce);
-        match state.tx_sender.try_send(tx) {
+        match state.tx_sender.try_send(RpcTxRequest::fire(tx)) {
             Ok(()) => {
                 *next_nonce += 1;
                 state.faucet_claims.lock().await.insert(req.address.clone(), current_epoch);
@@ -1836,7 +1899,7 @@ async fn submit_job(
         }
     }
 
-    if state.tx_sender.try_send(tx.clone()).is_err() {
+    if state.tx_sender.try_send(RpcTxRequest::fire(tx.clone())).is_err() {
         return err(StatusCode::SERVICE_UNAVAILABLE, "node busy; retry");
     }
     (
@@ -2015,7 +2078,7 @@ mod tests {
     use commputer_core::wallet::Wallet;
     use commputer_core::signing::sign_transaction;
 
-    fn make_rpc_state() -> (Arc<RpcState>, mpsc::Receiver<Transaction>) {
+    fn make_rpc_state() -> (Arc<RpcState>, mpsc::Receiver<RpcTxRequest>) {
         let (tx_sender, rx) = mpsc::channel(16);
         let state = Arc::new(RpcState {
             tx_sender,
@@ -2099,18 +2162,58 @@ mod tests {
             .body(Body::from(body))
             .unwrap();
 
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        // /tx now AWAITS the event loop's real verdict, so drive the request
+        // and a stand-in event loop (drain the channel, reply Ok) concurrently.
+        let tx_hash = tx.hash();
+        let client = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+        let received = rx.recv().await.expect("tx forwarded to the channel");
+        assert_eq!(received.tx.hash(), tx_hash);
+        received
+            .reply
+            .expect("/tx must set a reply channel")
+            .send(Ok(()))
+            .unwrap();
 
+        let resp = client.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
         let body_bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
         let result: SubmitTxResponse = serde_json::from_slice(&body_bytes).unwrap();
-        assert!(result.accepted);
+        assert!(result.accepted, "accepted only after the event loop confirms admission");
         assert!(!result.tx_hash.is_empty());
         assert!(result.error.is_none());
+    }
 
-        // Verify the transaction was forwarded to the channel.
-        let received = rx.try_recv().unwrap();
-        assert_eq!(received.hash(), tx.hash());
+    /// The point of the validate-before-acknowledge change: a rejection is
+    /// reported to the submitter (accepted=false + reason), not swallowed. This
+    /// used to be impossible — /tx answered accepted=true before the gate ran.
+    #[tokio::test]
+    async fn submit_tx_reports_the_real_rejection() {
+        let (state, mut rx) = make_rpc_state();
+        let app = build_router(state);
+        let tx = make_signed_tx();
+        let body = serde_json::to_vec(&tx).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tx")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let client = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+        let received = rx.recv().await.expect("tx forwarded to the channel");
+        // Stand-in event loop rejects it, as validate_tx_for_mempool would.
+        received
+            .reply
+            .expect("/tx must set a reply channel")
+            .send(Err("invalid nonce".to_string()))
+            .unwrap();
+
+        let resp = client.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let result: SubmitTxResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(!result.accepted, "a rejected tx must not report accepted");
+        assert_eq!(result.error.as_deref(), Some("invalid nonce"));
     }
 
     #[tokio::test]

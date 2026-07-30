@@ -145,7 +145,7 @@ pub struct EventLoop {
     /// Peer reputation scores: higher is better. Starts at 100.
     pub peer_scores: HashMap<libp2p::PeerId, i32>,
     /// Receiver for transactions submitted via the RPC server.
-    pub rpc_rx: Option<mpsc::Receiver<Transaction>>,
+    pub rpc_rx: Option<mpsc::Receiver<crate::rpc::RpcTxRequest>>,
     /// Shared RPC state (for updating the status snapshot).
     pub rpc_state: Option<Arc<crate::rpc::RpcState>>,
     /// Feature 127: Orphan block pool — blocks whose parents we don't have yet.
@@ -350,7 +350,7 @@ impl EventLoop {
     /// Attach the RPC channel and shared state for the RPC server.
     pub fn attach_rpc(
         &mut self,
-        rx: mpsc::Receiver<Transaction>,
+        rx: mpsc::Receiver<crate::rpc::RpcTxRequest>,
         state: Arc<crate::rpc::RpcState>,
     ) {
         self.rpc_rx = Some(rx);
@@ -921,7 +921,7 @@ impl EventLoop {
                     rx.recv().await
                 } else {
                     // No RPC channel — park forever.
-                    std::future::pending::<Option<Transaction>>().await
+                    std::future::pending::<Option<crate::rpc::RpcTxRequest>>().await
                 }
             };
             // Track-2 (Phase B): DA backend commands + the single actor-tx sink.
@@ -957,9 +957,9 @@ impl EventLoop {
                         }
                     }
                 }
-                Some(tx) = rpc_recv => {
-                    info!("Received transaction from RPC: {}", hex::encode(tx.hash().0));
-                    self.handle_rpc_transaction(tx);
+                Some(req) = rpc_recv => {
+                    info!("Received transaction from RPC: {}", hex::encode(req.tx.hash().0));
+                    self.handle_rpc_transaction(req);
                 }
                 Some(kind) = actor_recv => {
                     // P4: the single wallet-nonce owner signs + admits the loop's tx.
@@ -2652,13 +2652,52 @@ impl EventLoop {
     }
 
     /// Handle a transaction submitted via the RPC server: validate, add to mempool, broadcast.
-    fn handle_rpc_transaction(&mut self, tx: Transaction) {
-        if let Err(reason) = self.validate_tx_for_mempool(&tx) {
-            warn!("RPC transaction rejected: {}", reason);
+    fn handle_rpc_transaction(&mut self, req: crate::rpc::RpcTxRequest) {
+        let crate::rpc::RpcTxRequest { tx, reply } = req;
+
+        // The verdict this returns is what /tx now reports to the submitter,
+        // instead of the old "accepted the instant it was queued". On rejection
+        // the caller gets the real reason; a fire-and-forget sender (reply None)
+        // keeps the old log-only behavior.
+
+        // IDEMPOTENT RESUBMIT: a tx ALREADY IN OUR MEMPOOL is not a failure —
+        // it is already admitted. Report success so a client's retry after a
+        // busy-node 202 does not read its queued tx as an error.
+        //
+        // Test the LIVE mempool, not the coarse seen-hash set: a tx admitted
+        // then EVICTED (enforce_mempool_limit) or EXPIRED (1h sweep) is still
+        // "seen" while present in neither the pool nor the chain, and must NOT
+        // be reported accepted — that would drop it silently, the exact class
+        // this change ends. The cheap O(1) seen-hash lookup GATES the O(pending)
+        // scan: every pooled tx is also seen, so `seen` is a necessary
+        // precondition, and a flood of fresh (unseen) txs never pays for the
+        // scan — it fails fast here and meets the normal validation path.
+        //
+        // A seen-but-not-pooled tx falls through to validate_tx_for_mempool,
+        // which rejects it as a duplicate with an explicit error (an honest 400,
+        // not a false accept). It is NOT re-admitted until the epoch seen-clear;
+        // making evict/expire prune seen so re-admission works is an alpha.7
+        // follow-up, and a pre-existing behavior this change does not worsen.
+        let tx_hash = tx.hash();
+        if self.seen_tx_hashes.contains(&tx_hash)
+            && self.pending_txs.iter().any(|t| t.hash() == tx_hash)
+        {
+            if let Some(reply) = reply {
+                let _ = reply.send(Ok(()));
+            }
             return;
         }
 
-        let tx_hash = tx.hash();
+        if let Err(reason) = self.validate_tx_for_mempool(&tx) {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(reason.to_string()));
+            } else {
+                warn!("RPC transaction rejected: {}", reason);
+            }
+            return;
+        }
+
+        // tx_hash already computed above for the mempool-membership check.
         self.seen_tx_hashes.insert(tx_hash);
 
         // Broadcast on the transactions gossipsub topic.
@@ -2694,6 +2733,11 @@ impl EventLoop {
         // status reflects the post-eviction size.
         self.enforce_mempool_limit();
         self.update_rpc_status();
+
+        // Admitted — tell the submitter it was genuinely accepted.
+        if let Some(reply) = reply {
+            let _ = reply.send(Ok(()));
+        }
     }
 
     /// Validate a transaction for mempool admission: signature, nonce, dedup.
