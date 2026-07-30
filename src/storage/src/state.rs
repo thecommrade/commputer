@@ -951,6 +951,36 @@ impl ChainState {
     ///   what a crash-restart would lose; accepted.
     /// - memory-only (tests + try_reorg's rocks-detached replay): restore the pre-block
     ///   snapshot taken at entry (there is no disk copy to reload).
+    /// Would this block's transactions ALL apply cleanly on top of the current
+    /// state? Non-mutating: the state is byte-for-byte restored on every path.
+    ///
+    /// This is the primitive that lets a node refuse to VOTE for a block it
+    /// cannot apply. Without it, a peer can propose a block that passes the
+    /// structural checks (signatures, roots, chain_id) but fails at apply — a
+    /// dust transfer, a bad nonce, an over-spend — grind its header so its hash
+    /// wins the deterministic lowest-hash vote, and get every honest node to
+    /// finalize it. Finalization CONSUMES the round, so when apply then fails
+    /// there is no recovery: that height is stuck forever and the network
+    /// halts. This is the safety prerequisite for opening consensus to
+    /// non-founder nodes.
+    ///
+    /// SAFETY: it reuses `apply_txs_with_rollback` verbatim, so the predicate
+    /// can never drift from what apply actually does, and wraps it in an outer
+    /// capture/rollback so the OK path (which leaves the txs applied) is undone
+    /// too. Every field `apply_transaction` + settlement can touch is in the
+    /// snapshot (see `capture_pre_block`); `blocks`/`receipts` are only mutated
+    /// at persist, which a trial never reaches. Pinned non-mutating by
+    /// `would_txs_apply_is_non_mutating`.
+    pub fn would_txs_apply(&mut self, block: &Block) -> Result<(), StateError> {
+        let snap = self.capture_pre_block();
+        let result = self.apply_txs_with_rollback(block);
+        // Restore unconditionally: on Err apply_txs already rolled back (this is
+        // an idempotent second restore to the same snapshot); on Ok this is the
+        // rollback that makes the call a pure predicate.
+        self.rollback_to_pre_block(snap);
+        result
+    }
+
     fn apply_txs_with_rollback(&mut self, block: &Block) -> Result<(), StateError> {
         let snap = self.capture_pre_block();
         let applied: Result<(), StateError> = (|| {
@@ -7120,6 +7150,72 @@ mod tests {
             re.compute_state_root(), root,
             "state root identical after crash-reopen (the fork-after-restart criterion)"
         );
+    }
+
+    /// The whole halt-vector fix rests on `would_txs_apply` being NON-MUTATING.
+    /// If its rollback were incomplete, every vote would corrupt consensus state
+    /// and fork the network. Pin it: the state root must be byte-identical after
+    /// a trial of BOTH an appliable block (OK path — where apply_txs leaves the
+    /// txs applied and the outer rollback must undo them) and an unappliable one
+    /// (Err path). And it must return the right verdict for each.
+    #[test]
+    fn would_txs_apply_is_non_mutating() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::generate();
+        let sender = *wallet.address();
+        let mut state = ChainState::open(dir.path()).unwrap();
+        state.apply_block(&genesis_block()).unwrap();
+        state.accounts.get_or_create(sender).balance = Amount::from_comme(100);
+        state.total_emitted = Amount::from_comme(100).raw();
+
+        // Fingerprint ALL 11 snapshotted fields, not just the state root:
+        // compute_state_root folds in accounts + the six consensus maps but NOT
+        // total_emitted/total_burned/current_epoch/nerf_rate, and the trial
+        // MOVES total_burned (it burns the tx fee). A helper closure captures
+        // everything the rollback must restore, so a broken rollback of any
+        // field is caught — not just the seven the root happens to cover.
+        let fingerprint = |s: &ChainState| {
+            (
+                s.compute_state_root(),
+                s.total_emitted,
+                s.total_burned,
+                s.current_epoch,
+                // NerfRate is not PartialEq; its Debug form is a faithful,
+                // dependency-free fingerprint of every field.
+                format!("{:?}", s.nerf_rate),
+            )
+        };
+        let before = fingerprint(&state);
+
+        // APPLIABLE: transfer to a new account paying the creation fee.
+        let good = validated_block(&state, 1, addr(5), vec![signed_tx(
+            &wallet, 0,
+            TxKind::Transfer { to: addr(2), amount: Amount::from_comme(33) },
+            commputer_core::transaction::ACCOUNT_CREATION_FEE,
+        )]);
+        assert!(state.would_txs_apply(&good).is_ok(), "a valid block must trial-apply Ok");
+        assert_eq!(
+            fingerprint(&state), before,
+            "OK-path trial must leave ALL snapshotted state untouched (fee burn included)"
+        );
+
+        // UNAPPLIABLE: transfer to a NEW account paying only MINIMUM_FEE — the
+        // exact halt-vector shape (accepted by structural checks, rejected at
+        // apply for the account-creation fee).
+        let bad = validated_block(&state, 1, addr(5), vec![signed_tx(
+            &wallet, 0,
+            TxKind::Transfer { to: addr(3), amount: Amount::from_comme(1) },
+            commputer_core::transaction::MINIMUM_FEE,
+        )]);
+        assert!(state.would_txs_apply(&bad).is_err(), "the unappliable block must be rejected");
+        assert_eq!(
+            fingerprint(&state), before,
+            "Err-path trial must leave ALL snapshotted state untouched"
+        );
+
+        // And a real apply of the good block still works afterwards — the trials
+        // left nothing behind that would poison it.
+        assert!(state.apply_block_validated(&good).is_ok(), "real apply unaffected by prior trials");
     }
 
     #[test]

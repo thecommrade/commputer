@@ -2331,6 +2331,23 @@ impl EventLoop {
     fn validate_block_from_peer(&mut self, block: &Block, source: libp2p::PeerId) -> bool {
         // === Stage 1: Header checks ===
 
+        // CHAIN ID. Apply rejects a foreign chain_id (storage/src/state.rs
+        // apply_block), but this gate did not check it — so a foreign-chain
+        // block could be voted on and FINALIZED, and only then fail to apply.
+        // The round is consumed by then, so that height can never be
+        // re-finalized: one such block from any peer stalls every node that
+        // votes for it. Reject before it can ever win a round.
+        if !block.header.chain_id.is_empty()
+            && block.header.chain_id != commputer_core::genesis::TESTNET_CHAIN_ID
+        {
+            warn!(
+                "Rejected block from {}: foreign chain_id {:?} (expected {:?})",
+                source, block.header.chain_id, commputer_core::genesis::TESTNET_CHAIN_ID
+            );
+            self.adjust_peer_score(source, -20);
+            return false;
+        }
+
         // Feature 123: Protocol version check.
         // Item 1: Don't ban for version mismatch — peer may be running older software.
         if block.header.protocol_version != commputer_core::block::CURRENT_PROTOCOL_VERSION {
@@ -2447,8 +2464,63 @@ impl EventLoop {
             }
         }
 
+        // HALT-VECTOR GUARD: never vote for a block we cannot APPLY.
+        if !self.block_is_votable_on_tip(block) {
+            self.adjust_peer_score(source, -20);
+            return false;
+        }
+
         // Block passed all checks — reward the peer.
         self.adjust_peer_score(source, 1);
+        true
+    }
+
+    /// The halt-vector guard, shared by EVERY path that turns a peer block into
+    /// a votable candidate. Returns false only when the block builds on our own
+    /// tip yet would NOT apply — the one case we must never vote for.
+    ///
+    /// Every structural check (signatures, roots, chain_id) answers "is this
+    /// block well-formed?", never "would it apply on our chain?" Without the
+    /// latter, a peer proposes a block that passes structure but fails apply (a
+    /// dust transfer, a bad nonce, an over-spend), grinds its header until its
+    /// hash is the lowest candidate so the deterministic vote picks it, and
+    /// every honest node finalizes it. Finalizing CONSUMES the round, so apply
+    /// then fails with only a warning and that height is stuck forever: one
+    /// crafted block halts the whole network. This is the safety prerequisite
+    /// for opening consensus beyond the founder set.
+    ///
+    /// It MUST guard both entry points, or the unguarded one is a full bypass:
+    /// `validate_block_from_peer` (direct gossip) AND `process_orphans` (a
+    /// block buffered while its parent was missing — validated then, when its
+    /// parent was NOT our tip so this check was skipped, and later promoted to
+    /// a candidate once the parent applies). The orphan path is exactly how the
+    /// first version of this fix was bypassed.
+    ///
+    /// Only fires for a block on OUR tip carrying txs: a block on a parent we
+    /// don't hold can't be trial-applied on our tip (vote-height discipline
+    /// already refuses to endorse it, and sync fetches the real chain), and an
+    /// empty block carries no failing tx — its only apply-failure path is the
+    /// settlement pot invariants, which are content-independent and so cannot
+    /// be an attacker-controlled grinding target. `would_txs_apply` is proven
+    /// non-mutating (`would_txs_apply_is_non_mutating`), so this cannot corrupt
+    /// state.
+    fn block_is_votable_on_tip(&mut self, block: &Block) -> bool {
+        let our_tip = self
+            .state
+            .blocks
+            .latest()
+            .map(|b| b.hash())
+            .unwrap_or(commputer_core::block::BlockHash::GENESIS);
+        if block.header.parent_hash != our_tip || block.transactions.is_empty() {
+            return true;
+        }
+        if let Err(e) = self.state.would_txs_apply(block) {
+            warn!(
+                "Halt-vector guard: block {} at height {} builds on our tip but would not apply ({:?}) — refusing to vote",
+                block.hash(), block.height(), e
+            );
+            return false;
+        }
         true
     }
 
@@ -2563,6 +2635,15 @@ impl EventLoop {
                 let hash = orphan.hash();
                 let height = orphan.height();
                 debug!("Processing orphan block {} at height {} (parent now available)", hash, height);
+                // Re-run the halt-vector guard at PROMOTION. The orphan was
+                // validated when buffered, but its parent was not our tip then,
+                // so the trial-apply was skipped; now the parent has applied and
+                // this orphan builds on our tip, so it must be trial-applied
+                // before it becomes a votable candidate. Skipping this here was
+                // a full bypass of the fix.
+                if !self.block_is_votable_on_tip(&orphan) {
+                    continue;
+                }
                 self.consensus.add_candidate(orphan);
                 self.consensus.try_finalize_round(height, self.peer_ips.len());
                 self.try_apply_finalized(height);
@@ -2697,6 +2778,33 @@ impl EventLoop {
             && !matches!(tx.kind, commputer_core::transaction::TxKind::ValidatorRegister { .. })
         {
             return Err("fee below minimum");
+        }
+
+        // CLOSE THE ADMISSION GAP: enforce here what APPLY enforces.
+        //
+        // Any rule consensus checks at apply but the gate does not is a hole
+        // that admits a tx the whole network accepts, gossips and packs into a
+        // block — and then discards during production, with no receipt and no
+        // error to the sender. That is not hypothetical: it silently killed
+        // EVERY faucet dispense in this project's history and every
+        // `commputer send` to a new address, for months, because both paid
+        // MINIMUM_FEE while apply demands ACCOUNT_CREATION_FEE for a recipient
+        // the chain has never seen.
+        //
+        // Fixing the two builders that tripped it only moved the hazard to the
+        // next builder. The rules belong HERE, where every submitter meets
+        // them — including anyone posting to /tx without our CLI.
+        //
+        // Mirrors storage/src/state.rs apply_transaction's Transfer arm. Both
+        // sides read committed state only, so the verdicts agree.
+        if let commputer_core::transaction::TxKind::Transfer { to, amount } = &tx.kind {
+            if amount.raw() < commputer_core::transaction::DUST_LIMIT {
+                return Err("amount below dust limit");
+            }
+            let recipient_exists = self.state.accounts.get(to).is_some();
+            if !recipient_exists && tx.fee < commputer_core::transaction::ACCOUNT_CREATION_FEE {
+                return Err("transfer to a new account requires the account-creation fee");
+            }
         }
         // 1.2-MEMPOOL ingress pre-filter (C7): a PoUW verification-game tx (Commit/Reveal/CompleteJob/
         // ClaimJob) whose job_id has NEITHER an open lifecycle NOR a pending record is permanently
