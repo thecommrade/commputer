@@ -13,6 +13,7 @@ pub mod block_maps;
 pub mod mempool_quota;
 pub mod requeue_rules;
 pub mod consensus_set;
+pub mod weighted_schedule;
 pub mod peer_hash;
 pub mod da_store;
 // §1.12 (2026-07-19): re-exported so node integration tests can reach
