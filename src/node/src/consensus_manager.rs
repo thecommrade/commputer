@@ -467,10 +467,14 @@ impl ConsensusManager {
     /// candidate that does extend it (matching the deterministic tie-break),
     /// else None — meaning "cannot endorse", which the caller answers with
     /// NotReady rather than a vote.
+    /// `validators` is the consensus set, used only to rank competing
+    /// candidates by their producer's VIEW OFFSET before falling back to the
+    /// block hash. Pass an empty slice to keep the old hash-only ordering.
     pub fn query_votable_preference(
         &mut self,
         height: u64,
         tip_hash: BlockHash,
+        validators: &[Address],
     ) -> Option<BlockHash> {
         let state = self.heights.get_mut(&height)?;
         // Locked: keep voting for what we already committed to, as long as it
@@ -495,12 +499,36 @@ impl ConsensusManager {
         //
         // A pure function of (candidate set, our tip) makes every honest node
         // answer identically, so the tally concentrates instead of splitting.
+        // ANTI-GRINDING: rank by (producer's view offset, hash), not hash alone.
+        //
+        // `is_valid_leader` accepts three views at once (current, ±3s clock
+        // skew), so up to three addresses are legal leaders at one height. With
+        // a hash-only rule, any of them can re-roll its header (timestamp, tx
+        // order) until it sorts lowest and steal the round from the primary —
+        // a grinding attack that works INSIDE the pinned trio, today, without
+        // an open validator set.
+        //
+        // View offset is a pure function of (height, validator set) and never
+        // of block content, so it cannot be ground: the primary's candidate
+        // always outranks a fallback's, and the hash decides only BETWEEN
+        // candidates of the same view. This is why CometBFT's proposer
+        // selection "depends only on the validator set and voting powers,
+        // never on block content".
+        //
+        // Candidates from a producer outside the set rank last (view None) but
+        // are still selectable, so a set we cannot yet derive (bootstrap, or an
+        // empty `validators`) degrades to the previous hash-only behaviour
+        // rather than refusing to vote.
         let choice = state
             .candidates
             .iter()
             .filter(|(_, b)| b.header.parent_hash == tip_hash)
-            .map(|(h, _)| *h)
-            .min();
+            .min_by_key(|(h, b)| {
+                let view = commputer::leader::view_offset_of(height, validators, &b.header.producer)
+                    .unwrap_or(usize::MAX);
+                (view, **h)
+            })
+            .map(|(h, _)| *h);
         // Commit to it: from here on this height, this is our vote.
         if let Some(c) = choice
             && let Some(st) = self.heights.get_mut(&height)
@@ -2084,6 +2112,61 @@ mod tests {
         assert!(cm.surrender_lost_at(99, &applied.hash()).is_empty());
     }
 
+    /// THE GRINDING ATTACK, pinned. `is_valid_leader` accepts three views at
+    /// once, so a fallback leader is legal at the same height as the primary.
+    /// With hash-only ranking it could re-roll its header until it sorted
+    /// lowest and steal the round. Ranking by (view offset, hash) means the
+    /// primary wins even when the fallback's hash is lower — and the fallback
+    /// cannot change its view offset, because that is a pure function of the
+    /// height and the validator set.
+    #[test]
+    fn a_fallback_leader_cannot_grind_a_lower_hash_to_beat_the_primary() {
+        let validators = vec![addr(1), addr(2), addr(3)];
+        // height 5 of 3 sorted validators -> primary index 5 % 3 = 2 -> addr(3).
+        // addr(1) is then a legal FALLBACK (view offset 1) under the 3-view window.
+        let height = 5u64;
+        let tip = BlockHash([7u8; 32]);
+
+        // Find a fallback-produced block whose hash is LOWER than the
+        // primary's — the grinding an attacker would perform.
+        let mut primary = make_test_block_with_producer(height, addr(3));
+        primary.header.parent_hash = tip;
+        let mut ground: Option<Block> = None;
+        for ts in 0..400u64 {
+            let mut b = make_test_block_with_timestamp(height, addr(1), 1000 + ts);
+            b.header.parent_hash = tip;
+            if b.hash() < primary.hash() {
+                ground = Some(b);
+                break;
+            }
+        }
+        let ground = ground.expect("a lower-hash fallback block exists");
+        assert!(ground.hash() < primary.hash(), "the attacker did win on hash");
+
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4);
+        cm.add_candidate(ground.clone());
+        cm.add_candidate(primary.clone());
+
+        assert_eq!(
+            cm.query_votable_preference(height, tip, &validators),
+            Some(primary.hash()),
+            "the PRIMARY must win despite the fallback having ground a lower hash"
+        );
+
+        // And with no validator set to reason about, it degrades to hash-only
+        // rather than refusing to vote.
+        let mut cm2 = ConsensusManager::new();
+        cm2.cleanup_below(4);
+        cm2.add_candidate(ground.clone());
+        cm2.add_candidate(primary.clone());
+        assert_eq!(
+            cm2.query_votable_preference(height, tip, &[]),
+            Some(ground.hash()),
+            "empty set falls back to the previous hash-only ordering"
+        );
+    }
+
     /// The per-height vote LOCK is what makes one-round finality (beta=1) safe.
     /// Without it, a node answering "lowest candidate hash" would switch its
     /// vote the moment a lower-hash candidate arrived — so one node could help
@@ -2098,7 +2181,7 @@ mod tests {
         let mut first = make_test_block_with_producer(5, addr(9));
         first.header.parent_hash = tip;
         cm.add_candidate(first.clone());
-        let locked = cm.query_votable_preference(5, tip).expect("votes for the only candidate");
+        let locked = cm.query_votable_preference(5, tip, &[]).expect("votes for the only candidate");
         assert_eq!(locked, first.hash());
 
         // A second candidate arrives; find one that hashes LOWER so the
@@ -2117,7 +2200,7 @@ mod tests {
         assert!(lower.hash() < first.hash());
 
         assert_eq!(
-            cm.query_votable_preference(5, tip),
+            cm.query_votable_preference(5, tip, &[]),
             Some(first.hash()),
             "must keep voting for the locked choice even though a lower hash arrived"
         );
@@ -2192,7 +2275,7 @@ mod tests {
         good.header.parent_hash = our_tip;
         cm.add_candidate(good.clone());
         assert_eq!(
-            cm.query_votable_preference(5, our_tip),
+            cm.query_votable_preference(5, our_tip, &[]),
             Some(good.hash()),
             "a candidate building on our tip is votable"
         );
@@ -2201,7 +2284,7 @@ mod tests {
         // the plain preference would happily return something.
         let foreign_tip = BlockHash([9u8; 32]);
         assert_eq!(
-            cm.query_votable_preference(5, foreign_tip),
+            cm.query_votable_preference(5, foreign_tip, &[]),
             None,
             "no candidate extends that tip — must answer NotReady, not a vote"
         );
@@ -2233,8 +2316,8 @@ mod tests {
         ba.add_candidate(b);
         ba.add_candidate(a);
 
-        assert_eq!(ab.query_votable_preference(5, our_tip), Some(lowest));
-        assert_eq!(ba.query_votable_preference(5, our_tip), Some(lowest));
+        assert_eq!(ab.query_votable_preference(5, our_tip, &[]), Some(lowest));
+        assert_eq!(ba.query_votable_preference(5, our_tip, &[]), Some(lowest));
     }
 
     /// A quorum can form around a hash whose block BODY we never received

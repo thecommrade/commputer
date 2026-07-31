@@ -1994,7 +1994,11 @@ impl EventLoop {
                                                 let tip_hash = self.state.blocks.latest()
                                                     .map(|b| b.hash())
                                                     .unwrap_or(BlockHash::GENESIS);
-                                                match self.consensus.query_votable_preference(height, tip_hash) {
+                                                // Pass the consensus set so the vote ranks
+                                                // candidates by their producer's view offset
+                                                // before the (grindable) block hash.
+                                                let vote_validators = self.consensus_validators();
+                                                match self.consensus.query_votable_preference(height, tip_hash, &vote_validators) {
                                                     Some(pref) => ConsensusResponse::Vote {
                                                         height,
                                                         preference: pref.0,
@@ -2394,13 +2398,9 @@ impl EventLoop {
         // converge across nodes, and strict rejection causes banning during
         // bootstrap. Enable strict rejection once the network is stable.
         // TODO: re-enable rejection after mainnet stabilizes
-        // Alpha pin: same allowlist restriction as the production-side list —
-        // both sides of the leader check must derive the same schedule.
-        let validators: Vec<Address> = self.state.accounts.iter()
-            .filter(|a| a.is_validator)
-            .filter(|a| crate::testnet_genesis::is_pinned_validator(&a.address))
-            .map(|a| a.address)
-            .collect();
+        // Same derivation as the production side — both sides of the leader
+        // check must produce the identical schedule (see consensus_validators).
+        let validators: Vec<Address> = self.consensus_validators();
         if validators.len() >= 2 {
             let seconds_since_parent = if let Some(parent) = self.state.blocks.get(&block.header.parent_hash) {
                 block.header.timestamp.saturating_sub(parent.header.timestamp)
@@ -2473,6 +2473,42 @@ impl EventLoop {
         // Block passed all checks — reward the peer.
         self.adjust_peer_score(source, 1);
         true
+    }
+
+    /// The addresses eligible to take part in consensus, derived from committed
+    /// chain state. ONE derivation, used by BOTH the validation side and the
+    /// production side — if the two sides disagree about the set they disagree
+    /// about who the valid leader is, so this must never be duplicated.
+    ///
+    /// Registration is free and automatic, so it cannot gate participation on
+    /// its own: an attacker mints identities at zero cost, floods candidates,
+    /// and grinds headers until one wins every round. The real gate is BONDED
+    /// STAKE (`MIN_CONSENSUS_BOND`), which cannot be minted — N Sybil
+    /// identities cost N × 1 COMME of genuinely bonded, slashable balance. The
+    /// alpha allowlist still applies while it is in force; once it is retired,
+    /// stake alone decides, which is what makes opening the set safe.
+    ///
+    /// Sorted for determinism: every node must derive the SAME ORDER or the
+    /// round-robin leader schedule differs between them. `accounts.iter()` is
+    /// map iteration and its order is not guaranteed.
+    fn consensus_validators(&self) -> Vec<Address> {
+        let mut set: Vec<Address> = self
+            .state
+            .accounts
+            .iter()
+            .filter(|a| {
+                commputer::consensus_set::is_consensus_eligible(
+                    a.is_validator,
+                    self.state.bonded_of(&a.address),
+                    commputer::consensus_set::MIN_CONSENSUS_BOND,
+                    crate::testnet_genesis::pin_is_active(),
+                    crate::testnet_genesis::is_pinned_validator(&a.address),
+                )
+            })
+            .map(|a| a.address)
+            .collect();
+        set.sort_unstable_by_key(|a| a.0);
+        set
     }
 
     /// The halt-vector guard, shared by EVERY path that turns a peer block into
@@ -2691,6 +2727,31 @@ impl EventLoop {
         if let Err(reason) = self.validate_tx_for_mempool(&tx) {
             if let Some(reply) = reply {
                 let _ = reply.send(Err(reason.to_string()));
+            } else {
+                warn!("RPC transaction rejected: {}", reason);
+            }
+            return;
+        }
+
+        // ASK CONSENSUS, don't re-implement it. The checks above are a
+        // hand-written mirror of apply's rules, and a hand-written mirror is
+        // exactly what caused this project's worst bug class — it covered
+        // Transfer and silently missed nine other TxKinds, each of which was
+        // admitted here, gossiped, packed, and then discarded during block
+        // production with no error to the sender. Trial-applying the tx closes
+        // the whole class by construction: the gate cannot drift from apply,
+        // because for this final check it IS apply.
+        //
+        // Enforces `gate_accepts(tx, S) => apply(tx, S).is_ok()`. The mempool
+        // may be STRICTER than consensus, never looser — doubly so here,
+        // because one bad tx fails the WHOLE block at apply.
+        //
+        // `would_tx_apply` is non-mutating (capture + rollback, same primitive
+        // the halt-vector guard uses).
+        if let Err(e) = self.state.would_tx_apply(&tx) {
+            let reason = format!("would not apply: {e:?}");
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(reason));
             } else {
                 warn!("RPC transaction rejected: {}", reason);
             }
@@ -3656,14 +3717,8 @@ impl EventLoop {
         // Leader election: only produce if we're the elected leader for this height.
         // Round-robin with view change fallback every 6 seconds.
         // Skip leader check during bootstrap (< 2 known validators on-chain).
-        // Alpha pin: the CONSENSUS set is restricted to the compiled allowlist —
-        // registration is free+automatic while the public installer is live, and
-        // an unpinned set lets any stranger's node enter (and reorder) rotation.
-        let validators: Vec<Address> = self.state.accounts.iter()
-            .filter(|a| a.is_validator)
-            .filter(|a| crate::testnet_genesis::is_pinned_validator(&a.address))
-            .map(|a| a.address)
-            .collect();
+        // Same derivation as the validation side (see consensus_validators).
+        let validators: Vec<Address> = self.consensus_validators();
         let our_addr = *self.wallet.address();
         let seconds_waiting = self.last_block_seen_time
             .map(|t| t.elapsed().as_secs())

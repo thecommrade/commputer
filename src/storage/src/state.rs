@@ -971,6 +971,40 @@ impl ChainState {
     /// snapshot (see `capture_pre_block`); `blocks`/`receipts` are only mutated
     /// at persist, which a trial never reaches. Pinned non-mutating by
     /// `would_txs_apply_is_non_mutating`.
+    /// Would this SINGLE transaction apply cleanly against current state?
+    /// Non-mutating: state is restored on every path.
+    ///
+    /// This exists so the mempool gate can ASK CONSENSUS instead of
+    /// re-implementing it. Hand-mirroring apply's rules into the gate is what
+    /// caused this project's worst bug class: a rule enforced at apply but not
+    /// at admission produces a tx that every node accepts, gossips and packs,
+    /// and that is then discarded during block production with no receipt and
+    /// no error to the sender. We mirrored the Transfer rules by hand and it
+    /// was STILL incomplete — nine other TxKinds (Batch, MultiSig, SubmitJobV2,
+    /// BurstCompute, MilestoneBurn, CharitableDonation, StorageWill,
+    /// KeyRotation, SubmitJob) had no mirror at all and were silently dropping.
+    ///
+    /// Calling apply closes the whole class by construction: the gate cannot
+    /// drift from apply because it IS apply. Bitcoin takes the same approach —
+    /// `AcceptToMemoryPool` calls the consensus checks rather than duplicating
+    /// them.
+    ///
+    /// The invariant this enforces: `gate_accepts(tx, S) => apply(tx, S).is_ok()`.
+    /// The mempool may be STRICTER than consensus (that is Bitcoin's policy vs
+    /// consensus split) but must never be LOOSER — for us doubly so, because
+    /// `apply_txs_with_rollback` fails the WHOLE BLOCK on one bad tx.
+    ///
+    /// COST: a pre-block snapshot per call (an accounts-map clone), the same
+    /// per-tx cost `select_applicable_txs` already pays during block
+    /// production. Fine at testnet scale; a cached-overlay view is the
+    /// optimisation if account count grows.
+    pub fn would_tx_apply(&mut self, tx: &Transaction) -> Result<(), StateError> {
+        let snap = self.capture_pre_block();
+        let result = self.apply_transaction(tx);
+        self.rollback_to_pre_block(snap);
+        result
+    }
+
     pub fn would_txs_apply(&mut self, block: &Block) -> Result<(), StateError> {
         let snap = self.capture_pre_block();
         let result = self.apply_txs_with_rollback(block);

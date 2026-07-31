@@ -230,3 +230,78 @@ mod tests {
         assert!(!is_valid_leader(0, &addr(3), &validators, 0));
     }
 }
+
+/// How many view-changes past the primary is `producer` for `height`?
+///
+/// 0 = the primary leader for this height, 1 = the first fallback, and so on.
+/// `None` if the producer is not in the validator set (or the set is empty).
+///
+/// ANTI-GRINDING. `is_valid_leader` deliberately accepts three views at once
+/// (current, and ±3s of clock-skew tolerance), so up to THREE addresses can be
+/// legal leaders at one height. If the vote then arbitrates between their
+/// candidates by BLOCK HASH — a field the producer re-rolls for free via
+/// timestamp or tx ordering — any of them can grind a header until it sorts
+/// lowest and steal the round from the primary. That attack does not need an
+/// open validator set; it works inside the pinned trio.
+///
+/// Ranking by `(view_offset, hash)` removes the incentive: the primary's
+/// candidate always outranks a fallback's, and the hash decides only BETWEEN
+/// candidates of the same view. View offset is a pure function of the height
+/// and the validator set — never of block content — which is precisely why
+/// CometBFT's proposer selection is grinding-proof.
+pub fn view_offset_of(height: u64, validators: &[Address], producer: &Address) -> Option<usize> {
+    if validators.is_empty() {
+        return None;
+    }
+    let mut sorted = validators.to_vec();
+    sorted.sort();
+    let n = sorted.len();
+    let producer_idx = sorted.iter().position(|a| a == producer)?;
+    let primary_idx = (height as usize) % n;
+    Some((producer_idx + n - primary_idx) % n)
+}
+
+#[cfg(test)]
+mod view_offset_tests {
+    use super::*;
+
+    fn addr(n: u8) -> Address {
+        Address([n; 32])
+    }
+
+    /// The primary for a height has offset 0; fallbacks increase in schedule
+    /// order. This is what lets the vote prefer the primary WITHOUT consulting
+    /// any grindable field.
+    #[test]
+    fn offset_is_zero_for_the_primary_and_increases_by_view() {
+        let vs = vec![addr(1), addr(2), addr(3)];
+        // height 0 -> primary is sorted[0] = addr(1)
+        assert_eq!(view_offset_of(0, &vs, &addr(1)), Some(0));
+        assert_eq!(view_offset_of(0, &vs, &addr(2)), Some(1));
+        assert_eq!(view_offset_of(0, &vs, &addr(3)), Some(2));
+        // height 1 -> primary rotates to sorted[1] = addr(2)
+        assert_eq!(view_offset_of(1, &vs, &addr(2)), Some(0));
+        assert_eq!(view_offset_of(1, &vs, &addr(3)), Some(1));
+        assert_eq!(view_offset_of(1, &vs, &addr(1)), Some(2));
+    }
+
+    /// It agrees with the leader schedule itself — offset 0 is exactly
+    /// `leader_for_height`, so ranking by it cannot disagree with the rotation.
+    #[test]
+    fn offset_zero_matches_leader_for_height() {
+        let vs = vec![addr(7), addr(3), addr(9), addr(1)];
+        for h in 0..12u64 {
+            let primary = leader_for_height(h, &vs).unwrap();
+            assert_eq!(view_offset_of(h, &vs, &primary), Some(0), "height {h}");
+        }
+    }
+
+    /// A producer outside the set has no view — its candidate must not be
+    /// rankable ahead of a legitimate one.
+    #[test]
+    fn unknown_producer_and_empty_set_have_no_view() {
+        let vs = vec![addr(1), addr(2)];
+        assert_eq!(view_offset_of(0, &vs, &addr(42)), None);
+        assert_eq!(view_offset_of(0, &[], &addr(1)), None);
+    }
+}
