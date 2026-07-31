@@ -130,6 +130,17 @@ pub fn is_pinned_validator(addr: &commputer_core::identity::Address) -> bool {
     is_pinned_in(ALPHA_PINNED_VALIDATORS, addr)
 }
 
+/// Is the alpha allowlist IN FORCE (non-empty)?
+///
+/// Distinct from `is_pinned_validator`, which answers "not restricted" (true
+/// for everyone) when the list is empty. Consensus eligibility needs to tell
+/// the two regimes apart: while the allowlist is active it is the trust
+/// anchor, and once retired the bonded-stake Sybil gate takes over. Conflating
+/// them would disable the stake gate exactly when the set opens.
+pub fn pin_is_active() -> bool {
+    !ALPHA_PINNED_VALIDATORS.is_empty()
+}
+
 /// Testable core of `is_pinned_validator`.
 fn is_pinned_in(list: &[&str], addr: &commputer_core::identity::Address) -> bool {
     if list.is_empty() {

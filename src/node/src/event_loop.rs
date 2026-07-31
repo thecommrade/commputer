@@ -2508,6 +2508,35 @@ impl EventLoop {
             .map(|a| a.address)
             .collect();
         set.sort_unstable_by_key(|a| a.0);
+
+        // TOTAL, never empty. An empty eligible set is an unrecoverable halt:
+        // no address is a legal producer, so the chain cannot make the very
+        // block that would fix it. This is reachable with no attacker at all —
+        // a mass unbond, a slash cascade, or a bond-accounting bug. Cosmos:
+        // "a chain cannot produce a block without a validator set."
+        //
+        // Fall back to every registered validator (ignoring the stake gate) and
+        // say so loudly. A degraded set that still produces blocks is strictly
+        // better than a halt that needs human hands, and the operator gets an
+        // alarm rather than silence.
+        if set.len() < commputer::consensus_set::MIN_CONSENSUS_SET {
+            let mut fallback: Vec<Address> = self
+                .state
+                .accounts
+                .iter()
+                .filter(|a| a.is_validator)
+                .map(|a| a.address)
+                .collect();
+            fallback.sort_unstable_by_key(|a| a.0);
+            warn!(
+                "consensus set below minimum ({} < {}) — falling back to all {} registered \
+                 validators to avoid a halt; check bonding/slashing state",
+                set.len(),
+                commputer::consensus_set::MIN_CONSENSUS_SET,
+                fallback.len()
+            );
+            return fallback;
+        }
         set
     }
 
