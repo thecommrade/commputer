@@ -214,6 +214,11 @@ pub struct ConsensusManager {
     pub validator_blocks: HashMap<(Address, u64), BlockHash>,
     /// Feature 125: Slashed validators for the current epoch — earn zero rewards.
     pub slashed_validators: HashSet<Address>,
+    /// Last consensus set seen by `query_votable_preference`, so the SELF-vote
+    /// in `try_finalize_round` can rank candidates by the same anti-grinding
+    /// rule as the vote we answer peers with. Empty ⇒ fall back to lowest-hash,
+    /// i.e. exactly the pre-anti-grinding behaviour.
+    cached_validators: Vec<Address>,
     /// Feature 129: Track when each height started consensus.
     pub height_start_time: HashMap<u64, Instant>,
     /// Feature 121: View change history.
@@ -251,6 +256,7 @@ impl ConsensusManager {
             },
             validator_blocks: HashMap::new(),
             slashed_validators: HashSet::new(),
+            cached_validators: Vec::new(),
             height_start_time: HashMap::new(),
             view_changes: Vec::new(),
             last_block_time: HashMap::new(),
@@ -299,7 +305,15 @@ impl ConsensusManager {
             0 => (1, 1, 1),          // n=1: solo; the zero-peer gate blocks it anyway
             1 => (2, 2, 1),          // n=2: both must agree
             2 => (3, 2, 1),          // n=3: 2 of 3 — tolerates one node down
-            3..=5 => (4, 3, 1),      // n=4..6: 3 is a majority at n=4
+            // n=4,5: 3 is a STRICT majority of both.
+            3..=4 => (4, 3, 1),
+            // n=6: 3 was EXACTLY HALF — two disjoint sets of 3 could each reach
+            // quorum and, with beta=1, each finalize a different block at the
+            // same height. A safety violation needing ZERO Byzantine nodes,
+            // purely from a partition or message timing. Quorum must be a
+            // strict majority of the VOTERS (peer_count + 1) on every beta=1
+            // rung; 4 of 6 is.
+            5 => (6, 4, 1),
             6..=10 => (5, 4, 8),
             11..=20 => (10, 7, 14),
             _ => (20, 14, 20),
@@ -329,6 +343,7 @@ impl ConsensusManager {
             params,
             validator_blocks: HashMap::new(),
             slashed_validators: HashSet::new(),
+            cached_validators: Vec::new(),
             height_start_time: HashMap::new(),
             view_changes: Vec::new(),
             last_block_time: HashMap::new(),
@@ -476,6 +491,12 @@ impl ConsensusManager {
         tip_hash: BlockHash,
         validators: &[Address],
     ) -> Option<BlockHash> {
+        // Remember the set so the SELF-vote in try_finalize_round can apply the
+        // same anti-grinding rank. Without this the two ballots use different
+        // rules and the grinding attack stays open through our own vote.
+        if !validators.is_empty() {
+            self.cached_validators = validators.to_vec();
+        }
         let state = self.heights.get_mut(&height)?;
         // Locked: keep voting for what we already committed to, as long as it
         // still builds on our tip. Changing our vote mid-height would let one
@@ -640,14 +661,37 @@ impl ConsensusManager {
                 // one dissenting self-vote deadlocks the height forever. Live
                 // 2026-07-26: 435 votes arrived at height 897 and nothing ever
                 // finalized.
-                // Our locked choice if we have one, else the deterministic
-                // lowest hash. Same rule as the vote we send peers.
-                if let Some(ours) = state
-                    .locked_choice
-                    .or_else(|| state.candidates.keys().min().copied())
-                {
+                // Our locked choice if we have one, else the SAME
+                // anti-grinding rank we answer peers with: (producer's view
+                // offset, hash).
+                //
+                // This used to be a bare lowest-hash `min()` while
+                // query_votable_preference ranked by view offset — the comment
+                // claimed they matched and they did not. Our own ballot was
+                // therefore still grindable: a fallback leader that ground a
+                // lower hash captured our self-vote, and at n=3 with quorum 2
+                // our vote is one of the two needed. Ranking here only
+                // REORDERS candidates, never removes one, so it cannot cost us
+                // a vote.
+                let cached = std::mem::take(&mut self.cached_validators);
+                if let Some(ours) = state.locked_choice.or_else(|| {
+                    state
+                        .candidates
+                        .iter()
+                        .min_by_key(|(h, b)| {
+                            let view = commputer::leader::view_offset_of(
+                                height,
+                                &cached,
+                                &b.header.producer,
+                            )
+                            .unwrap_or(usize::MAX);
+                            (view, **h)
+                        })
+                        .map(|(h, _)| *h)
+                }) {
                     *tally.entry(ours).or_insert(0) += 1;
                 }
+                self.cached_validators = cached;
                 state.aggregator = VoteAggregator::new(self.params.sample_size);
                 let finalized = state.voter.record_round(&tally);
                 if finalized {
@@ -706,6 +750,16 @@ impl ConsensusManager {
     /// gossip/sync and a subsequent take succeeds.
     pub fn take_finalized(&mut self, height: u64) -> Option<Block> {
         self.take_finalized_with_lost(height).map(|(block, _)| block)
+    }
+
+    /// Tell the manager the current consensus set, so the SELF-vote can rank
+    /// candidates by the same anti-grinding rule as peer answers even at a
+    /// height where no peer has queried us. `query_votable_preference` also
+    /// populates this as a side effect.
+    pub fn set_consensus_validators(&mut self, validators: &[Address]) {
+        if !validators.is_empty() {
+            self.cached_validators = validators.to_vec();
+        }
     }
 
     /// Like `take_finalized`, but also returns every transaction that was
@@ -1843,7 +1897,17 @@ mod tests {
 
     #[test]
     fn scaling_curve_five_peers_still_testing_profile() {
-        assert_curve(5, 4, 3, 1);
+        // CHANGED for SAFETY, not cosmetics. This pinned (4, 3, 1) at
+        // peer_count=5, i.e. n=6 voters with a quorum of 3 — EXACTLY HALF. At
+        // beta=1 one certificate is final, so two disjoint sets of 3 could each
+        // finalize a different block at the same height with ZERO Byzantine
+        // nodes. Quorum is now 4, a strict majority of 6.
+        //
+        // The real invariant is pinned by
+        // `every_beta_one_rung_has_a_strict_majority_quorum`, which asserts the
+        // PROPERTY rather than these constants — value-pinning tests like this
+        // one are what let the unsafe rung survive.
+        assert_curve(5, 6, 4, 1);
     }
 
     #[test]
@@ -2110,6 +2174,96 @@ mod tests {
         assert!(!cm.has_height(5), "round state consumed, matching take semantics");
         // A height we never tracked surrenders nothing.
         assert!(cm.surrender_lost_at(99, &applied.hash()).is_empty());
+    }
+
+    /// EVERY beta=1 rung must have a quorum that is a STRICT MAJORITY of the
+    /// voters (peer_count + 1). At beta=1 a single quorum certificate is final,
+    /// so a quorum of exactly half lets two disjoint sets each finalize a
+    /// different block at one height — a safety violation with ZERO Byzantine
+    /// nodes, from nothing worse than a partition. n=6 (peer_count 5) was
+    /// exactly that: quorum 3 of 6.
+    ///
+    /// Deliberately stops at peer_count 5: the rungs above are Snowball alpha
+    /// under beta>1, where the argument is probabilistic over repeated rounds,
+    /// not a single-certificate BFT quorum.
+    #[test]
+    fn every_beta_one_rung_has_a_strict_majority_quorum() {
+        for peer_count in 0..=5usize {
+            let mut cm = ConsensusManager::new();
+            cm.update_params_for_network_size(peer_count);
+            let voters = peer_count + 1;
+            let q = cm.params.quorum;
+            assert_eq!(cm.params.decision_threshold, 1, "peer_count {peer_count} is a beta=1 rung");
+            assert!(
+                2 * q > voters,
+                "peer_count {peer_count} (n={voters}): quorum {q} is not a strict majority — \
+                 two disjoint quorums could each finalize at beta=1"
+            );
+        }
+    }
+
+    /// Regression for the specific hole: n=6 must need 4, not 3.
+    #[test]
+    fn n_of_six_requires_four_not_three() {
+        let mut cm = ConsensusManager::new();
+        cm.update_params_for_network_size(5); // 5 peers + self = 6 voters
+        assert_eq!(cm.params.quorum, 4, "3 of 6 is exactly half, not a majority");
+    }
+
+    /// THE SELF-VOTE HOLE, pinned. Our own ballot must use the SAME
+    /// anti-grinding rank as the vote we answer peers with. It used to be a
+    /// bare lowest-hash min() while peer answers ranked by view offset — so a
+    /// fallback leader that ground a lower hash still captured our self-vote,
+    /// and at n=3 with quorum 2 that vote is one of the two needed.
+    #[test]
+    fn the_self_vote_uses_the_same_anti_grinding_rank_as_peer_answers() {
+        let validators = vec![addr(1), addr(2), addr(3)];
+        let height = 5u64; // primary = sorted[5 % 3] = sorted[2] = addr(3)
+        let tip = BlockHash([7u8; 32]);
+
+        let mut primary = make_test_block_with_producer(height, addr(3));
+        primary.header.parent_hash = tip;
+        // A fallback (addr(1)) that ground a LOWER hash than the primary.
+        let mut ground = None;
+        for ts in 0..400u64 {
+            let mut b = make_test_block_with_timestamp(height, addr(1), 1000 + ts);
+            b.header.parent_hash = tip;
+            if b.hash() < primary.hash() {
+                ground = Some(b);
+                break;
+            }
+        }
+        let ground = ground.expect("a lower-hash fallback exists");
+
+        let mut cm = ConsensusManager::new();
+        cm.cleanup_below(4);
+        cm.add_candidate(ground.clone());
+        cm.add_candidate(primary.clone());
+        // Seed the set WITHOUT calling query_votable_preference: that would set
+        // locked_choice, which short-circuits before the ranking and would make
+        // this test pass without ever exercising the fix.
+        cm.set_consensus_validators(&validators);
+        assert!(
+            cm.heights.get(&height).and_then(|s| s.locked_choice).is_none(),
+            "locked_choice must be unset so the ranking path is the one under test"
+        );
+
+        // ONE peer votes for the primary, so at n=3 (quorum 2) OUR ballot is
+        // decisive: primary reaches quorum only if our self-vote joins it. If
+        // the self-vote were still bare lowest-hash it would go to the ground
+        // block, the tally would split 1-1, and nothing would finalize.
+        let pa = PeerId::random();
+        for _ in 0..5 {
+            cm.record_peer_response(height, primary.hash(), pa);
+            cm.try_finalize_round(height, 2);
+        }
+        assert_eq!(
+            cm.finalized_at_height(height),
+            Some(primary.hash()),
+            "our self-vote must rank by view offset like the peer answer does; \
+             on the old lowest-hash rule it would have gone to the ground block \
+             and split the tally"
+        );
     }
 
     /// THE GRINDING ATTACK, pinned. `is_valid_leader` accepts three views at

@@ -4144,6 +4144,13 @@ impl EventLoop {
             }
         }
 
+        // Keep the consensus manager's view of the validator set fresh, so the
+        // SELF-vote in try_finalize_round ranks candidates by the same
+        // anti-grinding rule as the answers we give peers — even at heights
+        // where no peer has queried us.
+        let vs = self.consensus_validators();
+        self.consensus.set_consensus_validators(&vs);
+
         // Apply any newly finalized blocks (in height order).
         let mut finalized = self.consensus.finalized_heights();
         finalized.sort();
