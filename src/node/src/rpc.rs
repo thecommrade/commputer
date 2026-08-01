@@ -2753,6 +2753,13 @@ mod tests {
     /// Default path (no key configured): the middleware is a pass-through.
     /// A loopback request with NO X-API-Key MUST still be accepted (200).
     /// This pins that the patch does not regress the unauthenticated default.
+    // clippy::await_holding_lock is CORRECT to warn in production, so it is
+    // allowed HERE ONLY rather than workspace-wide. This is a std::sync::Mutex
+    // used purely to serialize tests that mutate a PROCESS-GLOBAL env var; the
+    // guard must outlive the awaits or a concurrent test can observe the wrong
+    // environment. Production async code uses tokio::sync::Mutex, which this
+    // lint does not flag.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn loopback_passes_through_when_no_key_set() {
         // Alpha.5 (R1): "no key" now also means "no COMMPUTER_RPC_KEY in env" —
@@ -3005,6 +3012,13 @@ mod tests {
     /// With NO CLI/config key but COMMPUTER_RPC_KEY exported, the admin tier
     /// MUST enforce the env-supplied key: keyless request 401s, the correct
     /// header reaches the handler.
+    // clippy::await_holding_lock is CORRECT to warn in production, so it is
+    // allowed HERE ONLY rather than workspace-wide. This is a std::sync::Mutex
+    // used purely to serialize tests that mutate a PROCESS-GLOBAL env var; the
+    // guard must outlive the awaits or a concurrent test can observe the wrong
+    // environment. Production async code uses tokio::sync::Mutex, which this
+    // lint does not flag.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn env_fallback_supplies_admin_key() {
         let _env = lock_rpc_key_env();
@@ -3241,9 +3255,6 @@ mod tests {
 
     // ── A-batch item 6 (faucet money-path builder) test ──
 
-    /// The inert faucet substrate builds a valid, signed 1-COMME Transfer with the
-    /// requested nonce, MINIMUM_FEE, and correct recipient. Verifies the exact
-    /// building block the D6 dispenser will queue once a faucet wallet is wired.
     // ── /faucet now waits for the REAL verdict ────────────────────────────────
     //
     // The bug these pin: /faucet answered "1 COMME dispensed" the instant the tx
@@ -3400,6 +3411,8 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("already claimed"));
     }
 
+    /// The faucet substrate builds a valid, signed 1-COMME Transfer with the
+    /// requested nonce, the account-creation fee, and the correct recipient.
     #[test]
     fn build_faucet_transfer_makes_valid_signed_1_comme() {
         let faucet = Wallet::generate();

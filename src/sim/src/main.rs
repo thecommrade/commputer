@@ -1069,11 +1069,13 @@ fn simulate_sensitivity(output_dir: &str) {
                 ]).unwrap();
             }
 
-            println!("  {}: circ={:.2}, daily={:.6}, burned={:.2} ({}% from baseline)",
-                label, metrics.0, metrics.1, metrics.2,
-                format!("{:+.1}", if baseline_metrics.0 > 0.0 {
-                    (metrics.0 - baseline_metrics.0) / baseline_metrics.0 * 100.0
-                } else { 0.0 }));
+            let delta_pct = if baseline_metrics.0 > 0.0 {
+                (metrics.0 - baseline_metrics.0) / baseline_metrics.0 * 100.0
+            } else {
+                0.0
+            };
+            println!("  {}: circ={:.2}, daily={:.6}, burned={:.2} ({:+.1}% from baseline)",
+                label, metrics.0, metrics.1, metrics.2, delta_pct);
         }
     }
 

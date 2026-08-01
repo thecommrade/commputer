@@ -7255,13 +7255,6 @@ mod tests {
         );
     }
 
-    /// The whole halt-vector fix rests on `would_txs_apply` being NON-MUTATING.
-    /// If its rollback were incomplete, every vote would corrupt consensus state
-    /// and fork the network. Pin it: the state root must be byte-identical after
-    /// a trial of BOTH an appliable block (OK path — where apply_txs leaves the
-    /// txs applied and the outer rollback must undo them) and an unappliable one
-    /// (Err path). And it must return the right verdict for each.
-
     /// The schedule snapshot must be written by REAL BLOCK APPLICATION at epoch
     /// boundaries — that is the whole point: it is produced by the deterministic
     /// path every node replays, so every node derives the identical schedule
@@ -7310,6 +7303,12 @@ mod tests {
         );
     }
 
+    /// The whole halt-vector fix rests on `would_txs_apply` being NON-MUTATING.
+    /// If its rollback were incomplete, every vote would corrupt consensus state
+    /// and fork the network. Pin it: the state root must be byte-identical after
+    /// a trial of BOTH an appliable block (OK path — where apply_txs leaves the
+    /// txs applied and the outer rollback must undo them) and an unappliable one
+    /// (Err path). And it must return the right verdict for each.
     #[test]
     fn would_txs_apply_is_non_mutating() {
         let dir = tempfile::tempdir().unwrap();

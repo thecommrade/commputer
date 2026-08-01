@@ -160,7 +160,7 @@ mod tests {
         store.put(b2);
 
         let b3 = make_block(3, h2);
-        let h3 = b3.hash();
+        let _h3 = b3.hash();
         store.put(b3);
 
         assert_eq!(store.len(), 4);

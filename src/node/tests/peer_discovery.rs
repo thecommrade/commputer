@@ -5,7 +5,6 @@
 //! unit test without network access, we simulate the discovery process using
 //! the PeerStore and gossip-based peer exchange.
 
-use std::collections::HashMap;
 use commputer_network::peer::{PeerId, PeerInfo, PeerStore};
 
 fn make_node_id(n: u8) -> PeerId {

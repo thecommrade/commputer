@@ -50,7 +50,14 @@ pub enum FinalizeMethod {
 }
 
 /// A finalized block record for health tracking.
+///
+/// `height` and `finalized_at` are recorded but not currently read by any health
+/// computation — they are retained deliberately because this struct is `Debug`,
+/// and a health record that cannot say WHICH block it describes, or WHEN we
+/// finalized it, is close to useless when diagnosing a stall from a log dump.
+/// Dropping them would shrink the struct and lose the diagnostic.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct BlockRecord {
     height: u64,
     timestamp: u64,     // block timestamp from header
@@ -234,7 +241,6 @@ impl Default for ChainHealthMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::sleep;
 
     #[test]
     fn healthy_at_start() {

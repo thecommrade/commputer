@@ -23,7 +23,7 @@ fn test_analytics_ml_training_e2e() {
     assert_eq!(l2_id, "commputer-analytics-l2");
 
     // 3. Network routes to GPU validator
-    let gpu_validators = vec!["validator_gpu_1", "validator_gpu_2", "validator_gpu_3"];
+    let gpu_validators = ["validator_gpu_1", "validator_gpu_2", "validator_gpu_3"];
     let assigned = &gpu_validators[0]; // best scored
 
     // 4. Job executes
@@ -60,7 +60,7 @@ fn test_analytics_ml_training_e2e() {
 
 #[test]
 fn test_capacity_overflow_flagship_to_other() {
-    let total = 100u64;
+    let _total = 100u64;
     let flagship_reserved = 51u64;
     let other_reserved = 49u64;
 

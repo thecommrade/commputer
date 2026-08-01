@@ -2,7 +2,6 @@
 //!
 //! These tests simulate multiple nodes in a single process without real networking.
 
-use std::collections::HashMap;
 use commputer_core::block::{Block, BlockHeader, BlockHash};
 use commputer_core::identity::Address;
 use commputer_core::token::Amount;
@@ -135,6 +134,7 @@ impl NetworkSim {
         self.latency = ticks;
     }
 
+    #[allow(dead_code)] // harness capability, kept for scenarios not yet written
     fn add_packet_loss(&mut self, rate: f64) {
         self.packet_loss = rate.clamp(0.0, 1.0);
     }

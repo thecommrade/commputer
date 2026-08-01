@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn fifty_percent_in_four_years() {
-        let schedule = EmissionSchedule::new();
+        // No schedule instance needed: this asserts on the CONSTANTS alone.
         // Era 0: 63,072,000 blocks x 15,854,895 units/block
         let era0_total = HALVING_INTERVAL as u128 * INITIAL_BLOCK_REWARD as u128;
         let total_supply = 2_000_000_000u128 * UNITS_PER_COMME as u128;

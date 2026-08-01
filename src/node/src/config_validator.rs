@@ -105,12 +105,12 @@ pub struct ConfigValidator;
 impl ConfigValidator {
     /// Run all checks and return results.
     pub fn check_all(config: &NodeConfig) -> Vec<CheckResult> {
-        let mut results = Vec::new();
-
-        results.push(Self::check_tcp_port(config.p2p_port));
-        results.push(Self::check_rpc_port(config.rpc_port));
-        results.push(Self::check_port_conflict(config.p2p_port, config.rpc_port));
-        results.push(Self::check_disk_space(&config.data_dir));
+        let mut results = vec![
+            Self::check_tcp_port(config.p2p_port),
+            Self::check_rpc_port(config.rpc_port),
+            Self::check_port_conflict(config.p2p_port, config.rpc_port),
+            Self::check_disk_space(&config.data_dir),
+        ];
         results.extend(Self::check_seed_nodes(&config.seed_nodes));
         results.push(Self::check_ntp_status());
 

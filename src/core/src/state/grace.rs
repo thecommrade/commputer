@@ -1,8 +1,8 @@
-/// Grace balance tracking for contributor offline tolerance.
-///
-/// Contributors earn grace by being online. The ratio is 2:1 — every second
-/// online earns 2 seconds of grace. Drain is 1:1 — every second offline costs
-/// 1 second of grace. Maximum grace balance is 10 years in seconds.
+//! Grace balance tracking for contributor offline tolerance.
+//!
+//! Contributors earn grace by being online. The ratio is 2:1 — every second
+//! online earns 2 seconds of grace. Drain is 1:1 — every second offline costs
+//! 1 second of grace. Maximum grace balance is 10 years in seconds.
 
 /// 10 years in seconds.
 pub const MAX_GRACE_BALANCE: u64 = 10 * 365 * 24 * 3600;

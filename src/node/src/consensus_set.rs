@@ -24,7 +24,6 @@
 //! Sybil identities then cost real balance per identity instead of nothing,
 //! and the honest-majority assumption rests on stake rather than on key count.
 
-use commputer_core::identity::Address;
 
 /// Is `addr` eligible to take part in consensus?
 ///

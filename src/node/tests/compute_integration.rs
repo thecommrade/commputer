@@ -65,9 +65,9 @@ fn test_compute_job_end_to_end() {
     assert_ne!(result_hash, [0u8; 32]);
 
     // 5. Verification: 3 verifiers check the result
-    let verifier_results = vec![
-        mock_result_hash(wasm_input), // matches
-        mock_result_hash(wasm_input), // matches
+    let verifier_results = [
+        mock_result_hash(wasm_input),   // matches
+        mock_result_hash(wasm_input),   // matches
         mock_result_hash(b"different"), // doesn't match
     ];
     let matching = verifier_results.iter().filter(|r| **r == result_hash).count();

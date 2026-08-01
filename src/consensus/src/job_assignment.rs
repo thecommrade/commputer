@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(capacity_flagship_slots(1), 1);
         assert_eq!(capacity_other_slots(1), 0);
 
-        let mut tracker = CapacityTracker::new(1);
+        let tracker = CapacityTracker::new(1);
         assert!(tracker.can_accept_flagship());
         // Other can use all slots when flagship is empty
         assert!(tracker.can_accept_other());
