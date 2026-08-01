@@ -33,6 +33,36 @@ const CF_PENDING: &str = "pending_jobs";
 // on existing DBs (create_missing_column_families).
 const CF_ESCALATION: &str = "escalation_rounds";
 
+/// Per-epoch validator snapshot (schedule input): epoch -> ordered
+/// (address, stake) list. Written during block apply so every node that
+/// replays the chain derives it identically.
+const CF_VALSET: &str = "epoch_validator_sets";
+
+/// THE column-family list. Declared ONCE and used by both `open` and
+/// `clear_all`.
+///
+/// These were previously two hand-maintained copies. A column family added to
+/// `open` but missed in `clear_all` survives `reset_to_genesis` — the node
+/// wipes everything else, re-seeds genesis, replays the chain, and silently
+/// carries stale data from the abandoned chain into the new one. That exact
+/// bug shape has already cost this project once (`0fb7e78`), and a comment
+/// asking future edits to keep two lists in sync would not have prevented it.
+/// One list cannot disagree with itself.
+pub(crate) const ALL_CFS: &[&str] = &[
+    CF_BLOCKS,
+    CF_BLOCK_HEIGHTS,
+    CF_ACCOUNTS,
+    CF_META,
+    CF_ARCHIVED,
+    CF_ESCROW,
+    CF_BONDED,
+    CF_UNBONDING,
+    CF_LIFECYCLE,
+    CF_PENDING,
+    CF_ESCALATION,
+    CF_VALSET,
+];
+
 pub const META_TOTAL_EMITTED: &str = "total_emitted";
 pub const META_TOTAL_BURNED: &str = "total_burned";
 pub const META_CURRENT_EPOCH: &str = "current_epoch";
@@ -79,11 +109,7 @@ impl RocksStore {
         // crash — SIGKILL/panic — loses nothing either way: the WAL already has the batch.)
         opts.set_atomic_flush(true);
 
-        let cf_names = [
-            CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
-            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING, CF_ESCALATION,
-        ];
-        let cfs: Vec<ColumnFamilyDescriptor> = cf_names
+        let cfs: Vec<ColumnFamilyDescriptor> = ALL_CFS
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, Options::default()))
             .collect();
@@ -382,10 +408,9 @@ impl RocksStore {
         let range_start: &[u8] = &[];
         let range_end: &[u8] = &[0xFF; 128]; // Covers any key length
         let mut batch = rocksdb::WriteBatch::default();
-        for cf_name in &[
-            CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
-            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING, CF_ESCALATION,
-        ] {
+        // ALL_CFS, not a second hand-written list: a CF missing here would
+        // survive reset_to_genesis and leak stale data into the new chain.
+        for cf_name in ALL_CFS {
             let cf = self.cf(cf_name);
             batch.delete_range_cf(&cf, range_start, range_end);
         }
@@ -515,6 +540,84 @@ impl RocksStore {
         let cf = self.cf(CF_ESCROW);
         batch.delete_cf(&cf, job_id);
     }
+    // ── Per-epoch validator snapshot (proposer-schedule input) ──
+    //
+    // Key: epoch as 8 big-endian bytes, so RocksDB's lexicographic key order IS
+    // numeric epoch order — that makes the prune-below scan a forward range
+    // rather than a full iterate.
+    // Value: borsh Vec<(Address, u64)>, ORDER-SIGNIFICANT. The order is part of
+    // the schedule's identity: the same membership in a different order builds
+    // a different proposer cycle, so this must round-trip exactly.
+    //
+    // Written inside the block's WriteBatch during apply, so it is derived by
+    // deterministic block application on every node — never from a timer, which
+    // is the divergence class this whole change exists to close.
+
+    /// Stage a per-epoch validator snapshot into the block's batch.
+    pub fn batch_put_epoch_validators(
+        &self,
+        batch: &mut WriteBatch,
+        epoch: u64,
+        set: &[(Address, u64)],
+    ) {
+        let cf = self.cf(CF_VALSET);
+        let mut buf = Vec::with_capacity(8 + set.len() * 40);
+        buf.extend_from_slice(&(set.len() as u64).to_le_bytes());
+        for (addr, stake) in set {
+            buf.extend_from_slice(&addr.0);
+            buf.extend_from_slice(&stake.to_le_bytes());
+        }
+        batch.put_cf(&cf, epoch.to_be_bytes(), buf);
+    }
+
+    /// Read a per-epoch validator snapshot. `None` when that epoch was never
+    /// recorded (before the feature existed, or pruned).
+    pub fn get_epoch_validators(&self, epoch: u64) -> Option<Vec<(Address, u64)>> {
+        let cf = self.cf(CF_VALSET);
+        let raw = self.db.get_cf(&cf, epoch.to_be_bytes()).ok()??;
+        if raw.len() < 8 {
+            return None;
+        }
+        let n = u64::from_le_bytes(raw[0..8].try_into().ok()?) as usize;
+        // Reject a truncated or over-long record rather than returning a
+        // partial set: a short set here would silently change the schedule.
+        if raw.len() != 8 + n * 40 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = 8 + i * 40;
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&raw[off..off + 32]);
+            let stake = u64::from_le_bytes(raw[off + 32..off + 40].try_into().ok()?);
+            out.push((Address(a), stake));
+        }
+        Some(out)
+    }
+
+    /// Drop snapshots for epochs strictly below `keep_from`.
+    ///
+    /// The schedule only ever reads the current epoch's snapshot (taken two
+    /// epochs back), so a small ring is sufficient and unbounded growth is
+    /// pointless. Big-endian keys make this a forward range scan.
+    pub fn prune_epoch_validators_below(&self, keep_from: u64) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_VALSET);
+        let mut batch = WriteBatch::default();
+        batch.delete_range_cf(&cf, 0u64.to_be_bytes(), keep_from.to_be_bytes());
+        self.db.write(batch)
+    }
+
+    /// Delete one epoch's snapshot.
+    ///
+    /// Used by `revert_block` on a reorg. Deliberately a targeted delete: the
+    /// valset map must NOT join `revert_block`'s "all consensus maps must be
+    /// empty" guard, because it is non-empty from genesis onward and that guard
+    /// would then refuse every reorg forever.
+    pub fn delete_epoch_validators(&self, epoch: u64) -> Result<(), rocksdb::Error> {
+        let cf = self.cf(CF_VALSET);
+        self.db.delete_cf(&cf, epoch.to_be_bytes())
+    }
+
     pub fn batch_put_bonded(&self, batch: &mut WriteBatch, who: &Address, amount: u64) {
         let cf = self.cf(CF_BONDED);
         batch.put_cf(&cf, who.0, amount.to_le_bytes());
@@ -725,10 +828,9 @@ impl RocksStore {
     /// Estimate database size on disk (in bytes).
     pub fn estimate_db_size(&self) -> u64 {
         let mut total: u64 = 0;
-        for cf_name in &[
-            CF_BLOCKS, CF_BLOCK_HEIGHTS, CF_ACCOUNTS, CF_META, CF_ARCHIVED,
-            CF_ESCROW, CF_BONDED, CF_UNBONDING, CF_LIFECYCLE, CF_PENDING, CF_ESCALATION,
-        ] {
+        // ALL_CFS, not a second hand-written list: a CF missing here would
+        // survive reset_to_genesis and leak stale data into the new chain.
+        for cf_name in ALL_CFS {
             if let Some(cf) = self.db.cf_handle(cf_name)
                 && let Ok(Some(size_str)) = self.db.property_value_cf(&cf, "rocksdb.estimate-live-data-size")
                     && let Ok(size) = size_str.parse::<u64>() {
@@ -901,5 +1003,107 @@ mod tests {
         store.put_account(&Account::new(test_address(3))).unwrap();
         let accounts = store.all_accounts();
         assert_eq!(accounts.len(), 3);
+    }
+
+    /// ★ THE HIGHEST-VALUE TEST IN THIS CHANGE.
+    ///
+    /// `open` and `clear_all` used to hold two hand-maintained copies of the
+    /// column-family list. A CF present in `open` but missing from `clear_all`
+    /// survives `reset_to_genesis`: the node wipes everything else, re-seeds
+    /// genesis, replays the chain, and silently carries stale data from the
+    /// ABANDONED chain into the new one. That bug shape has already cost this
+    /// project once (`0fb7e78`).
+    ///
+    /// Both now derive from `ALL_CFS`, so they cannot disagree — this test
+    /// proves the property end-to-end rather than trusting the refactor: write
+    /// into every CF, clear, and assert nothing survives anywhere.
+    #[test]
+    fn clear_all_wipes_every_column_family_including_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksStore::open(dir.path()).unwrap();
+
+        // Put something in every CF we have accessors for, including the new one.
+        store.put_account(&Account::new(test_address(1))).unwrap();
+        store.put_bonded(&test_address(2), 5_000).unwrap();
+        store.put_meta_u64(META_TOTAL_EMITTED, 42).unwrap();
+        let mut batch = WriteBatch::default();
+        store.batch_put_epoch_validators(&mut batch, 7, &[(test_address(3), 100)]);
+        store.db.write(batch).unwrap();
+
+        assert!(store.get_epoch_validators(7).is_some(), "precondition: valset written");
+        assert_eq!(store.all_accounts().len(), 1);
+
+        store.clear_all().unwrap();
+
+        assert!(
+            store.get_epoch_validators(7).is_none(),
+            "epoch validator snapshot SURVIVED clear_all — stale schedule input would leak \
+             from the abandoned chain into the resynced one"
+        );
+        assert_eq!(store.all_accounts().len(), 0, "accounts survived clear_all");
+        assert_eq!(store.all_bonded().unwrap().len(), 0, "bonded survived clear_all");
+    }
+
+    /// The snapshot must round-trip with its ORDER intact: the same membership
+    /// in a different order builds a different proposer cycle, so order is part
+    /// of the schedule's identity, not incidental.
+    #[test]
+    fn epoch_validators_round_trip_preserving_order_and_stakes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksStore::open(dir.path()).unwrap();
+        let set = vec![
+            (test_address(9), 300u64),
+            (test_address(1), 100u64),
+            (test_address(5), 200u64),
+        ];
+        let mut batch = WriteBatch::default();
+        store.batch_put_epoch_validators(&mut batch, 3, &set);
+        store.db.write(batch).unwrap();
+
+        let got = store.get_epoch_validators(3).expect("snapshot readable");
+        assert_eq!(got, set, "order and stakes must survive exactly");
+        assert!(store.get_epoch_validators(4).is_none(), "unwritten epoch is None");
+    }
+
+    /// Pruning keeps the recent ring and drops the rest — and must not touch
+    /// the epoch at the boundary itself.
+    #[test]
+    fn pruning_drops_only_epochs_below_the_keep_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksStore::open(dir.path()).unwrap();
+        let mut batch = WriteBatch::default();
+        for e in 0..10u64 {
+            store.batch_put_epoch_validators(&mut batch, e, &[(test_address(1), e)]);
+        }
+        store.db.write(batch).unwrap();
+
+        store.prune_epoch_validators_below(7).unwrap();
+
+        for e in 0..7u64 {
+            assert!(store.get_epoch_validators(e).is_none(), "epoch {e} should be pruned");
+        }
+        for e in 7..10u64 {
+            assert!(store.get_epoch_validators(e).is_some(), "epoch {e} must be kept");
+        }
+    }
+
+    /// A truncated record must read as absent, never as a SHORT validator set —
+    /// a partial set would silently change who may propose.
+    #[test]
+    fn a_corrupt_snapshot_reads_as_absent_not_as_a_short_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksStore::open(dir.path()).unwrap();
+        let cf = store.cf("epoch_validator_sets");
+        // Claims 3 entries but carries only one entry's worth of bytes.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&3u64.to_le_bytes());
+        bad.extend_from_slice(&[7u8; 32]);
+        bad.extend_from_slice(&1u64.to_le_bytes());
+        store.db.put_cf(&cf, 2u64.to_be_bytes(), bad).unwrap();
+
+        assert!(
+            store.get_epoch_validators(2).is_none(),
+            "a truncated record must not yield a partial validator set"
+        );
     }
 }
