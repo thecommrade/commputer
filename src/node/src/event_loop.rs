@@ -229,6 +229,10 @@ pub struct EventLoop {
     /// `build_schedule` materialises the whole cycle, so it must run once per
     /// epoch, never per height.
     shadow_schedule_epoch: Option<u64>,
+    /// The stake-weighted proposer schedule for the current epoch — now LIVE.
+    /// Cached because `build_schedule` materialises the whole cycle (up to
+    /// MAX_CYCLE_LEN entries); it must be rebuilt per epoch, never per height.
+    schedule_cache: Option<commputer::schedule_epoch::EpochSchedule>,
     /// Local height at the last stall-triggered NON-destructive sync re-engage.
     /// One re-engage attempt per height: a second stall at the same height means
     /// sync gained nothing (fork shape) and recovery escalates to the
@@ -336,6 +340,7 @@ impl EventLoop {
             block_request_at: HashMap::new(),
             requeue_budget: Self::REQUEUE_BUDGET_PER_TURN,
             shadow_schedule_epoch: None,
+            schedule_cache: None,
             stall_reengage_height: u64::MAX,
             last_resync: None,
             peer_last_seen: HashMap::new(),
@@ -1999,10 +2004,10 @@ impl EventLoop {
                                                 let tip_hash = self.state.blocks.latest()
                                                     .map(|b| b.hash())
                                                     .unwrap_or(BlockHash::GENESIS);
-                                                // Pass the consensus set so the vote ranks
+                                                // Pass the SCHEDULE CYCLE so the vote ranks
                                                 // candidates by their producer's view offset
                                                 // before the (grindable) block hash.
-                                                let vote_validators = self.consensus_validators();
+                                                let vote_validators = self.consensus_cycle();
                                                 match self.consensus.query_votable_preference(height, tip_hash, &vote_validators) {
                                                     Some(pref) => ConsensusResponse::Vote {
                                                         height,
@@ -2404,18 +2409,30 @@ impl EventLoop {
         // bootstrap. Enable strict rejection once the network is stable.
         // TODO: re-enable rejection after mainnet stabilizes
         // Same derivation as the production side — both sides of the leader
-        // check must produce the identical schedule (see consensus_validators).
-        let validators: Vec<Address> = self.consensus_validators();
-        if validators.len() >= 2 {
+        // check must produce the identical schedule (see consensus_cycle).
+        //
+        // ⚠ EPOCH CAVEAT, harmless only while this check is NON-ENFORCING.
+        // `consensus_cycle()` returns the schedule for the CURRENT TIP's epoch,
+        // not for `block.height()`'s epoch. Validating a block from an older
+        // epoch (during sync, or a deep reorg) therefore judges it against the
+        // wrong schedule. Today that can only mis-word a debug! line, because
+        // the branch below logs and accepts regardless. BEFORE re-enabling
+        // rejection here (see the TODO above), this MUST switch to the schedule
+        // for `epoch_of(block.height())` or a syncing node will reject valid
+        // history. The pre-flip code had the same flaw — it used the live
+        // mutable set for every height — so this is not a regression, but it is
+        // now a documented precondition rather than a latent surprise.
+        let validators: Vec<Address> = self.consensus_cycle();
+        if commputer::leader::distinct_validator_count(&validators) >= 2 {
             let seconds_since_parent = if let Some(parent) = self.state.blocks.get(&block.header.parent_hash) {
                 block.header.timestamp.saturating_sub(parent.header.timestamp)
             } else {
                 0
             };
-            if !commputer::leader::is_valid_leader(
+            if !commputer::leader::cycle_is_valid_leader(
+                &validators,
                 block.height(),
                 &block.header.producer,
-                &validators,
                 seconds_since_parent,
             ) {
                 debug!("Leader mismatch: producer {} not expected leader for height {} ({}s since parent) — accepting anyway",
@@ -2480,20 +2497,23 @@ impl EventLoop {
         true
     }
 
-    /// SHADOW MODE for the stake-weighted proposer schedule.
+    /// The stake-weighted proposer schedule for the current epoch — LIVE as of
+    /// the flip; previously shadow-only.
     ///
-    /// Once per schedule-epoch, derive the schedule from the SNAPSHOT taken two
-    /// epochs back and log its digest. Nothing consumes the result: production
-    /// and voting still use the existing round-robin. This exists so that when
-    /// we do flip, we already know every node agrees — a digest mismatch in the
-    /// logs is a disagreement we would otherwise only discover as a fork.
+    /// Derived from the SNAPSHOT taken two epochs back, so every node computes an
+    /// identical schedule without having to agree on the live, mutable validator
+    /// set. Rebuilt only when the epoch changes: `build_schedule` materialises the
+    /// whole cycle (up to MAX_CYCLE_LEN entries) and must not run per height.
     ///
-    /// Recomputed only when the epoch changes: `build_schedule` materialises the
-    /// whole cycle (up to MAX_CYCLE_LEN entries), which must not run per height.
-    fn log_shadow_schedule(&mut self) {
+    /// Still logs the digest on every epoch change. That log is what proved the
+    /// flip safe before it was armed (all three nodes printed identical digests
+    /// for 30 consecutive epochs) and it remains the cheapest possible detector:
+    /// two nodes printing different digests for one epoch WOULD disagree about who
+    /// may propose, and we see it in a log diff instead of as a fork.
+    fn refresh_schedule(&mut self) {
         let height = self.state.blocks.height();
         let epoch = commputer::schedule_epoch::epoch_of(height);
-        if self.shadow_schedule_epoch == Some(epoch) {
+        if self.shadow_schedule_epoch == Some(epoch) && self.schedule_cache.is_some() {
             return;
         }
 
@@ -2551,6 +2571,66 @@ impl EventLoop {
             commputer::schedule_epoch::digest_hex(&sched.digest),
         );
         self.shadow_schedule_epoch = Some(epoch);
+        self.schedule_cache = Some(sched);
+    }
+
+    /// THE proposer cycle every consensus decision must use — production,
+    /// validation, the vote we answer peers with, and our own ballot.
+    ///
+    /// A cycle is a list in which each validator appears once per unit of weight,
+    /// so a plain sorted set IS a cycle in which everyone has weight 1. That is
+    /// why the degraded path below is safe rather than merely convenient: if no
+    /// schedule can be derived (too early in the chain's life, or a pruned
+    /// snapshot) this returns the live sorted consensus set, which the
+    /// cycle-aware leader functions interpret as exactly the round-robin the
+    /// chain used before the flip. There is no third behaviour to get wrong.
+    ///
+    /// ⚠ ALL FOUR CONSENSUS DECISION SITES MUST CALL THIS. Moving three of the
+    /// four leaves a node disagreeing with itself about who may produce — it
+    /// would validate a block it would never have proposed, or refuse to vote for
+    /// one it just produced.
+    fn consensus_cycle(&mut self) -> Vec<Address> {
+        self.refresh_schedule();
+        let cycle = self
+            .schedule_cache
+            .as_ref()
+            .map(|s| s.cycle.clone())
+            .unwrap_or_default();
+
+        // NEVER-DEGENERATE FLOOR. `consensus_validators()` is deliberately TOTAL
+        // and never empty, because a set with no legal producer is an
+        // unrecoverable halt: no address may build the very block that would fix
+        // it. A schedule derived from a snapshot has no such guarantee — a
+        // snapshot that is short, stale, or filtered down to a single eligible
+        // address would yield a cycle with fewer than 2 DISTINCT validators.
+        //
+        // That is not merely degraded, it is a deadlock: the production gate
+        // needs >= 2 distinct validators, so every non-seed node stops
+        // producing; the tip therefore stops advancing; `refresh_schedule` keys
+        // the epoch off the tip height, so the epoch can never roll and the bad
+        // schedule can never be replaced. It cannot self-heal.
+        //
+        // So the floor is inherited rather than assumed: if the schedule cannot
+        // name at least two distinct validators but the live set can, use the
+        // live set. At equal stakes both derivations are the same list anyway,
+        // so this changes nothing on a healthy chain.
+        if commputer::leader::distinct_validator_count(&cycle) >= 2 {
+            return cycle;
+        }
+        let live = self.consensus_validators();
+        if commputer::leader::distinct_validator_count(&live)
+            > commputer::leader::distinct_validator_count(&cycle)
+        {
+            warn!(
+                "schedule names {} distinct validator(s); falling back to the live set of {} \
+                 to keep leader election alive",
+                commputer::leader::distinct_validator_count(&cycle),
+                commputer::leader::distinct_validator_count(&live),
+            );
+            live
+        } else {
+            cycle
+        }
     }
 
     /// The addresses eligible to take part in consensus, derived from committed
@@ -3822,26 +3902,35 @@ impl EventLoop {
         }
 
         // Leader election: only produce if we're the elected leader for this height.
-        // Round-robin with view change fallback every 6 seconds.
+        // STAKE-WEIGHTED schedule with view change fallback every 6 seconds.
         // Skip leader check during bootstrap (< 2 known validators on-chain).
-        // Same derivation as the validation side (see consensus_validators).
-        let validators: Vec<Address> = self.consensus_validators();
+        // Same derivation as the validation side (see consensus_cycle).
+        let validators: Vec<Address> = self.consensus_cycle();
         let our_addr = *self.wallet.address();
         let seconds_waiting = self.last_block_seen_time
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
 
-        if validators.len() >= 2 {
+        // DISTINCT validators, not cycle length: a cycle's len() is Σweights, so
+        // one validator weighted 2 would otherwise read as a two-validator
+        // network and be cleared to produce alone.
+        if commputer::leader::distinct_validator_count(&validators) >= 2 {
             // Strict leader election: only the elected leader produces.
             // View change fallback handles leader unavailability (6s intervals).
             // If consensus stalls, the stall timer in handle_consensus_tick handles it.
-            if !commputer::leader::is_valid_leader(next_height, &our_addr, &validators, seconds_waiting) {
+            if !commputer::leader::cycle_is_valid_leader(&validators, next_height, &our_addr, seconds_waiting) {
                 // Silent until now: this return is the most common reason a
                 // node produces nothing, and with no log a stalled network
                 // could not be diagnosed without a source-level bisect.
                 debug!(
                     "Skipping block production — not leader for height {} (waiting {}s, {} validators)",
-                    next_height, seconds_waiting, validators.len()
+                    next_height,
+                    seconds_waiting,
+                    // DISTINCT, not validators.len(): that is Σweights now. This
+                    // line exists to diagnose "why is nothing being produced",
+                    // and printing 4095 for a three-node network would send the
+                    // reader after a corrupt validator set that does not exist.
+                    commputer::leader::distinct_validator_count(&validators)
                 );
                 return;
             }
@@ -4222,20 +4311,13 @@ impl EventLoop {
             }
         }
 
-        // Keep the consensus manager's view of the validator set fresh, so the
+        // Keep the consensus manager's view of the schedule fresh, so the
         // SELF-vote in try_finalize_round ranks candidates by the same
         // anti-grinding rule as the answers we give peers — even at heights
-        // where no peer has queried us.
-        let vs = self.consensus_validators();
+        // where no peer has queried us. This also refreshes the epoch schedule,
+        // which is what logs the digest on an epoch change.
+        let vs = self.consensus_cycle();
         self.consensus.set_consensus_validators(&vs);
-
-        // SHADOW MODE: derive the stake-weighted schedule for this epoch and
-        // log its digest. It DECIDES NOTHING — production and voting still use
-        // the existing round-robin. The digest is an instrument: if two nodes
-        // ever print different digests for the same epoch, they WOULD have
-        // disagreed about who may propose, and we learn it from a log
-        // comparison instead of from a fork.
-        self.log_shadow_schedule();
 
         // Apply any newly finalized blocks (in height order).
         let mut finalized = self.consensus.finalized_heights();

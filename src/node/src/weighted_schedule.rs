@@ -172,10 +172,30 @@ pub fn build_cycle(validators: &[Address], weights: &[u64]) -> Vec<Address> {
 /// it ITS OWN FALLBACK and the outage cannot be routed around. The chain would
 /// wait out repeated view timeouts on a node already known to be silent.
 ///
-/// So each view advances to the next DISTINCT validator. If fewer distinct
-/// validators exist than views requested, it wraps around them — and with only
-/// one validator in the cycle it returns that one, because there is nobody
-/// else to hand off to.
+/// So each view advances to the next DISTINCT validator.
+///
+/// AFTER A FULL LAP IT RETURNS TO THE PRIMARY. The rotation is
+/// `[primary, d0, d1, … d(k-1)]` repeating — so view `k+1` comes back around to
+/// the primary rather than cycling among the fallbacks forever. Two reasons:
+///
+///   1. It is what the set-based `fallback_leader` this replaces already does
+///      (`sorted[(h + views) % n]` wraps), so at equal stakes the two agree for
+///      EVERY view count, not merely the first n-1. That exact agreement is the
+///      safety argument for flipping this on a live chain — see the equivalence
+///      tests in `leader.rs`. An earlier version excluded the primary
+///      permanently, which diverged at `views == n` (~18 s of stall) and would
+///      have made a rolling upgrade disagree about who may produce precisely
+///      when the network was already struggling.
+///   2. Permanently excluding the primary is not obviously safe: a leader that
+///      was briefly slow can never be tried again for that height, even after
+///      every other validator has also failed.
+///
+/// What it still prevents is the thing that matters — handing the round straight
+/// back to the node whose silence caused the view change, which a naive
+/// `cycle[(slot + views) % W]` does on a weighted cycle because a heavy
+/// validator occupies adjacent slots.
+///
+/// With only one validator in the cycle it returns that one: nobody to hand to.
 ///
 /// Bounded: at most one lap of the cycle, then modular arithmetic.
 pub fn proposer_after_views(cycle: &[Address], height: u64, views: usize) -> Option<Address> {
@@ -194,16 +214,18 @@ pub fn proposer_after_views(cycle: &[Address], height: u64, views: usize) -> Opt
         let cand = cycle[(start + step) % n];
         if cand != current && !distinct.contains(&cand) {
             distinct.push(cand);
-            if distinct.len() == views {
-                return Some(cand);
-            }
         }
     }
     if distinct.is_empty() {
         // Only one validator appears in the cycle: nobody to fall back to.
         return Some(current);
     }
-    Some(distinct[(views - 1) % distinct.len()])
+    // One full rotation is the primary plus every distinct fallback.
+    let period = distinct.len() + 1;
+    match views % period {
+        0 => Some(current),
+        r => Some(distinct[r - 1]),
+    }
 }
 
 /// The proposer for `height`, stake-weighted. `None` if there is no set.

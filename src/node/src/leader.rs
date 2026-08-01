@@ -261,6 +261,324 @@ pub fn view_offset_of(height: u64, validators: &[Address], producer: &Address) -
     Some((producer_idx + n - primary_idx) % n)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SCHEDULE-AWARE VARIANTS (the stake-weighted flip)
+//
+// The four functions above index a SORTED SET by `height % n`, which gives every
+// validator an identical share regardless of stake — so splitting one stake
+// across k identities multiplies that operator's share by k. These variants take
+// a precomputed weighted CYCLE instead (see `weighted_schedule`), in which a
+// validator appears once per unit of weight.
+//
+// EQUIVALENCE (why flipping these on is safe on the live chain): at EQUAL stakes
+// `scale_weights` reduces every weight to 1, so the cycle is exactly the sorted
+// set and `cycle[h % n]` IS `sorted[h % n]`. The tests at the bottom of this file
+// assert that equality directly against the originals, for n = 1..=6 — not by
+// reasoning, by comparison. Our three founder nodes hold equal bonds today
+// (verified live: `validators=3 cycle_len=3`, i.e. every weight reduced to 1), so
+// the flip is a behavioural no-op until stakes actually diverge.
+//
+// The cycle is derived from an epoch SNAPSHOT taken two epochs back, so every
+// node computes the same one without needing to agree on the live mutable set.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Seconds a leader gets before the network advances to the next view.
+/// Shared by both the set-based and cycle-based paths so they cannot drift.
+pub const VIEW_CHANGE_INTERVAL: u64 = 6;
+
+/// Clock-skew grace: how far into the adjacent view an address is still accepted.
+pub const CLOCK_SKEW_TOLERANCE: u64 = 3;
+
+/// `fallback_leader` over a weighted cycle.
+///
+/// Note this delegates the view walk to `proposer_after_views`, which advances to
+/// the next DISTINCT validator rather than the next slot. On a weighted cycle a
+/// heavy validator occupies adjacent slots, so a naive `+1 slot` could hand the
+/// round back to the very node whose silence caused the view change.
+pub fn cycle_fallback_leader(
+    cycle: &[Address],
+    height: u64,
+    seconds_since_expected: u64,
+) -> Option<Address> {
+    let views = (seconds_since_expected / VIEW_CHANGE_INTERVAL) as usize;
+    crate::weighted_schedule::proposer_after_views(cycle, height, views)
+}
+
+/// `is_valid_leader` over a weighted cycle — same three-window acceptance.
+///
+/// Deliberately mirrors the original's structure (current view, previous view
+/// within tolerance, next view within tolerance) so the two cannot diverge in
+/// which windows they accept. That three-view acceptance is also why the vote
+/// must rank by view offset rather than by block hash: up to three addresses are
+/// legal here at once, and a hash is grindable.
+pub fn cycle_is_valid_leader(
+    cycle: &[Address],
+    height: u64,
+    address: &Address,
+    seconds_waiting: u64,
+) -> bool {
+    if cycle.is_empty() {
+        return false;
+    }
+
+    if cycle_fallback_leader(cycle, height, seconds_waiting).as_ref() == Some(address) {
+        return true;
+    }
+
+    if seconds_waiting >= CLOCK_SKEW_TOLERANCE {
+        let prev = seconds_waiting.saturating_sub(CLOCK_SKEW_TOLERANCE);
+        if cycle_fallback_leader(cycle, height, prev).as_ref() == Some(address) {
+            return true;
+        }
+    } else if cycle_fallback_leader(cycle, height, 0).as_ref() == Some(address) {
+        return true;
+    }
+
+    let next = seconds_waiting.saturating_add(CLOCK_SKEW_TOLERANCE);
+    if cycle_fallback_leader(cycle, height, next).as_ref() == Some(address) {
+        return true;
+    }
+
+    false
+}
+
+/// How many DISTINCT validators appear in a cycle.
+///
+/// A cycle's `len()` is Σweights, NOT the validator count — one validator with
+/// weight 2 yields a length-2 cycle. Anything gating on "how many validators are
+/// there" (bootstrap checks, quorum sizing) must use this, or a single
+/// heavily-weighted validator reads as a multi-validator network and is allowed
+/// to produce alone.
+pub fn distinct_validator_count(cycle: &[Address]) -> usize {
+    // sort+dedup, not a Vec::contains scan: a cycle can hold MAX_CYCLE_LEN
+    // entries and this runs on the production and validation paths.
+    let mut seen: Vec<Address> = cycle.to_vec();
+    seen.sort_unstable();
+    seen.dedup();
+    seen.len()
+}
+
+/// `view_offset_of` over a weighted cycle: how many view-changes past the primary
+/// this producer is. 0 = primary. `None` if the producer never comes up.
+///
+/// Bounded by the number of DISTINCT validators in the cycle, not by its length —
+/// a cycle can be thousands of slots long, but the view walk visits each validator
+/// at most once.
+/// SINGLE PASS. This is called inside `min_by_key` — i.e. once per candidate
+/// block — on both the peer-vote answer and our own ballot, so it is genuinely
+/// hot. An earlier version called `proposer_after_views` once per view, and each
+/// of those re-walked the whole cycle: O(cycle_len · k²), measured at ~1 ms per
+/// candidate with 64 validators. Walking the rotation once is O(cycle_len · k)
+/// and needs no allocation beyond the distinct list it is already building.
+///
+/// Correctness rests on the rotation `proposer_after_views` defines:
+/// `[primary, d0, d1, … d(k-1)]` repeating. So the primary is offset 0 and
+/// `d(i)` is offset `i+1` — exactly what this walk yields.
+pub fn cycle_view_offset_of(cycle: &[Address], height: u64, producer: &Address) -> Option<usize> {
+    let n = cycle.len();
+    if n == 0 {
+        return None;
+    }
+    let start = (height % n as u64) as usize;
+    let current = cycle[start];
+    if &current == producer {
+        return Some(0);
+    }
+    let mut seen: Vec<Address> = Vec::new();
+    for step in 1..=n {
+        let cand = cycle[(start + step) % n];
+        if cand != current && !seen.contains(&cand) {
+            seen.push(cand);
+            if &cand == producer {
+                return Some(seen.len());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod cycle_equivalence_tests {
+    use super::*;
+    use crate::weighted_schedule::{build_cycle, scale_weights};
+
+    fn addr(n: u8) -> Address {
+        Address([n; 32])
+    }
+
+    fn equal_cycle(n: usize) -> (Vec<Address>, Vec<Address>) {
+        let vs: Vec<Address> = (1..=n as u8).map(addr).collect();
+        let cycle = build_cycle(&vs, &scale_weights(&vec![777u64; n]));
+        (vs, cycle)
+    }
+
+    /// THE FLIP'S SAFETY ARGUMENT, stated as a test: at equal stakes the
+    /// cycle-based leader is byte-identical to the set-based one it replaces.
+    /// If this ever fails, flipping the live network forks it.
+    #[test]
+    fn equal_stakes_make_the_cycle_leader_identical_to_the_set_leader() {
+        for n in 1..=6usize {
+            let (vs, cycle) = equal_cycle(n);
+            assert_eq!(cycle.len(), n, "n={n}: equal stakes must give one slot each");
+            for h in 0..120u64 {
+                for secs in [0u64, 1, 5, 6, 7, 11, 12, 17, 18, 23, 24, 60] {
+                    assert_eq!(
+                        cycle_fallback_leader(&cycle, h, secs),
+                        fallback_leader(h, &vs, secs),
+                        "n={n} h={h} secs={secs}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The acceptance windows must match too — a node that accepts a different
+    /// set of leaders than its peers stalls or forks even if the primary agrees.
+    ///
+    /// `secs` deliberately runs past SEVERAL full view-wraps (a wrap is
+    /// `n * VIEW_CHANGE_INTERVAL` seconds — 18 s at n=3). The first version of
+    /// this flip diverged from the live behaviour at exactly the first wrap, and
+    /// a range that stopped short of it would have shipped the bug. This is also
+    /// what makes a ROLLING upgrade safe: old and new nodes agree at every view
+    /// count, so they cannot disagree about who may produce mid-rollout.
+    #[test]
+    fn equal_stakes_make_leader_validity_identical() {
+        for n in 1..=6usize {
+            let (vs, cycle) = equal_cycle(n);
+            for h in 0..60u64 {
+                for cand in &vs {
+                    for secs in 0..130u64 {
+                        assert_eq!(
+                            cycle_is_valid_leader(&cycle, h, cand, secs),
+                            is_valid_leader(h, cand, &vs, secs),
+                            "n={n} h={h} secs={secs}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The vote's anti-grinding rank must not change either.
+    #[test]
+    fn equal_stakes_make_view_offset_identical() {
+        for n in 1..=6usize {
+            let (vs, cycle) = equal_cycle(n);
+            for h in 0..60u64 {
+                for cand in &vs {
+                    assert_eq!(
+                        cycle_view_offset_of(&cycle, h, cand),
+                        view_offset_of(h, &vs, cand),
+                        "n={n} h={h}"
+                    );
+                }
+            }
+            assert_eq!(
+                cycle_view_offset_of(&cycle, 0, &addr(200)),
+                None,
+                "a producer outside the cycle has no view"
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROL. The equivalence above must hold BECAUSE stakes are
+    /// equal, not because the two paths are the same code. With unequal stakes
+    /// the cycle-based schedule must actually differ from plain rotation —
+    /// otherwise these tests would pass even if the flip did nothing.
+    #[test]
+    fn unequal_stakes_actually_diverge_from_plain_rotation() {
+        let vs = vec![addr(1), addr(2), addr(3)];
+        let cycle = build_cycle(&vs, &scale_weights(&[5_000u64, 1_000, 1_000]));
+        assert!(cycle.len() > vs.len(), "weighting must lengthen the cycle");
+        let differs = (0..60u64).any(|h| {
+            cycle_fallback_leader(&cycle, h, 0) != fallback_leader(h, &vs, 0)
+        });
+        assert!(differs, "unequal stakes must change the schedule");
+    }
+
+    /// NEGATIVE CONTROLS for the other two equivalences. Without these, the
+    /// `equal_stakes_make_*_identical` tests above could pass simply because the
+    /// cycle path and the set path were doing the same (unweighted) thing — the
+    /// tests would be green on a flip that achieved nothing. Each assertion here
+    /// fails if weighting stops mattering.
+    #[test]
+    fn unequal_stakes_diverge_for_validity_and_view_offset_too() {
+        let vs = vec![addr(1), addr(2), addr(3)];
+        let cycle = build_cycle(&vs, &scale_weights(&[5_000u64, 1_000, 1_000]));
+
+        let validity_differs = (0..60u64).any(|h| {
+            vs.iter().any(|cand| {
+                (0..24u64).any(|secs| {
+                    cycle_is_valid_leader(&cycle, h, cand, secs)
+                        != is_valid_leader(h, cand, &vs, secs)
+                })
+            })
+        });
+        assert!(
+            validity_differs,
+            "weighting must change WHO IS ACCEPTED as leader somewhere"
+        );
+
+        let offset_differs = (0..60u64).any(|h| {
+            vs.iter()
+                .any(|cand| cycle_view_offset_of(&cycle, h, cand) != view_offset_of(h, &vs, cand))
+        });
+        assert!(
+            offset_differs,
+            "weighting must change the anti-grinding vote RANK somewhere"
+        );
+    }
+
+    /// `distinct_validator_count` gates solo production, so it gets its own test:
+    /// it must count VALIDATORS, never slots.
+    #[test]
+    fn distinct_count_counts_validators_not_slots() {
+        assert_eq!(distinct_validator_count(&[]), 0);
+        assert_eq!(distinct_validator_count(&[addr(1)]), 1);
+        // One validator holding every slot is still ONE validator — this is the
+        // case that must not read as "a multi-validator network".
+        assert_eq!(distinct_validator_count(&[addr(1); 9]), 1);
+        let vs = vec![addr(1), addr(2), addr(3)];
+        let weighted = build_cycle(&vs, &scale_weights(&[5_000u64, 1_000, 1_000]));
+        assert!(weighted.len() > 3, "precondition: the cycle repeats");
+        assert_eq!(distinct_validator_count(&weighted), 3);
+    }
+
+    /// `cycle_view_offset_of` was rewritten from k calls to a single pass; pin
+    /// that it still agrees with the rotation `proposer_after_views` defines,
+    /// on a WEIGHTED cycle where the two could plausibly disagree.
+    #[test]
+    fn view_offset_agrees_with_the_view_walk_on_a_weighted_cycle() {
+        let vs = vec![addr(1), addr(2), addr(3), addr(4)];
+        let cycle = build_cycle(&vs, &scale_weights(&[7_000u64, 3_000, 1_000, 1_000]));
+        let k = distinct_validator_count(&cycle);
+        for h in 0..50u64 {
+            for views in 0..k {
+                let who = crate::weighted_schedule::proposer_after_views(&cycle, h, views).unwrap();
+                assert_eq!(
+                    cycle_view_offset_of(&cycle, h, &who),
+                    Some(views),
+                    "h={h} views={views}: offset must invert the view walk"
+                );
+            }
+        }
+    }
+
+    /// A view change must never hand the round back to the node that just failed
+    /// to produce, even when that node holds most of the stake and therefore
+    /// occupies adjacent slots.
+    #[test]
+    fn a_view_change_always_leaves_the_current_leader() {
+        let vs = vec![addr(1), addr(2), addr(3)];
+        let cycle = build_cycle(&vs, &scale_weights(&[9_000u64, 500, 500]));
+        for h in 0..80u64 {
+            let primary = cycle_fallback_leader(&cycle, h, 0).unwrap();
+            let after = cycle_fallback_leader(&cycle, h, VIEW_CHANGE_INTERVAL).unwrap();
+            assert_ne!(after, primary, "h={h}: view change stayed on the same node");
+        }
+    }
+}
+
 #[cfg(test)]
 mod view_offset_tests {
     use super::*;

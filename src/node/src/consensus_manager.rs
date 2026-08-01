@@ -545,8 +545,12 @@ impl ConsensusManager {
             .iter()
             .filter(|(_, b)| b.header.parent_hash == tip_hash)
             .min_by_key(|(h, b)| {
-                let view = commputer::leader::view_offset_of(height, validators, &b.header.producer)
-                    .unwrap_or(usize::MAX);
+                let view = commputer::leader::cycle_view_offset_of(
+                    validators,
+                    height,
+                    &b.header.producer,
+                )
+                .unwrap_or(usize::MAX);
                 (view, **h)
             })
             .map(|(h, _)| *h);
@@ -679,9 +683,9 @@ impl ConsensusManager {
                         .candidates
                         .iter()
                         .min_by_key(|(h, b)| {
-                            let view = commputer::leader::view_offset_of(
-                                height,
+                            let view = commputer::leader::cycle_view_offset_of(
                                 &cached,
+                                height,
                                 &b.header.producer,
                             )
                             .unwrap_or(usize::MAX);
