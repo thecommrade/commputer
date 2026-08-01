@@ -133,6 +133,16 @@ pub const FINALITY_DEPTH: u64 = 10;
 /// Feature 135: Checkpoint interval — every N blocks is a checkpoint that cannot be reorged past.
 pub const CHECKPOINT_INTERVAL: u64 = 100;
 
+/// Blocks per PROPOSER-SCHEDULE epoch — the cadence at which the validator
+/// pool + stakes are snapshotted for the schedule.
+///
+/// Deliberately equal to `CHECKPOINT_INTERVAL`: that boundary is already
+/// treated as un-reorgable, so a schedule input taken there is settled by a
+/// rule the system already relies on. Mirrored by
+/// `node/src/schedule_epoch.rs::EPOCH_BLOCKS`, and the two are pinned equal by
+/// a test there — they are the same protocol constant seen from two crates.
+pub const SCHEDULE_EPOCH_BLOCKS: u64 = CHECKPOINT_INTERVAL;
+
 /// Feature 183: Archival threshold — accounts with zero balance and no activity for
 /// this many epochs are archived to cold storage.
 pub const ARCHIVAL_EPOCH_THRESHOLD: u64 = 1000;
@@ -3066,6 +3076,35 @@ impl ChainState {
         // out-of-band current_epoch bump to disk at the next block.
         rocks.batch_put_meta_u64(&mut batch, rocks::META_TOTAL_EMITTED, self.total_emitted);
         rocks.batch_put_meta_u64(&mut batch, rocks::META_TOTAL_BURNED, self.total_burned);
+
+        // PROPOSER-SCHEDULE SNAPSHOT. At an epoch boundary, record the
+        // registered validators and their bonded stake, riding this block's
+        // WriteBatch so it is written by deterministic block application — the
+        // same path every node replays — and never from a wall-clock tick,
+        // which is the divergence class this whole change exists to close.
+        //
+        // We store the raw POOL (every `is_validator` account with its bonded
+        // stake), not the filtered consensus set. Eligibility (the allowlist,
+        // the stake floor) is a RULE applied at read time by the node layer,
+        // and it belongs in one place: `consensus_set::is_consensus_eligible`.
+        // Baking a filtered set in here would freeze today's rule into
+        // historical data and force a re-snapshot to ever change it. The pool
+        // is objective chain state; who is eligible is a policy over it.
+        if block.height().is_multiple_of(SCHEDULE_EPOCH_BLOCKS) {
+            let epoch = block.height() / SCHEDULE_EPOCH_BLOCKS;
+            let mut pool: Vec<(Address, u64)> = self
+                .accounts
+                .iter()
+                .filter(|a| a.is_validator)
+                .map(|a| (a.address, self.bonded_of(&a.address)))
+                .collect();
+            // Sorted: order is part of the schedule's identity (the same
+            // membership in a different order builds a different proposer
+            // cycle), and `accounts.iter()` is map iteration whose order is not
+            // guaranteed to match between nodes.
+            pool.sort_unstable_by_key(|(a, _)| a.0);
+            rocks.batch_put_epoch_validators(&mut batch, epoch, &pool);
+        }
         rocks.batch_put_meta_u64(&mut batch, rocks::META_CURRENT_EPOCH, self.current_epoch);
         rocks.batch_put_meta_u64(&mut batch, rocks::META_NERF_RATE_BPS, self.nerf_rate.rate_bps as u64);
         // Accounts: deletes BEFORE puts — WriteBatch is last-write-wins per key, so a
@@ -7192,6 +7231,55 @@ mod tests {
     /// a trial of BOTH an appliable block (OK path — where apply_txs leaves the
     /// txs applied and the outer rollback must undo them) and an unappliable one
     /// (Err path). And it must return the right verdict for each.
+
+    /// The schedule snapshot must be written by REAL BLOCK APPLICATION at epoch
+    /// boundaries — that is the whole point: it is produced by the deterministic
+    /// path every node replays, so every node derives the identical schedule
+    /// input. A snapshot written by a timer, or only in memory, would
+    /// reintroduce exactly the divergence this design exists to remove.
+    #[test]
+    fn the_schedule_snapshot_is_written_by_block_apply_at_epoch_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(dir.path()).unwrap();
+        state.apply_block(&genesis_block()).unwrap();
+
+        // Two registered validators with different bonded stake.
+        let v1 = addr(11);
+        let v2 = addr(22);
+        for (v, bond) in [(v1, 500u64), (v2, 1_500u64)] {
+            let acct = state.accounts.get_or_create(v);
+            acct.is_validator = true;
+            acct.balance = Amount::from_raw(10_000);
+            state.bonded_stake.insert(v, bond);
+        }
+
+        // Apply blocks across an epoch boundary.
+        let boundary = SCHEDULE_EPOCH_BLOCKS;
+        for h in 1..=boundary {
+            let b = validated_block(&state, h, addr(5), vec![]);
+            state.apply_block_validated(&b).unwrap();
+        }
+
+        let rocks = state.rocks.as_ref().expect("rocks-backed in this test");
+        let epoch = boundary / SCHEDULE_EPOCH_BLOCKS;
+        let snap = rocks
+            .get_epoch_validators(epoch)
+            .expect("epoch boundary must have written a snapshot");
+
+        assert_eq!(snap.len(), 2, "both registered validators must be in the pool");
+        // Sorted by address: order is part of the schedule's identity, and
+        // accounts.iter() order is not guaranteed to match between nodes.
+        let mut want = vec![(v1, 500u64), (v2, 1_500u64)];
+        want.sort_unstable_by_key(|(a, _)| a.0);
+        assert_eq!(snap, want, "pool must carry each validator's bonded stake, address-sorted");
+
+        // A non-boundary height must NOT write one.
+        assert!(
+            rocks.get_epoch_validators(epoch + 1).is_none(),
+            "only epoch boundaries write a snapshot"
+        );
+    }
+
     #[test]
     fn would_txs_apply_is_non_mutating() {
         let dir = tempfile::tempdir().unwrap();

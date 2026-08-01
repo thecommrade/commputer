@@ -125,6 +125,21 @@ mod tests {
         Address([n; 32])
     }
 
+    /// The storage layer writes the snapshot every
+    /// `SCHEDULE_EPOCH_BLOCKS` blocks; this module decides which epoch a height
+    /// belongs to and which snapshot it reads. If the two constants ever drift,
+    /// nodes would snapshot at one cadence and read at another — the schedule
+    /// would silently reference an epoch that was never written. Same protocol
+    /// constant, two crates, pinned equal here.
+    #[test]
+    fn epoch_length_matches_the_storage_snapshot_cadence() {
+        assert_eq!(
+            EPOCH_BLOCKS,
+            commputer_storage::state::SCHEDULE_EPOCH_BLOCKS,
+            "schedule epoch length must equal the storage snapshot cadence"
+        );
+    }
+
     #[test]
     fn epochs_are_height_derived_and_contiguous() {
         assert_eq!(epoch_of(0), 0);
