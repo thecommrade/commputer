@@ -18,6 +18,19 @@
 set -u
 set -o pipefail
 
+# SINGLE-FLIGHT: the harness binds FIXED ports, so two concurrent runs collide
+# and produce FALSE failures. Take the lock in the outer stage only (the
+# namespaced re-exec below inherits the held lock fd); a second run queues
+# loudly instead of colliding. Guarded by env var so the re-exec can't deadlock.
+HARNESS_LOCK="${FORMATION_LOCK:-/tmp/commputer-harness.lock}"
+if [[ "${FORMATION_ISOLATED:-0}" != "1" && -z "${FORMATION_LOCK_HELD:-}" ]]; then
+    if ! flock -n "${HARNESS_LOCK}" true 2>/dev/null; then
+        echo "[formation] another harness run holds ${HARNESS_LOCK} — waiting (concurrent runs collide on fixed ports)..."
+    fi
+    exec env FORMATION_LOCK_HELD=1 \
+        flock -w "${FORMATION_LOCK_WAIT:-7200}" "${HARNESS_LOCK}" bash "$0" "$@"
+fi
+
 FORMATION_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${FORMATION_ROOT}/../.." && pwd)"
 SRC_DIR="${REPO_ROOT}/src"

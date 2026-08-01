@@ -30,6 +30,19 @@
 
 set -uo pipefail
 
+# SINGLE-FLIGHT: two concurrent predeploy runs clobber each other's fixed log
+# paths below, and their harness halves collide on the harness's fixed ports
+# (which fakes failures — it happened twice). Serialize whole runs: a second
+# invocation waits for the first instead of corrupting its evidence.
+PREDEPLOY_LOCK="${PREDEPLOY_LOCK:-/tmp/commputer-predeploy.lock}"
+if [ -z "${PREDEPLOY_LOCK_HELD:-}" ]; then
+  if ! flock -n "${PREDEPLOY_LOCK}" true 2>/dev/null; then
+    echo "== another predeploy run holds ${PREDEPLOY_LOCK} — waiting for it to finish =="
+  fi
+  exec env PREDEPLOY_LOCK_HELD=1 \
+    flock -w "${PREDEPLOY_LOCK_WAIT:-7200}" "${PREDEPLOY_LOCK}" bash "$0" "$@"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SRC_DIR="${REPO_ROOT}/src"
