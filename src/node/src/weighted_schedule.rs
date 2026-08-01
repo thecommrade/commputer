@@ -68,10 +68,62 @@ pub fn scale_weights(stakes: &[u64]) -> Vec<u64> {
         // schedule reduce exactly to round-robin.
         return vec![1; stakes.len()];
     }
-    stakes
+    // FIRST try the exact ratio in smallest terms. Dividing every stake by
+    // their GCD preserves proportions exactly, and for the ratios a real
+    // validator set produces (3:1:1, or all-equal) it collapses enormous stake
+    // numbers to single digits — a 3-slot cycle instead of a 4095-slot one for
+    // the same schedule.
+    //
+    // Order matters: reducing the SCALED weights instead would not work,
+    // because the `+1` floor applied below destroys the common factor. Live
+    // output showed exactly that — 3:1:1 stakes became [2456, 819, 819], whose
+    // GCD is 1, so nothing reduced.
+    let exact = reduce_by_gcd(stakes.to_vec());
+    let exact_total: u128 = exact.iter().map(|w| *w as u128).sum();
+    if exact_total <= MAX_CYCLE_LEN as u128 && exact.iter().all(|w| *w >= 1) {
+        return exact;
+    }
+
+    // The exact ratio is too large (a pathological spread, or coprime stakes
+    // in raw units). Fall back to a proportional scaling with a floor of 1, so
+    // the cycle stays bounded and nobody is scaled out entirely.
+    let scaled: Vec<u64> = stakes
         .iter()
         .map(|s| 1 + ((*s as u128 * budget as u128) / total) as u64)
-        .collect()
+        .collect();
+    reduce_by_gcd(scaled)
+}
+
+/// Divide weights by their greatest common divisor.
+///
+/// Purely an efficiency measure — dividing every weight by a common factor
+/// cannot change any validator's PROPORTION, so the schedule is unchanged; it
+/// is just expressed in the smallest equivalent terms.
+///
+/// It matters because the cycle length is the SUM of the weights, and we
+/// rebuild that whole cycle each epoch. Observed live: three near-equal stakes
+/// scaled to 1365 each, giving a 4095-entry cycle where 3 entries express
+/// exactly the same schedule — a 1365x cost for no information. Equal stakes
+/// are also the common case for a small validator set, so this is the case
+/// worth optimising.
+fn reduce_by_gcd(mut weights: Vec<u64>) -> Vec<u64> {
+    let divisor = weights.iter().copied().fold(0u64, gcd);
+    if divisor > 1 {
+        for w in &mut weights {
+            *w /= divisor;
+        }
+    }
+    weights
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    let (mut a, mut b) = (a, b);
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
 }
 
 /// One full cycle of proposers: `Σ weights` entries, each validator appearing
@@ -241,6 +293,37 @@ mod tests {
         let vs = vec![addr(1), addr(2)];
         let cycle = build_cycle(&vs, &w);
         assert!(cycle.contains(&addr(2)), "the small holder must still appear");
+    }
+
+    /// Reducing weights by their GCD must not change ANY validator's share —
+    /// it only expresses the same schedule in smaller terms. Found from live
+    /// output: three near-equal stakes produced a 4095-entry cycle where 3
+    /// entries say exactly the same thing.
+    #[test]
+    fn gcd_reduction_shrinks_the_cycle_without_changing_the_schedule() {
+        let vs = vec![addr(1), addr(2), addr(3)];
+
+        // Equal stakes — the common case for a small set.
+        let equal = vec![1_000_000_000u64; 3];
+        let w = scale_weights(&equal);
+        assert_eq!(w, vec![1, 1, 1], "equal stakes reduce to the smallest terms");
+        assert_eq!(build_cycle(&vs, &w).len(), 3, "3 slots, not thousands");
+
+        // A 3:1:1 split must still be 3:1:1 after reduction.
+        let split = vec![3_000_000_000u64, 1_000_000_000, 1_000_000_000];
+        let ws = scale_weights(&split);
+        let total: u64 = ws.iter().sum();
+        assert!(total < 100, "cycle should be small, got {total}: {ws:?}");
+        let cycle = build_cycle(&vs, &ws);
+        let c1 = cycle.iter().filter(|a| **a == addr(1)).count() as f64 / cycle.len() as f64;
+        assert!((c1 - 0.6).abs() < 0.05, "3-of-5 share must survive reduction, got {c1:.3}");
+
+        // And the proposer sequence must be unchanged versus the unreduced
+        // weighting — the reduction is invisible to consumers.
+        let unreduced = vec![3u64, 1, 1];
+        let reduced_cycle = build_cycle(&vs, &ws);
+        let plain_cycle = build_cycle(&vs, &unreduced);
+        assert_eq!(reduced_cycle, plain_cycle, "same schedule, smaller terms");
     }
 
     /// Bounded: a pathological spread must not allocate an enormous schedule.
