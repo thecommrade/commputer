@@ -18,6 +18,29 @@ Thumbs.db
 *.pem
 *.secret
 
+# Claude Code working tree — DENY BY DEFAULT, allow-list the exceptions.
+# Written this way round on purpose: this directory holds
+# settings.local.json (machine-local credentials and standing tool approvals)
+# and .claude/worktrees/ (>1 GB of live git worktrees). An ignore list that
+# names what to EXCLUDE would leak the next thing anyone drops in here; this
+# one leaks nothing unless a human adds a `!` line on purpose.
+#
+# Tracked, and why:
+#   bin/          the lane + promotion tooling. It has to travel with the repo,
+#                 or a lane cannot see the rules that govern promoting it.
+#   qc/QC_LEDGER.md  the findings record — the durable output of QC work.
+# Deliberately NOT tracked:
+#   qc/QUEUE-review.md  the post-commit hook appends to it on every commit, so
+#                 tracking it would leave the tree dirty immediately after each
+#                 commit and quietly erode the clean-tree precondition for
+#                 merging. It is regenerable from git log + the ledger watermark.
+#   qc/DIGEST-*.md      generated each morning; reproducible, not evidence.
+.claude/*
+!.claude/bin/
+!.claude/qc/
+.claude/qc/*
+!.claude/qc/QC_LEDGER.md
+
 # Node data directories
 src/commputer-testnet/
 src/commputer-data/

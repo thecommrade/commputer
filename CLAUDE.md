@@ -52,7 +52,13 @@ via attended Tier-3 review (below):**
 - NEVER push from `~/Coin` or any lane. Publishing happens ONLY via the
   `~/commputer-clean` airlock after a clean security scan — ask before pushing,
   and ask again after the scan.
-- NEVER stage `.claude/`; CLAUDE.md changes need founder sign-off to commit.
+- `.claude/` is DENY-BY-DEFAULT in `.gitignore`. Exactly two things are tracked:
+  `.claude/bin/` (lane + promotion tooling, Tier 3 — attended only, because it
+  judges its own promotion) and `.claude/qc/QC_LEDGER.md` (the findings record).
+  Everything else — `settings.local.json`, `worktrees/`, the review queue, the
+  digests — must NEVER be staged. Do not add `!` lines to that ignore block
+  without founder sign-off; it is the rule, not a convenience.
+- CLAUDE.md changes need founder sign-off to commit.
 - NEVER commit personal information, internal IPs (192.168.x.x, 10.x.x.x,
   100.x.x.x), API tokens, passwords, or private keys.
 - The gate runs ONLY as `bash ~/Coin/scripts/predeploy.sh` (flock-serialized —
