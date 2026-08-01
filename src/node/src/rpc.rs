@@ -91,10 +91,65 @@ pub struct RpcTxRequest {
     pub reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 }
 
-impl RpcTxRequest {
-    /// Fire-and-forget submission (internal issuers): no verdict wanted.
-    pub fn fire(tx: Transaction) -> Self {
-        Self { tx, reply: None }
+// NOTE: there was a `RpcTxRequest::fire(tx)` constructor here — a fire-and-forget
+// submission with `reply: None`. It is deliberately GONE.
+//
+// Every endpoint that reports an outcome to a caller must use
+// `submit_awaiting_verdict`. `fire` existed so an issuer could skip the wait,
+// and both endpoints that used it (/faucet and /submit_job) ended up telling
+// callers a transaction had succeeded when only the QUEUEING had succeeded —
+// the silent-loss class that has cost this project more debugging than any
+// other single bug. /tx was fixed first and the other two were simply forgotten,
+// because the convenient wrong thing was still one call away.
+//
+// `reply` stays an `Option` because the event loop tolerates a submitter that
+// went away; but nothing in-tree constructs one without a reply channel, and
+// anything that wants to should have to write it out and justify itself.
+
+/// How long an endpoint waits for the event loop's admission verdict.
+///
+/// Generous on purpose: the loop drains the channel every iteration so a verdict
+/// normally lands in milliseconds, but one select! arm body runs to completion
+/// first, and a heavy body (a sync batch, an orphan cascade) can hold the loop
+/// for seconds during catch-up. Timing out early would misreport an admitted tx
+/// as failed — the exact dishonesty this machinery exists to remove.
+const VERDICT_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The node's real answer to "was this transaction admitted?".
+#[derive(Debug)]
+pub(crate) enum TxVerdict {
+    /// Passed the mempool gate.
+    Admitted,
+    /// The gate rejected it, with the reason that used to vanish into a log line.
+    Rejected(String),
+    /// Never queued — the channel was full.
+    QueueFull,
+    /// Never queued, or the loop dropped the reply: the node is shutting down.
+    NodeStopping,
+    /// Queued, but no answer within `VERDICT_WAIT`. **NOT a rejection** — the tx
+    /// is sitting in the channel and will most likely be admitted. Callers must
+    /// not report this as failure, and must not undo side effects on it.
+    Unconfirmed,
+}
+
+/// Submit a transaction and wait for the mempool gate's REAL verdict.
+///
+/// The single place this is decided. It used to be open-coded per endpoint,
+/// which is precisely how `/tx` came to tell the truth while `/faucet` and
+/// `/submit_job` kept answering on a successful queue.
+pub(crate) async fn submit_awaiting_verdict(state: &RpcState, tx: Transaction) -> TxVerdict {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if let Err(e) = state.tx_sender.try_send(RpcTxRequest { tx, reply: Some(reply_tx) }) {
+        return match e {
+            mpsc::error::TrySendError::Full(_) => TxVerdict::QueueFull,
+            mpsc::error::TrySendError::Closed(_) => TxVerdict::NodeStopping,
+        };
+    }
+    match tokio::time::timeout(VERDICT_WAIT, reply_rx).await {
+        Ok(Ok(Ok(()))) => TxVerdict::Admitted,
+        Ok(Ok(Err(reason))) => TxVerdict::Rejected(reason),
+        Ok(Err(_recv_err)) => TxVerdict::NodeStopping,
+        Err(_timeout) => TxVerdict::Unconfirmed,
     }
 }
 
@@ -215,44 +270,31 @@ async fn submit_tx(
     // Send WITH a reply channel and await the event loop's real verdict, so
     // `accepted` means the tx passed the mempool gate — not merely that it was
     // queued. Shape-identical response; only its truthfulness changes.
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if let Err(e) = state.tx_sender.try_send(RpcTxRequest { tx, reply: Some(reply_tx) }) {
-        let (code, msg) = match e {
-            mpsc::error::TrySendError::Full(_) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Transaction queue full, try again later",
-            ),
-            mpsc::error::TrySendError::Closed(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "Node is shutting down")
-            }
-        };
-        return (
-            code,
-            Json(SubmitTxResponse { accepted: false, tx_hash, error: Some(msg.into()) }),
-        );
-    }
-
-    // Bounded wait for the real verdict. The event loop drains this channel
-    // every iteration, so a verdict normally lands in milliseconds — but a
-    // single select! arm body runs to completion first, and a heavy body (a
-    // sync batch, an orphan cascade) can hold the loop for seconds during
-    // catch-up. The window is generous so that does not misreport an accepted
-    // tx as failed; if it still fires, the answer is an honest "queued, not yet
-    // confirmed" (HTTP 202), NEVER a rejection — a resubmit is idempotent
-    // (handle_rpc_transaction reports a duplicate as accepted).
-    match tokio::time::timeout(std::time::Duration::from_secs(15), reply_rx).await {
-        Ok(Ok(Ok(()))) => (
+    //
+    // The wait itself lives in `submit_awaiting_verdict`, shared with /faucet and
+    // /submit_job. It was open-coded here first, and keeping it that way is
+    // exactly how those two endpoints were left behind still answering on a
+    // successful queue.
+    match submit_awaiting_verdict(&state, tx).await {
+        TxVerdict::Admitted => (
             StatusCode::OK,
             Json(SubmitTxResponse { accepted: true, tx_hash, error: None }),
         ),
-        Ok(Ok(Err(reason))) => (
+        TxVerdict::Rejected(reason) => (
             // The mempool gate rejected it. This is the verdict that used to be
             // silently dropped to a log line.
             StatusCode::BAD_REQUEST,
             Json(SubmitTxResponse { accepted: false, tx_hash, error: Some(reason) }),
         ),
-        Ok(Err(_recv_err)) => (
-            // The event loop dropped the reply without answering (shutdown).
+        TxVerdict::QueueFull => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SubmitTxResponse {
+                accepted: false,
+                tx_hash,
+                error: Some("Transaction queue full, try again later".into()),
+            }),
+        ),
+        TxVerdict::NodeStopping => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(SubmitTxResponse {
                 accepted: false,
@@ -260,7 +302,7 @@ async fn submit_tx(
                 error: Some("Node stopped before confirming the transaction".into()),
             }),
         ),
-        Err(_timeout) => (
+        TxVerdict::Unconfirmed => (
             // 202 Accepted: queued for processing, outcome not yet known. NOT a
             // rejection — the tx is in the channel and will very likely be
             // admitted; the client can resubmit (idempotent) or poll /balance.
@@ -1197,8 +1239,26 @@ async fn faucet(
         }
 
         let tx = build_faucet_transfer(wallet, to, *next_nonce);
-        match state.tx_sender.try_send(RpcTxRequest::fire(tx)) {
-            Ok(()) => {
+        let tx_hash = hex::encode(tx.hash().0);
+
+        // WAIT FOR THE REAL VERDICT before claiming anything happened.
+        //
+        // This used to answer `"1 COMME dispensed"` the instant `try_send`
+        // succeeded, and consume BOTH the epoch claim slot and the nonce in that
+        // same breath. A dispense the gate then rejected was therefore invisible
+        // AND unretryable: the caller was told they had been paid, and their one
+        // claim for the epoch was already spent. That is strictly worse than a
+        // generic silent loss, and it is what the alpha.7 notes promised to fix.
+        //
+        // The nonce lock is deliberately held across this await, which serializes
+        // dispenses. That is the point: apply requires `tx.nonce == account.nonce`
+        // EXACTLY (storage/src/state.rs), so a gap or a reuse bricks every later
+        // dispense. Serializing keeps at most one faucet tx in flight, which is
+        // what makes the rejection path below safe to resync. The faucet is
+        // inherently low-rate — one claim per address per epoch — so this costs
+        // nothing real.
+        match submit_awaiting_verdict(&state, tx).await {
+            TxVerdict::Admitted => {
                 *next_nonce += 1;
                 state.faucet_claims.lock().await.insert(req.address.clone(), current_epoch);
                 return (StatusCode::OK, Json(serde_json::json!({
@@ -1206,10 +1266,58 @@ async fn faucet(
                     "detail": "1 COMME dispensed",
                     "address": req.address,
                     "epoch": current_epoch,
+                    "tx_hash": tx_hash,
                 })));
             }
-            Err(_) => {
-                // Channel full/closed — do NOT consume the nonce or the claim slot.
+            TxVerdict::Rejected(reason) => {
+                // Nothing was dispensed: consume NEITHER the nonce NOR the claim
+                // slot, so the caller can simply try again.
+                //
+                // RESYNC the nonce to chain truth. Our tx did not enter the
+                // mempool, so the account's on-chain nonce is authoritative for
+                // the next attempt. This is safe only because the lock above
+                // guarantees no other faucet tx is in flight — otherwise this
+                // could rewind beneath one and mint a duplicate nonce.
+                if let Some(chain_nonce) = state
+                    .balances
+                    .lock()
+                    .await
+                    .get(&hex::encode(wallet.address().0))
+                    .map(|b| b.nonce)
+                {
+                    if *next_nonce != chain_nonce {
+                        warn!(
+                            "faucet nonce resync after rejection: {} -> {} (chain)",
+                            *next_nonce, chain_nonce
+                        );
+                        *next_nonce = chain_nonce;
+                    }
+                }
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "error": "faucet dispense rejected",
+                    "detail": reason,
+                    "address": req.address,
+                })));
+            }
+            TxVerdict::Unconfirmed => {
+                // Ambiguous, and the ONLY case where we consume optimistically.
+                // The tx is queued and will most likely be admitted; if we did
+                // not advance the nonce and it lands, the next dispense would
+                // reuse a spent nonce and fail. If it turns out to have been
+                // rejected, the resync above repairs the drift on the next
+                // attempt. The claim slot is NOT spent, so the caller keeps
+                // their epoch claim either way.
+                *next_nonce += 1;
+                return (StatusCode::ACCEPTED, Json(serde_json::json!({
+                    "success": false,
+                    "detail": "queued but not yet confirmed (node busy); it may still be \
+                               dispensed — check /balance before retrying",
+                    "address": req.address,
+                    "tx_hash": tx_hash,
+                })));
+            }
+            TxVerdict::QueueFull | TxVerdict::NodeStopping => {
+                // Never queued — consume NOTHING (retryable).
                 return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
                     "error": "faucet temporarily unavailable",
                     "detail": "node is busy; retry shortly",
@@ -1899,17 +2007,49 @@ async fn submit_job(
         }
     }
 
-    if state.tx_sender.try_send(RpcTxRequest::fire(tx.clone())).is_err() {
-        return err(StatusCode::SERVICE_UNAVAILABLE, "node busy; retry");
+    // Wait for the real verdict. This previously answered `accepted: true` on a
+    // successful queue, so a job whose transaction the gate then rejected was
+    // reported as submitted — after the chunks had already been published to DA
+    // and advertised to the network. The submitter had no way to learn their job
+    // would never run.
+    let tx_hash = hex::encode(tx.hash().0);
+    let da_root = hex::encode(att.da_root);
+    match submit_awaiting_verdict(&state, tx).await {
+        TxVerdict::Admitted => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "accepted": true,
+                "da_root": da_root,
+                "tx_hash": tx_hash,
+            })),
+        ),
+        TxVerdict::Rejected(reason) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "accepted": false,
+                "error": "job transaction rejected",
+                "detail": reason,
+                "da_root": da_root,
+                "tx_hash": tx_hash,
+            })),
+        ),
+        TxVerdict::Unconfirmed => (
+            // Queued, outcome unknown. NOT a rejection — the DA chunks are
+            // already published, so a resubmit is wasteful; poll instead.
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "accepted": false,
+                "detail": "queued but not yet confirmed (node busy); the job may still be \
+                           admitted — poll the job status before resubmitting",
+                "da_root": da_root,
+                "tx_hash": tx_hash,
+            })),
+        ),
+        TxVerdict::QueueFull => err(StatusCode::SERVICE_UNAVAILABLE, "node busy; retry"),
+        TxVerdict::NodeStopping => {
+            err(StatusCode::INTERNAL_SERVER_ERROR, "node stopped before confirming the job")
+        }
     }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "accepted": true,
-            "da_root": hex::encode(att.da_root),
-            "tx_hash": hex::encode(tx.hash().0),
-        })),
-    )
 }
 
 /// cors_middleware is applied as the OUTERMOST layer (over the whole merged app)
@@ -3104,6 +3244,162 @@ mod tests {
     /// The inert faucet substrate builds a valid, signed 1-COMME Transfer with the
     /// requested nonce, MINIMUM_FEE, and correct recipient. Verifies the exact
     /// building block the D6 dispenser will queue once a faucet wallet is wired.
+    // ── /faucet now waits for the REAL verdict ────────────────────────────────
+    //
+    // The bug these pin: /faucet answered "1 COMME dispensed" the instant the tx
+    // was QUEUED, consuming the caller's one-per-epoch claim slot and the faucet
+    // nonce in the same breath. A dispense the gate then rejected was invisible
+    // AND unretryable. What matters is not just the status code — it is which
+    // side effects survive each verdict.
+
+    /// Stand in for the event loop: take one request and answer with `verdict`.
+    fn fake_event_loop(
+        mut rx: mpsc::Receiver<RpcTxRequest>,
+        verdict: Result<(), String>,
+    ) -> tokio::task::JoinHandle<Option<Transaction>> {
+        tokio::spawn(async move {
+            let req = rx.recv().await?;
+            if let Some(reply) = req.reply {
+                let _ = reply.send(verdict);
+            }
+            Some(req.tx)
+        })
+    }
+
+    /// `Wallet` is deliberately not `Clone` (it holds signing material), so the
+    /// generated wallet is MOVED into the state and its address returned for
+    /// assertions.
+    fn state_with_faucet() -> (Arc<RpcState>, mpsc::Receiver<RpcTxRequest>, Address) {
+        let (state, rx) = make_rpc_state();
+        let wallet = Wallet::generate();
+        let faucet_addr = *wallet.address();
+        // make_rpc_state builds an Arc; rebuild with the faucet wired in.
+        let mut inner = Arc::try_unwrap(state).ok().expect("sole owner of the test state");
+        inner.faucet_wallet = Some(wallet);
+        (Arc::new(inner), rx, faucet_addr)
+    }
+
+    async fn call_faucet(state: &Arc<RpcState>, address: &str) -> (StatusCode, serde_json::Value) {
+        let (code, Json(body)) = faucet(
+            State(state.clone()),
+            Json(FaucetRequest { address: address.to_string() }),
+        )
+        .await;
+        (code, body)
+    }
+
+    /// THE FIX. A rejected dispense must leave the caller able to try again:
+    /// no claim slot spent, no nonce burned, and the real reason surfaced.
+    #[tokio::test]
+    async fn faucet_rejection_consumes_neither_claim_slot_nor_nonce() {
+        let (state, rx, _w) = state_with_faucet();
+        let addr = "11".repeat(32);
+        let loop_task = fake_event_loop(rx, Err("insufficient fee for account creation".into()));
+
+        let (code, body) = call_faucet(&state, &addr).await;
+        loop_task.await.unwrap();
+
+        assert_eq!(code, StatusCode::BAD_REQUEST, "a rejection must not read as success");
+        assert_eq!(body["detail"], "insufficient fee for account creation",
+            "the real gate reason must reach the caller, not vanish into a log");
+        assert!(
+            !state.faucet_claims.lock().await.contains_key(&addr),
+            "REGRESSION: the epoch claim slot was spent on a dispense that never happened"
+        );
+        assert_eq!(
+            *state.faucet_next_nonce.lock().await, 0,
+            "REGRESSION: a rejected tx burned a nonce; apply requires an exact match, so a \
+             gap bricks every later dispense"
+        );
+    }
+
+    /// Serve a SEQUENCE of verdicts, so one test can make several calls.
+    fn fake_event_loop_seq(
+        mut rx: mpsc::Receiver<RpcTxRequest>,
+        verdicts: Vec<Result<(), String>>,
+    ) -> tokio::task::JoinHandle<Vec<Transaction>> {
+        tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for v in verdicts {
+                match rx.recv().await {
+                    Some(req) => {
+                        if let Some(reply) = req.reply {
+                            let _ = reply.send(v);
+                        }
+                        seen.push(req.tx);
+                    }
+                    None => break,
+                }
+            }
+            seen
+        })
+    }
+
+    /// The property a user actually cares about: a rejected dispense can simply
+    /// be tried again, and the retry succeeds — same address, same epoch, and
+    /// crucially the SAME nonce, because the failed attempt burned nothing.
+    #[tokio::test]
+    async fn faucet_retry_after_rejection_succeeds_and_reuses_the_nonce() {
+        let (state, rx, _w) = state_with_faucet();
+        let addr = "22".repeat(32);
+        let loop_task =
+            fake_event_loop_seq(rx, vec![Err("transient gate rejection".into()), Ok(())]);
+
+        let (first, _) = call_faucet(&state, &addr).await;
+        assert_eq!(first, StatusCode::BAD_REQUEST);
+        assert!(
+            !state.faucet_claims.lock().await.contains_key(&addr),
+            "the address must still be allowed to claim this epoch"
+        );
+
+        let (second, body) = call_faucet(&state, &addr).await;
+        assert_eq!(second, StatusCode::OK, "the retry must be allowed and must succeed");
+        assert_eq!(body["success"], true);
+
+        let sent = loop_task.await.unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            sent[0].nonce, sent[1].nonce,
+            "the rejected attempt must not have consumed the nonce, so the retry reuses it"
+        );
+        assert_eq!(*state.faucet_next_nonce.lock().await, 1, "only the success advances it");
+    }
+
+    /// A successful dispense DOES consume both — otherwise the per-epoch limit
+    /// is meaningless and the nonce desyncs.
+    #[tokio::test]
+    async fn faucet_success_consumes_claim_slot_and_advances_nonce() {
+        let (state, rx, _w) = state_with_faucet();
+        let addr = "33".repeat(32);
+        let loop_task = fake_event_loop(rx, Ok(()));
+
+        let (code, body) = call_faucet(&state, &addr).await;
+        let sent = loop_task.await.unwrap().expect("a tx must have been submitted");
+
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["success"], true);
+        assert_eq!(sent.nonce, 0, "the first dispense must use the starting nonce");
+        assert!(state.faucet_claims.lock().await.contains_key(&addr));
+        assert_eq!(*state.faucet_next_nonce.lock().await, 1);
+    }
+
+    /// A second claim in the same epoch is still refused after the fix.
+    #[tokio::test]
+    async fn faucet_still_enforces_one_claim_per_epoch() {
+        let (state, rx, _w) = state_with_faucet();
+        let addr = "44".repeat(32);
+        let loop_task = fake_event_loop(rx, Ok(()));
+        let (first, _) = call_faucet(&state, &addr).await;
+        loop_task.await.unwrap();
+        assert_eq!(first, StatusCode::OK);
+
+        // No event loop this time: if the per-epoch check did not short-circuit,
+        // this would hang on the verdict instead of returning immediately.
+        let (second, body) = call_faucet(&state, &addr).await;
+        assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+        assert!(body["error"].as_str().unwrap().contains("already claimed"));
+    }
+
     #[test]
     fn build_faucet_transfer_makes_valid_signed_1_comme() {
         let faucet = Wallet::generate();
