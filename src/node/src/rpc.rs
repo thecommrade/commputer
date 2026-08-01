@@ -869,9 +869,33 @@ async fn get_pending_rewards(
     State(state): State<Arc<RpcState>>,
     Path(address): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Canonical lock order (see RpcState): status before balances.
+    // Canonical lock order (see RpcState): status → balances → chain_health.
     let status = state.status.lock().await;
     let balances = state.balances.lock().await;
+    let chain_health = state.chain_health.lock().await;
+
+    // Registered is NOT the same as able to earn. `is_validator` is set by any
+    // ValidatorRegister tx, and registration is free and automatic at every
+    // boot — but while the alpha allowlist is in force, only pinned addresses
+    // are ever selected to produce, so everyone else earns exactly zero.
+    // Counting registrations here would (a) tell a stranger's node it is owed a
+    // fortune it can never receive, and (b) divide the real earners' estimate by
+    // a number any passer-by can inflate. Both get worse, not better, once the
+    // figure is the true six-digit one.
+    let eligible = |addr_hex: &str, is_validator: bool| -> bool {
+        if !is_validator {
+            return false;
+        }
+        if !crate::testnet_genesis::pin_is_active() {
+            // Allowlist retired: eligibility is bonded stake, which this
+            // snapshot does not carry. Fall back to registration and say so in
+            // the response rather than silently guessing.
+            return true;
+        }
+        commputer_core::identity::Address::from_hex(addr_hex)
+            .map(|a| crate::testnet_genesis::is_pinned_validator(&a))
+            .unwrap_or(false)
+    };
 
     if let Some(info) = balances.get(&address) {
         if !info.is_validator {
@@ -883,30 +907,74 @@ async fn get_pending_rewards(
                 "note": "address is not a validator",
             })));
         }
-        // Estimate based on equal share among validators.
-        let validator_count = balances.values().filter(|b| b.is_validator).count().max(1);
-        // QC-006: this read `100 COMME/day` from a literal, which was never the
-        // emission schedule and was wrong by ~6,850x at era 0 — the endpoint told
-        // an operator ~33 COMME/day where the chain actually pays ~228,310. It is
-        // a public, key-free route, so explorers and anyone sizing hardware got
-        // that number. Derive it from the real halving schedule instead; the
-        // helper already existed and had no callers, while the startup banner
-        // used the true schedule — so the log and the API disagreed on one machine.
-        let emission = commputer_consensus::emission::EmissionSchedule::new();
-        let estimated_reward =
-            emission.per_validator_daily_rate(status.height, validator_count as u64);
+        if !eligible(&address, true) {
+            return (StatusCode::OK, Json(serde_json::json!({
+                "address": address,
+                "estimated_reward": 0,
+                "composite_score": 0,
+                "epoch": status.epoch,
+                "note": "registered, but not in the active consensus set — \
+                         this address is never selected to produce and earns nothing",
+            })));
+        }
+        let validator_count = balances
+            .iter()
+            .filter(|(addr, b)| eligible(addr, b.is_validator))
+            .count()
+            .max(1);
+
+        // QC-006: this read `100 COMME/day` from a literal that was never the
+        // emission schedule — wrong by ~6,850x at era 0, on a public key-free
+        // route that operator.html points new operators at.
+        //
+        // Derived from two MEASURED inputs rather than one literal replacing
+        // another. `block_reward` is the chain's own single source of truth for
+        // issuance. Blocks-per-day comes from the health monitor's observed
+        // `avg_block_time`, NOT from the 2s target: 2s is a floor
+        // (`min_block_interval_secs`) and consensus rounds only add to it, so
+        // any constant derived from the target overstates issuance — the repo's
+        // own 2026-07-30 measurement put real blocks nearer 2.4s, i.e. ~20% fewer
+        // per day than the 43,200 a 2s assumption gives.
+        // (`EmissionSchedule::per_validator_daily_rate` hardcodes that 43,200 and
+        // is therefore off by the same margin wherever it is used — see the QC
+        // ledger. Not fixed here; that helper also feeds the startup banner and
+        // deserves its own change.)
+        let avg_block_time = chain_health
+            .get("avg_block_time")
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(2.0);
+        let blocks_per_day = (86_400.0 / avg_block_time) as u64;
+        let estimated_reward = commputer_core::token::block_reward(status.height)
+            .saturating_mul(blocks_per_day)
+            / validator_count as u64;
 
         (StatusCode::OK, Json(serde_json::json!({
             "address": address,
             "estimated_reward": estimated_reward,
-            "estimated_reward_basis": "per-validator share of the halving-schedule \
-                                       emission at the current height, equal-weighted",
+            // Say what the number is NOT, too. The chain pays 100% of the block
+            // reward to the producer and selects producers by STAKE WEIGHT, so an
+            // equal split is only correct while bonds are equal — true of the
+            // three founder nodes today and false the moment stakes diverge.
+            "estimated_reward_basis": "equal split of observed-rate emission among the \
+                                       active consensus set; the chain actually pays 100% \
+                                       to each block's producer and selects producers by \
+                                       stake weight, so this is an equal-stake approximation",
             "block_reward": commputer_core::token::block_reward(status.height),
+            "avg_block_time_secs": avg_block_time,
+            "blocks_per_day": blocks_per_day,
+            "eligible_validators": validator_count,
             "height": status.height,
-            // STILL A PLACEHOLDER, deliberately left as one. There is no
-            // composite scoring anywhere in the node, so any value here is
-            // invented; replacing the literal with a computed-looking
-            // expression would only make the fiction harder to notice.
+            // STILL A PLACEHOLDER, deliberately left as one — but note the
+            // precise reason, because an earlier draft of this comment claimed
+            // composite scoring does not exist and that is FALSE.
+            // `EpochProofSummary::composite_score` (core/src/proof.rs) is real,
+            // is called from consensus/src/anchor.rs, and is summed into every
+            // epoch summary in the event loop. What is missing is only the
+            // plumbing: RpcState carries proof_leaderboard and
+            // validator_performance, not per-address epoch summaries. So this
+            // is wired-up work, not invention — which is exactly why the wrong
+            // comment was worth correcting rather than deleting.
             "composite_score": 100,
             "epoch": status.epoch,
             "validator_count": validator_count,
@@ -2469,11 +2537,20 @@ mod tests {
     /// by ~6,850x, which is exactly how the defect survived on a public route.
     #[tokio::test]
     async fn rewards_are_derived_from_the_emission_schedule_not_a_literal() {
+        // Must be an address that can actually EARN. An arbitrary string here
+        // now lands in the not-in-the-consensus-set branch — which is how the
+        // first version of this test failed, and a fair sign the old fixture
+        // was describing a node that never existed.
+        let addr: String = crate::testnet_genesis::ALPHA_PINNED_VALIDATORS
+            .first()
+            .map(|s| (*s).to_string())
+            .unwrap_or_else(|| "ab".repeat(32)); // pin retired: any registrant is eligible
+
         let (state, _rx) = make_rpc_state();
         state.balances.lock().await.insert(
-            "abc".to_string(),
+            addr.clone(),
             BalanceInfo {
-                address: "abc".to_string(),
+                address: addr.clone(),
                 balance: 0,
                 tier: "standard".to_string(),
                 nonce: 0,
@@ -2487,7 +2564,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/rewards/abc")
+                    .uri(format!("/rewards/{addr}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2499,19 +2576,71 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let got = v["estimated_reward"].as_u64().unwrap();
 
-        // The harness pins height 42, so era 0: one validator earns the whole
-        // per-day emission.
-        let expected = commputer_consensus::emission::EmissionSchedule::new()
-            .per_validator_daily_rate(42, 1);
-        assert_eq!(got, expected, "must track the halving schedule");
+        // Read the height back out of the response rather than restating the
+        // harness's 42, so bumping the shared fixture cannot fail this test with
+        // a bare numeric mismatch.
+        let height = v["height"].as_u64().unwrap();
+        let bpd = v["blocks_per_day"].as_u64().unwrap();
+        let expected = commputer_core::token::block_reward(height) * bpd / 1;
+        assert_eq!(got, expected, "must be block_reward x observed blocks/day");
 
+        // The real regression guard: never again the literal.
         let old_literal = 100u64 * commputer_core::token::UNITS_PER_COMME;
         assert_ne!(got, old_literal, "regressed to the hardcoded 100 COMME/day");
-        assert!(
-            got > old_literal * 1000,
-            "era-0 emission dwarfs the old literal; got {got}, literal {old_literal}"
+
+        // Blocks/day must come from the MEASURED average, not the 2s target.
+        // Default fixture has no block samples, so the monitor's own 2.0s
+        // fallback applies — assert we consumed it rather than a constant.
+        let avg = v["avg_block_time_secs"].as_f64().unwrap();
+        assert!(avg > 0.0 && avg.is_finite(), "block time must be usable");
+        assert_eq!(bpd, (86_400.0 / avg) as u64, "blocks/day must follow the observed rate");
+        assert_eq!(v["eligible_validators"].as_u64().unwrap(), 1);
+    }
+
+    /// QC-006 follow-up: registration is free and automatic, but while the alpha
+    /// allowlist is in force only pinned addresses ever produce. An unpinned
+    /// registrant must be told zero — the previous behaviour quoted it a full
+    /// validator's income, and correcting the emission figure made that lie
+    /// ~6,850x larger on the endpoint operator.html sends newcomers to.
+    #[tokio::test]
+    async fn an_unpinned_registrant_is_told_it_earns_nothing() {
+        if !crate::testnet_genesis::pin_is_active() {
+            return; // allowlist retired; eligibility is stake and this case is moot
+        }
+        let (state, _rx) = make_rpc_state();
+        state.balances.lock().await.insert(
+            "dead".repeat(16),
+            BalanceInfo {
+                address: "dead".repeat(16),
+                balance: 0,
+                tier: "standard".to_string(),
+                nonce: 0,
+                is_validator: true,
+                total_mined: 0,
+            },
         );
-        assert_eq!(v["height"].as_u64().unwrap(), 42);
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/rewards/{}", "dead".repeat(16)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["estimated_reward"].as_u64().unwrap(),
+            0,
+            "a registrant outside the consensus set earns nothing and must be told so"
+        );
+        assert!(v["note"].as_str().unwrap().contains("consensus set"));
     }
 
     /// W5.7 F-1: oversized Batch should be rejected by validate_shape
