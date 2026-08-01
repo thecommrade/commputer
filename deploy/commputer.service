@@ -13,11 +13,25 @@ Restart=on-failure
 RestartSec=10
 LimitNOFILE=65535
 
+# The node derives EVERY path from $HOME — config.rs commputer_dir() is
+# `dirs::home_dir()/.commputer` and there is no CLI flag or env override for it.
+# ProtectHome=read-only below makes the service user's real home read-only, so
+# without this override the node cannot create its data or wallet directory. That
+# failure is silent: ensure_dirs() discards the mkdir error (`let _ = ...`), so the
+# node starts and then fails later with something unrelated-looking. Pointing HOME
+# at the state directory puts the data under /var/lib/commputer/.commputer, which
+# StateDirectory= makes writable.
+Environment=HOME=/var/lib/commputer
+WorkingDirectory=/var/lib/commputer
+
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/commputer
+# Creates /var/lib/commputer owned by User= at start and grants write access to it.
+# Preferred over a bare ReadWritePaths=, which REFUSES TO START if the directory
+# does not exist yet — the state of a fresh install.
+StateDirectory=commputer
 PrivateTmp=true
 
 # Logging

@@ -352,14 +352,27 @@ ExecStart=/usr/local/bin/commputer run --testnet --port 9000 --rpc-port 9944
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65535
+Environment=HOME=/var/lib/commputer
+WorkingDirectory=/var/lib/commputer
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/commputer
+StateDirectory=commputer
 ```
 
-Adjust `User`/`ReadWritePaths`. If you run as a system user the wallet/data
-directories must live under `/var/lib/commputer`, not `/root/.commputer`.
+**`Environment=HOME=` is required, not optional.** The node derives every path from
+`$HOME` (data and wallet both live under `$HOME/.commputer`) and has no CLI flag or
+environment variable to relocate them. `ProtectHome=read-only` makes the service
+user's real home read-only, so without the `HOME` override the node cannot create
+its data or wallet directory — and it does not report that clearly, because the
+directory-creation error is discarded and the node fails later with an unrelated
+message. Setting `HOME` puts everything under `/var/lib/commputer/.commputer`.
+
+`StateDirectory=commputer` creates `/var/lib/commputer` owned by `User=` on start and
+makes it writable. Prefer it over a bare `ReadWritePaths=`, which refuses to start
+when the directory does not exist yet — the state of a fresh install.
+
+If you change `User=`, keep `HOME` pointed at a directory that user can write.
 
 Set `COMMPUTER_WALLET_PASSWORD` via a `EnvironmentFile=` referencing a
 `chmod 600` file. Never put the password directly in the unit file.

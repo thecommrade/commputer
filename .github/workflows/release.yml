@@ -6,10 +6,12 @@
 #   `commputer` alpha binaries, checksums them, and publishes a GitHub Release
 #   with the binaries + a combined SHA-256 manifest attached as assets.
 #
-# INSTALL TO
-#   .github/workflows/release.yml  — in the PUBLIC (airlocked) repo
-#   (github.com/thecommrade/commputer). It is NOT wired into the working repo;
-#   this file lives in src/staging/ops/ as the reviewable source.
+# WHERE THIS LIVES
+#   THIS file (.github/workflows/release.yml) is the LIVE one — it is what runs on
+#   a tag push, in this repo and in the PUBLIC airlocked mirror
+#   (github.com/thecommrade/commputer). A historical copy also sits in
+#   src/staging/ops/release.yml; that copy is NOT authoritative and may be stale.
+#   Edit this file, not that one.
 #
 # COMPLEMENTS (does not replace)
 #   - .github/workflows/ci.yml   → per-push/PR test CI (build + test + clippy + fmt)
@@ -33,13 +35,21 @@
 # HONEST ALPHA FRAMING (surfaced in the release notes below, keep it truthful)
 #   L1 consensus is LIVE, and as of 2026-07-18 PoUW PAYS OUT on a live multi-node
 #   testbed (executor/verifier/DA actors landed; on-chain EscalationRound landed
-#   2026-07-19). Consensus resets to chain-id `commputer-testnet-3` for this
-#   release. Expect genesis RESETS / state wipes between versions regardless —
-#   this is still an untested alpha. Do not oversell, do not treat it as money.
+#   2026-07-19). Genesis RESETS / state wipes can happen between versions — this is
+#   still an untested alpha. Do not oversell, do not treat it as money.
+#
+#   ⚠ PER-VERSION FACTS DO NOT BELONG IN THIS FILE. Whether a given release resets
+#   state, and what it changed, goes in docs/release-notes/<TAG>.md, which the
+#   release step appends to the notes. A version-specific claim written inline here
+#   silently keeps shipping on every LATER release and becomes a false statement to
+#   operators — which is exactly what happened: this block asserted "Consensus resets
+#   to chain-id commputer-testnet-3 for this release" long after that reset, and
+#   alpha.7 does not reset at all.
 #
 # VERSION SOURCE OF TRUTH
-#   src/Cargo.toml  →  [workspace.package] version = "0.1.0-alpha.1"
-#   First alpha tag: v0.1.0-alpha.1  (tag == "v" + that version; enforced below).
+#   src/Cargo.toml  →  [workspace.package] version   (do NOT restate the value here;
+#   it goes stale. The verify-version job below reads it and requires tag == "v" +
+#   that version, so the manifest is the single authority.)
 #
 # CRATE / BIN
 #   Package + binary name: `commputer` (src/node/Cargo.toml). Workspace root is
