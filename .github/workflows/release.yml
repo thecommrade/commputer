@@ -233,17 +233,34 @@ jobs:
           Automated alpha release built from tag \`${TAG}\`.
 
           ## ⚠ Honest alpha status — read before you join
-          - **Coordinated-upgrade network.** No cross-version compatibility. Expect
-            **genesis RESETS / state wipes** between versions — balances do not carry over.
-            This release resets consensus to chain-id \`commputer-testnet-3\`.
+          - **Coordinated-upgrade network.** No cross-version compatibility: every node on
+            the network must run the SAME release. Genesis RESETS / state wipes can happen
+            between versions — when a release does reset, it is stated explicitly under
+            "What's new" below and balances do not carry over. Chain-id: \`commputer-testnet-3\`.
           - **L1 consensus is LIVE, and PoUW now PAYS OUT.** Live multi-node payout was
             proven 2026-07-18 (executor / verifier / DA actors landed) and the on-chain
             EscalationRound (second-round dispute resolution) landed 2026-07-19. PoUW
             jobs submit, claim, verify, and settle for real — this is still an
             **untested alpha network**, not production money.
-          - Some RPC/P2P hardening (producer-signature enforcement, vote aggregator,
-            mempool quota, faucet) lands at the reset — before that the surface is
-            partially unhardened. This is a test network. Do not treat it as money.
+          - **Only partially hardened.** Producer-signature enforcement, the vote
+            aggregator, mempool quotas and faucet limits are in place, but the RPC/P2P
+            surface is still being hardened release by release, and the validator set is
+            still restricted to the founder nodes. This is a test network. Do not treat
+            it as money.
+          EOF
+
+          # Per-release specifics — what actually changed, and whether THIS release
+          # resets state — live in docs/release-notes/<TAG>.md. They are deliberately
+          # kept out of the static boilerplate above: a version-specific claim written
+          # inline outlives the release it described and silently becomes a false
+          # statement to operators on every later tag.
+          if [ -f "docs/release-notes/${TAG}.md" ]; then
+            { echo; cat "docs/release-notes/${TAG}.md"; } >> release-notes.md
+          else
+            echo "::warning::no docs/release-notes/${TAG}.md — publishing without a What's-new section"
+          fi
+
+          cat >> release-notes.md <<EOF
 
           ## Assets
           - \`commputer-linux-x86_64\` — GNU/Linux x86_64 (primary, required)
