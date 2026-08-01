@@ -4,18 +4,29 @@
 
 Get a node running and mining $COMME immediately:
 
-```bash
-# 1. Build the node
-cd ~/Coin/src
-cargo build --release -p commputer-node
-cd ../..
+The fastest path is the installer — it fetches a verified binary for your platform:
 
-# 2. Create a wallet (saves to ~/.commputer/keystore.json)
-./target/release/commputer-node wallet create
+```bash
+curl -sSf https://commputer.xyz/install.sh | sh
+
+# Create a wallet (encrypted keystore at ~/.commputer/keystore.json)
+commputer wallet create
 # You will be prompted for a password. Save your 24-word seed phrase securely.
 
-# 3. Start the node (runs testnet by default)
-./target/release/commputer-node run --port 9000 --rpc-port 9944 --contribution-percent 100
+# Start the node (testnet)
+commputer run --testnet --port 9000 --rpc-port 9944 --contribution-percent 100
+```
+
+To build from source instead:
+
+```bash
+git clone https://github.com/thecommrade/commputer.git
+cd commputer/src
+cargo build --release -p commputer          # workspace root is src/
+
+# The binary lands at src/target/release/commputer
+./target/release/commputer wallet create
+./target/release/commputer run --testnet --port 9000 --rpc-port 9944 --contribution-percent 100
 ```
 
 **That's it.** Your node is now:
@@ -55,23 +66,30 @@ Note: Hardware beyond the reference node ceiling provides diminishing returns du
 
 ```bash
 # Build from source
-cd Coin/src
-cargo build --release -p commputer-node
+git clone https://github.com/thecommrade/commputer.git
+cd commputer/src                 # the cargo workspace root is src/, not the repo root
+cargo build --release -p commputer
 
-# Binary at target/release/commputer-node
+# Binary at src/target/release/commputer
+```
+
+Or install a prebuilt, checksum-verified binary:
+
+```bash
+curl -sSf https://commputer.xyz/install.sh | sh
 ```
 
 ## Initial Setup
 
 ### 1. Create a Wallet
 ```bash
-commputer-node wallet create
+commputer wallet create
 ```
 Save the 24-word seed phrase securely. The encrypted keystore is saved to `~/.commputer/keystore.json`.
 
 ### 2. Start the Node
 ```bash
-commputer-node run \
+commputer run \
   --port 9000 \
   --rpc-port 9944 \
   --contribution-percent 100
@@ -85,13 +103,17 @@ The node will:
 - Begin block production and proof challenges
 
 ### 3. Connect to Seeds
+The node already defaults to the public testnet seed, so this is only needed to
+point at a different one:
+
 ```bash
-commputer-node run --seeds "/ip4/1.2.3.4/tcp/9000/p2p/12D3KooW..."
+commputer run --testnet --seeds "seed.commputer.xyz:9000"
 ```
 
-Or via DNS seeds:
+A multiaddr works too, if you have one for a specific peer:
+
 ```bash
-commputer-node run --dns-seeds "seed1.commputer.network,seed2.commputer.network"
+commputer run --testnet --seeds "/ip4/1.2.3.4/tcp/9000/p2p/12D3KooW..."
 ```
 
 ## Configuration
@@ -142,7 +164,11 @@ curl http://127.0.0.1:9944/storage/metrics
 ## Data Directories
 
 - **Keystore**: `~/.commputer/keystore.json`
-- **Chain data**: `commputer-testnet/` (RocksDB, relative to working directory)
+- **Chain data**: `~/.commputer/testnet/` (RocksDB). Mainnet would use
+  `~/.commputer/mainnet/`. Both are derived from `$HOME`, NOT from the working
+  directory — see `config.rs::data_dir`. If you run the node as a system user under
+  systemd, set `Environment=HOME=` to a writable path or the node cannot create these
+  (see `deploy/commputer.service`).
 
 ## Troubleshooting
 
@@ -173,7 +199,7 @@ curl http://127.0.0.1:9944/storage/metrics
 
 ### RocksDB corruption
 - RocksDB uses WAL with PointInTime recovery
-- On corruption, delete the `commputer-testnet/` directory and resync
+- On corruption, delete `~/.commputer/testnet/` and resync from peers
 
 ## Graceful Shutdown
 

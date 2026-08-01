@@ -46,11 +46,11 @@ VPS providers put hundreds of nodes in the same /16 subnet. The eclipse attack d
 
 ```bash
 # Clone the repository
-git clone https://github.com/commputer-xyz/commputer.git
-cd commputer
+git clone https://github.com/thecommrade/commputer.git
+cd commputer/src          # the cargo workspace root is src/, not the repo root
 
 # Build in release mode
-cargo build --release
+cargo build --release -p commputer
 
 # The binary is at:
 ./target/release/commputer
@@ -309,6 +309,6 @@ If `commputer health` shows eclipse risk, your peers are too concentrated in one
 
 ## Getting Help
 
-- GitHub Issues: https://github.com/commputer-xyz/commputer/issues
-- Documentation: https://docs.commputer.xyz
-- Community: https://commputer.xyz/community
+- GitHub Issues: https://github.com/thecommrade/commputer/issues
+- Website: https://commputer.xyz
+- Operator guide: https://commputer.xyz/operator.html

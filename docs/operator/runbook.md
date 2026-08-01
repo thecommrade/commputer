@@ -1,7 +1,7 @@
 # Commputer Validator Operator Runbook
 
-> **Status:** testnet-1 / pre-launch. Treat any "TODO" markers as items the
-> founder must finalize before this guide is shipped to operators.
+> **Status:** `commputer-testnet-3` / public alpha. Binaries are published per
+> release; see Â§3. Treat any "TODO" markers as items the founder must finalize.
 
 ---
 
@@ -16,7 +16,11 @@ ranges are flagged `NerfedIncidental` and earn drastically reduced rewards
 section below). The intended operator profile is therefore a **single home
 machine on a residential ISP**, not a rack of cloud instances.
 
-Consensus is Snowball (sample=3, quorum=2, threshold=5). Block time is **2 s**
+Consensus is Snowball. The parameters SCALE WITH THE VALIDATOR COUNT
+(`src/node/src/consensus_manager.rs`): at 3 validators it is sample=3, quorum=2,
+beta=1 — a block is final after ONE quorum round. â  The `commputer version`
+banner still prints a hardcoded `threshold=5`; that string is stale, the curve
+above is authoritative. Block time is **2 s**
 (`src/core/src/genesis.rs:40`, `testnet.toml`). Testnet epoch is **60 s**;
 mainnet epoch is **3600 s** (`commputer.toml`, `genesis.json`). Block reward
 starts at ~15.855 COMME and halves every 63,072,000 blocks
@@ -86,7 +90,13 @@ under it.
 
 ## 3. Build from source
 
-The chain ships **no binary releases yet**. Build from source.
+Prebuilt, checksum-verified binaries ARE published per release
+(https://github.com/thecommrade/commputer/releases/latest, or
+`curl -sSf https://commputer.xyz/install.sh | sh`). Building from source is still
+supported and is described below.
+
+â  Linux **aarch64** is currently NOT published â that build leg fails, so ARM
+Linux operators must build from source.
 
 ### 3.1 Install Rust
 
@@ -141,13 +151,15 @@ You should see something like:
 commputer 0.1.0 (git: <hash>)
   Built:     <date>
   Protocol:  /commputer/0.1.0
-  Chain ID:  commputer-testnet-1
+  Chain ID:  commputer-testnet-3
   Supply:    2,000,000,000 COMME
   Consensus: Snowball (sample=3, quorum=2, threshold=5)
 ```
 
-If `Chain ID` is **not** `commputer-testnet-1`, you have the wrong build —
-stop and rebuild.
+If `Chain ID` is **not** `commputer-testnet-3`, you have the wrong build —
+stop and rebuild. (The chain-id changes at a coordinated reset; it was
+`commputer-testnet-1` before the alpha reset, and this guide previously still told
+operators to expect that, so a correct build read as broken.)
 
 ---
 
@@ -208,7 +220,7 @@ CLI flags override the file. A sensible testnet config:
 ```toml
 # ~/.commputer/config.toml
 network = "testnet"
-chain_id = "commputer-testnet-1"
+chain_id = "commputer-testnet-3"
 seeds = ["seed.commputer.xyz:9000"]   # replaced by founder before launch
 port = 9000
 rpc_port = 9944
@@ -253,7 +265,7 @@ The default `genesis.json` shipped at the repository root pins:
 
 ```json
 {
-  "chain_id": "commputer-testnet-1",
+  "chain_id": "commputer-testnet-3",
   "total_supply": 200000000000000000,
   "epoch_duration_secs": 3600,
   "emission_base_rate": 10000000000,
