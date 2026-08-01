@@ -161,6 +161,51 @@ pub fn build_cycle(validators: &[Address], weights: &[u64]) -> Vec<Address> {
     cycle
 }
 
+/// The proposer for `height` after `views` view-changes, skipping to a
+/// genuinely DIFFERENT validator each time.
+///
+/// A plain `cycle[(slot + views) % W]` is wrong on a weighted cycle, and
+/// dangerously so. Weighting places a heavy validator in adjacent slots —
+/// `{5,1,1}` produces `[a,a,b,a,c,a,a]` — so advancing one slot from the first
+/// `a` lands on `a` again. A view change exists precisely because the current
+/// leader is not producing; handing the slot back to that same dead node makes
+/// it ITS OWN FALLBACK and the outage cannot be routed around. The chain would
+/// wait out repeated view timeouts on a node already known to be silent.
+///
+/// So each view advances to the next DISTINCT validator. If fewer distinct
+/// validators exist than views requested, it wraps around them — and with only
+/// one validator in the cycle it returns that one, because there is nobody
+/// else to hand off to.
+///
+/// Bounded: at most one lap of the cycle, then modular arithmetic.
+pub fn proposer_after_views(cycle: &[Address], height: u64, views: usize) -> Option<Address> {
+    let n = cycle.len();
+    if n == 0 {
+        return None;
+    }
+    let start = (height % n as u64) as usize;
+    let current = cycle[start];
+    if views == 0 {
+        return Some(current);
+    }
+    // Distinct validators following `start`, in cycle order.
+    let mut distinct: Vec<Address> = Vec::new();
+    for step in 1..=n {
+        let cand = cycle[(start + step) % n];
+        if cand != current && !distinct.contains(&cand) {
+            distinct.push(cand);
+            if distinct.len() == views {
+                return Some(cand);
+            }
+        }
+    }
+    if distinct.is_empty() {
+        // Only one validator appears in the cycle: nobody to fall back to.
+        return Some(current);
+    }
+    Some(distinct[(views - 1) % distinct.len()])
+}
+
 /// The proposer for `height`, stake-weighted. `None` if there is no set.
 pub fn proposer_for_height(height: u64, validators: &[Address], stakes: &[u64]) -> Option<Address> {
     let weights = scale_weights(stakes);
@@ -293,6 +338,78 @@ mod tests {
         let vs = vec![addr(1), addr(2)];
         let cycle = build_cycle(&vs, &w);
         assert!(cycle.contains(&addr(2)), "the small holder must still appear");
+    }
+
+    /// THE HAZARD, pinned. On a weighted cycle a heavy validator occupies
+    /// adjacent slots, so a naive one-slot view advance hands the round back to
+    /// the very node that just failed to produce — it becomes its own fallback
+    /// and the outage cannot be routed around.
+    #[test]
+    fn a_view_change_never_hands_the_slot_back_to_the_same_validator() {
+        let vs = vec![addr(1), addr(2), addr(3)];
+        let cycle = build_cycle(&vs, &[5, 1, 1]);
+        assert_eq!(cycle[0], cycle[1], "precondition: the heavy validator IS adjacent to itself");
+
+        for h in 0..cycle.len() as u64 {
+            let primary = proposer_after_views(&cycle, h, 0).unwrap();
+            let naive = cycle[((h as usize) + 1) % cycle.len()];
+            let first_fallback = proposer_after_views(&cycle, h, 1).unwrap();
+
+            assert_ne!(
+                first_fallback, primary,
+                "height {h}: view 1 returned the SAME validator — a dead leader would be its own \
+                 fallback"
+            );
+            // And demonstrate the naive rule really would have failed here.
+            if naive == primary {
+                assert_ne!(first_fallback, naive, "height {h}: must not repeat the naive mistake");
+            }
+        }
+    }
+
+    /// Successive views must keep advancing through DIFFERENT validators, so a
+    /// second outage is also routed around.
+    #[test]
+    fn successive_views_walk_through_distinct_validators() {
+        let vs = vec![addr(1), addr(2), addr(3)];
+        let cycle = build_cycle(&vs, &[5, 1, 1]);
+        let a = proposer_after_views(&cycle, 0, 0).unwrap();
+        let b = proposer_after_views(&cycle, 0, 1).unwrap();
+        let c = proposer_after_views(&cycle, 0, 2).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c, "three views should reach all three validators");
+    }
+
+    /// LIVE SAFETY: with equal stakes the cycle has one slot per validator, so
+    /// the view walk must reduce exactly to today's `(index + views) % n`.
+    /// Our founder nodes hold equal bonds, so the flip must not change their
+    /// view-change behaviour either — not just their primary schedule.
+    #[test]
+    fn equal_stakes_make_the_view_walk_identical_to_plain_rotation() {
+        for n in 1..=6usize {
+            let vs: Vec<Address> = (1..=n as u8).map(addr).collect();
+            let cycle = build_cycle(&vs, &scale_weights(&vec![100u64; n]));
+            assert_eq!(cycle.len(), n, "equal stakes give one slot each");
+            for h in 0..40u64 {
+                for views in 0..n {
+                    let got = proposer_after_views(&cycle, h, views).unwrap();
+                    let want = vs[((h as usize) + views) % n];
+                    assert_eq!(got, want, "n={n} h={h} views={views}");
+                }
+            }
+        }
+    }
+
+    /// A single validator has nobody to fall back to — must return itself
+    /// rather than looping forever or returning None.
+    #[test]
+    fn a_lone_validator_falls_back_to_itself_without_hanging() {
+        let cycle = vec![addr(1); 4];
+        for views in 0..5 {
+            assert_eq!(proposer_after_views(&cycle, 2, views), Some(addr(1)));
+        }
+        assert_eq!(proposer_after_views(&[], 0, 1), None, "empty cycle is safe");
     }
 
     /// Reducing weights by their GCD must not change ANY validator's share —
