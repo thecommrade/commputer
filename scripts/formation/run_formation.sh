@@ -43,14 +43,49 @@ SOAK_SET=( soak_30min )
 # Stage 1 (outside the namespace): build, then re-exec inside it.
 # --------------------------------------------------------------------------
 if [[ "${FORMATION_ISOLATED:-0}" != "1" ]]; then
-    if [[ ! -x "${NODE_BIN}" || -n "${FORCE_BUILD:-}" ]]; then
-        echo "[formation] building harness binary (--features formation-test)..."
-        ( cd "${SRC_DIR}" && CARGO_TARGET_DIR="${FORMATION_TARGET}" \
-            cargo build --release -p commputer --bin commputer --features formation-test ) || {
-            echo "[formation] BUILD FAILED" >&2; exit 2; }
-    fi
+    # ALWAYS build. Cargo is incremental, so a no-op build costs about a second.
+    #
+    # ⚠ THIS USED TO BE `if [[ ! -x "${NODE_BIN}" ]]`, which rebuilt only when the
+    # binary was MISSING — it never compared source mtimes. Every run after the
+    # first therefore tested whatever binary happened to be lying in the target
+    # dir. On 2026-08-01 that silently ran the PRE-FLIP consensus code against
+    # post-flip sources and reported PASS on the first scenario. A harness that
+    # can pass while testing code you did not write is worse than no harness at
+    # all, because it manufactures false confidence exactly when you are about to
+    # change consensus.
+    echo "[formation] building harness binary (--features formation-test)..."
+    ( cd "${SRC_DIR}" && CARGO_TARGET_DIR="${FORMATION_TARGET}" \
+        cargo build --release -p commputer --bin commputer --features formation-test ) || {
+        echo "[formation] BUILD FAILED" >&2; exit 2; }
     [[ -x "${NODE_BIN}" ]] || { echo "[formation] no binary at ${NODE_BIN}" >&2; exit 2; }
+
+    # Belt-and-suspenders: prove the binary is NEWER than every source it is
+    # built from. If cargo ever declines to rebuild (clock skew, a stale
+    # fingerprint), refuse to run rather than report a result about the wrong
+    # code.
+    #
+    # -prune the target dirs FIRST. They live under SRC_DIR and contain
+    # build-script generated .rs files (serde, typenum, thiserror, clang-sys...)
+    # that are rewritten during the very build this is checking, so scanning
+    # them made the guard fire on a perfectly fresh binary — a false alarm on a
+    # check whose only value is being trustworthy. It also walked a multi-GB
+    # tree on every run.
+    #
+    # Cargo.toml / Cargo.lock are included: a feature or dependency change alters
+    # the binary just as surely as a .rs edit does.
+    NEWEST_SRC="$(find "${SRC_DIR}" \
+        \( -path '*/target' -o -path '*/target/*' \) -prune -o \
+        \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'build.rs' \) \
+        -newer "${NODE_BIN}" -print -quit 2>/dev/null)"
+    if [[ -n "${NEWEST_SRC}" ]]; then
+        echo "[formation] STALE BINARY — ${NEWEST_SRC} is newer than ${NODE_BIN}" >&2
+        echo "[formation] refusing to run: results would describe code you did not build" >&2
+        echo "[formation] (set SKIP_FRESHNESS_CHECK=1 only if you deliberately want to run a pre-built binary)" >&2
+        [[ -n "${SKIP_FRESHNESS_CHECK:-}" ]] || exit 2
+        echo "[formation] SKIP_FRESHNESS_CHECK set — proceeding against a KNOWN-STALE binary" >&2
+    fi
     echo "[formation] binary: ${NODE_BIN} ($("${NODE_BIN}" --version 2>/dev/null | head -1))"
+    echo "[formation] binary is newer than every .rs source — verified fresh"
 
     unshare -r -n true 2>/dev/null || {
         echo "[formation] unprivileged network namespaces unavailable — REFUSING to run" >&2
