@@ -117,6 +117,71 @@ pub fn digest_hex(d: &[u8; 32]) -> String {
     hex::encode(&d[..8])
 }
 
+/// The schedule a node derives for one epoch, plus the digest proving it.
+#[derive(Debug, Clone)]
+pub struct EpochSchedule {
+    pub epoch: u64,
+    pub snapshot_height: u64,
+    /// True when no snapshot was available and we fell back to the live set.
+    pub fallback_used: bool,
+    pub validators: Vec<Address>,
+    pub stakes: Vec<u64>,
+    pub weights: Vec<u64>,
+    pub cycle: Vec<Address>,
+    pub digest: [u8; 32],
+}
+
+impl EpochSchedule {
+    /// The proposer this schedule assigns to `height`. `None` if empty.
+    pub fn proposer_for(&self, height: u64) -> Option<Address> {
+        if self.cycle.is_empty() {
+            return None;
+        }
+        Some(self.cycle[(height % self.cycle.len() as u64) as usize])
+    }
+}
+
+/// Build the schedule for `epoch` from an already-filtered eligible set.
+///
+/// The caller supplies the eligible `(address, stake)` pairs — eligibility is a
+/// rule that lives in `consensus_set`, and the stored snapshot deliberately
+/// holds the raw pool rather than a filtered set, so that rule can change
+/// without re-snapshotting the chain.
+///
+/// `eligible` MUST be in canonical (address-sorted) order: the same membership
+/// in a different order builds a different cycle, so order is part of the
+/// schedule's identity.
+pub fn build_schedule(
+    epoch: u64,
+    snapshot_height: u64,
+    fallback_used: bool,
+    eligible: &[(Address, u64)],
+) -> EpochSchedule {
+    let validators: Vec<Address> = eligible.iter().map(|(a, _)| *a).collect();
+    let stakes: Vec<u64> = eligible.iter().map(|(_, s)| *s).collect();
+    let weights = crate::weighted_schedule::scale_weights(&stakes);
+    let cycle = crate::weighted_schedule::build_cycle(&validators, &weights);
+    let digest = schedule_digest(
+        epoch,
+        snapshot_height,
+        fallback_used,
+        &validators,
+        &stakes,
+        &weights,
+        &cycle,
+    );
+    EpochSchedule {
+        epoch,
+        snapshot_height,
+        fallback_used,
+        validators,
+        stakes,
+        weights,
+        cycle,
+        digest,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +282,48 @@ mod tests {
         for (what, d) in cases {
             assert_ne!(base, d, "digest must change when {what} differs");
         }
+    }
+
+    /// A node that fell back to the live set must NEVER produce the same digest
+    /// as one reading a real snapshot, even with identical validators and
+    /// stakes. Otherwise shadow mode reports agreement between two nodes that
+    /// derived their schedule from different sources — the instrument would be
+    /// lying in exactly the case it exists to catch.
+    #[test]
+    fn a_fallback_schedule_never_matches_a_snapshot_schedule() {
+        let eligible = vec![(addr(1), 100u64), (addr(2), 100u64)];
+        let from_snapshot = build_schedule(4, 299, false, &eligible);
+        let from_fallback = build_schedule(4, 299, true, &eligible);
+        assert_ne!(
+            from_snapshot.digest, from_fallback.digest,
+            "fallback must be distinguishable from a real snapshot"
+        );
+    }
+
+    /// The built schedule must agree with the weighted-schedule module it wraps,
+    /// or shadow mode would validate a schedule nobody will actually use.
+    #[test]
+    fn build_schedule_agrees_with_the_weighted_schedule_module() {
+        let eligible = vec![(addr(1), 300u64), (addr(2), 100u64), (addr(3), 100u64)];
+        let sched = build_schedule(2, 99, false, &eligible);
+        let validators: Vec<Address> = eligible.iter().map(|(a, _)| *a).collect();
+        let stakes: Vec<u64> = eligible.iter().map(|(_, s)| *s).collect();
+        for h in 0..50u64 {
+            assert_eq!(
+                sched.proposer_for(h),
+                crate::weighted_schedule::proposer_for_height(h, &validators, &stakes),
+                "height {h}"
+            );
+        }
+    }
+
+    /// An empty eligible set must yield an empty schedule that reports no
+    /// proposer — never a panic, and never a silent index into nothing.
+    #[test]
+    fn an_empty_eligible_set_is_safe() {
+        let sched = build_schedule(1, 0, true, &[]);
+        assert!(sched.cycle.is_empty());
+        assert_eq!(sched.proposer_for(7), None);
     }
 
     /// Validator ORDER is part of the identity: two nodes that agree on

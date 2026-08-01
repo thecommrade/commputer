@@ -2437,6 +2437,20 @@ impl ChainState {
     }
 
     /// Provide read access to the underlying RocksStore (if any).
+    /// The validator POOL recorded at `epoch`'s boundary: every registered
+    /// validator and its bonded stake at that height, address-sorted.
+    ///
+    /// `None` when that epoch was never recorded — before the feature existed,
+    /// pruned, or running memory-only. Callers must treat that as "no snapshot"
+    /// and fall back explicitly; it must never be read as an empty validator
+    /// set, which would mean "nobody may propose".
+    ///
+    /// Returns the RAW pool. Eligibility (allowlist, stake floor) is a rule the
+    /// caller applies, so it can change without re-snapshotting the chain.
+    pub fn epoch_validator_pool(&self, epoch: u64) -> Option<Vec<(Address, u64)>> {
+        self.rocks.as_ref()?.get_epoch_validators(epoch)
+    }
+
     pub fn rocks(&self) -> Option<&RocksStore> {
         self.rocks.as_ref()
     }

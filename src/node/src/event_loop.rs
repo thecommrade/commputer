@@ -225,6 +225,10 @@ pub struct EventLoop {
     /// each of those calls would otherwise get a fresh cap. Reset at the top of
     /// the loop; see `requeue_lost_txs`.
     requeue_budget: usize,
+    /// Last epoch for which the shadow schedule was computed and logged.
+    /// `build_schedule` materialises the whole cycle, so it must run once per
+    /// epoch, never per height.
+    shadow_schedule_epoch: Option<u64>,
     /// Local height at the last stall-triggered NON-destructive sync re-engage.
     /// One re-engage attempt per height: a second stall at the same height means
     /// sync gained nothing (fork shape) and recovery escalates to the
@@ -331,6 +335,7 @@ impl EventLoop {
             stall_start: None,
             block_request_at: HashMap::new(),
             requeue_budget: Self::REQUEUE_BUDGET_PER_TURN,
+            shadow_schedule_epoch: None,
             stall_reengage_height: u64::MAX,
             last_resync: None,
             peer_last_seen: HashMap::new(),
@@ -2475,6 +2480,79 @@ impl EventLoop {
         true
     }
 
+    /// SHADOW MODE for the stake-weighted proposer schedule.
+    ///
+    /// Once per schedule-epoch, derive the schedule from the SNAPSHOT taken two
+    /// epochs back and log its digest. Nothing consumes the result: production
+    /// and voting still use the existing round-robin. This exists so that when
+    /// we do flip, we already know every node agrees — a digest mismatch in the
+    /// logs is a disagreement we would otherwise only discover as a fork.
+    ///
+    /// Recomputed only when the epoch changes: `build_schedule` materialises the
+    /// whole cycle (up to MAX_CYCLE_LEN entries), which must not run per height.
+    fn log_shadow_schedule(&mut self) {
+        let height = self.state.blocks.height();
+        let epoch = commputer::schedule_epoch::epoch_of(height);
+        if self.shadow_schedule_epoch == Some(epoch) {
+            return;
+        }
+
+        let snapshot_height = commputer::schedule_epoch::snapshot_height_for(epoch);
+        let snapshot_epoch = snapshot_height / commputer::schedule_epoch::EPOCH_BLOCKS;
+        let pool = self.state.epoch_validator_pool(snapshot_epoch);
+        let fallback_used = pool.is_none();
+
+        // No snapshot for that epoch (too early in the chain's life, pruned, or
+        // memory-only): fall back to the live set so shadow mode still reports
+        // something, and RECORD that it did — the digest commits to this flag,
+        // so a node using the fallback can never compare equal to one using a
+        // real snapshot. Silently substituting would make the instrument lie.
+        let eligible: Vec<(Address, u64)> = match pool {
+            Some(p) => p
+                .into_iter()
+                .filter(|(addr, bonded)| {
+                    commputer::consensus_set::is_consensus_eligible(
+                        true, // every entry in the pool was is_validator when recorded
+                        *bonded,
+                        commputer::consensus_set::MIN_CONSENSUS_BOND,
+                        crate::testnet_genesis::pin_is_active(),
+                        crate::testnet_genesis::is_pinned_validator(addr),
+                    )
+                })
+                .collect(),
+            None => {
+                let mut live: Vec<(Address, u64)> = self
+                    .consensus_validators()
+                    .into_iter()
+                    .map(|a| {
+                        let bonded = self.state.bonded_of(&a);
+                        (a, bonded)
+                    })
+                    .collect();
+                live.sort_unstable_by_key(|(a, _)| a.0);
+                live
+            }
+        };
+
+        let sched = commputer::schedule_epoch::build_schedule(
+            epoch,
+            snapshot_height,
+            fallback_used,
+            &eligible,
+        );
+        info!(
+            "shadow schedule: epoch={} snapshot_height={} validators={} cycle_len={} \
+             fallback={} digest={}",
+            sched.epoch,
+            sched.snapshot_height,
+            sched.validators.len(),
+            sched.cycle.len(),
+            sched.fallback_used,
+            commputer::schedule_epoch::digest_hex(&sched.digest),
+        );
+        self.shadow_schedule_epoch = Some(epoch);
+    }
+
     /// The addresses eligible to take part in consensus, derived from committed
     /// chain state. ONE derivation, used by BOTH the validation side and the
     /// production side — if the two sides disagree about the set they disagree
@@ -4150,6 +4228,14 @@ impl EventLoop {
         // where no peer has queried us.
         let vs = self.consensus_validators();
         self.consensus.set_consensus_validators(&vs);
+
+        // SHADOW MODE: derive the stake-weighted schedule for this epoch and
+        // log its digest. It DECIDES NOTHING — production and voting still use
+        // the existing round-robin. The digest is an instrument: if two nodes
+        // ever print different digests for the same epoch, they WOULD have
+        // disagreed about who may propose, and we learn it from a log
+        // comparison instead of from a fork.
+        self.log_shadow_schedule();
 
         // Apply any newly finalized blocks (in height order).
         let mut finalized = self.consensus.finalized_heights();
