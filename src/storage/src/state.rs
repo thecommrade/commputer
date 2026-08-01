@@ -141,7 +141,23 @@ pub const CHECKPOINT_INTERVAL: u64 = 100;
 /// rule the system already relies on. Mirrored by
 /// `node/src/schedule_epoch.rs::EPOCH_BLOCKS`, and the two are pinned equal by
 /// a test there — they are the same protocol constant seen from two crates.
+#[cfg(not(feature = "formation-test"))]
 pub const SCHEDULE_EPOCH_BLOCKS: u64 = CHECKPOINT_INTERVAL;
+
+/// Formation-harness builds use a SHORT epoch.
+///
+/// Harness chains only reach roughly height 75-100, so at the production
+/// cadence they never cross a schedule-epoch boundary: every scenario would sit
+/// in epoch 0, whose snapshot is taken at genesis before any node has
+/// registered as a validator. Shadow mode would then report three nodes
+/// agreeing on an EMPTY schedule — agreement that proves nothing, which is
+/// worse than no signal because it looks like coverage.
+///
+/// At 10 blocks per epoch a scenario crosses several boundaries, so the harness
+/// actually exercises snapshot write → read-two-epochs-back → schedule → digest,
+/// and can catch a regression there. The production cadence is unchanged.
+#[cfg(feature = "formation-test")]
+pub const SCHEDULE_EPOCH_BLOCKS: u64 = 10;
 
 /// Feature 183: Archival threshold — accounts with zero balance and no activity for
 /// this many epochs are archived to cold storage.

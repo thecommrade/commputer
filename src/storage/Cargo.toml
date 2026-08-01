@@ -6,6 +6,12 @@ license.workspace = true
 repository.workspace = true
 description = "Blockchain state storage: blocks, accounts, proofs"
 
+[features]
+# Mirrors the node crate's flag. Shortens SCHEDULE_EPOCH_BLOCKS so the local
+# formation harness — whose chains only reach ~100 blocks — actually crosses
+# schedule-epoch boundaries. Compile-time only; never enabled for release.
+formation-test = []
+
 [dependencies]
 commputer-core = { workspace = true }
 # PoUW P2: the per-job verification lifecycle held in ChainState (the §3 Ledger-trait integration

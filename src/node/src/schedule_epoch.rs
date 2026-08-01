@@ -39,7 +39,11 @@ use sha2::{Digest, Sha256};
 /// Blocks per schedule epoch. Matches `CHECKPOINT_INTERVAL`, which the chain
 /// already treats as un-reorgable, so an epoch boundary is a height that is
 /// settled by the same rule the rest of the system already trusts.
-pub const EPOCH_BLOCKS: u64 = 100;
+/// Kept equal to `storage::SCHEDULE_EPOCH_BLOCKS` — the write cadence and the
+/// read cadence are the same protocol constant seen from two crates, and a
+/// test pins them equal. Both shorten together under `formation-test` so the
+/// harness can cross epoch boundaries (see the storage constant for why).
+pub const EPOCH_BLOCKS: u64 = commputer_storage::state::SCHEDULE_EPOCH_BLOCKS;
 
 /// Which schedule epoch a height belongs to.
 pub fn epoch_of(height: u64) -> u64 {
@@ -190,19 +194,29 @@ mod tests {
         Address([n; 32])
     }
 
-    /// The storage layer writes the snapshot every
-    /// `SCHEDULE_EPOCH_BLOCKS` blocks; this module decides which epoch a height
-    /// belongs to and which snapshot it reads. If the two constants ever drift,
-    /// nodes would snapshot at one cadence and read at another — the schedule
-    /// would silently reference an epoch that was never written. Same protocol
-    /// constant, two crates, pinned equal here.
+    /// The write cadence (storage) and the read cadence (here) can no longer
+    /// drift: `EPOCH_BLOCKS` IS the storage constant, so there is one
+    /// definition rather than two kept in step by a test. An equality
+    /// assertion would now be tautological — it would look like coverage while
+    /// checking nothing.
+    ///
+    /// What is still worth asserting is that the value is USABLE: a zero would
+    /// divide by zero in `epoch_of`, and the production cadence should remain
+    /// the checkpoint interval, which the chain already treats as un-reorgable.
     #[test]
-    fn epoch_length_matches_the_storage_snapshot_cadence() {
+    fn the_epoch_length_is_usable_and_matches_the_checkpoint_interval() {
+        assert!(EPOCH_BLOCKS > 0, "a zero epoch length divides by zero in epoch_of");
+
+        #[cfg(not(feature = "formation-test"))]
         assert_eq!(
             EPOCH_BLOCKS,
-            commputer_storage::state::SCHEDULE_EPOCH_BLOCKS,
-            "schedule epoch length must equal the storage snapshot cadence"
+            commputer_storage::state::CHECKPOINT_INTERVAL,
+            "production epochs should land on the already-un-reorgable checkpoint boundary"
         );
+
+        // Whatever the cadence, the lag must still be a whole epoch — the
+        // property the whole design rests on.
+        assert!(snapshot_height_for(2) < 2 * EPOCH_BLOCKS);
     }
 
     #[test]

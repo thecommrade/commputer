@@ -10,7 +10,7 @@ description = "Commputer node: a communal supercomputer coordinated by blockchai
 # Empties ALPHA_PINNED_VALIDATORS so the local formation harness can run
 # multi-producer scenarios with randomly-generated test wallets. Compile-time
 # only; never enabled for release builds.
-formation-test = []
+formation-test = ["commputer-storage/formation-test"]
 
 [dependencies]
 commputer-core = { workspace = true }
