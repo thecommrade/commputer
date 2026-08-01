@@ -885,13 +885,28 @@ async fn get_pending_rewards(
         }
         // Estimate based on equal share among validators.
         let validator_count = balances.values().filter(|b| b.is_validator).count().max(1);
-        // Base daily emission: ~100 COMME/day for testnet.
-        let daily_emission_raw = 100u64 * commputer_core::token::UNITS_PER_COMME;
-        let estimated_reward = daily_emission_raw / validator_count as u64;
+        // QC-006: this read `100 COMME/day` from a literal, which was never the
+        // emission schedule and was wrong by ~6,850x at era 0 — the endpoint told
+        // an operator ~33 COMME/day where the chain actually pays ~228,310. It is
+        // a public, key-free route, so explorers and anyone sizing hardware got
+        // that number. Derive it from the real halving schedule instead; the
+        // helper already existed and had no callers, while the startup banner
+        // used the true schedule — so the log and the API disagreed on one machine.
+        let emission = commputer_consensus::emission::EmissionSchedule::new();
+        let estimated_reward =
+            emission.per_validator_daily_rate(status.height, validator_count as u64);
 
         (StatusCode::OK, Json(serde_json::json!({
             "address": address,
             "estimated_reward": estimated_reward,
+            "estimated_reward_basis": "per-validator share of the halving-schedule \
+                                       emission at the current height, equal-weighted",
+            "block_reward": commputer_core::token::block_reward(status.height),
+            "height": status.height,
+            // STILL A PLACEHOLDER, deliberately left as one. There is no
+            // composite scoring anywhere in the node, so any value here is
+            // invented; replacing the literal with a computed-looking
+            // expression would only make the fiction harder to notice.
             "composite_score": 100,
             "epoch": status.epoch,
             "validator_count": validator_count,
@@ -2445,6 +2460,58 @@ mod tests {
         assert_eq!(status.height, 42);
         assert_eq!(status.epoch, 1);
         assert_eq!(status.accounts, 3);
+    }
+
+    /// QC-006: /rewards must quote the real halving schedule, not a literal.
+    ///
+    /// Pinned against the OLD constant explicitly. A test that only checked
+    /// "reward > 0" passed just as happily while the endpoint was understating
+    /// by ~6,850x, which is exactly how the defect survived on a public route.
+    #[tokio::test]
+    async fn rewards_are_derived_from_the_emission_schedule_not_a_literal() {
+        let (state, _rx) = make_rpc_state();
+        state.balances.lock().await.insert(
+            "abc".to_string(),
+            BalanceInfo {
+                address: "abc".to_string(),
+                balance: 0,
+                tier: "standard".to_string(),
+                nonce: 0,
+                is_validator: true,
+                total_mined: 0,
+            },
+        );
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/rewards/abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let got = v["estimated_reward"].as_u64().unwrap();
+
+        // The harness pins height 42, so era 0: one validator earns the whole
+        // per-day emission.
+        let expected = commputer_consensus::emission::EmissionSchedule::new()
+            .per_validator_daily_rate(42, 1);
+        assert_eq!(got, expected, "must track the halving schedule");
+
+        let old_literal = 100u64 * commputer_core::token::UNITS_PER_COMME;
+        assert_ne!(got, old_literal, "regressed to the hardcoded 100 COMME/day");
+        assert!(
+            got > old_literal * 1000,
+            "era-0 emission dwarfs the old literal; got {got}, literal {old_literal}"
+        );
+        assert_eq!(v["height"].as_u64().unwrap(), 42);
     }
 
     /// W5.7 F-1: oversized Batch should be rejected by validate_shape
