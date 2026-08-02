@@ -906,6 +906,58 @@ async fn get_fee_estimate(
 
 // ── Feature 254: Pending rewards ──
 
+/// Build the honest "why is this address not counted" response for
+/// `get_pending_rewards`'s early-return path (QC-006 rev 3b, I-1 residual).
+///
+/// The two regimes must NOT share one sentence. While the pin is active, a
+/// non-pinned address is a VERIFIED negative — the allowlist is the trust
+/// anchor and this snapshot has the whole list, so "earns nothing" is a fact
+/// this handler can back. Once the pin retires, `eligible()` returning
+/// `false` means only that `bonded = 0` (the hardcoded stand-in, see the
+/// comment above `eligible`) failed the real floor — NOT that the address's
+/// actual bonded stake failed it. This handler has no per-address bond
+/// figure to check (`BalanceInfo` does not carry one), so asserting "earns
+/// nothing" here would be a specific factual claim about a number it never
+/// looked at. Split into its own function so the two sentences — and the
+/// choice between them — are one thing this file can unit-test directly,
+/// independent of which regime happens to be compiled in.
+///
+/// RESIDUAL, not closed by this function: the real fix is to plumb a real
+/// per-address bonded-stake figure into `BalanceInfo` (and therefore into
+/// `event_loop.rs`'s balance sweep), so `eligible()` can pass a genuine
+/// `bonded` instead of the hardcoded `0`. That is out of scope for this lane
+/// (it touches a protected file) and is tracked as a set-opening
+/// precondition against QC-006 in the QC ledger. Until it lands, the
+/// pin-retired branch below is this handler's honest ceiling: "unknown," not
+/// "no."
+fn ineligibility_response(address: &str, epoch: u64, pin_active: bool) -> serde_json::Value {
+    if pin_active {
+        serde_json::json!({
+            "address": address,
+            "estimated_reward": 0,
+            "composite_score": 0,
+            "epoch": epoch,
+            "note": "registered, but not in the consensus set that can actually \
+                     produce blocks — this address is never selected to produce \
+                     and earns nothing",
+            "eligibility_basis": "allowlist",
+        })
+    } else {
+        serde_json::json!({
+            "address": address,
+            "estimated_reward": 0,
+            "composite_score": 0,
+            "epoch": epoch,
+            "note": "registered, but this handler cannot verify this address's \
+                     bonded stake from the balance snapshot it holds — \
+                     eligibility is UNKNOWN, not confirmed ineligible, and the \
+                     zero reported below is pending verification, not a claim \
+                     about what this address will actually earn.",
+            "eligibility_basis": "bonded-stake",
+        })
+    }
+}
+
 /// GET /rewards/{address} — an ESTIMATE of future mining income, not an
 /// accrued or owed balance. See `estimated_reward_basis` and
 /// `eligibility_basis` in the response for what the number assumes.
@@ -968,15 +1020,10 @@ async fn get_pending_rewards(
             })));
         }
         if !eligible(&address, true) {
-            return (StatusCode::OK, Json(serde_json::json!({
-                "address": address,
-                "estimated_reward": 0,
-                "composite_score": 0,
-                "epoch": status.epoch,
-                "note": "registered, but not in the consensus set that can actually \
-                         produce blocks — this address is never selected to produce \
-                         and earns nothing",
-            })));
+            return (
+                StatusCode::OK,
+                Json(ineligibility_response(&address, status.epoch, pin_active)),
+            );
         }
         let validator_count = balances
             .iter()
@@ -2786,6 +2833,17 @@ mod tests {
             "must follow the seeded block time; this literal cannot be produced by \
              the 2.0s no-samples fallback the endpoint uses at boot"
         );
+
+        // QC-006 rev 3b (I-1 re-review): under `--features formation-test`
+        // this address is queried in the PIN-RETIRED regime (`pin_active() ==
+        // false`), which is the one currently-compilable build that actually
+        // serves a regime-B response — proving `eligibility_basis` is real,
+        // reachable output here, not dead code, per the re-review's I-2
+        // caveat. Under the default (pin-active) build the same field must
+        // read "allowlist" instead.
+        let expected_basis = if crate::testnet_genesis::pin_is_active() { "allowlist" } else { "bonded-stake" };
+        assert_eq!(v["eligibility_basis"].as_str().unwrap(), expected_basis);
+        assert!(v["estimated_reward_basis"].as_str().unwrap().contains("stake weight"));
     }
 
     /// QC-006 follow-up: registration is free and automatic, but while the alpha
@@ -2832,6 +2890,70 @@ mod tests {
             "a registrant outside the consensus set earns nothing and must be told so"
         );
         assert!(v["note"].as_str().unwrap().contains("consensus set"));
+        // QC-006 rev 3b: while the pin is active this negative claim IS
+        // verifiable (the snapshot has the whole allowlist), so the basis
+        // must read "allowlist", not the unverifiable-regime label.
+        assert_eq!(v["eligibility_basis"].as_str().unwrap(), "allowlist");
+    }
+
+    /// QC-006 rev 3b (I-1 re-review): rev 3's `bonded = 0` fix made the
+    /// pin-retired early-return diverge EVERY caller to a note that stated,
+    /// as unqualified fact, "this address is never selected to produce and
+    /// earns nothing" — false for a genuinely-bonded validator once the set
+    /// actually opens, because this handler never looked at the real bond.
+    /// `ineligibility_response` is the fix: it is pulled out of the handler
+    /// specifically so the two regimes' wording is a single, directly
+    /// testable decision, independent of which feature set happens to be
+    /// compiled in.
+    ///
+    /// This is a plain unit test, not gated by `--features formation-test`
+    /// or `cfg(test)` regime plumbing, because the branch it covers is NOT
+    /// reachable end-to-end through the live handler under ANY build in this
+    /// repo today: production's `pin_active() == false` combined with a
+    /// non-zero `MIN_CONSENSUS_BOND` doesn't exist yet (that is the future
+    /// state I-1 is about), and `--features formation-test` retires the pin
+    /// but ALSO zeroes `MIN_CONSENSUS_BOND` in the same commit
+    /// (`consensus_set.rs`), so `eligible()` never returns `false` for a
+    /// validator there either — see
+    /// `rewards_follow_a_seeded_block_time_not_the_2s_floor`'s formation-test
+    /// run, which necessarily takes the SUCCESS path in that regime, not
+    /// this one. Calling the pure function directly is what makes the
+    /// pin-retired wording verifiable at all without touching
+    /// `consensus_set.rs` / `testnet_genesis.rs` (out of scope for this
+    /// lane) to decouple the two constants.
+    ///
+    /// RESIDUAL: closing this for real — i.e. making the pin-retired branch
+    /// reachable with a genuine bonded-or-not answer instead of "unknown" —
+    /// needs real per-address bonded stake plumbed into `BalanceInfo`. That
+    /// is a set-opening precondition tracked against QC-006 in the QC
+    /// ledger, not something this function can supply on its own.
+    #[test]
+    fn ineligibility_response_distinguishes_verified_from_unverifiable() {
+        let pinned = ineligibility_response("addr", 7, true);
+        assert_eq!(pinned["eligibility_basis"], "allowlist");
+        assert_eq!(pinned["estimated_reward"], 0);
+        assert_eq!(pinned["epoch"], 7);
+        let note = pinned["note"].as_str().unwrap();
+        assert!(
+            note.contains("earns nothing"),
+            "pin-active is a VERIFIED negative — the snapshot has the whole \
+             allowlist, so this claim is one the handler can back"
+        );
+
+        let retired = ineligibility_response("addr", 7, false);
+        assert_eq!(retired["eligibility_basis"], "bonded-stake");
+        assert_eq!(retired["estimated_reward"], 0);
+        let note = retired["note"].as_str().unwrap();
+        assert!(
+            !note.contains("earns nothing"),
+            "pin-retired must NOT assert a specific fact about bonded stake \
+             this handler never looked at"
+        );
+        assert!(
+            note.contains("UNKNOWN") || note.contains("cannot verify"),
+            "must say eligibility is unverifiable from this snapshot, not silently \
+             imply it was checked and failed: got {note:?}"
+        );
     }
 
     /// W5.7 F-1: oversized Batch should be rejected by validate_shape
