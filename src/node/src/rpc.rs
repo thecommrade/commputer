@@ -521,6 +521,10 @@ pub struct ComplianceDashboard {
     pub nerfed_count: u64,
     pub current_nerf_percentage: u32,
     pub suspicious_count: u64,
+    /// §10 honesty: false until nerf enforcement is wired to a reward path.
+    pub enforcement_active: bool,
+    /// Explains what the numbers below do and do not measure.
+    pub note: String,
 }
 
 /// Feature 150: Anti-scale metrics response.
@@ -530,6 +534,42 @@ pub struct AntiScaleDashboard {
     pub total_nerfed_rewards: u64,
     pub nerf_percentage_history: Vec<(u64, u32)>,
     pub largest_detected_clusters: Vec<(usize, String)>,
+    /// §10 honesty: false until nerf enforcement is wired to a reward path.
+    pub enforcement_active: bool,
+    /// Explains what the numbers below do and do not measure.
+    pub note: String,
+}
+
+/// §10 honesty (North Star Phase 0): nothing writes compliance stats yet, so
+/// serving Default zeros reads as "checked and clean". Until enforcement is
+/// wired, these endpoints say so explicitly. The 80 is NerfRate::INITIAL
+/// (8000 bps) — the protocol floor constant, currently applied to no one.
+pub fn honest_compliance_dashboard() -> ComplianceDashboard {
+    ComplianceDashboard {
+        enforcement_active: false,
+        note: "Nerf enforcement is not yet wired to any reward path. Counts are \
+               structural zeros (nothing is checked yet), not measurements. \
+               current_nerf_percentage is the protocol floor constant, applied to no one."
+            .to_string(),
+        total_validators: 0,
+        compliant_count: 0,
+        nerfed_count: 0,
+        current_nerf_percentage: 80,
+        suspicious_count: 0,
+    }
+}
+
+pub fn honest_anti_scale_dashboard() -> AntiScaleDashboard {
+    AntiScaleDashboard {
+        enforcement_active: false,
+        note: "Warehouse detection is not yet wired to any reward path. Totals are \
+               structural zeros, not measurements."
+            .to_string(),
+        total_warehouse_detections: 0,
+        total_nerfed_rewards: 0,
+        nerf_percentage_history: Vec::new(),
+        largest_detected_clusters: Vec::new(),
+    }
 }
 
 /// Feature 180: Network health dashboard response.
@@ -557,12 +597,11 @@ async fn get_peer_quality(
     Json(quality)
 }
 
-/// GET /compliance — Feature 142: network-wide compliance stats.
-async fn get_compliance(
-    State(state): State<Arc<RpcState>>,
-) -> Json<ComplianceDashboard> {
-    let stats = state.compliance_stats.lock().await.clone();
-    Json(stats)
+/// GET /compliance — Feature 142. Serves the honest constant payload: the
+/// RpcState.compliance_stats mutex has no writer anywhere, so reading it
+/// would serve Default zeros dressed up as measurements.
+async fn get_compliance(State(_state): State<Arc<RpcState>>) -> Json<ComplianceDashboard> {
+    Json(honest_compliance_dashboard())
 }
 
 /// GET /storage/metrics — Feature 188: storage metrics.
@@ -573,12 +612,9 @@ async fn get_storage_metrics(
     Json(metrics)
 }
 
-/// GET /anti-scale — Feature 150: warehouse detection stats.
-async fn get_anti_scale(
-    State(state): State<Arc<RpcState>>,
-) -> Json<AntiScaleDashboard> {
-    let metrics = state.anti_scale_metrics.lock().await.clone();
-    Json(metrics)
+/// GET /anti-scale — Feature 150. Same honesty rule as /compliance.
+async fn get_anti_scale(State(_state): State<Arc<RpcState>>) -> Json<AntiScaleDashboard> {
+    Json(honest_anti_scale_dashboard())
 }
 
 // ── Feature 241: WebSocket RPC ──
@@ -2182,6 +2218,8 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/faucet", post(faucet))
         .route("/leaderboard", get(get_leaderboard))
         .route("/stats", get(get_stats_page))
+        .route("/compliance", get(get_compliance))
+        .route("/anti-scale", get(get_anti_scale))
         .route_layer(middleware::from_fn_with_state(rpc_state.clone(), rate_limit_middleware));
 
     // ADMIN tier — rate-limited AND key-gated (auth_middleware).
@@ -2191,8 +2229,6 @@ pub fn build_router(rpc_state: Arc<RpcState>) -> Router {
         .route("/storage/metrics", get(get_storage_metrics))
         .route("/traffic", get(get_traffic))
         .route("/network/quality", get(get_peer_quality))
-        .route("/compliance", get(get_compliance))
-        .route("/anti-scale", get(get_anti_scale))
         .route("/peers/full", get(get_peers_full))
         // Track-2 (Phase B): job submission. KEYED tier — it accepts a submitter seed, so it is
         // NOT on the public tier (the founder may relax to public / loopback-only per §5). 32 MiB
@@ -3845,5 +3881,21 @@ mod tests {
         drop(g);
         guards.clear();
         assert_eq!(WS_CONNECTIONS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn compliance_dashboard_is_honest_until_enforcement_exists() {
+        let d = honest_compliance_dashboard();
+        assert!(!d.enforcement_active);
+        assert_eq!(d.current_nerf_percentage, 80);
+        assert!(d.note.contains("not yet wired"));
+    }
+
+    #[test]
+    fn anti_scale_dashboard_is_honest_until_enforcement_exists() {
+        let d = honest_anti_scale_dashboard();
+        assert!(!d.enforcement_active);
+        assert!(d.note.contains("not yet wired"));
+        assert!(d.total_warehouse_detections == 0);
     }
 }
