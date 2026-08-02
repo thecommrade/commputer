@@ -172,9 +172,15 @@ pub struct RpcState {
     pub receipts: Mutex<HashMap<String, serde_json::Value>>,
     /// Node metrics snapshot.
     pub metrics: Mutex<NodeMetrics>,
-    /// Feature 142: Compliance dashboard stats.
+    /// Feature 142: Compliance dashboard stats. Still initialized in protected
+    /// main.rs; readers were removed by the Phase 0 honesty change (get_compliance
+    /// now returns a constant honest payload) — removing this field is a Tier 3 edit.
+    #[allow(dead_code)]
     pub compliance_stats: Mutex<ComplianceDashboard>,
-    /// Feature 150: Anti-scale metrics.
+    /// Feature 150: Anti-scale metrics. Still initialized in protected main.rs;
+    /// readers were removed by the Phase 0 honesty change (get_anti_scale now
+    /// returns a constant honest payload) — removing this field is a Tier 3 edit.
+    #[allow(dead_code)]
     pub anti_scale_metrics: Mutex<AntiScaleDashboard>,
     /// Feature 180: Network health dashboard data.
     pub network_health: Mutex<NetworkHealthDashboard>,
@@ -516,28 +522,28 @@ async fn get_receipt(
 /// Feature 142: Compliance dashboard response.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComplianceDashboard {
+    /// §10 honesty: false until nerf enforcement is wired to a reward path.
+    pub enforcement_active: bool,
+    /// Explains what the numbers below do and do not measure.
+    pub note: String,
     pub total_validators: u64,
     pub compliant_count: u64,
     pub nerfed_count: u64,
     pub current_nerf_percentage: u32,
     pub suspicious_count: u64,
-    /// §10 honesty: false until nerf enforcement is wired to a reward path.
-    pub enforcement_active: bool,
-    /// Explains what the numbers below do and do not measure.
-    pub note: String,
 }
 
 /// Feature 150: Anti-scale metrics response.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AntiScaleDashboard {
-    pub total_warehouse_detections: u64,
-    pub total_nerfed_rewards: u64,
-    pub nerf_percentage_history: Vec<(u64, u32)>,
-    pub largest_detected_clusters: Vec<(usize, String)>,
     /// §10 honesty: false until nerf enforcement is wired to a reward path.
     pub enforcement_active: bool,
     /// Explains what the numbers below do and do not measure.
     pub note: String,
+    pub total_warehouse_detections: u64,
+    pub total_nerfed_rewards: u64,
+    pub nerf_percentage_history: Vec<(u64, u32)>,
+    pub largest_detected_clusters: Vec<(usize, String)>,
 }
 
 /// §10 honesty (North Star Phase 0): nothing writes compliance stats yet, so
@@ -3094,6 +3100,55 @@ mod tests {
             StatusCode::OK,
             "public /status MUST stay open without a key even when an admin key is set"
         );
+    }
+
+    /// PUBLIC route (Phase 0 honesty): /compliance and /anti-scale must be
+    /// reachable with NO key even when an admin key IS configured, and their
+    /// bodies must carry the honest `enforcement_active: false` signal. This
+    /// pins the Phase 0 change against two regressions at once: moving the
+    /// routes back behind auth_middleware, or reverting a handler to read the
+    /// (now-unwritten) compliance_stats/anti_scale_metrics mutex.
+    #[tokio::test]
+    async fn compliance_and_anti_scale_are_public_and_honest() {
+        let (mut state, _rx) = make_rpc_state();
+        Arc::get_mut(&mut state)
+            .expect("state Arc must be unique before router build")
+            .api_key = Some("s3cret-key".to_string());
+        let app = build_router(state);
+
+        let compliance_req = Request::builder()
+            .method("GET")
+            .uri("/compliance")
+            .body(Body::empty())
+            .unwrap();
+        let compliance_resp = app.clone().oneshot(compliance_req).await.unwrap();
+        assert_eq!(
+            compliance_resp.status(),
+            StatusCode::OK,
+            "public /compliance MUST stay open without a key even when an admin key is set"
+        );
+        let body_bytes = axum::body::to_bytes(compliance_resp.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let compliance: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(compliance["enforcement_active"], false);
+
+        let anti_scale_req = Request::builder()
+            .method("GET")
+            .uri("/anti-scale")
+            .body(Body::empty())
+            .unwrap();
+        let anti_scale_resp = app.oneshot(anti_scale_req).await.unwrap();
+        assert_eq!(
+            anti_scale_resp.status(),
+            StatusCode::OK,
+            "public /anti-scale MUST stay open without a key even when an admin key is set"
+        );
+        let body_bytes = axum::body::to_bytes(anti_scale_resp.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let anti_scale: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(anti_scale["enforcement_active"], false);
     }
 
     /// ADMIN route: /metrics must be rejected (401) without the key when a key is
