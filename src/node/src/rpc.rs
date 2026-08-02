@@ -906,7 +906,9 @@ async fn get_fee_estimate(
 
 // ── Feature 254: Pending rewards ──
 
-/// GET /rewards/{address} — estimated pending mining rewards.
+/// GET /rewards/{address} — an ESTIMATE of future mining income, not an
+/// accrued or owed balance. See `estimated_reward_basis` and
+/// `eligibility_basis` in the response for what the number assumes.
 async fn get_pending_rewards(
     State(state): State<Arc<RpcState>>,
     Path(address): Path<String>,
@@ -916,27 +918,43 @@ async fn get_pending_rewards(
     let balances = state.balances.lock().await;
     let chain_health = state.chain_health.lock().await;
 
+    let pin_active = crate::testnet_genesis::pin_is_active();
+
     // Registered is NOT the same as able to earn. `is_validator` is set by any
     // ValidatorRegister tx, and registration is free and automatic at every
-    // boot — but while the alpha allowlist is in force, only pinned addresses
-    // are ever selected to produce, so everyone else earns exactly zero.
-    // Counting registrations here would (a) tell a stranger's node it is owed a
-    // fortune it can never receive, and (b) divide the real earners' estimate by
-    // a number any passer-by can inflate. Both get worse, not better, once the
-    // figure is the true six-digit one.
+    // boot. Who can actually earn is a CONSENSUS question with two regimes —
+    // pinned allowlist vs. bonded stake — and `consensus_set` is the one
+    // place that derivation is allowed to live (its module doc: "one
+    // derivation, used everywhere"). A hand-rolled version of this rule
+    // previously lived here and, in the allowlist-retired regime, returned
+    // `true` for every registrant — exactly the inversion `consensus_set.rs`
+    // exists to forbid (see its test
+    // `the_open_regime_is_not_disabled_by_the_empty_allowlist`). Delegating
+    // closes that gap (QC-006 rev 3, I-1).
+    //
+    // This snapshot (`BalanceInfo`) carries no bonded-stake figure, so the
+    // real per-address bond is unknown here and 0 is passed. That is not a
+    // guess dressed up as data — it is deliberately conservative:
+    //   * while the pin is active, `is_consensus_eligible` never consults
+    //     `bonded` at all, so passing 0 changes nothing;
+    //   * once the pin retires, 0 against the real `MIN_CONSENSUS_BOND`
+    //     (> 0 outside the test harness) FAILS CLOSED — nobody is reported
+    //     eligible rather than everybody, the safe direction to be wrong in;
+    //   * under `--features formation-test`, `MIN_CONSENSUS_BOND` is itself 0
+    //     by design (consensus_set.rs), so `0 >= 0` correctly restores
+    //     is_validator-only semantics for that harness, which is exactly the
+    //     regime it is meant to exercise.
     let eligible = |addr_hex: &str, is_validator: bool| -> bool {
-        if !is_validator {
-            return false;
-        }
-        if !crate::testnet_genesis::pin_is_active() {
-            // Allowlist retired: eligibility is bonded stake, which this
-            // snapshot does not carry. Fall back to registration and say so in
-            // the response rather than silently guessing.
-            return true;
-        }
-        commputer_core::identity::Address::from_hex(addr_hex)
+        let pinned = commputer_core::identity::Address::from_hex(addr_hex)
             .map(|a| crate::testnet_genesis::is_pinned_validator(&a))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        commputer::consensus_set::is_consensus_eligible(
+            is_validator,
+            0,
+            commputer::consensus_set::MIN_CONSENSUS_BOND,
+            pin_active,
+            pinned,
+        )
     };
 
     if let Some(info) = balances.get(&address) {
@@ -955,8 +973,9 @@ async fn get_pending_rewards(
                 "estimated_reward": 0,
                 "composite_score": 0,
                 "epoch": status.epoch,
-                "note": "registered, but not in the active consensus set — \
-                         this address is never selected to produce and earns nothing",
+                "note": "registered, but not in the consensus set that can actually \
+                         produce blocks — this address is never selected to produce \
+                         and earns nothing",
             })));
         }
         let validator_count = balances
@@ -967,7 +986,7 @@ async fn get_pending_rewards(
 
         // QC-006: this read `100 COMME/day` from a literal that was never the
         // emission schedule — wrong by ~6,850x at era 0, on a public key-free
-        // route that operator.html points new operators at.
+        // route.
         //
         // Derived from two MEASURED inputs rather than one literal replacing
         // another. `block_reward` is the chain's own single source of truth for
@@ -981,15 +1000,50 @@ async fn get_pending_rewards(
         // is therefore off by the same margin wherever it is used — see the QC
         // ledger. Not fixed here; that helper also feeds the startup banner and
         // deserves its own change.)
-        let avg_block_time = chain_health
+        //
+        // Before the health monitor has two samples it has nothing to average
+        // and returns a 2.0s floor (chain_health_monitor.rs) — indistinguishable
+        // from a real 2.0s measurement unless the response says which one it
+        // is. `block_time_source` is that provenance flag, so a fresh-boot
+        // answer can be told apart from a steady-state one instead of quietly
+        // overstating by up to ~4.3x in the first minutes (QC-006 rev 3, I-4).
+        let (avg_block_time, block_time_source): (f64, &str) = match chain_health
             .get("avg_block_time")
             .and_then(|v| v.as_f64())
             .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(2.0);
+        {
+            Some(v) => (v, "measured"),
+            None => (2.0, "default_no_samples"),
+        };
         let blocks_per_day = (86_400.0 / avg_block_time) as u64;
         let estimated_reward = commputer_core::token::block_reward(status.height)
             .saturating_mul(blocks_per_day)
             / validator_count as u64;
+
+        // The basis must say WHICH regime produced `validator_count`, not
+        // assert "the active consensus set" unconditionally — a fixed string
+        // here was a promise the response didn't keep the moment the
+        // allowlist retires (QC-006 rev 3, I-2).
+        let (eligibility_basis, estimated_reward_basis): (&str, &str) = if pin_active {
+            (
+                "allowlist",
+                "equal split of observed-rate emission among the alpha-allowlisted \
+                 consensus set; the chain actually pays 100% to each block's \
+                 producer and selects producers by stake weight, so this is an \
+                 equal-stake approximation",
+            )
+        } else {
+            (
+                "bonded-stake",
+                "equal split of observed-rate emission among validators this \
+                 snapshot could verify against the bonded-stake floor; per-address \
+                 bond is not carried here, so eligibility is evaluated as \
+                 zero-bonded and therefore fails closed against the real floor \
+                 outside the formation-test harness (whose floor is deliberately \
+                 zero) — the chain actually pays 100% to each block's producer \
+                 and selects producers by stake weight",
+            )
+        };
 
         (StatusCode::OK, Json(serde_json::json!({
             "address": address,
@@ -998,12 +1052,11 @@ async fn get_pending_rewards(
             // reward to the producer and selects producers by STAKE WEIGHT, so an
             // equal split is only correct while bonds are equal — true of the
             // three founder nodes today and false the moment stakes diverge.
-            "estimated_reward_basis": "equal split of observed-rate emission among the \
-                                       active consensus set; the chain actually pays 100% \
-                                       to each block's producer and selects producers by \
-                                       stake weight, so this is an equal-stake approximation",
+            "estimated_reward_basis": estimated_reward_basis,
+            "eligibility_basis": eligibility_basis,
             "block_reward": commputer_core::token::block_reward(status.height),
             "avg_block_time_secs": avg_block_time,
+            "block_time_source": block_time_source,
             "blocks_per_day": blocks_per_day,
             "eligible_validators": validator_count,
             "height": status.height,
@@ -1019,7 +1072,6 @@ async fn get_pending_rewards(
             // comment was worth correcting rather than deleting.
             "composite_score": 100,
             "epoch": status.epoch,
-            "validator_count": validator_count,
         })))
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({
@@ -2618,13 +2670,16 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let got = v["estimated_reward"].as_u64().unwrap();
 
-        // Read the height back out of the response rather than restating the
-        // harness's 42, so bumping the shared fixture cannot fail this test with
-        // a bare numeric mismatch.
+        // Read the height and validator count back out of the response rather
+        // than restating the harness's 42 / 1, so bumping the shared fixture
+        // cannot fail this test with a bare numeric mismatch. (QC-006 rev 3,
+        // M-3: this used to divide by a dead literal `/ 1` that silently
+        // encoded the single-validator assumption instead of naming it.)
         let height = v["height"].as_u64().unwrap();
         let bpd = v["blocks_per_day"].as_u64().unwrap();
-        let expected = commputer_core::token::block_reward(height) * bpd / 1;
-        assert_eq!(got, expected, "must be block_reward x observed blocks/day");
+        let eligible_validators = v["eligible_validators"].as_u64().unwrap();
+        let expected = commputer_core::token::block_reward(height) * bpd / eligible_validators;
+        assert_eq!(got, expected, "must be block_reward x observed blocks/day / eligible validators");
 
         // The real regression guard: never again the literal.
         let old_literal = 100u64 * commputer_core::token::UNITS_PER_COMME;
@@ -2637,6 +2692,100 @@ mod tests {
         assert!(avg > 0.0 && avg.is_finite(), "block time must be usable");
         assert_eq!(bpd, (86_400.0 / avg) as u64, "blocks/day must follow the observed rate");
         assert_eq!(v["eligible_validators"].as_u64().unwrap(), 1);
+
+        // QC-006 rev 3 (I-3b): this fixture never seeds `chain_health`, so it
+        // IS the no-samples/boot case — assert the provenance flag says so,
+        // rather than letting a silent 2.0s assumption pass as a measurement.
+        assert_eq!(avg, 2.0, "no samples were seeded; must be the documented floor");
+        assert_eq!(
+            v["block_time_source"].as_str().unwrap(),
+            "default_no_samples",
+            "boot-time fallback must be labelled, not presented as a measurement"
+        );
+    }
+
+    /// QC-006 rev 3 (I-3a): rev 2's test derived its expectations from the
+    /// response's own fields (`bpd == 86_400 / avg`, both read out of the
+    /// same payload), so it would still pass if the handler deleted the
+    /// `chain_health` read and hardcoded 2.0 — precisely the defect this
+    /// epic exists to catch. This test seeds a REAL, non-default average and
+    /// checks against literals computed independently, offline, below —
+    /// deleting the `chain_health` read fails this test.
+    #[tokio::test]
+    async fn rewards_follow_a_seeded_block_time_not_the_2s_floor() {
+        // Three eligible validators, matching the live chain's founder count.
+        // Under the allowlist regime that means the three pinned addresses;
+        // once the allowlist retires (formation-test), `MIN_CONSENSUS_BOND`
+        // is itself 0 (consensus_set.rs), so any registered validator is
+        // eligible — either way, use real, distinct 64-hex addresses (rev-1's
+        // "abc" fixture bug must not come back).
+        let addrs: Vec<String> = if crate::testnet_genesis::pin_is_active() {
+            crate::testnet_genesis::ALPHA_PINNED_VALIDATORS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        } else {
+            vec!["aa".repeat(32), "bb".repeat(32), "cc".repeat(32)]
+        };
+        assert_eq!(addrs.len(), 3, "fixture must exercise all three eligible slots");
+
+        let (state, _rx) = make_rpc_state();
+        {
+            let mut balances = state.balances.lock().await;
+            for addr in &addrs {
+                balances.insert(addr.clone(), BalanceInfo {
+                    address: addr.clone(),
+                    balance: 0,
+                    tier: "standard".to_string(),
+                    nonce: 0,
+                    is_validator: true,
+                    total_mined: 0,
+                });
+            }
+        }
+        // A real measured average, not the 2.0s no-samples floor.
+        *state.chain_health.lock().await = serde_json::json!({"avg_block_time": 2.884});
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/rewards/{}", addrs[0]))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Hand-computed offline, independent of the handler under test:
+        //   height = 42 (make_rpc_state's fixed fixture) => era 0 =>
+        //     block_reward = INITIAL_BLOCK_REWARD = 1_585_489_599 raw
+        //   avg_block_time = 2.884s => blocks_per_day = (86_400/2.884) as u64
+        //     = 29_958
+        //   estimated_reward = 1_585_489_599 * 29_958 / 3 = 15_832_699_135_614 raw
+        // This independently reproduces the repo's own 2026-07-30 research
+        // figure of ~158,327 COMME/day to four digits (consensus_set.rs:75-76;
+        // rev-2 review, Angle 3).
+        assert_eq!(v["height"].as_u64().unwrap(), 42);
+        assert_eq!(v["avg_block_time_secs"].as_f64().unwrap(), 2.884);
+        assert_eq!(v["block_time_source"].as_str().unwrap(), "measured");
+        assert_eq!(
+            v["blocks_per_day"].as_u64().unwrap(),
+            29_958,
+            "must follow the seeded rate, not the 2s floor"
+        );
+        assert_eq!(v["eligible_validators"].as_u64().unwrap(), 3);
+        assert_eq!(
+            v["estimated_reward"].as_u64().unwrap(),
+            15_832_699_135_614,
+            "must follow the seeded block time; this literal cannot be produced by \
+             the 2.0s no-samples fallback the endpoint uses at boot"
+        );
     }
 
     /// QC-006 follow-up: registration is free and automatic, but while the alpha
@@ -3888,12 +4037,23 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
+        // QC-006 rev 3, M-4: get_pending_rewards is now the widest lock-holder
+        // in the file (status → balances → chain_health, three mutexes) but
+        // was not exercised here. It takes all three locks regardless of
+        // whether the address is found, so no balance needs to be seeded.
+        let sc = state.clone();
+        let c = tokio::spawn(async move {
+            let _ = get_pending_rewards(State(sc), Path("nonexistent".to_string())).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
         // Release status; a single-order implementation runs both to completion.
         drop(status_guard);
 
         let joined = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let _ = a.await;
             let _ = b.await;
+            let _ = c.await;
         })
         .await;
         assert!(
