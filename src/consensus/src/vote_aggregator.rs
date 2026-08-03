@@ -5,18 +5,18 @@
 //! before emitting the `HashMap<BlockHash, usize>` that
 //! [`crate::snowball::SnowballVoter::record_round`] consumes.
 //!
-//! WHY: the live vote-counting path (`ConsensusManager::record_response` in
-//! `src/node/src/consensus_manager.rs`) increments a per-hash counter with NO
-//! peer identity, so one peer can fabricate quorum just by spamming votes, and
-//! the k-of-n sampling helper (`SnowballVoter::select_sample`) has zero callers.
-//! This component closes both gaps: per-peer dedup defeats single-peer flooding,
-//! and sampling caps how many peers any hash can draw on per round.
+//! WHY: this is the LIVE vote-counting path. `ConsensusManager` holds one
+//! `VoteAggregator<PeerId>` per height (a `HeightState` field) and feeds it via
+//! `record_peer_response` -> `record_vote`; `try_finalize_round` reads `tally()`
+//! and resets the aggregator on a quorum round. Per-peer dedup defeats
+//! single-peer vote flooding; per-(height, voter) supersession (below) keeps the
+//! tally a single-round SNAPSHOT rather than a union over time (QC-004); and
+//! k-sampling caps how many peers any hash can draw on per round. The historical
+//! `ConsensusManager::record_response` per-hash counter with no peer identity is
+//! now `#[cfg(test)]`-only.
 //!
-//! WIRING (INERT): this is a standalone, unit-tested component. Threading a real
-//! `PeerId` into `ConsensusManager::record_response` and the `event_loop` feed
-//! sites is the founder-gated protected enforcement batch; nothing here is wired
-//! into the node yet. It is generic over the peer-key type `P` so the node can
-//! instantiate it with whichever peer identifier it threads through at that time.
+//! It is generic over the peer-key type `P` so the node instantiates it with the
+//! authenticated `PeerId` it threads through at the intake site.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -34,6 +34,12 @@ pub struct VoteAggregator<P> {
     /// Using a set per key makes a repeat vote from the same peer a no-op, so no
     /// peer can inflate a hash's count beyond 1.
     votes: HashMap<(u64, BlockHash), HashSet<P>>,
+    /// QC-004: each voter's CURRENT vote per height. A peer that later votes a
+    /// different hash at the same height supersedes its earlier one — the earlier
+    /// vote is removed from `votes` before the new one is recorded, so a voter is
+    /// never counted for two hashes and the tally stays a single-round snapshot
+    /// rather than a union over time.
+    last_vote: HashMap<(u64, P), BlockHash>,
 }
 
 impl<P: Eq + Hash + Clone> VoteAggregator<P> {
@@ -42,28 +48,50 @@ impl<P: Eq + Hash + Clone> VoteAggregator<P> {
         Self {
             sample_size,
             votes: HashMap::new(),
+            last_vote: HashMap::new(),
         }
     }
 
     /// Update k when the network rescales (mirrors `SnowballParams::sample_size`).
     /// Recorded votes are kept — only the per-tally sampling bound changes.
     ///
-    /// Called by `ConsensusManager::update_params_for_network_size` as the (1→20)
-    /// peer curve grows: a stale small `k` (e.g. `k=1`) would cap every `tally()`
-    /// below the new quorum and deadlock finalization mid-round.
+    /// Called by `ConsensusManager::apply_rung` as the (1→20) peer curve grows:
+    /// a stale small `k` (e.g. `k=1`) would cap every `tally()` below the new
+    /// quorum and deadlock finalization mid-round.
     pub fn set_sample_size(&mut self, sample_size: usize) {
         self.sample_size = sample_size;
     }
 
     /// Record `peer`'s vote for `block_hash` at `height`.
     ///
-    /// Returns `true` if this vote was newly counted, `false` if `peer` had
-    /// already voted for the same `(height, block_hash)` (deduped — a no-op).
+    /// QC-004 supersession: if `peer` already voted a DIFFERENT hash at this
+    /// height, that earlier vote is removed before the new one is recorded, so a
+    /// voter is counted for at most one hash per height. Returns `true` if this
+    /// vote was newly counted, `false` if `peer` had already voted for this same
+    /// `(height, block_hash)` (deduped — a no-op).
     pub fn record_vote(&mut self, height: u64, block_hash: BlockHash, peer: P) -> bool {
+        if let Some(prev) = self.last_vote.get(&(height, peer.clone())) {
+            if *prev != block_hash {
+                let prev_key = (height, *prev);
+                if let Some(set) = self.votes.get_mut(&prev_key) {
+                    set.remove(&peer);
+                    if set.is_empty() {
+                        self.votes.remove(&prev_key);
+                    }
+                }
+            }
+        }
+        self.last_vote.insert((height, peer.clone()), block_hash);
         self.votes
             .entry((height, block_hash))
             .or_default()
             .insert(peer)
+    }
+
+    /// QC-004: the hash `peer` currently votes for at `height`, if any. Used to
+    /// assert the single-round-snapshot invariant and to guard double-counting.
+    pub fn has_voted(&self, height: u64, peer: &P) -> Option<BlockHash> {
+        self.last_vote.get(&(height, peer.clone())).copied()
     }
 
     /// Deduped voter count for a single `(height, block_hash)`, ignoring sampling.
@@ -227,6 +255,47 @@ mod tests {
         assert_eq!(rescaled.get(&hash(1)), Some(&20));
         let quorum = 14usize;
         assert!(rescaled.get(&hash(1)).copied().unwrap_or(0) >= quorum);
+    }
+
+    #[test]
+    fn cross_time_vote_supersedes_not_unions() {
+        // QC-004: a voter that later votes a different hash at the same height
+        // supersedes its earlier vote — the tally is a single-round SNAPSHOT, not
+        // a union over time. Without supersession P1 and P2 would each be counted
+        // for BOTH X and Y, manufacturing a phantom X:2 AND Y:2 from two voters.
+        let mut agg: VoteAggregator<u64> = VoteAggregator::new(20);
+        let (x, y) = (hash(1), hash(2));
+        agg.record_vote(5, x, 1);
+        agg.record_vote(5, x, 2);
+        assert_eq!(agg.deduped_count(5, x), 2);
+
+        // Both voters drift to Y, with NO reset between (the sub-quorum window).
+        agg.record_vote(5, y, 1);
+        agg.record_vote(5, y, 2);
+
+        // X is now empty (both superseded); only Y holds the two voters.
+        assert_eq!(agg.deduped_count(5, x), 0, "superseded votes must not linger");
+        assert_eq!(agg.deduped_count(5, y), 2);
+        assert_eq!(agg.has_voted(5, &1), Some(y));
+        assert_eq!(agg.has_voted(5, &2), Some(y));
+
+        // The tally is a snapshot: Y:2 only, never X:2 AND Y:2.
+        let mut rng = StdRng::seed_from_u64(1);
+        let tally = agg.tally(5, &mut rng);
+        assert_eq!(tally.get(&x), None);
+        assert_eq!(tally.get(&y), Some(&2));
+    }
+
+    #[test]
+    fn re_voting_the_same_hash_is_still_a_dedup_noop() {
+        // Supersession must not break the existing dedup: a peer re-voting the
+        // SAME hash stays counted once and is not spuriously removed.
+        let mut agg: VoteAggregator<u64> = VoteAggregator::new(20);
+        let x = hash(1);
+        assert!(agg.record_vote(7, x, 1));
+        assert!(!agg.record_vote(7, x, 1));
+        assert_eq!(agg.deduped_count(7, x), 1);
+        assert_eq!(agg.has_voted(7, &1), Some(x));
     }
 
     #[test]

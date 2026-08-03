@@ -93,6 +93,55 @@ pub const MAX_NOTREADY_STALL_RESETS: u32 = 5;
 /// fresh budget through churn; denial only ever fails closed.
 pub const MAX_NOTREADY_STALL_RESET_PEERS: usize = 64;
 
+/// The clamped input to the Snowball rung table (QC-001 / QC-012).
+///
+/// A newtype with a PRIVATE field and a single production constructor `derive`,
+/// so the only value that can size the rung is the clamp's output — re-passing a
+/// raw `peer_ips.len()` to the production entry point (`update_params_for_rung`)
+/// is a COMPILE error, not a silent regression. This is deliberate: the rejected
+/// da9478a fix re-keyed the rung on a bare voter count that could EXCEED
+/// peer_count and RAISE the bar (turning an expensive halt into a cheap forced
+/// finalization); here `derive` returns `min(peer_count, ...)`, which can only
+/// LOWER the bar, and the type system prevents anything else from reaching the
+/// table.
+pub struct RungInput(usize);
+
+impl RungInput {
+    /// Clamp the rung input to on-chain truth. Returns 0 iff `peer_count == 0`
+    /// (preserving the zero-peer solo path byte-for-byte); otherwise
+    /// `min(peer_count, max(1, distinct_eligible - 1))`.
+    ///
+    /// `distinct_eligible` is the number of distinct eligible validators in the
+    /// current consensus cycle and INCLUDES self; the `- 1` sizes the rung over
+    /// PEERS (the table is keyed on peer_count, and our own vote is added
+    /// separately as the self-vote in `try_finalize_round`). The `max(1, ...)`
+    /// floor keeps a lone-registered node on the 2-voter rung rather than the
+    /// degenerate solo `(1,1,1)` rung — closing QC-012, the fresh-chain
+    /// {0,1}-voter collapse the peer-keyed sizing could reach. Because the result
+    /// is always `<= peer_count` and the rung table is monotonic non-decreasing
+    /// in its input, the clamp can only lower the quorum bar, so it cannot by
+    /// construction halt a chain the raw count would not.
+    pub fn derive(peer_count: usize, distinct_eligible: usize) -> Self {
+        if peer_count == 0 {
+            RungInput(0)
+        } else {
+            RungInput(peer_count.min(distinct_eligible.saturating_sub(1).max(1)))
+        }
+    }
+
+    /// Test-only: construct a specific rung input directly.
+    #[cfg(test)]
+    pub fn raw(v: usize) -> Self {
+        RungInput(v)
+    }
+
+    /// Test-only: the clamped value.
+    #[cfg(test)]
+    pub fn effective(&self) -> usize {
+        self.0
+    }
+}
+
 /// Feature 121: View change state — tracks when a view change is triggered.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -289,8 +338,12 @@ impl ConsensusManager {
     /// peer_count in [3,5] preserves the bbbed4f-validated 3-node stress
     /// behaviour. See ADR-0002 (docs/adrs/0002_snowball_consensus.md) and
     /// `src/consensus/src/config.rs` for the parameter envelope.
-    pub fn update_params_for_network_size(&mut self, peer_count: usize) {
-        let (sample, quorum, threshold): (usize, usize, u32) = match peer_count {
+    /// Apply a rung to the params and propagate to live voters. PRIVATE: the
+    /// only production caller is `update_params_for_rung`, which requires a
+    /// clamped `RungInput`. The table below is byte-identical to the historical
+    /// `update_params_for_network_size` body; only the input is now clamped.
+    fn apply_rung(&mut self, effective: usize) {
+        let (sample, quorum, threshold): (usize, usize, u32) = match effective {
             // β=3 at 0 peers: defense in depth behind the zero-peer gate in
             // try_finalize_round — a stale-params race must not be able to
             // one-shot finalize a private block.
@@ -349,6 +402,23 @@ impl ConsensusManager {
             // finalization mid-round. `sample` is the k just chosen above.
             state.aggregator.set_sample_size(sample);
         }
+    }
+
+    /// Production entry point for rung sizing (QC-001). Takes a clamped
+    /// `RungInput` so the rung can never be sized from a raw socket count — the
+    /// clamp (`min(peer_count, distinct_eligible - 1)`) can only lower the bar,
+    /// which is why extra sockets can no longer inflate the quorum past the
+    /// reachable validator votes.
+    pub fn update_params_for_rung(&mut self, input: RungInput) {
+        self.apply_rung(input.0);
+    }
+
+    /// Test-only shim preserving the historical peer-count entry point so the
+    /// existing rung/curve tests keep exercising the table directly. Production
+    /// code must go through `update_params_for_rung`.
+    #[cfg(test)]
+    pub fn update_params_for_network_size(&mut self, peer_count: usize) {
+        self.apply_rung(peer_count);
     }
 
     /// Create a consensus manager with custom Snowball parameters (Feature 131).
@@ -681,7 +751,12 @@ impl ConsensusManager {
     /// Feed accumulated responses into the voter and reset for the next round.
     /// `peer_count` is used to scale the timeout to network size.
     /// Returns a `ConsensusRoundResult` indicating the outcome.
-    pub fn try_finalize_round(&mut self, height: u64, peer_count: usize) -> ConsensusRoundResult {
+    pub fn try_finalize_round(
+        &mut self,
+        height: u64,
+        peer_count: usize,
+        tip_hash: BlockHash,
+    ) -> ConsensusRoundResult {
         // Zero-peer solo-finalize gate: at 0 peers the solo rung would let a
         // node self-vote its own candidate to finalization every stall timeout,
         // minting a private fork (observed 4x live, 2026-07-24). Only the
@@ -708,6 +783,20 @@ impl ConsensusManager {
             // beta-consecutive-round semantics are preserved) before feeding the
             // round into the voter.
             let mut tally = state.aggregator.tally(height, &mut rand::thread_rng());
+            // QC-004/QC-005 content bound: a vote counts only for a candidate we
+            // HOLD whose parent is our tip. Unknown-hash echo votes (the
+            // catch-up path, where a lagging proposer answers with a hash we do
+            // not hold) and foreign-parent votes are not votable and must not
+            // drive finalization. Emptiness is judged on the FILTERED tally, so
+            // an all-inadmissible round does NOT consume the round (the reset
+            // below is gated on a quorum round) and accumulated honest votes
+            // survive to the next tick.
+            tally.retain(|h, _| {
+                state
+                    .candidates
+                    .get(h)
+                    .is_some_and(|b| b.header.parent_hash == tip_hash)
+            });
             if !tally.is_empty() {
                 // Count OUR OWN vote. The aggregator only holds peer responses,
                 // so a quorum of q previously meant "q PEERS agree" — with two
@@ -743,26 +832,54 @@ impl ConsensusManager {
                 // REORDERS candidates, never removes one, so it cannot cost us
                 // a vote.
                 let cached = std::mem::take(&mut self.cached_validators);
-                if let Some(ours) = state.locked_choice.or_else(|| {
-                    state
-                        .candidates
-                        .iter()
-                        .min_by_key(|(h, b)| {
-                            let view = commputer::leader::cycle_view_offset_of(
-                                &cached,
-                                height,
-                                &b.header.producer,
-                            )
-                            .unwrap_or(usize::MAX);
-                            (view, **h)
-                        })
-                        .map(|(h, _)| *h)
-                }) {
+                // Our self-vote must name a candidate we could actually cast for
+                // peers: the SAME parent==tip predicate as query_votable_preference
+                // (QC-005), so the ballot we count equals the ballot we cast. A
+                // stale locked_choice whose parent is no longer our tip is
+                // re-checked and dropped rather than self-counted.
+                let self_choice = state
+                    .locked_choice
+                    .filter(|h| {
+                        state
+                            .candidates
+                            .get(h)
+                            .is_some_and(|b| b.header.parent_hash == tip_hash)
+                    })
+                    .or_else(|| {
+                        state
+                            .candidates
+                            .iter()
+                            .filter(|(_, b)| b.header.parent_hash == tip_hash)
+                            .min_by_key(|(h, b)| {
+                                let view = commputer::leader::cycle_view_offset_of(
+                                    &cached,
+                                    height,
+                                    &b.header.producer,
+                                )
+                                .unwrap_or(usize::MAX);
+                                (view, **h)
+                            })
+                            .map(|(h, _)| *h)
+                    });
+                if let Some(ours) = self_choice {
                     *tally.entry(ours).or_insert(0) += 1;
                 }
                 self.cached_validators = cached;
-                state.aggregator = VoteAggregator::new(self.params.sample_size);
+                // Round-consumption boundary (QC-001/QC-009 residue): consume the
+                // round (reset the aggregator, closing Snowball's beta window)
+                // ONLY when this tally reached quorum for some hash. Previously
+                // ANY non-empty tally reset it; once the clamp removes the
+                // accidental Sybil tax that made extra sockets self-limiting, a
+                // single stray vote resetting the round would let an attacker
+                // discard accumulated honest votes and choose when a round closes.
+                // Per-(height,voter) supersession in the aggregator bounds
+                // retention to one vote per voter, so holding across sub-quorum
+                // ticks cannot grow unbounded.
+                let quorum_round = tally.values().any(|&c| c >= self.params.quorum);
                 let finalized = state.voter.record_round(&tally);
+                if quorum_round {
+                    state.aggregator = VoteAggregator::new(self.params.sample_size);
+                }
                 if finalized {
                     info!(
                         "Snowball finalized at height {}: {:?}",
@@ -1380,6 +1497,100 @@ mod tests {
         );
     }
 
+    // ---- QC-001 / QC-012: the rung clamp ----
+
+    #[test]
+    fn qc012_derive_never_selects_the_solo_rung_with_peers() {
+        // The clamp cannot collapse to the degenerate (1,1,1) solo rung while
+        // peers are connected — the fresh-chain fork QC-012 (a da9478a artifact
+        // the peer-keyed sizing avoided and the clamp must keep avoiding).
+        // derive(p, 1) — only self registered, peers present — selects input 1
+        // (=> rung (2,2,1)), NEVER 0 (=> the solo (1,1,1)).
+        assert_eq!(RungInput::derive(1, 1).effective(), 1);
+        assert_eq!(RungInput::derive(2, 1).effective(), 1);
+        assert_eq!(RungInput::derive(5, 1).effective(), 1);
+    }
+
+    #[test]
+    fn qc012_derive_is_a_safety_clamp() {
+        // Sweep from 0: derive returns 0 IFF peer_count==0 (byte-preserving the
+        // zero-peer path); is >= 1 with any peer; and is ALWAYS <= peer_count, so
+        // the rung it selects is <= the rung the raw count would — a min can only
+        // lower the quorum bar, never raise it (the whole safety argument, and
+        // the exact axis the rejected da9478a broke).
+        for e in 0..=64usize {
+            assert_eq!(RungInput::derive(0, e).effective(), 0, "0 peers must give 0");
+        }
+        for p in 1..=64usize {
+            for e in 0..=64usize {
+                let v = RungInput::derive(p, e).effective();
+                assert!(v >= 1, "derive({p},{e}) = {v}, must be >= 1 with peers");
+                assert!(v <= p, "derive({p},{e}) = {v}, must be <= peer_count {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn qc001_derive_clamps_extra_sockets_on_the_pin_trio() {
+        // Live 3-node value: peer_count 2, distinct_eligible 3 -> min(2, 2) = 2
+        // -> rung (3,2,1), byte-identical to the pre-clamp peer-count sizing.
+        assert_eq!(RungInput::derive(2, 3).effective(), 2);
+        // The QC-001 close: extra sockets cannot raise the input above eligible-1.
+        // 8 sockets, 3 eligible -> min(8, 2) = 2, still rung (3,2,1) quorum 2.
+        assert_eq!(RungInput::derive(8, 3).effective(), 2);
+    }
+
+    #[test]
+    fn qc005_foreign_parent_votes_never_finalize_and_dont_consume_the_round() {
+        // Tip P. We hold X (parent P, tip-parented) and Y (parent P', foreign —
+        // admitted by QC-021 because addr(2) is in-set, but NOT votable). A peer
+        // votes Y repeatedly: the content filter drops Y from the tally, the
+        // self-vote never picks Y, so Y can never finalize; and because the
+        // FILTERED tally is empty the round is not consumed, so the peer's vote
+        // survives to supersede when it later learns the real block.
+        let mut cm = ConsensusManager::new();
+        cm.set_consensus_validators(&[addr(1), addr(2), addr(3)]);
+        cm.update_params_for_network_size(2); // rung (3,2,1), quorum 2
+
+        let tip = BlockHash([9u8; 32]);
+        let foreign = BlockHash([1u8; 32]);
+        let mut x = make_test_block_with_producer(5, addr(1));
+        x.header.parent_hash = tip;
+        let x_hash = x.hash();
+        let mut y = make_test_block_with_producer(5, addr(2));
+        y.header.parent_hash = foreign;
+        let y_hash = y.hash();
+        cm.add_candidate(x.clone());
+        cm.add_candidate(y.clone());
+
+        let p = PeerId::random();
+        for _ in 0..10 {
+            cm.record_peer_response(5, y_hash, p);
+            let r = cm.try_finalize_round(5, 2, tip);
+            assert_ne!(
+                r,
+                ConsensusRoundResult::Finalized,
+                "a foreign-parent block must never finalize"
+            );
+        }
+        assert_ne!(cm.finalized_at_height(5), Some(y_hash));
+
+        // Now the peer learns the real tip-parented block. Its vote supersedes Y,
+        // and with our self-vote (X, the only tip-parented candidate) quorum 2 is
+        // reached: the honest block finalizes.
+        for _ in 0..3 {
+            cm.record_peer_response(5, x_hash, p);
+            if cm.try_finalize_round(5, 2, tip) == ConsensusRoundResult::Finalized {
+                break;
+            }
+        }
+        assert_eq!(
+            cm.finalized_at_height(5),
+            Some(x_hash),
+            "the tip-parented block finalizes"
+        );
+    }
+
     // ---- Existing tests ----
 
     #[test]
@@ -1390,14 +1601,14 @@ mod tests {
         cm.add_candidate(block);
         // Not finalized without peer responses, even with one candidate.
         assert_eq!(cm.finalized_at_height(1), None);
-        cm.try_finalize_round(1, 3);
+        cm.try_finalize_round(1, 3, BlockHash::GENESIS);
         // Still not finalized — no peer votes received.
         assert_eq!(cm.finalized_at_height(1), None);
         // Finalize via peer voting: 5 rounds (decision_threshold), 2 votes each (quorum).
         for _ in 0..5 {
             cm.record_response(1, hash);
             cm.record_response(1, hash);
-            cm.try_finalize_round(1, 3);
+            cm.try_finalize_round(1, 3, BlockHash::GENESIS);
         }
         assert_eq!(cm.finalized_at_height(1), Some(hash));
     }
@@ -1428,7 +1639,7 @@ mod tests {
         for _ in 0..5 {
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_a);
-            cm.try_finalize_round(1, 3);
+            cm.try_finalize_round(1, 3, BlockHash::GENESIS);
         }
         assert_eq!(cm.finalized_at_height(1), Some(hash_a));
     }
@@ -1443,7 +1654,7 @@ mod tests {
         for _ in 0..5 {
             cm.record_response(1, hash);
             cm.record_response(1, hash);
-            cm.try_finalize_round(1, 3);
+            cm.try_finalize_round(1, 3, BlockHash::GENESIS);
         }
 
         let taken = cm.take_finalized(1);
@@ -1500,8 +1711,8 @@ mod tests {
             cm_b.record_response(1, majority_hash);
             cm_b.record_response(1, minority_hash);
 
-            cm_a.try_finalize_round(1, 3);
-            cm_b.try_finalize_round(1, 3);
+            cm_a.try_finalize_round(1, 3, BlockHash::GENESIS);
+            cm_b.try_finalize_round(1, 3, BlockHash::GENESIS);
 
             // Check if both finalized.
             let final_a = cm_a.finalized_at_height(1);
@@ -1548,7 +1759,7 @@ mod tests {
             cm.record_response(1, hash_b);
             cm.record_response(1, hash_b);
             cm.record_response(1, hash_a);
-            cm.try_finalize_round(1, 3);
+            cm.try_finalize_round(1, 3, BlockHash::GENESIS);
         }
         assert_eq!(cm.finalized_at_height(1), None, "Should not finalize after only 2 rounds");
 
@@ -1557,7 +1768,7 @@ mod tests {
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_a);
-            cm.try_finalize_round(1, 3);
+            cm.try_finalize_round(1, 3, BlockHash::GENESIS);
         }
 
         // block_a should win since it had strong majority in later rounds.
@@ -1579,7 +1790,7 @@ mod tests {
         for _ in 0..3 {
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_a);
-            cm.try_finalize_round(1, 3);
+            cm.try_finalize_round(1, 3, BlockHash::GENESIS);
         }
         assert_eq!(cm.finalized_at_height(1), None);
     }
@@ -1855,7 +2066,7 @@ mod tests {
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_a);
             cm.record_response(1, hash_b);
-            cm.try_finalize_round(1, 3);
+            cm.try_finalize_round(1, 3, BlockHash::GENESIS);
         }
 
         let winner = cm.finalized_at_height(1);
@@ -1882,11 +2093,11 @@ mod tests {
         for _ in 0..6 {
             cm_1.record_response(1, hash_a);
             cm_1.record_response(1, hash_a);
-            cm_1.try_finalize_round(1, 3);
+            cm_1.try_finalize_round(1, 3, BlockHash::GENESIS);
 
             cm_2.record_response(1, hash_a);
             cm_2.record_response(1, hash_a);
-            cm_2.try_finalize_round(1, 3);
+            cm_2.try_finalize_round(1, 3, BlockHash::GENESIS);
         }
 
         let final_1 = cm_1.finalized_at_height(1);
@@ -1950,7 +2161,7 @@ mod tests {
             for _ in 0..7 {
                 cm.record_response(1, hash_a);
             }
-            cm.try_finalize_round(1, 3);
+            cm.try_finalize_round(1, 3, BlockHash::GENESIS);
         }
         assert_eq!(cm.finalized_at_height(1), None);
 
@@ -1958,7 +2169,7 @@ mod tests {
         for _ in 0..7 {
             cm.record_response(1, hash_a);
         }
-        cm.try_finalize_round(1, 3);
+        cm.try_finalize_round(1, 3, BlockHash::GENESIS);
         assert_eq!(cm.finalized_at_height(1), Some(hash_a));
     }
 
@@ -2027,7 +2238,7 @@ mod tests {
             for _ in 0..cm.params.quorum {
                 cm.record_response(height, hash);
             }
-            let result = cm.try_finalize_round(height, 1);
+            let result = cm.try_finalize_round(height, 1, BlockHash::GENESIS);
             if result == ConsensusRoundResult::Finalized {
                 assert!(cm.finalized_at_height(height).is_some());
                 return;
@@ -2045,7 +2256,7 @@ mod tests {
         // Set the start time to the past so timeout triggers immediately.
         cm.height_start_time.insert(1, std::time::Instant::now() - std::time::Duration::from_secs(10));
 
-        let result = cm.try_finalize_round(1, 0);
+        let result = cm.try_finalize_round(1, 0, BlockHash::GENESIS);
         assert_eq!(result, ConsensusRoundResult::Stalled);
 
         // Verify no finalization happened (no fabricated votes).
@@ -2192,7 +2403,7 @@ mod tests {
             for _ in 0..14 {
                 cm.record_response(1, hash);
             }
-            cm.try_finalize_round(1, 100);
+            cm.try_finalize_round(1, 100, BlockHash::GENESIS);
         }
         assert!(
             cm.finalized_at_height(1).is_none(),
@@ -2337,7 +2548,7 @@ mod tests {
         for _ in 0..10 {
             cm.record_peer_response(5, winner.hash(), pa);
             cm.record_peer_response(5, winner.hash(), pb);
-            cm.try_finalize_round(5, 2);
+            cm.try_finalize_round(5, 2, BlockHash([7u8; 32]));
         }
         assert_eq!(cm.finalized_at_height(5), Some(winner.hash()));
 
@@ -2477,7 +2688,7 @@ mod tests {
         let pa = PeerId::random();
         for _ in 0..5 {
             cm.record_peer_response(height, primary.hash(), pa);
-            cm.try_finalize_round(height, 2);
+            cm.try_finalize_round(height, 2, BlockHash([7u8; 32]));
         }
         assert_eq!(
             cm.finalized_at_height(height),
@@ -2603,7 +2814,7 @@ mod tests {
         let mut finalized = false;
         for _ in 0..10 {
             cm.record_peer_response(5, block.hash(), only_peer);
-            if cm.try_finalize_round(5, 2) == ConsensusRoundResult::Finalized {
+            if cm.try_finalize_round(5, 2, BlockHash::GENESIS) == ConsensusRoundResult::Finalized {
                 finalized = true;
                 break;
             }
@@ -2627,7 +2838,7 @@ mod tests {
         cm.add_candidate(make_test_block_with_producer(5, addr(1)));
         for _ in 0..10 {
             assert_ne!(
-                cm.try_finalize_round(5, 2),
+                cm.try_finalize_round(5, 2, BlockHash([7u8; 32])),
                 ConsensusRoundResult::Finalized,
                 "no peer votes ⇒ no round ⇒ no finalization"
             );
@@ -2712,7 +2923,7 @@ mod tests {
         for _ in 0..10 {
             cm.record_peer_response(5, foreign, pa);
             cm.record_peer_response(5, foreign, pb);
-            cm.try_finalize_round(5, 2);
+            cm.try_finalize_round(5, 2, BlockHash([7u8; 32]));
         }
         if cm.finalized_at_height(5) == Some(foreign) {
             assert!(cm.take_finalized(5).is_none(), "no body -> no block");
@@ -2760,7 +2971,7 @@ mod tests {
         // Backdate so the stall timeout would otherwise fire.
         cm.height_start_time
             .insert(5, Instant::now() - std::time::Duration::from_secs(60));
-        assert_eq!(cm.try_finalize_round(5, 0), ConsensusRoundResult::NotReady);
+        assert_eq!(cm.try_finalize_round(5, 0, BlockHash([7u8; 32])), ConsensusRoundResult::NotReady);
         assert!(cm.finalized_at_height(5).is_none());
     }
 
@@ -2775,7 +2986,7 @@ mod tests {
         let peer = PeerId::random();
         assert!(cm.record_peer_response(5, hash, peer));
         // Gate fires at 0 peers but must NOT consume the pending round.
-        assert_eq!(cm.try_finalize_round(5, 0), ConsensusRoundResult::NotReady);
+        assert_eq!(cm.try_finalize_round(5, 0, BlockHash([7u8; 32])), ConsensusRoundResult::NotReady);
         // Same peer re-voting is still deduped -> aggregator survived the gate.
         assert!(!cm.record_peer_response(5, hash, peer));
 
@@ -2783,7 +2994,7 @@ mod tests {
         for _ in 0..5 {
             cm.record_response(5, hash);
             cm.record_response(5, hash);
-            cm.try_finalize_round(5, 3);
+            cm.try_finalize_round(5, 3, BlockHash::GENESIS);
         }
         assert_eq!(cm.finalized_at_height(5), Some(hash));
     }
@@ -2796,7 +3007,7 @@ mod tests {
         cm.add_candidate(make_test_block(1));
         cm.height_start_time
             .insert(1, Instant::now() - std::time::Duration::from_secs(60));
-        assert_eq!(cm.try_finalize_round(1, 0), ConsensusRoundResult::Stalled);
+        assert_eq!(cm.try_finalize_round(1, 0, BlockHash::GENESIS), ConsensusRoundResult::Stalled);
     }
 
     #[test]
@@ -2808,7 +3019,7 @@ mod tests {
         cm.height_start_time
             .insert(5, Instant::now() - std::time::Duration::from_secs(60));
         // applied_tip survives clear(): still an established node, still gated.
-        assert_eq!(cm.try_finalize_round(5, 0), ConsensusRoundResult::NotReady);
+        assert_eq!(cm.try_finalize_round(5, 0, BlockHash([7u8; 32])), ConsensusRoundResult::NotReady);
     }
 
     #[test]
@@ -2819,7 +3030,7 @@ mod tests {
         cm.add_candidate(make_test_block(5));
         cm.height_start_time
             .insert(5, Instant::now() - std::time::Duration::from_secs(60));
-        assert_eq!(cm.try_finalize_round(5, 0), ConsensusRoundResult::Stalled);
+        assert_eq!(cm.try_finalize_round(5, 0, BlockHash([7u8; 32])), ConsensusRoundResult::Stalled);
     }
 
     // ---- Per-peer NotReady stall-reset budget ----

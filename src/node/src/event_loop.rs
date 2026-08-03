@@ -1982,7 +1982,7 @@ impl EventLoop {
                                                 self.advance_network_height(height);
                                                 self.node_state.record_peer_height(commputer::peer_hash::peer_bucket(&peer), height);
                                                 self.consensus.add_candidate(block);
-                                                self.consensus.try_finalize_round(height, self.peer_ips.len());
+                                                self.consensus.try_finalize_round(height, self.peer_ips.len(), self.tip_hash());
                                                 self.try_apply_finalized(height);
                                             }
                                             // VOTE-HEIGHT DISCIPLINE (alpha.6).
@@ -2197,7 +2197,7 @@ impl EventLoop {
                 debug!("Received block candidate {} at height {}", hash, height);
                 self.consensus.add_candidate(block);
 
-                self.consensus.try_finalize_round(height, self.peer_ips.len());
+                self.consensus.try_finalize_round(height, self.peer_ips.len(), self.tip_hash());
                 self.try_apply_finalized(height);
 
                 // Legacy compat: also respond with vote.
@@ -2252,7 +2252,7 @@ impl EventLoop {
                     self.advance_network_height(height);
                     self.node_state.record_peer_height(commputer::peer_hash::peer_bucket(&source), height);
                     self.consensus.add_candidate(block);
-                    self.consensus.try_finalize_round(height, self.peer_ips.len());
+                    self.consensus.try_finalize_round(height, self.peer_ips.len(), self.tip_hash());
                     self.try_apply_finalized(height);
                 }
             }
@@ -2289,7 +2289,7 @@ impl EventLoop {
 
                 debug!("Received block proposal {} at height {}", hash, height);
                 self.consensus.add_candidate(block);
-                self.consensus.try_finalize_round(height, self.peer_ips.len());
+                self.consensus.try_finalize_round(height, self.peer_ips.len(), self.tip_hash());
                 self.try_apply_finalized(height);
 
                 // Immediately respond with our vote.
@@ -2832,7 +2832,7 @@ impl EventLoop {
         self.consensus.add_candidate(block);
 
         // Attempt finalization (handles single-candidate fast-path).
-        self.consensus.try_finalize_round(height, self.peer_ips.len());
+        self.consensus.try_finalize_round(height, self.peer_ips.len(), self.tip_hash());
         self.try_apply_finalized(height);
     }
 
@@ -2868,7 +2868,7 @@ impl EventLoop {
                     continue;
                 }
                 self.consensus.add_candidate(orphan);
-                self.consensus.try_finalize_round(height, self.peer_ips.len());
+                self.consensus.try_finalize_round(height, self.peer_ips.len(), self.tip_hash());
                 self.try_apply_finalized(height);
             }
         }
@@ -4142,6 +4142,18 @@ impl EventLoop {
 
     /// Consensus round tick (500ms): for each active height, publish a query
     /// and attempt to finalize the round from accumulated responses.
+    /// The hash of our current chain tip (or GENESIS before block 1). Recomputed
+    /// FRESH on every call — the consensus content filter (QC-004/QC-005) reads
+    /// it to keep only tip-parented votes, so a cached value would reject a
+    /// just-applied block's own child as foreign-parent and strand the height.
+    fn tip_hash(&self) -> BlockHash {
+        self.state
+            .blocks
+            .latest()
+            .map(|b| b.hash())
+            .unwrap_or(BlockHash::GENESIS)
+    }
+
     fn handle_consensus_tick(&mut self) {
         // Don't participate in consensus while syncing.
         if !self.node_state.is_active() {
@@ -4149,7 +4161,17 @@ impl EventLoop {
         }
 
         let peer_count = self.peer_ips.len();
-        self.consensus.update_params_for_network_size(peer_count);
+        // QC-001 clamp: size the rung from on-chain truth, not the raw socket
+        // count. distinct_eligible is derived fresh from the current cycle;
+        // RungInput::derive returns min(peer_count, distinct_eligible-1) (0 iff no
+        // peers), so extra sockets can no longer inflate the quorum bar. The
+        // consensus_cycle() call is cache-guarded and is taken again below for
+        // set_consensus_validators; the second hit is an early-return no-op.
+        let distinct_eligible =
+            commputer::leader::distinct_validator_count(&self.consensus_cycle());
+        self.consensus.update_params_for_rung(
+            crate::consensus_manager::RungInput::derive(peer_count, distinct_eligible),
+        );
         // A wall-clock stall accumulated with nobody to talk to is meaningless —
         // without this, a node that rejoins after a 0-peer stretch fires an
         // immediate (destructive) recovery off stale timing.
@@ -4200,7 +4222,7 @@ impl EventLoop {
             }
 
             // Try to finalize from responses accumulated in previous ticks.
-            let result = self.consensus.try_finalize_round(next_height, peer_count);
+            let result = self.consensus.try_finalize_round(next_height, peer_count, self.tip_hash());
             // Clear voted_peers after each round so the next Snowball sampling
             // round re-queries all peers (needed for decision_threshold rounds).
             self.voted_peers.clear();
