@@ -1272,15 +1272,18 @@ mod tests {
     }
 
     #[test]
-    fn qc021_local_block_admitted_over_a_full_unknown_map() {
-        // Our own produced block (from_network=false) is protected even if the
-        // map is already saturated with unknown-producer candidates.
+    fn qc021_local_block_protected_from_unknown_flood() {
+        // Our own produced block (from_network=false) is protected by the
+        // !from_network rule, so an unknown-producer flood — which the 8-slot
+        // pool holds to 8 candidates, not the full 64 — cannot keep it out.
         let mut cm = ConsensusManager::new();
         cm.set_consensus_validators(&[addr(1), addr(2), addr(3)]);
         let h = 7;
         for i in 0..64u8 {
             cm.add_candidate(make_test_block_with_producer(h, addr(50 + i)));
         }
+        // The flood is pooled to the unknown cap, leaving ample room.
+        assert!(cm.candidates_at_height(h) <= MAX_UNKNOWN_CANDIDATES_PER_HEIGHT);
         // A locally produced block whose producer is NOT even in the set is still
         // protected by the !from_network rule.
         let ours = make_test_block_with_producer(h, addr(200));
@@ -1290,6 +1293,56 @@ mod tests {
             cm.has_candidate(h, ours_hash),
             "a locally produced block was dropped behind an unknown-producer flood"
         );
+    }
+
+    #[test]
+    fn qc021_protected_displaces_unknown_when_map_is_full() {
+        // The displacement path (only reachable with a large open validator set,
+        // i.e. after the alpha pin is retired): when the map is genuinely full, an
+        // arriving PROTECTED (in-set) candidate must displace an UNKNOWN one — and
+        // never an in-set one. Guards against a filter-inversion regression in the
+        // displacement selector (e.g. `!contains` -> `contains` at the .find),
+        // which the flood tests above cannot catch because the 8-cap never lets
+        // the map reach 64.
+        let mut cm = ConsensusManager::new();
+        let set: Vec<Address> = (1..=60u8).map(addr).collect();
+        cm.set_consensus_validators(&set);
+        let h = 5;
+        // 56 in-set producers (protected, never capped) ...
+        for p in &set[..56] {
+            cm.add_candidate(make_test_block_with_producer(h, *p));
+        }
+        // ... plus 8 unknowns bring the map to exactly the cap.
+        let unknown_hashes: Vec<BlockHash> = (0..8u8)
+            .map(|i| {
+                let b = make_test_block_with_producer(h, addr(100 + i));
+                let hh = b.hash();
+                cm.add_candidate(b);
+                hh
+            })
+            .collect();
+        assert_eq!(cm.candidates_at_height(h), MAX_CANDIDATES_PER_HEIGHT);
+
+        // A 57th in-set producer arrives at a full map: admitted by displacing an
+        // unknown, and every in-set candidate must survive.
+        let newcomer = make_test_block_with_producer(h, set[56]);
+        let newcomer_hash = newcomer.hash();
+        cm.add_candidate(newcomer);
+        assert!(
+            cm.has_candidate(h, newcomer_hash),
+            "protected newcomer was not admitted at a full map"
+        );
+        assert_eq!(
+            cm.candidates_at_height(h),
+            MAX_CANDIDATES_PER_HEIGHT,
+            "map should stay at the cap after a displacement"
+        );
+        for p in &set[..56] {
+            let ph = make_test_block_with_producer(h, *p).hash();
+            assert!(cm.has_candidate(h, ph), "an in-set candidate was wrongly displaced");
+        }
+        let surviving = unknown_hashes.iter().filter(|hh| cm.has_candidate(h, **hh)).count();
+        assert_eq!(surviving, 7, "exactly one unknown should have been displaced");
     }
 
     #[test]
