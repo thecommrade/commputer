@@ -62,6 +62,21 @@ pub const MAX_HEIGHT_WINDOW: u64 = 1024;
 /// validator, so this is far above any legitimate need.
 pub const MAX_CANDIDATES_PER_HEIGHT: usize = 64;
 
+/// Security bound (QC-021): of the MAX_CANDIDATES_PER_HEIGHT slots at one height,
+/// how many may be held by candidates whose producer is NOT in the current
+/// consensus set — an "unknown" producer. Without a per-class bound, an unstaked
+/// stranger mints unbounded distinct block hashes at one height from throwaway
+/// keypairs and fills all 64 slots; the arriving-candidate drop then evicts the
+/// scheduled leader's real block, which is never tip-parented and so never
+/// votable (`query_votable_preference`), so that height can never finalize and
+/// the tip halts there permanently. A legitimate fork has at most one block per
+/// validator, so a small pool is far above any honest need for producers outside
+/// the set while leaving the bulk of the map for the set itself. Enforced only
+/// once the set is known (`cached_validators` non-empty); during the brief
+/// pre-bootstrap window before the schedule is first cached, the global cap alone
+/// applies (there are too few candidates then for the class bound to matter).
+pub const MAX_UNKNOWN_CANDIDATES_PER_HEIGHT: usize = 8;
+
 /// Security bound: maximum number of distinct checkpoint validators tracked per
 /// height. `CheckpointCommitment` carries an attacker-chosen `validator`
 /// Address, so without a cap one peer synthesises unbounded addresses per
@@ -387,16 +402,66 @@ impl ConsensusManager {
             return;
         }
 
-        // Security bound (see MAX_CANDIDATES_PER_HEIGHT): if this height already
-        // holds the maximum number of distinct candidates and this block is not
-        // one of them, drop it before it can grow validator_blocks / candidates.
-        // A peer cannot mint unbounded hashes (varying producer/timestamp) at one
-        // height; existing candidates are always preserved.
-        if let Some(state) = self.heights.get(&height)
-            && !state.candidates.contains_key(&hash)
-            && state.candidates.len() >= MAX_CANDIDATES_PER_HEIGHT
-        {
-            return;
+        // Admission control (QC-021). The per-height candidate map is a bounded
+        // resource, so WHO may consume a slot matters — not just how many slots
+        // are used. A candidate is PROTECTED if we produced it locally
+        // (`!from_network`) or its producer is in the current consensus set;
+        // anything else is an UNKNOWN producer. The producer field is trustworthy
+        // here: `validate_block_from_peer` verifies the producer signature before
+        // any add_candidate call, so a stranger cannot present an in-set producer
+        // address without that validator's key. Two rules replace the old bare
+        // "full → drop the arrival":
+        //   1. Unknown producers are collectively capped at
+        //      MAX_UNKNOWN_CANDIDATES_PER_HEIGHT, so a flood of throwaway-keyed
+        //      blocks cannot fill the map.
+        //   2. If the map is full, a protected candidate may DISPLACE an unknown
+        //      one rather than be dropped — so the scheduled leader's block is
+        //      never evicted by strangers. If nothing is displaceable the map is
+        //      MAX_CANDIDATES_PER_HEIGHT genuine set-member forks (not an attack),
+        //      and incumbents are preserved as before.
+        // Both rules apply only once the set is known; before that the global cap
+        // alone holds (see MAX_UNKNOWN_CANDIDATES_PER_HEIGHT).
+        let set_known = !self.cached_validators.is_empty();
+        let producer_in_set = set_known && self.cached_validators.contains(&producer);
+        let is_protected = !from_network || producer_in_set;
+
+        let mut displace: Option<BlockHash> = None;
+        if let Some(state) = self.heights.get(&height) {
+            if !state.candidates.contains_key(&hash) {
+                if set_known
+                    && !is_protected
+                    && state
+                        .candidates
+                        .values()
+                        .filter(|b| !self.cached_validators.contains(&b.header.producer))
+                        .count()
+                        >= MAX_UNKNOWN_CANDIDATES_PER_HEIGHT
+                {
+                    // The unknown-producer overflow pool is full — drop this one.
+                    return;
+                }
+                if state.candidates.len() >= MAX_CANDIDATES_PER_HEIGHT {
+                    if set_known && is_protected {
+                        displace = state
+                            .candidates
+                            .iter()
+                            .find(|(_, b)| !self.cached_validators.contains(&b.header.producer))
+                            .map(|(h, _)| *h);
+                        if displace.is_none() {
+                            // Full of genuine set-member candidates — a real
+                            // >=64-way fork, not an attack. Preserve incumbents.
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(victim) = displace {
+            if let Some(state) = self.heights.get_mut(&height) {
+                state.candidates.remove(&victim);
+            }
         }
 
         // Feature 125: Check for equivocation — only flag blocks received from the
@@ -899,6 +964,15 @@ impl ConsensusManager {
             .unwrap_or(0)
     }
 
+    /// Whether a specific candidate hash is currently held at `height`.
+    #[cfg(test)]
+    pub fn has_candidate(&self, height: u64, hash: BlockHash) -> bool {
+        self.heights
+            .get(&height)
+            .map(|s| s.candidates.contains_key(&hash))
+            .unwrap_or(false)
+    }
+
     /// All heights that currently have an active (non-finalized) vote.
     pub fn active_heights(&self) -> Vec<u64> {
         self.heights
@@ -1160,6 +1234,97 @@ mod tests {
             proof_summaries: vec![],
             compliance_summary: None, epoch_summary: None,
         }
+    }
+
+    // ---- QC-021: candidate-map admission control ----
+
+    #[test]
+    fn qc021_flood_cannot_evict_scheduled_leader() {
+        // 64 empty blocks from throwaway (unknown) producers must not fill the
+        // per-height map and evict a consensus-set producer's block. Reverting
+        // the admission logic makes this fail: the old code fills to 64 with the
+        // strangers and then drops the arriving leader block.
+        let mut cm = ConsensusManager::new();
+        let leader = addr(1);
+        cm.set_consensus_validators(&[leader, addr(2), addr(3)]);
+
+        let h = 1;
+        for i in 0..64u8 {
+            // addr(50..114) are all outside the set — distinct producers, hashes.
+            cm.add_candidate(make_test_block_with_producer(h, addr(50 + i)));
+        }
+        // The unknown-producer overflow pool is bounded well below capacity.
+        assert!(
+            cm.candidates_at_height(h) <= MAX_UNKNOWN_CANDIDATES_PER_HEIGHT,
+            "unknown producers took {} slots (cap {})",
+            cm.candidates_at_height(h),
+            MAX_UNKNOWN_CANDIDATES_PER_HEIGHT
+        );
+
+        // The scheduled leader's block is admitted despite the flood.
+        let leader_block = make_test_block_with_producer(h, leader);
+        let leader_hash = leader_block.hash();
+        cm.add_candidate(leader_block);
+        assert!(
+            cm.has_candidate(h, leader_hash),
+            "QC-021: the scheduled leader's block was evicted/dropped by the flood"
+        );
+    }
+
+    #[test]
+    fn qc021_local_block_admitted_over_a_full_unknown_map() {
+        // Our own produced block (from_network=false) is protected even if the
+        // map is already saturated with unknown-producer candidates.
+        let mut cm = ConsensusManager::new();
+        cm.set_consensus_validators(&[addr(1), addr(2), addr(3)]);
+        let h = 7;
+        for i in 0..64u8 {
+            cm.add_candidate(make_test_block_with_producer(h, addr(50 + i)));
+        }
+        // A locally produced block whose producer is NOT even in the set is still
+        // protected by the !from_network rule.
+        let ours = make_test_block_with_producer(h, addr(200));
+        let ours_hash = ours.hash();
+        cm.add_local_candidate(ours);
+        assert!(
+            cm.has_candidate(h, ours_hash),
+            "a locally produced block was dropped behind an unknown-producer flood"
+        );
+    }
+
+    #[test]
+    fn admission_preserves_legit_multiproducer_fork() {
+        // No regression: candidates from IN-SET producers are never subject to
+        // the unknown cap. A genuine fork among set members is fully retained.
+        let mut cm = ConsensusManager::new();
+        let set: Vec<Address> = (1..=20u8).map(addr).collect();
+        cm.set_consensus_validators(&set);
+        let h = 3;
+        for p in &set {
+            cm.add_candidate(make_test_block_with_producer(h, *p));
+        }
+        assert_eq!(
+            cm.candidates_at_height(h),
+            set.len(),
+            "in-set producers must never be capped like unknown ones"
+        );
+    }
+
+    #[test]
+    fn admission_falls_back_to_global_cap_before_set_is_known() {
+        // Before the schedule is ever cached, the class bound cannot apply
+        // (every producer is "unknown"); the global cap alone holds, exactly as
+        // the pre-fix behaviour. This guards the bootstrap window.
+        let mut cm = ConsensusManager::new();
+        let h = 2;
+        for i in 0..70u8 {
+            cm.add_candidate(make_test_block_with_producer(h, addr(50 + i)));
+        }
+        assert_eq!(
+            cm.candidates_at_height(h),
+            MAX_CANDIDATES_PER_HEIGHT,
+            "with no known set the global cap should still bound the map"
+        );
     }
 
     // ---- Existing tests ----
