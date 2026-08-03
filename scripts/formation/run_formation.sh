@@ -54,7 +54,15 @@ FAST_SET=(
     F1_runaway_detect
     F11_socket_flood
     F12_rung_inflation
+    F13_vote_capture
 )
+# F13_attest_kill is INTENTIONALLY NOT in FAST_SET: it pins the LIVENESS FLOOR of
+# the attestation gate, which this lane's clamp-only binary does not yet ship (the
+# binary does not read COMMPUTER_ATTEST_DISABLE), so it is only a trivial
+# healthy-mesh check until the gate lands. Run it by name:
+#   scripts/formation/run_formation.sh F13_attest_kill
+# Add it to FAST_SET once the attestation gate exists, so it proves the gate did
+# not cost liveness among honest nodes.
 # No soak scenario exists yet (scenarios/soak_30min.sh was never written), so
 # `soak`/`all` would fail with "no such scenario". Left EMPTY until a real soak
 # scenario lands; point this at that file when it does.
