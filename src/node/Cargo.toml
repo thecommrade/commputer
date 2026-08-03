@@ -12,6 +12,16 @@ description = "Commputer node: a communal supercomputer coordinated by blockchai
 # only; never enabled for release builds.
 formation-test = ["commputer-storage/formation-test"]
 
+# QC-021 adversarial harness client. A standalone libp2p dialer that floods a
+# running node with 64 crafted candidate blocks to reproduce the per-height
+# candidate-map exhaustion halt. Test/attack infrastructure only — built into
+# target/formation alongside the node, never shipped in a release. Reuses the
+# workspace crates (commputer_core block/signing/wallet, commputer_network
+# transport/topics/compress) so its wire format matches the node's exactly.
+[[bin]]
+name = "sybil_dialer"
+path = "src/bin/sybil_dialer.rs"
+
 [dependencies]
 commputer-core = { workspace = true }
 commputer-consensus = { workspace = true }

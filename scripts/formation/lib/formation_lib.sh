@@ -293,6 +293,70 @@ assert_progress() {
     return $(( ! ok ))
 }
 
+# --------------------------------------------------------------------------
+# LOG-LINE assertions (QC-021).
+#
+# The height-based verbs above cannot catch a consensus-dead node: a node that
+# finalizes nothing still climbs in height via sync (apply_synced_block,
+# event_loop.rs:4583-4643). These scrape the node LOG instead, so they detect a
+# production/finalization halt even while the reported height keeps moving.
+# Both strings are the live info! logs — verified in-tree before hard-coding:
+#   "Produced block candidate at height"  — event_loop.rs:4098
+#   "Snowball finalized at height"        — consensus_manager.rs:702-706
+# --------------------------------------------------------------------------
+
+# assert_produces <idx> <window_s> <min_new> — the node's count of
+# "Produced block candidate at height" log lines must increase by >= min_new
+# over the window. Mirrors assert_progress: snapshot, sleep, compare, pass/fail.
+assert_produces() {
+    local idx="$1"; local window="$2"; local min_new="$3"
+    local start; start="$(scrape "${idx}" "Produced block candidate at height")"
+    sleep "${window}"
+    local now; now="$(scrape "${idx}" "Produced block candidate at height")"
+    local gain=$(( ${now:-0} - ${start:-0} ))
+    if (( gain < min_new )); then
+        fail "node${idx} produced ${gain} block(s) in ${window}s (want >= ${min_new}): ${start} -> ${now}"
+        return 1
+    fi
+    pass "node${idx} produced ${gain} block(s) in ${window}s (>= ${min_new})"
+    return 0
+}
+
+# assert_finalizes <idx> <window_s> <min_new> — the node's count of
+# "Snowball finalized at height" log lines must increase by >= min_new over the
+# window. This is the QC-021 discriminator: a flooded node stops finalizing
+# (nothing at the poisoned height is votable) while a fixed node keeps going.
+assert_finalizes() {
+    local idx="$1"; local window="$2"; local min_new="$3"
+    local start; start="$(scrape "${idx}" "Snowball finalized at height")"
+    sleep "${window}"
+    local now; now="$(scrape "${idx}" "Snowball finalized at height")"
+    local gain=$(( ${now:-0} - ${start:-0} ))
+    if (( gain < min_new )); then
+        fail "node${idx} finalized ${gain} height(s) in ${window}s (want >= ${min_new}): ${start} -> ${now}"
+        return 1
+    fi
+    pass "node${idx} finalized ${gain} height(s) in ${window}s (>= ${min_new})"
+    return 0
+}
+
+# assert_not_producing <idx> <window_s> — RED-side verb: the
+# "Produced block candidate" count must NOT increase over the window. Used to
+# assert a poisoned node has stalled its production entirely.
+assert_not_producing() {
+    local idx="$1"; local window="$2"
+    local start; start="$(scrape "${idx}" "Produced block candidate at height")"
+    sleep "${window}"
+    local now; now="$(scrape "${idx}" "Produced block candidate at height")"
+    local gain=$(( ${now:-0} - ${start:-0} ))
+    if (( gain > 0 )); then
+        fail "node${idx} still producing: ${gain} new block(s) in ${window}s (${start} -> ${now}) — expected a stall"
+        return 1
+    fi
+    pass "node${idx} produced 0 blocks in ${window}s (stalled as expected)"
+    return 0
+}
+
 # assert_converged <tolerance> <timeout_s> <idx...> — heights within tolerance
 # AND identical fingerprints at a common recent height.
 assert_converged() {

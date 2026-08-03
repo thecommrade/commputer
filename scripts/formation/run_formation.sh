@@ -40,6 +40,9 @@ SRC_DIR="${REPO_ROOT}/src"
 # never overwriting the release binary that gets deployed.
 FORMATION_TARGET="${SRC_DIR}/target/formation"
 NODE_BIN="${FORMATION_NODE_BIN:-${FORMATION_TARGET}/release/commputer}"
+# QC-021 adversarial harness client, built into the same target/formation dir
+# with the same --features formation-test --release profile as the node.
+SYBIL_BIN="${FORMATION_SYBIL_BIN:-${FORMATION_TARGET}/release/sybil_dialer}"
 
 FAST_SET=(
     F5_mesh_convergence
@@ -49,8 +52,12 @@ FAST_SET=(
     F_isolation_solo_gate
     F8_fresh_join
     F1_runaway_detect
+    F11_socket_flood
 )
-SOAK_SET=( soak_30min )
+# No soak scenario exists yet (scenarios/soak_30min.sh was never written), so
+# `soak`/`all` would fail with "no such scenario". Left EMPTY until a real soak
+# scenario lands; point this at that file when it does.
+SOAK_SET=( )
 
 # --------------------------------------------------------------------------
 # Stage 1 (outside the namespace): build, then re-exec inside it.
@@ -71,6 +78,15 @@ if [[ "${FORMATION_ISOLATED:-0}" != "1" ]]; then
         cargo build --release -p commputer --bin commputer --features formation-test ) || {
         echo "[formation] BUILD FAILED" >&2; exit 2; }
     [[ -x "${NODE_BIN}" ]] || { echo "[formation] no binary at ${NODE_BIN}" >&2; exit 2; }
+
+    # Build the QC-021 attacker binary alongside the node (same package, same
+    # feature, same target dir). Cargo is incremental, so this is a no-op after
+    # the node build compiled the shared workspace crates.
+    echo "[formation] building sybil_dialer (QC-021 attacker, --features formation-test)..."
+    ( cd "${SRC_DIR}" && CARGO_TARGET_DIR="${FORMATION_TARGET}" \
+        cargo build --release -p commputer --bin sybil_dialer --features formation-test ) || {
+        echo "[formation] SYBIL BUILD FAILED" >&2; exit 2; }
+    [[ -x "${SYBIL_BIN}" ]] || { echo "[formation] no sybil binary at ${SYBIL_BIN}" >&2; exit 2; }
 
     # Belt-and-suspenders: prove the binary is NEWER than every source it is
     # built from. If cargo ever declines to rebuild (clock skew, a stale
