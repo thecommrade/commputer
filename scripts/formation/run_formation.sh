@@ -53,6 +53,7 @@ FAST_SET=(
     F8_fresh_join
     F1_runaway_detect
     F11_socket_flood
+    F12_rung_inflation
 )
 # No soak scenario exists yet (scenarios/soak_30min.sh was never written), so
 # `soak`/`all` would fail with "no such scenario". Left EMPTY until a real soak
