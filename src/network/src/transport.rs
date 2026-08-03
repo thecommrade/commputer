@@ -177,6 +177,11 @@ pub struct CommpBehaviour {
     /// per-peer rate limit (P8). `CommpBehaviourEvent::Da` is auto-derived by
     /// `NetworkBehaviour` from this field.
     pub da: libp2p::request_response::Behaviour<crate::da_protocol::DaCodec>,
+    /// Peer -> validator attestation — `/commputer/attest/1`. One signed
+    /// challenge/response per connection binds a PeerId to a validator Address so
+    /// vote intake can count only proven consensus-set peers (QC-009).
+    /// `CommpBehaviourEvent::Attest` is auto-derived from this field.
+    pub attest: libp2p::request_response::Behaviour<crate::attest_protocol::AttestCodec>,
 }
 
 /// Write the persistent libp2p identity key to `path`, owner-only (0600) from
@@ -311,6 +316,7 @@ impl CommpNetwork {
                 let sync = crate::sync_protocol::sync_behaviour();
                 let consensus = crate::consensus_protocol::consensus_behaviour();
                 let da = crate::da_protocol::da_behaviour();
+                let attest = crate::attest_protocol::attest_behaviour();
 
                 Ok(CommpBehaviour {
                     gossipsub,
@@ -322,6 +328,7 @@ impl CommpNetwork {
                     sync,
                     consensus,
                     da,
+                    attest,
                 })
             })?
             .with_swarm_config(|cfg| {

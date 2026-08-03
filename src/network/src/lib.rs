@@ -8,6 +8,7 @@ pub mod validation;
 pub mod eclipse;
 pub mod sync_protocol;
 pub mod da_protocol;
+pub mod attest_protocol;
 pub mod consensus_protocol;
 pub mod consensus_rate_limiter;
 pub mod sync_rate_limiter;

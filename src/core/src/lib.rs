@@ -1,3 +1,4 @@
+pub mod attest;
 pub mod block;
 pub mod transaction;
 pub mod proof;

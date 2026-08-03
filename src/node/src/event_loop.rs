@@ -168,8 +168,27 @@ pub struct EventLoop {
     pub ping_timestamps: HashMap<libp2p::PeerId, std::time::Instant>,
     /// Feature 172: Whether a network partition has been detected.
     pub partition_detected: bool,
-    /// Feature 175: Verified peer-to-validator mappings (PeerId -> Address, verified via tx signature).
-    pub verified_peer_validators: HashMap<libp2p::PeerId, Address>,
+    /// QC-009 attestation: PeerId -> validator Address, bound by a signed
+    /// challenge/response at connect (`/commputer/attest/1`, see
+    /// `commputer_core::attest`). Vote intake counts a peer only if it is bound
+    /// here to a validator ELIGIBLE at USE time (eligibility is never cached).
+    /// Per-connection, in-memory only; removed on ConnectionClosed. Replaces the
+    /// forgeable, write-only `verified_peer_validators` (which keyed on the gossip
+    /// relayer, not the vote originator).
+    pub attested_peers: HashMap<libp2p::PeerId, Address>,
+    /// Outstanding attest challenges: PeerId -> the nonce we issued. Cleared on a
+    /// verified Proof or on ConnectionClosed.
+    pub pending_attest: HashMap<libp2p::PeerId, [u8; 32]>,
+    /// Liveness floor: the last active tick at which we held >=1 bound eligible
+    /// peer. The unbound-vote fallback engages only after GRACE_T with zero bound
+    /// eligible peers, so a genuinely isolated node degrades to clamp semantics
+    /// rather than halting, while any honest peer keeps the clock fresh and locks
+    /// an attacker out.
+    pub last_bound_at: Option<std::time::Instant>,
+    /// Kill lever (formation-test builds only): suppresses challenge/answer so the
+    /// liveness-floor fallback can be exercised deliberately. Always false in a
+    /// production build — there is no runtime off-switch for the gate.
+    pub attest_disabled: bool,
     /// Feature 177: Connection quality metrics per peer.
     pub peer_quality: HashMap<libp2p::PeerId, PeerQuality>,
     /// Feature 178: Custom seed multiaddrs for periodic reconnection.
@@ -314,7 +333,19 @@ impl EventLoop {
             peer_rtts: HashMap::new(),
             ping_timestamps: HashMap::new(),
             partition_detected: true, // Start paused — unpause when peers connect
-            verified_peer_validators: HashMap::new(),
+            attested_peers: HashMap::new(),
+            pending_attest: HashMap::new(),
+            last_bound_at: None,
+            attest_disabled: {
+                #[cfg(feature = "formation-test")]
+                {
+                    std::env::var("COMMPUTER_ATTEST_DISABLE").is_ok()
+                }
+                #[cfg(not(feature = "formation-test"))]
+                {
+                    false
+                }
+            },
             peer_quality: HashMap::new(),
             custom_seeds: Vec::new(),
             data_dir: None,
@@ -1669,6 +1700,29 @@ impl EventLoop {
                 info!("Connected to peer: {} at {}", peer_id, addr_str);
                 // Initialize peer reputation score.
                 self.peer_scores.entry(peer_id).or_insert(100);
+
+                // QC-009 attestation: challenge this peer to prove it controls an
+                // eligible validator key. Runs once per peer (past the dual-stack
+                // dedup return and the MAX_PEERS/diversity gate, so only for a peer
+                // we are keeping). The nonce binds this exact (challenger,
+                // responder) pair; a copied/relayed answer is worthless. The kill
+                // lever (formation-test only) skips the send, leaving the peer
+                // unbound so the liveness floor degrades to unbound counting.
+                if !self.attest_disabled {
+                    let nonce: [u8; 32] = rand::random();
+                    self.pending_attest.insert(peer_id, nonce);
+                    let req = commputer_network::attest_protocol::AttestRequest::Challenge {
+                        chain_id: commputer_core::genesis::TESTNET_CHAIN_ID.to_string(),
+                        challenger_peer: self.network.local_peer_id.to_bytes(),
+                        responder_peer: peer_id.to_bytes(),
+                        nonce,
+                    };
+                    self.network
+                        .swarm
+                        .behaviour_mut()
+                        .attest
+                        .send_request(&peer_id, req);
+                }
             }
             SwarmEvent::Behaviour(CommpBehaviourEvent::Identify(
                 libp2p::identify::Event::Received { peer_id, info, .. }
@@ -1911,6 +1965,96 @@ impl EventLoop {
                     RrEvent::ResponseSent { .. } => {}
                 }
             }
+            // === QC-009 peer->validator attestation (/commputer/attest/1) ===
+            SwarmEvent::Behaviour(CommpBehaviourEvent::Attest(event)) => {
+                use libp2p::request_response::{Event as RrEvent, Message as RrMessage};
+                use commputer_network::attest_protocol::{AttestRequest, AttestResponse};
+                match event {
+                    RrEvent::Message { peer, message } => match message {
+                        RrMessage::Request { request, channel, .. } => {
+                            let AttestRequest::Challenge {
+                                chain_id,
+                                challenger_peer,
+                                responder_peer,
+                                nonce,
+                            } = request;
+                            // SERVE side. Mutual gate (constraint 3): answer only a
+                            // peer we ourselves connected to and challenged (in
+                            // pending_attest or already bound), never an
+                            // unconnected/unchallenged stranger. Anti-relay: the
+                            // challenge must name US as responder and the requesting
+                            // peer as challenger (a relayed challenge naming a
+                            // different challenger is refused), and the chain id must
+                            // match. Only then do we sign with our validator key.
+                            let we_challenged = self.pending_attest.contains_key(&peer)
+                                || self.attested_peers.contains_key(&peer);
+                            let names_us = responder_peer == self.network.local_peer_id.to_bytes();
+                            let names_caller = challenger_peer == peer.to_bytes();
+                            let chain_ok = chain_id == commputer_core::genesis::TESTNET_CHAIN_ID;
+                            let response = if we_challenged && names_us && names_caller && chain_ok {
+                                let sig = self
+                                    .wallet
+                                    .sign(&commputer_core::attest::build_attest_bytes(
+                                        &chain_id,
+                                        &responder_peer,
+                                        &challenger_peer,
+                                        &nonce,
+                                    ))
+                                    .to_bytes()
+                                    .to_vec();
+                                AttestResponse::Proof {
+                                    pubkey: self.wallet.public_key().to_bytes().to_vec(),
+                                    sig,
+                                }
+                            } else {
+                                AttestResponse::Decline
+                            };
+                            let _ = self
+                                .network
+                                .swarm
+                                .behaviour_mut()
+                                .attest
+                                .send_response(channel, response);
+                        }
+                        RrMessage::Response { response, .. } => {
+                            // CHALLENGER side. Verify the proof against the nonce we
+                            // issued THIS peer, binding PeerId->Address. Eligibility
+                            // is NOT checked here (constraint 5) — only at vote intake
+                            // — so a peer that attests before its ValidatorRegister
+                            // applies flips ineligible->eligible with no re-handshake.
+                            if let AttestResponse::Proof { pubkey, sig } = response {
+                                if let Some(nonce) = self.pending_attest.get(&peer).copied() {
+                                    if let Some(addr) = commputer_core::attest::verify_attestation(
+                                        &pubkey,
+                                        commputer_core::genesis::TESTNET_CHAIN_ID,
+                                        &peer.to_bytes(),
+                                        &self.network.local_peer_id.to_bytes(),
+                                        &nonce,
+                                        &sig,
+                                    ) {
+                                        debug!("Attestation OK: peer {} -> validator {}", peer, addr);
+                                        self.attested_peers.insert(peer, addr);
+                                    } else {
+                                        debug!("Attestation from {} failed verification", peer);
+                                    }
+                                    self.pending_attest.remove(&peer);
+                                }
+                            }
+                        }
+                    },
+                    RrEvent::OutboundFailure { peer, error, .. } => {
+                        // A peer on an older binary (no /commputer/attest/1) yields
+                        // this; it simply never binds and the liveness floor carries
+                        // it during a mixed-version rollout.
+                        debug!("Attest challenge to {} failed: {}", peer, error);
+                        self.pending_attest.remove(&peer);
+                    }
+                    RrEvent::InboundFailure { peer, error, .. } => {
+                        debug!("Attest response to {} failed: {}", peer, error);
+                    }
+                    RrEvent::ResponseSent { .. } => {}
+                }
+            }
             // === Track-2 DA request-response protocol (/commputer/da/1) ===
             SwarmEvent::Behaviour(CommpBehaviourEvent::Da(event)) => {
                 use libp2p::request_response::{Event as RrEvent, Message as RrMessage};
@@ -2084,13 +2228,28 @@ impl EventLoop {
                                     ConsensusResponse::Vote { height, preference, accept } => {
                                         info!("Received Vote from {} at height {} (accept={})", peer, height, accept);
                                         if accept {
-                                            // Slice 2 (finding [4]): source-attribute the vote to the
-                                            // noise-authenticated rr peer so VoteAggregator dedups by PeerId.
-                                            self.consensus.record_peer_response(height, BlockHash(preference), peer);
-                                            self.voted_peers.insert(peer);
-                                            // SECURITY(E9/[30]): key the health-monitor voter set on the
-                                            // FULL PeerId bytes (was the same ~16-bit grindable fold).
-                                            self.health_monitor.record_vote(commputer::peer_hash::peer_bucket(&peer));
+                                            // QC-009 vote-path gate: count a remote vote only from a peer
+                                            // that PROVED control of a validator eligible RIGHT NOW
+                                            // (attestation binding + use-time eligibility), or — only when
+                                            // nothing is bound anywhere past the grace window — from the
+                                            // unbound fallback so a genuinely isolated node degrades to clamp
+                                            // semantics instead of halting. An attacker's sockets cannot
+                                            // attest and cannot unbind our honest peers, so their votes never
+                                            // enter the k=3 sample. Bookkeeping (voted_peers / health) moves
+                                            // INSIDE the gate so an attacker cannot steer proposal
+                                            // re-targeting or partition health either.
+                                            let eligible = self.consensus_validators();
+                                            let bound_eligible = self
+                                                .attested_peers
+                                                .get(&peer)
+                                                .is_some_and(|addr| eligible.contains(addr));
+                                            if bound_eligible || self.unbound_fallback_active(&eligible) {
+                                                self.consensus.record_peer_response(height, BlockHash(preference), peer);
+                                                self.voted_peers.insert(peer);
+                                                self.health_monitor.record_vote(commputer::peer_hash::peer_bucket(&peer));
+                                            } else {
+                                                debug!("Dropped unattested vote from {} at height {}", peer, height);
+                                            }
                                         }
                                     }
                                     ConsensusResponse::NotReady { height, tip } => {
@@ -2156,7 +2315,13 @@ impl EventLoop {
                 if let Some(ref addr) = validator_addr {
                     self.compliance.deregister_node(addr);
                 }
-                self.verified_peer_validators.remove(&peer_id);
+                // QC-009 attestation is strictly per-connection: drop the binding
+                // and any outstanding challenge. A reconnecting honest peer
+                // re-challenges within one RTT; the grace clock (kept fresh by any
+                // other bound peer) means the fallback window never opens while any
+                // honest peer is reachable.
+                self.attested_peers.remove(&peer_id);
+                self.pending_attest.remove(&peer_id);
                 self.peer_scores.remove(&peer_id);
                 // Drain grace period for disconnected validators.
                 if let Some(ref validator_addr) = validator_addr
@@ -3225,7 +3390,6 @@ impl EventLoop {
                 validator_addr, source
             );
             self.peer_validators.insert(source, validator_addr);
-            self.verified_peer_validators.insert(source, validator_addr);
             self.peer_last_seen.insert(source, std::time::Instant::now());
 
             // If we already know this peer's IP, register with compliance checker.
@@ -4154,6 +4318,29 @@ impl EventLoop {
             .unwrap_or(BlockHash::GENESIS)
     }
 
+    /// QC-009 liveness floor: grace window before the unbound-vote fallback
+    /// engages after ALL validator bindings are lost. Must be >> handshake RTT
+    /// (so a normal reconnect never opens the window) and < the stall window.
+    const GRACE_T: Duration = Duration::from_secs(5);
+
+    /// True when NO connected peer is bound to a currently-eligible validator AND
+    /// that has held for at least GRACE_T since the last active tick that had one.
+    /// Only then are unbound votes counted, so a genuinely isolated node keeps
+    /// producing at clamp semantics rather than halting; any single honest bound
+    /// peer keeps `last_bound_at` fresh (in the tick) and holds this false,
+    /// locking an attacker's unbound sockets out. An attacker cannot force this
+    /// true — it cannot unbind our honest peers.
+    fn unbound_fallback_active(&self, eligible: &[Address]) -> bool {
+        let has_bound_eligible = self
+            .attested_peers
+            .iter()
+            .any(|(p, a)| self.peer_ips.contains_key(p) && eligible.contains(a));
+        !has_bound_eligible
+            && self
+                .last_bound_at
+                .is_some_and(|t| t.elapsed() >= Self::GRACE_T)
+    }
+
     fn handle_consensus_tick(&mut self) {
         // Don't participate in consensus while syncing.
         if !self.node_state.is_active() {
@@ -4172,6 +4359,25 @@ impl EventLoop {
         self.consensus.update_params_for_rung(
             crate::consensus_manager::RungInput::derive(peer_count, distinct_eligible),
         );
+
+        // QC-009 liveness floor: keep the grace clock fresh while we hold any peer
+        // bound to a currently-eligible validator. The unbound-vote fallback (in
+        // the vote gate) engages only after GRACE_T with zero such peers — a
+        // sustained isolation / kill test, never a transient reconnect. Start the
+        // clock at the FIRST active tick, not process boot, so a node that boots
+        // isolated does not immediately count unbound votes.
+        if self.last_bound_at.is_none() {
+            self.last_bound_at = Some(std::time::Instant::now());
+        }
+        let has_bound_eligible = {
+            let eligible = self.consensus_validators();
+            self.attested_peers
+                .iter()
+                .any(|(p, a)| self.peer_ips.contains_key(p) && eligible.contains(a))
+        };
+        if has_bound_eligible {
+            self.last_bound_at = Some(std::time::Instant::now());
+        }
         // A wall-clock stall accumulated with nobody to talk to is meaningless —
         // without this, a node that rejoins after a 0-peer stretch fires an
         // immediate (destructive) recovery off stale timing.
