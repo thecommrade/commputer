@@ -15,13 +15,13 @@
 # nodes (degrades, does not halt), which is the property that makes the safety
 # gate deployable.
 #
-# ⚠ NOT-YET-LOAD-BEARING ON THIS LANE. The clamp-only binary here does NOT read
-# COMMPUTER_ATTEST_DISABLE (there is no attestation gate yet — grep the binary:
-# the env var is unreferenced), so this scenario is TRIVIALLY GREEN: it is a
-# normal healthy-mesh finalize+converge check. It is established NOW so that when
-# the attestation gate ships, this file already exists to prove the gate did not
-# cost liveness — flip it into FAST_SET at that point (run_formation.sh keeps it
-# runnable by name until then).
+# LOAD-BEARING: this binary reads COMMPUTER_ATTEST_DISABLE (formation-test only,
+# event_loop.rs attest_disabled) and gates vote intake on the attestation binding.
+# With attestation disabled on all three, no peer binds, so the QC-009 vote gate
+# has nothing bound and MUST fall back to counting unbound votes after GRACE_T —
+# the chain has to keep finalizing and converge, proving the liveness floor
+# DEGRADES rather than halts. If it stalls or diverges, the floor is wired wrong.
+# In FAST_SET (run_formation.sh).
 #
 # Exit-code contract (via scenario_result): 0 pass · 1 assertion failed · 2 infra
 

@@ -825,6 +825,11 @@ impl EventLoop {
             if let Some(validator_addr) = self.peer_validators.remove(&peer_id) {
                 self.compliance.deregister_node(&validator_addr);
             }
+            // Drop the QC-009 binding too so it never lingers past a ban (harmless
+            // — peer_ips is already gone so it neither refreshes the grace clock
+            // nor votes — but kept consistent with ConnectionClosed).
+            self.attested_peers.remove(&peer_id);
+            self.pending_attest.remove(&peer_id);
         }
     }
 
@@ -2619,6 +2624,35 @@ impl EventLoop {
         // (ENFORCE_PRODUCER_SIGNATURES flips true in core/block.rs at the reset.)
         if !block.verify_producer_signature() {
             self.ban_peer(source, "sent block with missing/invalid producer signature");
+            return false;
+        }
+
+        // === Stage 1d: Producer-MEMBERSHIP enforcement (QC-009 backstop) ===
+        // A valid signature proves only that the block was signed by whoever it
+        // NAMES as producer — an attacker signs its own block with its own key.
+        // Producer ELIGIBILITY is otherwise enforced only by the attestation vote
+        // gate, so during that gate's liveness-floor fallback (a genuinely
+        // isolated node, or the one-node-at-a-time rollout window before >=2
+        // validators mutually bind) an attacker's unbound k-sampled votes could
+        // finalize AND apply a self-signed block. Require the producer to be a
+        // member of the current eligible set, so an open fallback can only ever
+        // finalize an ELIGIBLE producer's block. This is a MEMBERSHIP test, NOT
+        // the exact-leader schedule check above (which stays non-enforcing for
+        // bootstrap convergence): the 3 pinned founders are always eligible, so an
+        // honest block never fails it. Guarded on a known set (>= 2 distinct) so
+        // it is inert during the pre-registration bootstrap window, exactly like
+        // the leader check. (Set-opening precondition: unify this, the clamp
+        // denominator, and the vote-gate set into one derivation — they coincide
+        // only while the pin is static; see the QC ledger.)
+        if commputer::leader::distinct_validator_count(&validators) >= 2
+            && !validators.contains(&block.header.producer)
+        {
+            self.adjust_peer_score(source, -20);
+            debug!(
+                "Rejected block at height {} from ineligible producer {}",
+                block.height(),
+                block.header.producer
+            );
             return false;
         }
 
