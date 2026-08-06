@@ -4931,6 +4931,25 @@ impl EventLoop {
                     self.mempool_added_at.remove(h);
                 }
 
+                // QC-024 (CRITICAL): a successful sync apply is EVIDENCE AGAINST a
+                // fork, so it must clear the mismatch counter. Without this the
+                // Err arm below is write-only for the whole of a sync-only
+                // catch-up: the only other `record_success` caller is the Snowball
+                // finalize path, which a Syncing node structurally never reaches
+                // (its candidates are not tip-parented). The Err arm's comment says
+                // "consecutive" mismatches, but nothing made them consecutive — so
+                // three mismatches ANYWHERE across a multi-hour catch-up would call
+                // initiate_chain_resync -> reset_to_genesis and WIPE a node that is
+                // merely behind: exactly the wipe QC-024 forbids, done
+                // automatically. Latent before the serve-path fix (a stranded node
+                // received no blocks, so neither arm ran); live once sync works.
+                //
+                // Recorded HERE, before process_orphans: that call re-enters
+                // try_apply_finalized, which is the OTHER record_mismatch site, so
+                // a success recorded after it would erase a nested mismatch from
+                // the same tick. The Snowball path orders it the same way.
+                self.fork_detector.record_success();
+
                 // Requeue-on-loss, sync twin: a height applied via sync never
                 // goes through take_finalized, so cleanup_below would destroy
                 // any losing candidates still held here — the loss path a
@@ -4945,21 +4964,6 @@ impl EventLoop {
                 // Track-2 (Phase B): feed the PoUW loops the just-applied state.
                 self.push_executor_snapshot();
                 self.push_verifier_snapshot();
-
-                // QC-024 (CRITICAL): a successful sync apply is EVIDENCE AGAINST a
-                // fork, so it must clear the mismatch counter. Without this the
-                // Err arm below is write-only for the whole of a sync-only
-                // catch-up: the only other `record_success` caller is the Snowball
-                // finalize path (:4698), which a Syncing node structurally never
-                // reaches (its candidates are not tip-parented). The Err arm's own
-                // comment says "consecutive" mismatches, but nothing made them
-                // consecutive — so three parent mismatches ANYWHERE across a
-                // multi-hour catch-up would call initiate_chain_resync ->
-                // reset_to_genesis and WIPE a node that is merely behind. That is
-                // exactly the wipe QC-024 says never to perform, done automatically.
-                // Latent before the serve-path fix (a stranded node received no
-                // blocks, so neither arm ran); live the moment sync works.
-                self.fork_detector.record_success();
             }
             Err(e) => {
                 warn!("Sync: failed to apply block {} at height {}: {}", hash, height, e);

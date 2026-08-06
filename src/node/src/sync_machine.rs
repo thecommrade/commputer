@@ -25,7 +25,11 @@ pub const BATCH_TIMEOUT_SECS: u64 = 10;
 pub const HEIGHT_QUERY_TIMEOUT_SECS: u64 = 5;
 
 /// Number of failures before a peer is considered exhausted.
-pub const MAX_PEER_FAILURES: u32 = 10;
+/// QC-024: lowered from 10 so peer ROTATION happens strictly before the heavier
+/// whole-machine stall reset at `MAX_STALL_BATCH_FAILURES`. See the note there —
+/// while the two were equal, a peer was only ever exhausted by the same call that
+/// cleared the exhausted set, so rotation never actually occurred.
+pub const MAX_PEER_FAILURES: u32 = 3;
 
 /// Security bound: the maximum number of blocks ahead of our own height that a
 /// single sync cycle will target. Peer-reported heights are self-attested and
@@ -69,11 +73,17 @@ pub const MAX_SYNC_GAP: u64 = SYNC_BATCH_SIZE;
 /// majority can correct the target. Any forward progress (a batch that advances
 /// our height) resets the counter, so a slow-but-genuine sync never trips it.
 ///
-/// Kept at `MAX_PEER_FAILURES` so the watchdog also fires in the single-peer
-/// case: a lone peer is marked exhausted after `MAX_PEER_FAILURES` failures, and
-/// once exhausted `select_peer` returns `None` and no further failures are ever
-/// recorded — the reset must therefore trigger on that same failure, not later.
-pub const MAX_STALL_BATCH_FAILURES: u32 = MAX_PEER_FAILURES;
+/// QC-024: this used to be pinned EQUAL to `MAX_PEER_FAILURES`, because once a
+/// lone peer was exhausted `select_peer` returned `None`, no further failures
+/// could ever be recorded, and the reset therefore had to fire on that same
+/// failure or never. `select_peer` now FAILS OPEN (it retries a previously-failed
+/// peer rather than returning `None`), so failures keep accruing after exhaustion
+/// and that constraint is gone. Decoupling them is what makes peer ROTATION real:
+/// with both at 10, a peer was only ever marked exhausted by the very call that
+/// also reset and cleared `exhausted_peers`, so `select_peer` always saw an empty
+/// exhausted set and always answered `first()`. Rotating at 3 lets a healthy
+/// second peer be tried well before the heavier whole-machine reset at 10.
+pub const MAX_STALL_BATCH_FAILURES: u32 = 10;
 
 /// Re-engagement: minimum blocks behind the network tip before the standing
 /// re-sync check arms. A 1-block lag is normal gossip skew around a moving
@@ -295,6 +305,19 @@ impl SyncMachine {
     /// When caught up (`our_height >= target_height`), transitions to `Verifying`
     /// and clears height responses for re-collection.
     pub fn next_batch(&mut self, our_height: u64) -> Option<(u64, u64)> {
+        // QC-024: only a Downloading machine has a meaningful batch. Without this
+        // guard the stall watchdog defeats itself INSIDE ONE TICK:
+        // `record_batch_failure` calls `reset()` (state=Idle, target_height=0) and
+        // the driver then calls `next_batch` a few lines later, where the
+        // `our_height >= target_height` branch is trivially true against 0 — so
+        // the machine logs "reached target 0 — entering Verifying" and skips the
+        // Idle -> start() -> QueryHeight re-query the watchdog exists to trigger.
+        // It then verifies with zero evidence and can latch `sync_complete` on a
+        // node tens of thousands of blocks behind. Returning None here leaves the
+        // machine Idle so the driver's Idle arm restarts it properly next tick.
+        if self.state != SyncState::Downloading {
+            return None;
+        }
         if our_height >= self.target_height {
             info!(
                 "[sync] reached target {} — entering Verifying",
@@ -799,9 +822,17 @@ mod tests {
         let peer = make_peer();
         let mut reset = false;
         for _ in 0..(MAX_STALL_BATCH_FAILURES as usize + 8) {
-            // event loop requests the next batch each tick; our_height is stuck.
-            let _ = machine.next_batch(our_height);
+            // QC-024: this MUST mirror the driver's real order — the event loop
+            // charges the timeout FIRST and then calls next_batch in the same tick
+            // (event_loop.rs, Downloading arm). The old test had them reversed,
+            // which is precisely why it never caught the watchdog defeating
+            // itself: record_batch_failure resets (Idle, target 0), and the
+            // following next_batch used to see `our_height >= 0`, log "reached
+            // target 0" and jump to Verifying — so the machine skipped the
+            // Idle -> start() -> QueryHeight re-query the watchdog exists to
+            // deliver, and could then latch sync_complete while far behind.
             machine.record_batch_failure(peer);
+            let _ = machine.next_batch(our_height);
             if *machine.state() == SyncState::Idle {
                 reset = true;
                 break;
