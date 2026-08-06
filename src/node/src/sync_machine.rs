@@ -312,6 +312,19 @@ impl SyncMachine {
         if our_height > self.last_progress_height {
             self.last_progress_height = our_height;
             self.consecutive_stall_failures = 0;
+            // QC-024: forward progress ALSO clears the per-peer failure tallies.
+            // These were monotonic — only `reset()` cleared them — which was
+            // harmless while `batch_timed_out()` could never fire, but becomes a
+            // NEW permanent wedge now that it can: a batch that lands between the
+            // 5s tick and the 10s timeout is charged a failure AND makes progress
+            // in the same tick, so on a long catch-up (~3,000 batches) a peer
+            // accumulates MAX_PEER_FAILURES from ordinary slowness alone. Once
+            // every peer is exhausted `select_peer` returns None, the node sends
+            // no requests and records no failures — so the stall watchdog can
+            // never trip either — and it is stuck silently until a restart.
+            // A peer that just served us is demonstrably healthy; forget its past.
+            self.peer_failures.clear();
+            self.exhausted_peers.clear();
         }
 
         let start = our_height + 1;
@@ -460,13 +473,27 @@ impl SyncMachine {
     /// Pick a peer from `available` that has not been exhausted.
     ///
     /// Returns `None` if all available peers are exhausted.
+    /// Highest height we have observed progress to in the current download.
+    /// QC-024: the driver reads this to avoid charging a batch failure in the
+    /// same tick that we actually advanced (a late-but-successful batch).
+    pub fn last_progress_height(&self) -> u64 {
+        self.last_progress_height
+    }
+
     pub fn select_peer(&self, available: &[PeerId]) -> Option<PeerId> {
         for &peer in available {
             if !self.exhausted_peers.contains(&peer) {
                 return Some(peer);
             }
         }
-        None
+        // QC-024: never return None while we still have SOMEONE to ask. Returning
+        // None makes the driver send nothing — and because it also records no
+        // failure, the stall watchdog can never trip, so the node wedges silently
+        // and permanently (only a restart clears `exhausted_peers`). A peer we
+        // previously gave up on is strictly better than no peer at all: retrying
+        // it can only succeed or re-fail, and re-failing keeps the watchdog alive.
+        // Fail OPEN toward liveness, which is the whole point of QC-024.
+        available.first().copied()
     }
 
     /// Re-engagement probe for the (protected) event loop's sync-timer tick.

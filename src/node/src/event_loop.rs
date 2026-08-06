@@ -185,6 +185,9 @@ pub struct EventLoop {
     /// rather than halting, while any honest peer keeps the clock fresh and locks
     /// an attacker out.
     pub last_bound_at: Option<std::time::Instant>,
+    /// QC-024: rate-limits the "served an empty sync range" warning so an
+    /// attacker cannot turn it into a log-spam channel.
+    pub last_empty_serve_warn: Option<std::time::Instant>,
     /// Kill lever (formation-test builds only): suppresses challenge/answer so the
     /// liveness-floor fallback can be exercised deliberately. Always false in a
     /// production build — there is no runtime off-switch for the gate.
@@ -336,6 +339,7 @@ impl EventLoop {
             attested_peers: HashMap::new(),
             pending_attest: HashMap::new(),
             last_bound_at: None,
+            last_empty_serve_warn: None,
             attest_disabled: {
                 #[cfg(feature = "formation-test")]
                 {
@@ -1169,7 +1173,14 @@ impl EventLoop {
                                         }
                                     } else {
                                         // Normal batch download.
-                                        if self.sync_machine.batch_timed_out() {
+                                        // QC-024 ordering: evaluate the timeout only if we have NOT
+                                        // made progress. Previously the timeout was charged before
+                                        // `next_batch` observed our new height, so a batch that
+                                        // landed between the 5s tick and the 10s timeout booked a
+                                        // failure AND advanced us in the same tick — steadily
+                                        // exhausting healthy peers during an ordinary slow sync.
+                                        let progressed = our_height > self.sync_machine.last_progress_height();
+                                        if !progressed && self.sync_machine.batch_timed_out() {
                                             if let Some(peer) = self.sync_machine.select_peer(&peers) {
                                                 self.sync_machine.record_batch_failure(peer);
                                             }
@@ -1179,6 +1190,12 @@ impl EventLoop {
                                                 let req = commputer_network::sync_protocol::SyncRequest::GetBlocks { start, end };
                                                 self.network.swarm.behaviour_mut().sync.send_request(&peer, req);
                                                 debug!("Sync: requested batch {}-{} from {}", start, end, peer);
+                                            } else {
+                                                // QC-024: with select_peer failing open this means we
+                                                // genuinely have NO peers. Say so — a silent
+                                                // no-request loop is what made this class of wedge
+                                                // invisible in the first place.
+                                                debug!("Sync: batch {}-{} ready but no peer available", start, end);
                                             }
                                         }
                                     }
@@ -1920,21 +1937,51 @@ impl EventLoop {
                                             // range a catching-up node asks for. Every request
                                             // returned an empty vec, so a node more than ~1000
                                             // blocks behind could never advance a single block.
-                                            for h in start..=end.min(start.saturating_add(100)) {
+                                            //
+                                            // Span capped at SYNC_BATCH_SIZE, not the old 100. Now
+                                            // that a miss costs TWO RocksDB point-gets (height index
+                                            // then block) plus a borsh decode and a JSON encode — on
+                                            // the same task as consensus, with no bloom filter or
+                                            // block cache configured — the extra 90 heights were
+                                            // pure attack surface: the only honest requester is our
+                                            // own driver, which never asks for more than
+                                            // SYNC_BATCH_SIZE. Attacker-chosen COLD random heights
+                                            // across the whole keyspace defeat the page cache, and
+                                            // PeerIds are free to mint.
+                                            let span_end = end
+                                                .min(start.saturating_add(
+                                                    commputer::sync_machine::SYNC_BATCH_SIZE.saturating_sub(1),
+                                                ));
+                                            for h in start..=span_end {
                                                 if let Some(b) = self.state.get_block_by_height(h) {
                                                     if let Ok(data) = serde_json::to_vec(&b) {
                                                         blocks.push(data);
                                                     }
                                                 }
                                             }
-                                            if blocks.is_empty() {
-                                                // Observability (QC-024): a silently-empty serve is
-                                                // what made this undiagnosable for two days. If we
-                                                // genuinely hold none of a requested range, say so.
-                                                warn!(
-                                                    "Sync serve: hold no blocks in {}..={} for {} — responding empty",
-                                                    start, end, peer
-                                                );
+                                            // Observability (QC-024): a silently-empty serve is what
+                                            // made this undiagnosable for two days. But only warn
+                                            // when it is ACTUALLY anomalous — i.e. we should have
+                                            // held the range. A peer asking above our own tip is
+                                            // ordinary (it is ahead of us, or racing our next
+                                            // block), and warning on it would both mislead and hand
+                                            // an attacker a free log-spam channel. Rate-limited to
+                                            // one line per interval, mirroring the STUCK_WARN
+                                            // pattern in chain_health_monitor.
+                                            if blocks.is_empty() && span_end <= self.state.blocks.height() {
+                                                const EMPTY_SERVE_WARN_INTERVAL: std::time::Duration =
+                                                    std::time::Duration::from_secs(60);
+                                                let due = self
+                                                    .last_empty_serve_warn
+                                                    .is_none_or(|t| t.elapsed() >= EMPTY_SERVE_WARN_INTERVAL);
+                                                if due {
+                                                    self.last_empty_serve_warn = Some(std::time::Instant::now());
+                                                    warn!(
+                                                        "Sync serve: hold no blocks in {}..={} (our tip {}) for {} — responding empty; \
+                                                         a peer cannot catch up from us. Check RocksDB block history.",
+                                                        start, span_end, self.state.blocks.height(), peer
+                                                    );
+                                                }
                                             }
                                             SyncResponse::Blocks(blocks)
                                         } else {
@@ -4898,6 +4945,21 @@ impl EventLoop {
                 // Track-2 (Phase B): feed the PoUW loops the just-applied state.
                 self.push_executor_snapshot();
                 self.push_verifier_snapshot();
+
+                // QC-024 (CRITICAL): a successful sync apply is EVIDENCE AGAINST a
+                // fork, so it must clear the mismatch counter. Without this the
+                // Err arm below is write-only for the whole of a sync-only
+                // catch-up: the only other `record_success` caller is the Snowball
+                // finalize path (:4698), which a Syncing node structurally never
+                // reaches (its candidates are not tip-parented). The Err arm's own
+                // comment says "consecutive" mismatches, but nothing made them
+                // consecutive — so three parent mismatches ANYWHERE across a
+                // multi-hour catch-up would call initiate_chain_resync ->
+                // reset_to_genesis and WIPE a node that is merely behind. That is
+                // exactly the wipe QC-024 says never to perform, done automatically.
+                // Latent before the serve-path fix (a stranded node received no
+                // blocks, so neither arm ran); live the moment sync works.
+                self.fork_detector.record_success();
             }
             Err(e) => {
                 warn!("Sync: failed to apply block {} at height {}: {}", hash, height, e);
