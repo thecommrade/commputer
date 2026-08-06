@@ -6037,6 +6037,61 @@ mod tests {
         }
     }
 
+    /// QC-024 regression: a block pruned out of the in-memory store MUST still be
+    /// retrievable via the disk-backed getter.
+    ///
+    /// This is the primitive the sync serve path depends on. Memory is pruned to
+    /// MEMORY_BLOCK_RETENTION after every block (persist_applied_block), so a node
+    /// catching up asks for exactly the range that is NOT in memory. The sync
+    /// handler used to call the memory-only `state.blocks.get_by_height`, which
+    /// answered None and produced a silent empty response — making any node more
+    /// than MEMORY_BLOCK_RETENTION blocks behind permanently unable to catch up.
+    /// If `get_block_by_height` ever stops falling back to RocksDB, that wedge
+    /// returns, so pin BOTH halves: memory misses, disk still hits.
+    #[test]
+    fn qc024_pruned_block_is_still_served_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(dir.path()).unwrap();
+        state.apply_block(&genesis_block()).unwrap();
+
+        // Force a prune with a tiny retention rather than building 1000+ blocks:
+        // the defect is about "below the window", not about the window's size.
+        let keep: u64 = 3;
+        let mut parent = state.blocks.latest().unwrap().hash();
+        for h in 1..=10u64 {
+            let mut b = genesis_block();
+            b.header.height = h;
+            b.header.parent_hash = parent;
+            b.header.tx_root = b.compute_tx_root();
+            b.header.proof_root = b.compute_proof_root();
+            parent = b.hash();
+            state.blocks.put(b);
+        }
+        let old_height = 2u64;
+        let expected = state
+            .get_block_by_height(old_height)
+            .expect("block must exist before pruning");
+        // Persist it so the disk fallback has something to find, then prune memory.
+        if let Some(ref rocks) = state.rocks {
+            rocks.put_block(&expected).unwrap();
+        }
+        state.blocks.prune(keep);
+
+        // The in-memory store must genuinely have dropped it — otherwise this test
+        // is vacuous and would pass even with the old memory-only lookup.
+        assert!(
+            state.blocks.get_by_height(old_height).is_none(),
+            "test is vacuous: height {old_height} was not pruned from memory"
+        );
+        // ...and the disk-backed getter must still serve it. This is the assertion
+        // the sync serve path now relies on.
+        let served = state
+            .get_block_by_height(old_height)
+            .expect("QC-024: a pruned block must still be served from RocksDB");
+        assert_eq!(served.hash(), expected.hash());
+        assert_eq!(served.height(), old_height);
+    }
+
     // --- PoUW P2 (B1a): consensus money/stake map persistence + state root ---------
 
     #[test]

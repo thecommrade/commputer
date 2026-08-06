@@ -1891,8 +1891,17 @@ impl EventLoop {
                                 match request {
                                     SyncRequest::GetBlock { height } => {
                                         let resp = if self.sync_rate_limiter.check(commputer::peer_hash::peer_bucket_tagged(&peer, 0)) {
-                                            let block_bytes = self.state.blocks.get_by_height(height)
-                                                .and_then(|b| serde_json::to_vec(b).ok());
+                                            // QC-024: serve from the DISK-BACKED getter, not the
+                                            // in-memory BlockStore. `state.blocks` is pruned to the
+                                            // last MEMORY_BLOCK_RETENTION (1000) heights after every
+                                            // block (state.rs:3159), so the memory-only lookup
+                                            // answers None for anything older — silently, with an
+                                            // empty response and no log at any level. That is what
+                                            // made a lagging peer permanently unrecoverable: it
+                                            // learned the correct target (prune leaves latest_height
+                                            // intact) and then received nothing, forever.
+                                            let block_bytes = self.state.get_block_by_height(height)
+                                                .and_then(|b| serde_json::to_vec(&b).ok());
                                             SyncResponse::Block(block_bytes)
                                         } else {
                                             SyncResponse::Block(None)
@@ -1905,12 +1914,27 @@ impl EventLoop {
                                             let mut blocks = Vec::new();
                                             // [28]: saturating_add — `start` is attacker-
                                             // controlled; `start + 100` overflow-panics in debug.
+                                            // QC-024: disk-backed getter (see GetBlock above) — the
+                                            // memory-only lookup could not serve a batch older than
+                                            // the 1000-height retention window, which is EXACTLY the
+                                            // range a catching-up node asks for. Every request
+                                            // returned an empty vec, so a node more than ~1000
+                                            // blocks behind could never advance a single block.
                                             for h in start..=end.min(start.saturating_add(100)) {
-                                                if let Some(b) = self.state.blocks.get_by_height(h) {
-                                                    if let Ok(data) = serde_json::to_vec(b) {
+                                                if let Some(b) = self.state.get_block_by_height(h) {
+                                                    if let Ok(data) = serde_json::to_vec(&b) {
                                                         blocks.push(data);
                                                     }
                                                 }
+                                            }
+                                            if blocks.is_empty() {
+                                                // Observability (QC-024): a silently-empty serve is
+                                                // what made this undiagnosable for two days. If we
+                                                // genuinely hold none of a requested range, say so.
+                                                warn!(
+                                                    "Sync serve: hold no blocks in {}..={} for {} — responding empty",
+                                                    start, end, peer
+                                                );
                                             }
                                             SyncResponse::Blocks(blocks)
                                         } else {

@@ -2123,14 +2123,29 @@ async fn get_health_enhanced(
     let uptime = state.start_time.elapsed().as_secs();
     let chain_health = state.chain_health.lock().await.clone();
 
+    // QC-024: `synced` and `healthy` were both HARDCODED `true`. A node stuck
+    // 28,191 blocks behind for 28 hours reported `"synced": true` while the
+    // chain_health block in this same response said `stuck for 102328s` — so
+    // monitoring could not see a node that had permanently fallen out of the
+    // network, and the operator learned to distrust the alarm instead. Derive
+    // both from the chain-health signal that is already in hand (no new
+    // plumbing, so the protected RpcState construction is untouched). This is a
+    // conservative proxy: it reports NOT-synced whenever the chain is not
+    // advancing. It does not prove the converse (a node quietly applying blocks
+    // behind the tip still reads healthy), which needs the real sync flag
+    // plumbed through — tracked with QC-024.
+    let chain_is_advancing = chain_health
+        .get("is_healthy")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     Json(serde_json::json!({
-        "healthy": true,
+        "healthy": chain_is_advancing,
         "height": status.height,
         "epoch": status.epoch,
         "peers": peers.len(),
         "pending_txs": status.pending_txs,
         "uptime_secs": uptime,
-        "synced": true,
+        "synced": chain_is_advancing,
         "chain_id": crate::config::DEFAULT_TESTNET_CHAIN_ID,
         "chain_health": chain_health,
     }))

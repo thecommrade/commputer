@@ -317,8 +317,21 @@ impl SyncMachine {
         let start = our_height + 1;
         let end = (start + SYNC_BATCH_SIZE - 1).min(self.target_height);
         debug!("[sync] next_batch: ({}, {})", start, end);
-        self.current_batch = Some((start, end));
-        self.state_entered_at = Instant::now();
+        // QC-024: restart the in-flight clock ONLY for a genuinely different
+        // batch. This used to reset unconditionally on every call — and the sync
+        // driver calls `next_batch` every 5s tick (event_loop.rs sync_timer)
+        // while BATCH_TIMEOUT_SECS is 10, so `state_entered_at.elapsed()` could
+        // never reach the threshold. `batch_timed_out()` was therefore ALWAYS
+        // false, which made `record_batch_failure` (and with it peer exhaustion
+        // and the MAX_STALL_BATCH_FAILURES watchdog) unreachable in production:
+        // a batch that never returns was re-requested from the same peer
+        // forever, with no retry and no escalation. Re-requesting the SAME range
+        // must let the clock run.
+        let new_batch = Some((start, end));
+        if self.current_batch != new_batch {
+            self.current_batch = new_batch;
+            self.state_entered_at = Instant::now();
+        }
         Some((start, end))
     }
 
