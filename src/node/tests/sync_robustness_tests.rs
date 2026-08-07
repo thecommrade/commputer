@@ -9,7 +9,9 @@
 //!
 //! New file, zero runtime behavior change. (Roadmap: src/staging/docs/wirein_roadmap.md B-4.)
 
-use commputer::sync_machine::{SyncMachine, SyncState, MAX_PEER_FAILURES, SYNC_BATCH_SIZE};
+use commputer::sync_machine::{
+    SyncMachine, SyncState, MAX_PEER_FAILURES, MAX_STALL_BATCH_FAILURES, SYNC_BATCH_SIZE,
+};
 use libp2p::PeerId;
 use proptest::prelude::*;
 
@@ -92,9 +94,24 @@ proptest! {
         prop_assert_eq!(exhausted_at, MAX_PEER_FAILURES, "exhaustion at the threshold");
 
         if n_peers > 1 {
+            // Rotation still holds: while a HEALTHY alternative exists, an
+            // exhausted peer is skipped. This is the assertion that keeps
+            // `exhausted_peers` meaningful.
             prop_assert_eq!(m.select_peer(&peers), Some(peers[1]), "skip the exhausted peer");
         } else {
-            prop_assert_eq!(m.select_peer(&peers), None, "no peers left");
+            // QC-024 CONTRACT CHANGE: with every peer exhausted, `select_peer`
+            // now FAILS OPEN and returns the peer anyway instead of `None`.
+            // Returning `None` made the driver send no request AND record no
+            // failure, so the stall watchdog could never trip and the node wedged
+            // SILENTLY until a restart — the same class of unrecoverable stall
+            // QC-024 exists to remove. Retrying a peer that previously failed can
+            // only succeed or fail again, and failing again keeps the watchdog
+            // alive; asking nobody guarantees neither. Liveness beats tidiness.
+            prop_assert_eq!(
+                m.select_peer(&peers),
+                Some(peers[0]),
+                "fail open: a previously-failed peer beats asking nobody"
+            );
         }
     }
 }
@@ -126,37 +143,84 @@ fn reset_clears_all_transient_state() {
     // which this test must sidestep to observe reset() itself doing the clearing.
     let mut m = SyncMachine::new();
     let peer = PeerId::random();
+    // QC-024: `select_peer` now FAILS OPEN, so "returns None" is no longer a valid
+    // probe for "this peer is exhausted" — with nothing else available it hands
+    // the exhausted peer back on purpose (see peer_exhaustion_and_selection).
+    // Probe with a HEALTHY alternative instead: if the exhausted peer is genuinely
+    // tracked, selection skips it in favour of `healthy`. That observes the same
+    // internal state this test has always been about, and survives the contract
+    // change without weakening the assertion.
+    let healthy = PeerId::random();
     for _ in 0..MAX_PEER_FAILURES {
         m.record_batch_failure(peer);
     }
-    assert_eq!(m.select_peer(&[peer]), None, "peer exhausted");
+    assert_eq!(
+        m.select_peer(&[peer, healthy]),
+        Some(healthy),
+        "peer exhausted → skipped while a healthy alternative exists"
+    );
 
     // Exhaustion survives entering a fresh download...
     m.start();
     m.record_height(100);
     m.begin_downloading(0);
     assert_eq!(*m.state(), SyncState::Downloading);
-    assert_eq!(m.select_peer(&[peer]), None, "exhaustion persists across begin_downloading");
+    assert_eq!(
+        m.select_peer(&[peer, healthy]),
+        Some(healthy),
+        "exhaustion persists across begin_downloading"
+    );
 
     // ...and reset() clears all of it.
     m.reset();
     assert_eq!(*m.state(), SyncState::Idle);
     assert_eq!(m.target_height(), 0);
-    // Exhausted set cleared → the peer is selectable again.
-    assert_eq!(m.select_peer(&[peer]), Some(peer));
+    // Exhausted set cleared → the previously-exhausted peer is preferred again
+    // (it is first in the slice, so selecting it proves it is no longer skipped).
+    assert_eq!(m.select_peer(&[peer, healthy]), Some(peer));
 }
 
 #[test]
-fn stall_watchdog_self_resets_on_the_exhausting_failure() {
-    // Liveness watchdog (MAX_STALL_BATCH_FAILURES == MAX_PEER_FAILURES): while
-    // Downloading toward a nonzero target with no forward progress, the failure
-    // that exhausts a lone peer must ALSO trip the watchdog and reset the machine
-    // — once a lone peer is exhausted, select_peer returns None and no further
-    // failures are ever recorded, so firing any later would wedge the node in
-    // Downloading forever.
+fn stall_watchdog_fires_even_after_the_lone_peer_is_exhausted() {
+    // QC-024 REWRITE. This test used to assert that the failure which exhausts a
+    // lone peer must ALSO trip the watchdog, and the thresholds were pinned equal
+    // to force that. The stated reason was: once a lone peer is exhausted,
+    // select_peer returns None, no further failures are ever recorded, so a
+    // watchdog that fired later would never fire at all.
+    //
+    // That constraint is gone. select_peer now FAILS OPEN, so failures keep being
+    // recorded past exhaustion, which lets the two thresholds be decoupled
+    // (MAX_PEER_FAILURES=3 rotates; MAX_STALL_BATCH_FAILURES=10 resets). The new
+    // property is strictly stronger and is what the fix is for: exhaustion no
+    // longer silences failure accounting, so the watchdog reliably arrives.
+    assert!(
+        MAX_PEER_FAILURES < MAX_STALL_BATCH_FAILURES,
+        "rotation must come strictly before the whole-machine reset, or a peer is \
+         only ever exhausted by the same call that clears the exhausted set"
+    );
+
     let mut m = downloading_to(100);
     let peer = PeerId::random();
+
+    // Exhaust the lone peer. The machine must NOT reset yet — rotation is not a
+    // reset, and with only one peer there is nobody to rotate to.
     for _ in 0..MAX_PEER_FAILURES {
+        m.record_batch_failure(peer);
+    }
+    assert_eq!(
+        *m.state(),
+        SyncState::Downloading,
+        "exhausting a peer rotates; it must not tear down the download"
+    );
+    assert_eq!(
+        m.select_peer(&[peer]),
+        Some(peer),
+        "fail open: the lone exhausted peer is still handed back, so the driver \
+         keeps requesting and keeps recording failures"
+    );
+
+    // Keep failing. Because failures still accrue, the watchdog is reachable.
+    for _ in MAX_PEER_FAILURES..MAX_STALL_BATCH_FAILURES {
         m.record_batch_failure(peer);
     }
     assert_eq!(*m.state(), SyncState::Idle, "watchdog tore the wedged sync down");
